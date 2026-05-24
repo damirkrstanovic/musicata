@@ -13,9 +13,10 @@ use axum::{
     routing::get,
 };
 use musicata_core::{Library, LocalDiskProvider, MusicProvider};
+use musicata_storage::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
@@ -26,7 +27,9 @@ struct AppState {
 #[derive(Debug)]
 struct Config {
     library: PathBuf,
+    database: PathBuf,
     addr: SocketAddr,
+    rescan: bool,
 }
 
 #[tokio::main]
@@ -35,11 +38,10 @@ async fn main() -> Result<()> {
 
     let config = Config::from_args()?;
     let provider = LocalDiskProvider::new(&config.library);
-    let library = Arc::new(
-        provider
-            .scan()
-            .with_context(|| format!("failed to scan {}", provider.root().display()))?,
-    );
+    let database = Database::connect(&config.database)
+        .await
+        .with_context(|| format!("failed to open database {}", config.database.display()))?;
+    let library = Arc::new(load_or_scan_library(&database, &provider, config.rescan).await?);
 
     tracing::info!(
         artists = library.artists.len(),
@@ -59,6 +61,29 @@ async fn main() -> Result<()> {
         .context("server failed")?;
 
     Ok(())
+}
+
+async fn load_or_scan_library(
+    database: &Database,
+    provider: &LocalDiskProvider,
+    rescan: bool,
+) -> Result<Library> {
+    if !rescan && let Some(library) = database.load_library().await? {
+        tracing::info!(
+            artists = library.artists.len(),
+            albums = library.albums.len(),
+            tracks = library.tracks.len(),
+            "loaded library from database"
+        );
+        return Ok(library);
+    }
+
+    let library = provider
+        .scan()
+        .with_context(|| format!("failed to scan {}", provider.root().display()))?;
+    database.save_library(&library).await?;
+
+    Ok(library)
 }
 
 fn app(library: Arc<Library>) -> Router {
@@ -360,29 +385,106 @@ struct ErrorBody {
 
 impl Config {
     fn from_args() -> Result<Self> {
-        let mut library = PathBuf::from("testdata");
-        let mut addr: SocketAddr = "127.0.0.1:3030".parse()?;
-        let mut args = std::env::args().skip(1);
+        Self::from_sources(std::env::args().skip(1), |name| std::env::var(name).ok())
+    }
+
+    fn from_sources(
+        args: impl IntoIterator<Item = String>,
+        mut env: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let cli = ConfigOverrides::from_args(args)?;
+        let config_path = cli
+            .config_path
+            .clone()
+            .or_else(|| env("MUSICATA_CONFIG").map(PathBuf::from));
+
+        let mut config = Self::default();
+
+        if let Some(path) = config_path {
+            ConfigOverrides::from_file(&path)?.apply_to(&mut config);
+        }
+
+        ConfigOverrides {
+            config_path: None,
+            library: env("MUSICATA_LIBRARY")
+                .or_else(|| env("MUSICATA_LIBRARY_PATH"))
+                .map(PathBuf::from),
+            database: env("MUSICATA_DATABASE")
+                .or_else(|| env("MUSICATA_DATABASE_PATH"))
+                .map(PathBuf::from),
+            addr: env("MUSICATA_ADDR")
+                .or_else(|| env("MUSICATA_BIND_ADDR"))
+                .map(|value| parse_addr(&value, "MUSICATA_ADDR"))
+                .transpose()?,
+            rescan: env("MUSICATA_RESCAN")
+                .map(|value| parse_bool(&value, "MUSICATA_RESCAN"))
+                .transpose()?,
+        }
+        .apply_to(&mut config);
+
+        cli.apply_to(&mut config);
+
+        Ok(config)
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            library: PathBuf::from("testdata"),
+            database: PathBuf::from(".musicata/musicata.db"),
+            addr: "127.0.0.1:3030"
+                .parse()
+                .expect("default socket address is valid"),
+            rescan: false,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ConfigOverrides {
+    config_path: Option<PathBuf>,
+    library: Option<PathBuf>,
+    database: Option<PathBuf>,
+    addr: Option<SocketAddr>,
+    rescan: Option<bool>,
+}
+
+impl ConfigOverrides {
+    fn from_args(args: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut overrides = Self::default();
+        let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--config" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--config requires a path"))?;
+                    overrides.config_path = Some(PathBuf::from(value));
+                }
                 "--library" => {
                     let value = args
                         .next()
                         .ok_or_else(|| anyhow!("--library requires a path"))?;
-                    library = PathBuf::from(value);
+                    overrides.library = Some(PathBuf::from(value));
+                }
+                "--database" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--database requires a path"))?;
+                    overrides.database = Some(PathBuf::from(value));
                 }
                 "--addr" => {
                     let value = args
                         .next()
                         .ok_or_else(|| anyhow!("--addr requires host:port"))?;
-                    addr = value
-                        .parse()
-                        .with_context(|| format!("invalid --addr value: {value}"))?;
+                    overrides.addr = Some(parse_addr(&value, "--addr")?);
                 }
+                "--rescan" => overrides.rescan = Some(true),
                 "--help" | "-h" => {
                     println!(
-                        "Usage: musicata-server [--library PATH] [--addr HOST:PORT]\n\nDefaults: --library testdata --addr 127.0.0.1:3030"
+                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN\nConfig file keys: library, database, addr, rescan\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
                     );
                     std::process::exit(0);
                 }
@@ -390,8 +492,89 @@ impl Config {
             }
         }
 
-        Ok(Self { library, addr })
+        Ok(overrides)
     }
+
+    fn from_file(path: &PathBuf) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?;
+        let mut overrides = Self::default();
+
+        for (index, line) in content.lines().enumerate() {
+            let line = line.split_once('#').map(|(line, _)| line).unwrap_or(line);
+            let line = line.trim();
+
+            if line.is_empty() {
+                continue;
+            }
+
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| anyhow!("{}:{}: expected key = value", path.display(), index + 1))?;
+            let key = key.trim();
+            let value = unquote(value.trim());
+
+            match key {
+                "library" | "library_path" => overrides.library = Some(PathBuf::from(value)),
+                "database" | "database_path" => overrides.database = Some(PathBuf::from(value)),
+                "addr" | "bind_addr" => overrides.addr = Some(parse_addr(value, "config addr")?),
+                "rescan" => overrides.rescan = Some(parse_bool(value, "config rescan")?),
+                value => {
+                    return Err(anyhow!(
+                        "{}:{}: unknown config key `{value}`",
+                        path.display(),
+                        index + 1
+                    ));
+                }
+            }
+        }
+
+        Ok(overrides)
+    }
+
+    fn apply_to(self, config: &mut Config) {
+        if let Some(library) = self.library {
+            config.library = library;
+        }
+
+        if let Some(database) = self.database {
+            config.database = database;
+        }
+
+        if let Some(addr) = self.addr {
+            config.addr = addr;
+        }
+
+        if let Some(rescan) = self.rescan {
+            config.rescan = rescan;
+        }
+    }
+}
+
+fn parse_addr(value: &str, source: &str) -> Result<SocketAddr> {
+    value
+        .parse()
+        .with_context(|| format!("invalid {source} value: {value}"))
+}
+
+fn parse_bool(value: &str, source: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(anyhow!("invalid {source} value: {value}")),
+    }
+}
+
+fn unquote(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(value)
 }
 
 fn init_logging() {
@@ -402,13 +585,16 @@ fn init_logging() {
 
 #[cfg(test)]
 mod tests {
-    use super::{app, parse_range};
+    use super::{Config, app, parse_range};
     use axum::{
         body::{Body, to_bytes},
-        http::{Request, StatusCode, header::RANGE},
+        http::{
+            Request, StatusCode,
+            header::{CONTENT_TYPE, RANGE},
+        },
     };
     use musicata_core::{Library, scan_local_library};
-    use std::{fs, path::PathBuf, sync::Arc, time::SystemTime};
+    use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::SystemTime};
     use tower::ServiceExt;
 
     #[test]
@@ -417,6 +603,58 @@ mod tests {
         assert_eq!(parse_range("bytes=10-19", 100), Some((10, 19)));
         assert_eq!(parse_range("bytes=-10", 100), Some((90, 99)));
         assert_eq!(parse_range("bytes=150-", 100), None);
+    }
+
+    #[test]
+    fn loads_default_config() {
+        let config = Config::from_sources(Vec::<String>::new(), |_| None).expect("config");
+
+        assert_eq!(config.library, PathBuf::from("testdata"));
+        assert_eq!(config.database, PathBuf::from(".musicata/musicata.db"));
+        assert_eq!(config.addr.to_string(), "127.0.0.1:3030");
+        assert!(!config.rescan);
+    }
+
+    #[test]
+    fn layers_config_file_env_and_cli() {
+        let config_file = TempConfigFile::new(
+            "layered",
+            r#"
+            # Musicata config
+            library = "/from/file"
+            database = "/from/file.db"
+            addr = "127.0.0.1:4000"
+            rescan = false
+            "#,
+        );
+        let env = HashMap::from([
+            (
+                "MUSICATA_CONFIG".to_string(),
+                config_file.path.to_string_lossy().to_string(),
+            ),
+            ("MUSICATA_LIBRARY".to_string(), "/from/env".to_string()),
+            ("MUSICATA_DATABASE".to_string(), "/from/env.db".to_string()),
+            ("MUSICATA_ADDR".to_string(), "127.0.0.1:5000".to_string()),
+            ("MUSICATA_RESCAN".to_string(), "false".to_string()),
+        ]);
+        let config = Config::from_sources(
+            [
+                "--library".to_string(),
+                "/from/cli".to_string(),
+                "--database".to_string(),
+                "/from/cli.db".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:6000".to_string(),
+                "--rescan".to_string(),
+            ],
+            |name| env.get(name).cloned(),
+        )
+        .expect("config");
+
+        assert_eq!(config.library, PathBuf::from("/from/cli"));
+        assert_eq!(config.database, PathBuf::from("/from/cli.db"));
+        assert_eq!(config.addr.to_string(), "127.0.0.1:6000");
+        assert!(config.rescan);
     }
 
     #[tokio::test]
@@ -436,6 +674,25 @@ mod tests {
 
         assert!(body.contains(r#""track_count":3"#));
         assert!(body.contains(r#""album_count":2"#));
+    }
+
+    #[tokio::test]
+    async fn serves_health_json() {
+        let fixture = TestFixture::new("health");
+        let app = app(Arc::new(fixture.library()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(response.into_body()).await;
+
+        assert!(body.contains(r#""status":"ok""#));
+        assert!(body.contains(r#""provider":"local-disk""#));
     }
 
     #[tokio::test]
@@ -477,6 +734,41 @@ mod tests {
 
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
         assert_eq!(body.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn serves_album_artwork() {
+        let fixture = TestFixture::new("artwork");
+        let library = Arc::new(fixture.library());
+        let album_id = library
+            .albums
+            .iter()
+            .find(|album| album.artwork_url.is_some())
+            .expect("album artwork")
+            .id
+            .clone();
+        let app = app(library);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/albums/{album_id}/artwork"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "image/jpeg");
+        assert!(!body.is_empty());
     }
 
     #[tokio::test]
@@ -537,6 +829,31 @@ mod tests {
     }
 
     impl Drop for TestFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    struct TempConfigFile {
+        root: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TempConfigFile {
+        fn new(name: &str, contents: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("musicata-config-{name}-{unique}"));
+            fs::create_dir_all(&root).expect("create config fixture root");
+            let path = root.join("musicata.conf");
+            fs::write(&path, contents).expect("write config fixture");
+            Self { root, path }
+        }
+    }
+
+    impl Drop for TempConfigFile {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }

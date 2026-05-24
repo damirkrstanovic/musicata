@@ -32,7 +32,7 @@ Known limitations:
 
 ## Milestone 1: Server Foundation
 
-Status: in progress.
+Status: complete.
 
 Goal: replace prototype plumbing with the intended production server stack.
 
@@ -43,8 +43,8 @@ Tasks:
 - [x] Replace hand-written JSON with `serde` DTOs.
 - [x] Add `tracing` logs for startup, library scan state, and request summaries.
 - [x] Add structured request/error output.
-- Add config loading from CLI flags, environment variables, and a config file.
-- Define stable API response envelopes and error format.
+- [x] Add config loading from CLI flags, environment variables, and a config file.
+- [x] Define stable API response shapes and error format.
 
 Done when:
 
@@ -54,22 +54,26 @@ Done when:
 
 ## Milestone 2: Persistent Library Database
 
+Status: in progress.
+
 Goal: stop rebuilding the entire library only in memory.
 
 Tasks:
 
-- Add SQLite via SQLx.
-- Add migrations and schema versioning.
-- Store providers, provider items, artists, albums, tracks, artwork records, and scan state.
+- [x] Add SQLite via SQLx.
+- [x] Add initial schema migration.
+- [x] Store providers, provider items, artists, albums, tracks, artwork paths, and scan state.
 - Keep provider mappings separate from canonical entities.
-- Add full scan and incremental rescan commands.
+- [x] Add full rescan trigger with `--rescan` and `MUSICATA_RESCAN`.
+- Add incremental rescan commands.
 - Track file size, modified time, content hash where useful, and scan errors.
 
 Done when:
 
 - First scan populates SQLite.
 - Restarting the server loads from the database.
-- Rescan detects added, removed, and changed files.
+- Full rescan can replace the stored library.
+- Incremental rescan detects added, removed, and changed files.
 - Local file paths are not used as canonical track IDs.
 
 ## Milestone 3: Metadata Extraction And Updates
@@ -262,8 +266,9 @@ Done when:
 
 ## Immediate Next Steps
 
-The next implementation slice should be Milestone 1:
+The next implementation slice should be Milestone 2:
 
-1. Add config loading from CLI flags, environment variables, and a config file.
-3. Keep the current API shape and web UI behavior unchanged.
-4. Preserve the local-disk provider boundary while completing the transport layer.
+1. Track file size, modified time, and scan errors in SQLite.
+2. Add an incremental rescan command.
+3. Add schema versioning beyond the initial migration.
+4. Keep local file paths out of canonical IDs as the schema grows.

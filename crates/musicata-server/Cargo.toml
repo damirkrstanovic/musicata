@@ -9,6 +9,7 @@ repository.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 musicata-core = { path = "../musicata-core" }
+musicata-storage = { path = "../musicata-storage" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

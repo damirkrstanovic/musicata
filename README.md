@@ -68,7 +68,17 @@ Use another library path or port when needed:
 
 ```sh
 cargo run -p musicata-server -- --library /path/to/music --addr 127.0.0.1:3031
+cargo run -p musicata-server -- --library /path/to/music --database .musicata/musicata.db --rescan
 ```
+
+Configuration can also come from a config file or environment variables. Precedence is `defaults < config file < environment < CLI`.
+
+```sh
+cargo run -p musicata-server -- --config musicata.example.conf
+MUSICATA_LIBRARY=/path/to/music MUSICATA_DATABASE=.musicata/musicata.db MUSICATA_ADDR=127.0.0.1:3031 cargo run -p musicata-server
+```
+
+On first run the server scans the configured library and stores the result in SQLite. Later runs load from the database unless `--rescan` or `MUSICATA_RESCAN=true` is set.
 
 Useful endpoints:
 

@@ -47,6 +47,7 @@ Initial server requirements:
 
 - Run as a long-lived service on Linux first.
 - Store metadata and playback state in a local database.
+- Load the library from SQLite after the first scan, with explicit rescan support.
 - Scan configured local music folders.
 - Detect added, removed, and changed files.
 - Stream playable audio to controllers or players.
