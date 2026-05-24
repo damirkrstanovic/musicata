@@ -53,6 +53,7 @@ pub struct Library {
     pub artists: Vec<Artist>,
     pub albums: Vec<Album>,
     pub tracks: Vec<Track>,
+    pub scan_errors: Vec<ScanIssue>,
 }
 
 impl Library {
@@ -160,10 +161,18 @@ pub struct Track {
     pub year: Option<u16>,
     pub track_number: Option<u16>,
     pub extension: String,
+    pub file_size_bytes: Option<u64>,
+    pub modified_at_unix_seconds: Option<i64>,
     pub relative_path: String,
     pub stream_url: String,
     #[serde(skip)]
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ScanIssue {
+    pub path: String,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -226,14 +235,16 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
     })?;
 
     let mut files = Vec::new();
-    collect_audio_files(&root, &mut files)?;
-    files.sort();
+    let mut scan_errors = Vec::new();
+    collect_audio_files(&root, &mut files, &mut scan_errors, true)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
 
     let mut tracks = Vec::new();
     let mut album_builders: BTreeMap<String, AlbumBuilder> = BTreeMap::new();
     let mut artist_builders: BTreeMap<String, ArtistBuilder> = BTreeMap::new();
 
-    for path in files {
+    for file in files {
+        let path = file.path;
         let metadata = infer_track_metadata(&root, &path);
         let artist_id = stable_id("artist", &metadata.artist_name.to_ascii_lowercase());
         let album_key = format!(
@@ -290,6 +301,8 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
             year: metadata.year,
             track_number: metadata.track_number,
             extension,
+            file_size_bytes: file.file_size_bytes,
+            modified_at_unix_seconds: file.modified_at_unix_seconds,
             relative_path,
             stream_url: format!("/api/tracks/{track_id}/stream"),
             path,
@@ -348,7 +361,15 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
         artists,
         albums,
         tracks,
+        scan_errors,
     })
+}
+
+#[derive(Clone, Debug)]
+struct DiscoveredAudioFile {
+    path: PathBuf,
+    file_size_bytes: Option<u64>,
+    modified_at_unix_seconds: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -379,31 +400,88 @@ struct ArtistBuilder {
     track_count: usize,
 }
 
-fn collect_audio_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), ScanError> {
-    let entries = fs::read_dir(root).map_err(|source| ScanError::Io {
-        path: root.to_path_buf(),
-        source,
-    })?;
+fn collect_audio_files(
+    root: &Path,
+    files: &mut Vec<DiscoveredAudioFile>,
+    scan_errors: &mut Vec<ScanIssue>,
+    required: bool,
+) -> Result<(), ScanError> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(source) if required => {
+            return Err(ScanError::Io {
+                path: root.to_path_buf(),
+                source,
+            });
+        }
+        Err(source) => {
+            scan_errors.push(ScanIssue {
+                path: root.display().to_string(),
+                message: source.to_string(),
+            });
+            return Ok(());
+        }
+    };
 
     for entry in entries {
-        let entry = entry.map_err(|source| ScanError::Io {
-            path: root.to_path_buf(),
-            source,
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(source) => {
+                scan_errors.push(ScanIssue {
+                    path: root.display().to_string(),
+                    message: source.to_string(),
+                });
+                continue;
+            }
+        };
         let path = entry.path();
-        let file_type = entry.file_type().map_err(|source| ScanError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(source) => {
+                scan_errors.push(ScanIssue {
+                    path: path.display().to_string(),
+                    message: source.to_string(),
+                });
+                continue;
+            }
+        };
 
         if file_type.is_dir() {
-            collect_audio_files(&path, files)?;
+            collect_audio_files(&path, files, scan_errors, false)?;
         } else if file_type.is_file() && has_extension(&path, AUDIO_EXTENSIONS) {
-            files.push(path);
+            let file_metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(source) => {
+                    scan_errors.push(ScanIssue {
+                        path: path.display().to_string(),
+                        message: source.to_string(),
+                    });
+                    files.push(DiscoveredAudioFile {
+                        path,
+                        file_size_bytes: None,
+                        modified_at_unix_seconds: None,
+                    });
+                    continue;
+                }
+            };
+            files.push(DiscoveredAudioFile {
+                path,
+                file_size_bytes: Some(file_metadata.len()),
+                modified_at_unix_seconds: file_metadata
+                    .modified()
+                    .ok()
+                    .and_then(system_time_to_unix_seconds),
+            });
         }
     }
 
     Ok(())
+}
+
+fn system_time_to_unix_seconds(time: std::time::SystemTime) -> Option<i64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
 }
 
 fn infer_track_metadata(root: &Path, path: &Path) -> TrackMetadata {
@@ -592,6 +670,13 @@ mod tests {
                 .albums
                 .iter()
                 .any(|album| album.artwork_url.is_some())
+        );
+        assert!(library.scan_errors.is_empty());
+        assert!(
+            library
+                .tracks
+                .iter()
+                .all(|track| track.file_size_bytes == Some(0))
         );
     }
 

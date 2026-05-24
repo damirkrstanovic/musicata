@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use musicata_core::{Album, Artist, Library, ProviderMapping, Track};
+use musicata_core::{Album, Artist, Library, ProviderMapping, ScanIssue, Track};
 use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -44,6 +44,23 @@ impl Database {
         for statement in MIGRATION_001 {
             sqlx::query(statement).execute(&self.pool).await?;
         }
+        ensure_column(
+            &self.pool,
+            "tracks",
+            "file_size_bytes",
+            "ALTER TABLE tracks ADD COLUMN file_size_bytes INTEGER",
+        )
+        .await?;
+        ensure_column(
+            &self.pool,
+            "tracks",
+            "modified_at_unix_seconds",
+            "ALTER TABLE tracks ADD COLUMN modified_at_unix_seconds INTEGER",
+        )
+        .await?;
+        sqlx::query("PRAGMA user_version = 1")
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
@@ -54,6 +71,9 @@ impl Database {
 
         let result = async {
             sqlx::query("DELETE FROM tracks").execute(&mut *conn).await?;
+            sqlx::query("DELETE FROM scan_errors")
+                .execute(&mut *conn)
+                .await?;
             sqlx::query("DELETE FROM albums").execute(&mut *conn).await?;
             sqlx::query("DELETE FROM artists").execute(&mut *conn).await?;
             sqlx::query("DELETE FROM providers")
@@ -99,7 +119,7 @@ impl Database {
 
             for track in &library.tracks {
                 sqlx::query(
-                    "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, extension, relative_path, stream_url, path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, extension, file_size_bytes, modified_at_unix_seconds, relative_path, stream_url, path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 )
                 .bind(&track.id)
                 .bind(&track.provider.provider_id)
@@ -112,6 +132,8 @@ impl Database {
                 .bind(track.year.map(i64::from))
                 .bind(track.track_number.map(i64::from))
                 .bind(&track.extension)
+                .bind(track.file_size_bytes.map(u64_to_i64).transpose()?)
+                .bind(track.modified_at_unix_seconds)
                 .bind(&track.relative_path)
                 .bind(&track.stream_url)
                 .bind(path_to_string(&track.path))
@@ -119,7 +141,15 @@ impl Database {
                 .await?;
             }
 
-            Ok::<(), sqlx::Error>(())
+            for issue in &library.scan_errors {
+                sqlx::query("INSERT INTO scan_errors (path, message) VALUES (?1, ?2)")
+                    .bind(&issue.path)
+                    .bind(&issue.message)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+
+            Ok::<(), anyhow::Error>(())
         }
         .await;
 
@@ -157,10 +187,13 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         let track_rows = sqlx::query(
-            "SELECT id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, extension, relative_path, stream_url, path FROM tracks ORDER BY artist_name, year, album_title, track_number, title",
+            "SELECT id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, extension, file_size_bytes, modified_at_unix_seconds, relative_path, stream_url, path FROM tracks ORDER BY artist_name, year, album_title, track_number, title",
         )
         .fetch_all(&self.pool)
         .await?;
+        let scan_error_rows = sqlx::query("SELECT path, message FROM scan_errors ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
 
         let mut artists = Vec::with_capacity(artist_rows.len());
         for row in artist_rows {
@@ -204,9 +237,22 @@ impl Database {
                 year: optional_i64_to_u16(row.try_get("year")?, "year")?,
                 track_number: optional_i64_to_u16(row.try_get("track_number")?, "track_number")?,
                 extension: row.try_get("extension")?,
+                file_size_bytes: optional_i64_to_u64(
+                    row.try_get("file_size_bytes")?,
+                    "file_size_bytes",
+                )?,
+                modified_at_unix_seconds: row.try_get("modified_at_unix_seconds")?,
                 relative_path: row.try_get("relative_path")?,
                 stream_url: row.try_get("stream_url")?,
                 path: PathBuf::from(row.try_get::<String, _>("path")?),
+            });
+        }
+
+        let mut scan_errors = Vec::with_capacity(scan_error_rows.len());
+        for row in scan_error_rows {
+            scan_errors.push(ScanIssue {
+                path: row.try_get("path")?,
+                message: row.try_get("message")?,
             });
         }
 
@@ -216,6 +262,7 @@ impl Database {
             artists,
             albums,
             tracks,
+            scan_errors,
         }))
     }
 }
@@ -254,9 +301,16 @@ const MIGRATION_001: &[&str] = &[
         year INTEGER,
         track_number INTEGER,
         extension TEXT NOT NULL,
+        file_size_bytes INTEGER,
+        modified_at_unix_seconds INTEGER,
         relative_path TEXT NOT NULL,
         stream_url TEXT NOT NULL,
         path TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS scan_errors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT NOT NULL,
+        message TEXT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id)",
     "CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id)",
@@ -284,10 +338,41 @@ fn optional_i64_to_u16(value: Option<i64>, field: &str) -> Result<Option<u16>> {
         .transpose()
 }
 
+fn optional_i64_to_u64(value: Option<i64>, field: &str) -> Result<Option<u64>> {
+    value
+        .map(|value| u64::try_from(value).with_context(|| format!("invalid {field}: {value}")))
+        .transpose()
+}
+
+fn u64_to_i64(value: u64) -> Result<i64> {
+    i64::try_from(value).context("file size does not fit in SQLite INTEGER")
+}
+
+async fn ensure_column(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    alter_statement: &str,
+) -> Result<()> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await?;
+    let exists = rows.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .is_ok_and(|name| name == column)
+    });
+
+    if !exists {
+        sqlx::query(alter_statement).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::Database;
-    use musicata_core::{Album, Artist, Library, ProviderMapping, Track};
+    use musicata_core::{Album, Artist, Library, ProviderMapping, ScanIssue, Track};
     use std::{
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
@@ -311,6 +396,13 @@ mod tests {
         assert_eq!(loaded.albums.len(), 1);
         assert_eq!(loaded.tracks.len(), 1);
         assert_eq!(loaded.tracks[0].provider.item_id, "album/song.mp3");
+        assert_eq!(loaded.tracks[0].file_size_bytes, Some(1234));
+        assert_eq!(
+            loaded.tracks[0].modified_at_unix_seconds,
+            Some(1_800_000_000)
+        );
+        assert_eq!(loaded.scan_errors.len(), 1);
+        assert_eq!(loaded.scan_errors[0].message, "permission denied");
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -367,9 +459,15 @@ mod tests {
                 year: Some(2026),
                 track_number: Some(1),
                 extension: "mp3".to_string(),
+                file_size_bytes: Some(1234),
+                modified_at_unix_seconds: Some(1_800_000_000),
                 relative_path: "album/song.mp3".to_string(),
                 stream_url: "/api/tracks/track_1/stream".to_string(),
                 path: PathBuf::from("/music/album/song.mp3"),
+            }],
+            scan_errors: vec![ScanIssue {
+                path: "/music/bad".to_string(),
+                message: "permission denied".to_string(),
             }],
         }
     }

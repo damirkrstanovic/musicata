@@ -65,8 +65,10 @@ Tasks:
 - [x] Store providers, provider items, artists, albums, tracks, artwork paths, and scan state.
 - Keep provider mappings separate from canonical entities.
 - [x] Add full rescan trigger with `--rescan` and `MUSICATA_RESCAN`.
+- [x] Track file size, modified time, and scan errors in SQLite.
+- [x] Set initial SQLite schema version with `PRAGMA user_version`.
 - Add incremental rescan commands.
-- Track file size, modified time, content hash where useful, and scan errors.
+- Track content hash where useful.
 
 Done when:
 
@@ -268,7 +270,7 @@ Done when:
 
 The next implementation slice should be Milestone 2:
 
-1. Track file size, modified time, and scan errors in SQLite.
-2. Add an incremental rescan command.
-3. Add schema versioning beyond the initial migration.
+1. Add an incremental rescan command.
+2. Add content hashes where useful.
+3. Add explicit migration steps beyond schema version 1.
 4. Keep local file paths out of canonical IDs as the schema grows.
