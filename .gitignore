@@ -1,0 +1,6 @@
+/target/
+/.musicata/
+/testdata/
+*.db
+*.db-shm
+*.db-wal

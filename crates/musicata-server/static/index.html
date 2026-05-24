@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#16181d">
+    <title>Musicata</title>
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="library-panel">
+        <div class="brand">
+          <span class="brand-mark">M</span>
+          <div>
+            <h1>Musicata</h1>
+            <p id="summary">Scanning library...</p>
+          </div>
+        </div>
+
+        <label class="search">
+          <span>Search</span>
+          <input id="search" type="search" autocomplete="off" placeholder="Artist, album, track">
+        </label>
+
+        <section class="section">
+          <h2>Albums</h2>
+          <div id="albums" class="album-list"></div>
+        </section>
+      </aside>
+
+      <section class="content">
+        <header class="content-header">
+          <div>
+            <p class="eyebrow">Local disk provider</p>
+            <h2 id="view-title">Tracks</h2>
+          </div>
+          <button id="refresh" class="ghost-button" type="button">Refresh</button>
+        </header>
+
+        <div id="track-list" class="track-list"></div>
+      </section>
+
+      <footer class="player">
+        <img id="now-art" alt="" class="now-art">
+        <div class="now-text">
+          <strong id="now-title">Nothing playing</strong>
+          <span id="now-subtitle">Select a track to start browser playback.</span>
+        </div>
+        <div class="player-controls">
+          <button id="prev" type="button">Prev</button>
+          <button id="play-pause" type="button">Play</button>
+          <button id="next" type="button">Next</button>
+        </div>
+        <audio id="audio" preload="metadata" controls></audio>
+      </footer>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
+
