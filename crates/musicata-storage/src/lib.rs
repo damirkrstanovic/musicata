@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use musicata_core::{
-    Album, Artist, Library, ProviderMapping, ScanIssue, Track, TrackMetadataObservation,
+    Album, Artist, Library, MetadataApprovalState, ProviderMapping, ScanIssue, Track,
+    TrackMetadataObservation,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -71,6 +72,19 @@ impl Database {
                 sqlx::query(statement).execute(&self.pool).await?;
             }
             set_user_version(&self.pool, 3).await?;
+        }
+
+        if version < 4 {
+            for migration in MIGRATION_004_METADATA_OBSERVATION_COLUMNS {
+                ensure_column(
+                    &self.pool,
+                    "track_metadata_observations",
+                    migration.column,
+                    migration.alter_statement,
+                )
+                .await?;
+            }
+            set_user_version(&self.pool, 4).await?;
         }
 
         Ok(())
@@ -157,10 +171,13 @@ impl Database {
 
                 for observation in &track.observed_metadata {
                     sqlx::query(
-                        "INSERT INTO track_metadata_observations (track_id, source, title, artist_name, album_title, year, track_number) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        "INSERT INTO track_metadata_observations (track_id, source, confidence, observed_at_unix_seconds, approval_state, title, artist_name, album_title, year, track_number) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     )
                     .bind(&track.id)
                     .bind(&observation.source)
+                    .bind(f64::from(observation.confidence))
+                    .bind(observation.observed_at_unix_seconds)
+                    .bind(approval_state_to_str(&observation.approval_state))
                     .bind(&observation.title)
                     .bind(&observation.artist_name)
                     .bind(&observation.album_title)
@@ -222,7 +239,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         let observation_rows = sqlx::query(
-            "SELECT track_id, source, title, artist_name, album_title, year, track_number FROM track_metadata_observations ORDER BY track_id, id",
+            "SELECT track_id, source, confidence, observed_at_unix_seconds, approval_state, title, artist_name, album_title, year, track_number FROM track_metadata_observations ORDER BY track_id, id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -265,6 +282,9 @@ impl Database {
                 .or_default()
                 .push(TrackMetadataObservation {
                     source: row.try_get("source")?,
+                    confidence: f64_to_f32(row.try_get("confidence")?, "confidence")?,
+                    observed_at_unix_seconds: row.try_get("observed_at_unix_seconds")?,
+                    approval_state: approval_state_from_str(row.try_get("approval_state")?),
                     title: row.try_get("title")?,
                     artist_name: row.try_get("artist_name")?,
                     album_title: row.try_get("album_title")?,
@@ -340,7 +360,7 @@ impl Database {
         }
 
         let observation_rows = sqlx::query(
-            "SELECT track_id, source, title, artist_name, album_title, year, track_number FROM track_metadata_observations ORDER BY track_id, id",
+            "SELECT track_id, source, confidence, observed_at_unix_seconds, approval_state, title, artist_name, album_title, year, track_number FROM track_metadata_observations ORDER BY track_id, id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -349,6 +369,9 @@ impl Database {
             let track_id: String = row.try_get("track_id")?;
             let observation = TrackMetadataObservation {
                 source: row.try_get("source")?,
+                confidence: f64_to_f32(row.try_get("confidence")?, "confidence")?,
+                observed_at_unix_seconds: row.try_get("observed_at_unix_seconds")?,
+                approval_state: approval_state_from_str(row.try_get("approval_state")?),
                 title: row.try_get("title")?,
                 artist_name: row.try_get("artist_name")?,
                 album_title: row.try_get("album_title")?,
@@ -440,6 +463,15 @@ fn metadata_observations_fingerprint(observations: &[TrackMetadataObservation]) 
 
     for observation in observations {
         push_fingerprint_part(&mut fingerprint, &observation.source);
+        push_fingerprint_part(&mut fingerprint, &observation.confidence.to_string());
+        push_fingerprint_part(
+            &mut fingerprint,
+            &observation.observed_at_unix_seconds.to_string(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            approval_state_to_str(&observation.approval_state),
+        );
         push_fingerprint_part(
             &mut fingerprint,
             observation.title.as_deref().unwrap_or_default(),
@@ -528,6 +560,9 @@ const MIGRATION_001: &[&str] = &[
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         track_id TEXT NOT NULL,
         source TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0,
+        observed_at_unix_seconds INTEGER NOT NULL DEFAULT 0,
+        approval_state TEXT NOT NULL DEFAULT 'observed',
         title TEXT,
         artist_name TEXT,
         album_title TEXT,
@@ -566,6 +601,9 @@ const MIGRATION_003: &[&str] = &[
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         track_id TEXT NOT NULL,
         source TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0,
+        observed_at_unix_seconds INTEGER NOT NULL DEFAULT 0,
+        approval_state TEXT NOT NULL DEFAULT 'observed',
         title TEXT,
         artist_name TEXT,
         album_title TEXT,
@@ -574,6 +612,21 @@ const MIGRATION_003: &[&str] = &[
         FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
     )",
     "CREATE INDEX IF NOT EXISTS idx_track_metadata_observations_track_id ON track_metadata_observations(track_id)",
+];
+
+const MIGRATION_004_METADATA_OBSERVATION_COLUMNS: &[ColumnMigration] = &[
+    ColumnMigration {
+        column: "confidence",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN confidence REAL NOT NULL DEFAULT 0",
+    },
+    ColumnMigration {
+        column: "observed_at_unix_seconds",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN observed_at_unix_seconds INTEGER NOT NULL DEFAULT 0",
+    },
+    ColumnMigration {
+        column: "approval_state",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN approval_state TEXT NOT NULL DEFAULT 'observed'",
+    },
 ];
 
 async fn user_version(pool: &SqlitePool) -> Result<i64> {
@@ -615,8 +668,32 @@ fn optional_i64_to_u64(value: Option<i64>, field: &str) -> Result<Option<u64>> {
         .transpose()
 }
 
+fn f64_to_f32(value: f64, field: &str) -> Result<f32> {
+    if value.is_finite() && value >= f32::MIN as f64 && value <= f32::MAX as f64 {
+        Ok(value as f32)
+    } else {
+        Err(anyhow::anyhow!("invalid {field}: {value}"))
+    }
+}
+
 fn u64_to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).context("file size does not fit in SQLite INTEGER")
+}
+
+fn approval_state_to_str(state: &MetadataApprovalState) -> &'static str {
+    match state {
+        MetadataApprovalState::Observed => "observed",
+        MetadataApprovalState::Approved => "approved",
+        MetadataApprovalState::Rejected => "rejected",
+    }
+}
+
+fn approval_state_from_str(value: String) -> MetadataApprovalState {
+    match value.as_str() {
+        "approved" => MetadataApprovalState::Approved,
+        "rejected" => MetadataApprovalState::Rejected,
+        _ => MetadataApprovalState::Observed,
+    }
 }
 
 async fn ensure_column(
@@ -644,7 +721,8 @@ async fn ensure_column(
 mod tests {
     use super::Database;
     use musicata_core::{
-        Album, Artist, Library, ProviderMapping, ScanIssue, Track, TrackMetadataObservation,
+        Album, Artist, Library, MetadataApprovalState, ProviderMapping, ScanIssue, Track,
+        TrackMetadataObservation,
     };
     use std::{
         path::PathBuf,
@@ -677,6 +755,15 @@ mod tests {
         assert_eq!(loaded.tracks[0].content_hash, Some("abc123".to_string()));
         assert_eq!(loaded.tracks[0].observed_metadata.len(), 1);
         assert_eq!(loaded.tracks[0].observed_metadata[0].source, "folder_path");
+        assert_eq!(loaded.tracks[0].observed_metadata[0].confidence, 0.55);
+        assert_eq!(
+            loaded.tracks[0].observed_metadata[0].observed_at_unix_seconds,
+            1_800_000_000
+        );
+        assert_eq!(
+            loaded.tracks[0].observed_metadata[0].approval_state,
+            MetadataApprovalState::Observed
+        );
         assert_eq!(
             loaded.tracks[0].observed_metadata[0].title,
             Some("Song".to_string())
@@ -820,6 +907,9 @@ mod tests {
     fn fixture_observation(title: &str, track_number: u16) -> TrackMetadataObservation {
         TrackMetadataObservation {
             source: "folder_path".to_string(),
+            confidence: 0.55,
+            observed_at_unix_seconds: 1_800_000_000,
+            approval_state: MetadataApprovalState::Observed,
             title: Some(title.to_string()),
             artist_name: Some("Artist".to_string()),
             album_title: Some("Album".to_string()),

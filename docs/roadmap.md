@@ -92,7 +92,8 @@ Tasks:
 
 - [x] Add Lofty for embedded audio tags.
 - [x] Store observed metadata and canonical metadata separately.
-- Add metadata provenance per field: source, confidence, timestamp, and user approval state.
+- [x] Add metadata observation provenance: source, confidence, timestamp, and user approval state.
+- Add field-level provenance and review state for individual metadata values.
 - [x] Read embedded title, artist, album, year, and track number with folder-derived fallback.
 - Extract title, album, artist, album artist, track/disc numbers, dates, genres, composers, embedded artwork, lyrics, MusicBrainz IDs, and ISRCs where present.
 - [x] Preserve folder-derived fallback metadata for poorly tagged files.
@@ -277,6 +278,6 @@ Done when:
 
 The next implementation slice should be Milestone 3:
 
-1. Expand observations with field-level provenance: confidence, timestamp, and user approval state.
-2. Add tag-heavy fixtures for MP3, FLAC, and MP4/M4A.
-3. Extend embedded extraction to album artist, disc numbers, genres, composers, lyrics, MusicBrainz IDs, and artwork.
+1. Add tag-heavy fixtures for MP3, FLAC, and MP4/M4A.
+2. Extend embedded extraction to album artist, disc numbers, genres, composers, lyrics, MusicBrainz IDs, and artwork.
+3. Add field-level provenance and metadata review/apply API shapes before building the UI.

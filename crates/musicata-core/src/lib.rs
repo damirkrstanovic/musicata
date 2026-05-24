@@ -189,11 +189,22 @@ pub struct ProviderMapping {
 #[derive(Clone, Debug, Serialize)]
 pub struct TrackMetadataObservation {
     pub source: String,
+    pub confidence: f32,
+    pub observed_at_unix_seconds: i64,
+    pub approval_state: MetadataApprovalState,
     pub title: Option<String>,
     pub artist_name: Option<String>,
     pub album_title: Option<String>,
     pub year: Option<u16>,
     pub track_number: Option<u16>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataApprovalState {
+    Observed,
+    Approved,
+    Rejected,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -258,13 +269,19 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
     let mut album_builders: BTreeMap<String, AlbumBuilder> = BTreeMap::new();
     let mut artist_builders: BTreeMap<String, ArtistBuilder> = BTreeMap::new();
     let mut track_id_counts = BTreeMap::new();
+    let observed_at_unix_seconds = current_unix_seconds();
 
     for file in files {
         let path = file.path;
         let folder_metadata = infer_track_metadata(&root, &path);
-        let embedded_metadata = read_embedded_metadata(&path, &mut scan_errors);
+        let embedded_metadata =
+            read_embedded_metadata(&path, &mut scan_errors, observed_at_unix_seconds);
         let metadata = canonical_metadata(embedded_metadata.as_ref(), &folder_metadata);
-        let observed_metadata = metadata_observations(embedded_metadata, &folder_metadata);
+        let observed_metadata = metadata_observations(
+            embedded_metadata,
+            &folder_metadata,
+            observed_at_unix_seconds,
+        );
         let artist_id = stable_id("artist", &metadata.artist_name.to_ascii_lowercase());
         let album_key = format!(
             "{}::{}",
@@ -411,9 +428,12 @@ struct TrackMetadata {
 }
 
 impl TrackMetadataObservation {
-    fn folder_path(metadata: &TrackMetadata) -> Self {
+    fn folder_path(metadata: &TrackMetadata, observed_at_unix_seconds: i64) -> Self {
         Self {
             source: "folder_path".to_string(),
+            confidence: 0.55,
+            observed_at_unix_seconds,
+            approval_state: MetadataApprovalState::Observed,
             title: Some(metadata.title.clone()),
             artist_name: Some(metadata.artist_name.clone()),
             album_title: Some(metadata.album_title.clone()),
@@ -422,9 +442,12 @@ impl TrackMetadataObservation {
         }
     }
 
-    fn embedded_tag(tag: &lofty::tag::Tag) -> Option<Self> {
+    fn embedded_tag(tag: &lofty::tag::Tag, observed_at_unix_seconds: i64) -> Option<Self> {
         let observation = Self {
             source: "embedded_tag".to_string(),
+            confidence: 0.95,
+            observed_at_unix_seconds,
+            approval_state: MetadataApprovalState::Observed,
             title: clean_optional_tag_value(tag.title().as_deref()),
             artist_name: clean_optional_tag_value(tag.artist().as_deref()),
             album_title: clean_optional_tag_value(tag.album().as_deref()),
@@ -559,6 +582,13 @@ fn system_time_to_unix_seconds(time: std::time::SystemTime) -> Option<i64> {
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
 }
 
+fn current_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 fn hash_file_contents(path: &Path) -> Result<String, std::io::Error> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -590,6 +620,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 fn read_embedded_metadata(
     path: &Path,
     scan_errors: &mut Vec<ScanIssue>,
+    observed_at_unix_seconds: i64,
 ) -> Option<TrackMetadataObservation> {
     let tagged_file = match read_from_path(path) {
         Ok(tagged_file) => tagged_file,
@@ -605,12 +636,13 @@ fn read_embedded_metadata(
     tagged_file
         .primary_tag()
         .or_else(|| tagged_file.first_tag())
-        .and_then(TrackMetadataObservation::embedded_tag)
+        .and_then(|tag| TrackMetadataObservation::embedded_tag(tag, observed_at_unix_seconds))
 }
 
 fn metadata_observations(
     embedded_metadata: Option<TrackMetadataObservation>,
     folder_metadata: &TrackMetadata,
+    observed_at_unix_seconds: i64,
 ) -> Vec<TrackMetadataObservation> {
     let mut observations = Vec::new();
 
@@ -618,7 +650,10 @@ fn metadata_observations(
         observations.push(embedded_metadata);
     }
 
-    observations.push(TrackMetadataObservation::folder_path(folder_metadata));
+    observations.push(TrackMetadataObservation::folder_path(
+        folder_metadata,
+        observed_at_unix_seconds,
+    ));
     observations
 }
 
@@ -961,6 +996,9 @@ mod tests {
         };
         let embedded = TrackMetadataObservation {
             source: "embedded_tag".to_string(),
+            confidence: 0.95,
+            observed_at_unix_seconds: 1_800_000_000,
+            approval_state: MetadataApprovalState::Observed,
             title: Some("Embedded Title".to_string()),
             artist_name: None,
             album_title: Some("Embedded Album".to_string()),
