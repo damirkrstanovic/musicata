@@ -5,6 +5,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -265,6 +266,84 @@ impl Database {
             scan_errors,
         }))
     }
+
+    pub async fn detect_library_changes(&self, scanned: &Library) -> Result<LibraryChangeSet> {
+        let rows = sqlx::query(
+            "SELECT provider_item_id, file_size_bytes, modified_at_unix_seconds FROM tracks ORDER BY provider_item_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() && !scanned.tracks.is_empty() {
+            return Ok(LibraryChangeSet {
+                added: scanned.tracks.len(),
+                removed: 0,
+                modified: 0,
+            });
+        }
+
+        let mut stored = BTreeMap::new();
+        for row in rows {
+            stored.insert(
+                row.try_get::<String, _>("provider_item_id")?,
+                TrackFingerprint {
+                    file_size_bytes: optional_i64_to_u64(
+                        row.try_get("file_size_bytes")?,
+                        "file_size_bytes",
+                    )?,
+                    modified_at_unix_seconds: row.try_get("modified_at_unix_seconds")?,
+                },
+            );
+        }
+
+        let scanned: BTreeMap<_, _> = scanned
+            .tracks
+            .iter()
+            .map(|track| {
+                (
+                    track.provider.item_id.clone(),
+                    TrackFingerprint {
+                        file_size_bytes: track.file_size_bytes,
+                        modified_at_unix_seconds: track.modified_at_unix_seconds,
+                    },
+                )
+            })
+            .collect();
+
+        let stored_ids: BTreeSet<_> = stored.keys().collect();
+        let scanned_ids: BTreeSet<_> = scanned.keys().collect();
+        let added = scanned_ids.difference(&stored_ids).count();
+        let removed = stored_ids.difference(&scanned_ids).count();
+        let modified = stored_ids
+            .intersection(&scanned_ids)
+            .filter(|id| stored.get(**id) != scanned.get(**id))
+            .count();
+
+        Ok(LibraryChangeSet {
+            added,
+            removed,
+            modified,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LibraryChangeSet {
+    pub added: usize,
+    pub removed: usize,
+    pub modified: usize,
+}
+
+impl LibraryChangeSet {
+    pub fn has_changes(self) -> bool {
+        self.added > 0 || self.removed > 0 || self.modified > 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrackFingerprint {
+    file_size_bytes: Option<u64>,
+    modified_at_unix_seconds: Option<i64>,
 }
 
 const MIGRATION_001: &[&str] = &[
@@ -421,6 +500,57 @@ mod tests {
         let database = Database::connect(&db_path).await.expect("connect database");
 
         assert!(!fixture_library_exists(&database).await);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn detects_added_removed_and_modified_tracks() {
+        let db_path = temp_db_path("changes");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let library = fixture_library();
+        database.save_library(&library).await.expect("save library");
+
+        let mut changed = library.clone();
+        changed.tracks[0].file_size_bytes = Some(4321);
+        changed.tracks.push(Track {
+            id: "track_2".to_string(),
+            provider: ProviderMapping {
+                provider_id: "local-disk".to_string(),
+                item_id: "album/new-song.mp3".to_string(),
+            },
+            title: "New Song".to_string(),
+            artist_id: "artist_1".to_string(),
+            artist_name: "Artist".to_string(),
+            album_id: "album_1".to_string(),
+            album_title: "Album".to_string(),
+            year: Some(2026),
+            track_number: Some(2),
+            extension: "mp3".to_string(),
+            file_size_bytes: Some(10),
+            modified_at_unix_seconds: Some(1_800_000_100),
+            relative_path: "album/new-song.mp3".to_string(),
+            stream_url: "/api/tracks/track_2/stream".to_string(),
+            path: PathBuf::from("/music/album/new-song.mp3"),
+        });
+
+        let changes = database
+            .detect_library_changes(&changed)
+            .await
+            .expect("detect changes");
+        assert_eq!(changes.added, 1);
+        assert_eq!(changes.removed, 0);
+        assert_eq!(changes.modified, 1);
+        assert!(changes.has_changes());
+
+        changed.tracks.remove(0);
+        let changes = database
+            .detect_library_changes(&changed)
+            .await
+            .expect("detect changes");
+        assert_eq!(changes.added, 1);
+        assert_eq!(changes.removed, 1);
+        assert_eq!(changes.modified, 0);
 
         let _ = std::fs::remove_file(db_path);
     }

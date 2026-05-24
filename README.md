@@ -79,6 +79,13 @@ MUSICATA_LIBRARY=/path/to/music MUSICATA_DATABASE=.musicata/musicata.db MUSICATA
 ```
 
 On first run the server scans the configured library and stores the result in SQLite. Later runs load from the database unless `--rescan` or `MUSICATA_RESCAN=true` is set.
+By default, startup performs a lightweight incremental rescan check using provider item IDs, file sizes, and modified timestamps. Use `--no-incremental-rescan` to load only from the database.
+Use `--scan-once` for a non-server scan/update command:
+
+```sh
+cargo run -p musicata-server -- --scan-once
+cargo run -p musicata-server -- --scan-once --rescan
+```
 
 Useful endpoints:
 

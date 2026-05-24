@@ -30,6 +30,8 @@ struct Config {
     database: PathBuf,
     addr: SocketAddr,
     rescan: bool,
+    no_incremental_rescan: bool,
+    scan_once: bool,
 }
 
 #[tokio::main]
@@ -41,7 +43,15 @@ async fn main() -> Result<()> {
     let database = Database::connect(&config.database)
         .await
         .with_context(|| format!("failed to open database {}", config.database.display()))?;
-    let library = Arc::new(load_or_scan_library(&database, &provider, config.rescan).await?);
+    let library = Arc::new(
+        load_or_scan_library(
+            &database,
+            &provider,
+            config.rescan,
+            !config.no_incremental_rescan,
+        )
+        .await?,
+    );
 
     tracing::info!(
         artists = library.artists.len(),
@@ -50,6 +60,11 @@ async fn main() -> Result<()> {
         root = %library.source_root,
         "library ready"
     );
+
+    if config.scan_once {
+        tracing::info!("scan complete; exiting because --scan-once was set");
+        return Ok(());
+    }
 
     let listener = tokio::net::TcpListener::bind(config.addr)
         .await
@@ -67,8 +82,12 @@ async fn load_or_scan_library(
     database: &Database,
     provider: &LocalDiskProvider,
     rescan: bool,
+    incremental_rescan: bool,
 ) -> Result<Library> {
-    if !rescan && let Some(library) = database.load_library().await? {
+    if !rescan
+        && !incremental_rescan
+        && let Some(library) = database.load_library().await?
+    {
         tracing::info!(
             artists = library.artists.len(),
             albums = library.albums.len(),
@@ -78,12 +97,38 @@ async fn load_or_scan_library(
         return Ok(library);
     }
 
-    let library = provider
+    let scanned = provider
         .scan()
         .with_context(|| format!("failed to scan {}", provider.root().display()))?;
-    database.save_library(&library).await?;
 
-    Ok(library)
+    if !rescan
+        && incremental_rescan
+        && let Some(stored) = database.load_library().await?
+    {
+        let changes = database.detect_library_changes(&scanned).await?;
+        if changes.has_changes() {
+            tracing::info!(
+                added = changes.added,
+                removed = changes.removed,
+                modified = changes.modified,
+                "library changes detected"
+            );
+            database.save_library(&scanned).await?;
+            return Ok(scanned);
+        }
+
+        tracing::info!(
+            artists = stored.artists.len(),
+            albums = stored.albums.len(),
+            tracks = stored.tracks.len(),
+            "loaded unchanged library from database"
+        );
+        return Ok(stored);
+    }
+
+    database.save_library(&scanned).await?;
+
+    Ok(scanned)
 }
 
 fn app(library: Arc<Library>) -> Router {
@@ -404,6 +449,14 @@ impl Config {
             ConfigOverrides::from_file(&path)?.apply_to(&mut config);
         }
 
+        let incremental_rescan = env("MUSICATA_INCREMENTAL_RESCAN")
+            .map(|value| parse_bool(&value, "MUSICATA_INCREMENTAL_RESCAN"))
+            .transpose()?;
+        let no_incremental_rescan = env("MUSICATA_NO_INCREMENTAL_RESCAN")
+            .map(|value| parse_bool(&value, "MUSICATA_NO_INCREMENTAL_RESCAN"))
+            .transpose()?
+            .or_else(|| incremental_rescan.map(|value| !value));
+
         ConfigOverrides {
             config_path: None,
             library: env("MUSICATA_LIBRARY")
@@ -418,6 +471,10 @@ impl Config {
                 .transpose()?,
             rescan: env("MUSICATA_RESCAN")
                 .map(|value| parse_bool(&value, "MUSICATA_RESCAN"))
+                .transpose()?,
+            no_incremental_rescan,
+            scan_once: env("MUSICATA_SCAN_ONCE")
+                .map(|value| parse_bool(&value, "MUSICATA_SCAN_ONCE"))
                 .transpose()?,
         }
         .apply_to(&mut config);
@@ -437,6 +494,8 @@ impl Default for Config {
                 .parse()
                 .expect("default socket address is valid"),
             rescan: false,
+            no_incremental_rescan: false,
+            scan_once: false,
         }
     }
 }
@@ -448,6 +507,8 @@ struct ConfigOverrides {
     database: Option<PathBuf>,
     addr: Option<SocketAddr>,
     rescan: Option<bool>,
+    no_incremental_rescan: Option<bool>,
+    scan_once: Option<bool>,
 }
 
 impl ConfigOverrides {
@@ -482,9 +543,11 @@ impl ConfigOverrides {
                     overrides.addr = Some(parse_addr(&value, "--addr")?);
                 }
                 "--rescan" => overrides.rescan = Some(true),
+                "--no-incremental-rescan" => overrides.no_incremental_rescan = Some(true),
+                "--scan-once" => overrides.scan_once = Some(true),
                 "--help" | "-h" => {
                     println!(
-                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN\nConfig file keys: library, database, addr, rescan\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
+                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan] [--no-incremental-rescan] [--scan-once]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN, MUSICATA_INCREMENTAL_RESCAN, MUSICATA_SCAN_ONCE\nConfig file keys: library, database, addr, rescan, incremental_rescan, scan_once\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
                     );
                     std::process::exit(0);
                 }
@@ -519,6 +582,15 @@ impl ConfigOverrides {
                 "database" | "database_path" => overrides.database = Some(PathBuf::from(value)),
                 "addr" | "bind_addr" => overrides.addr = Some(parse_addr(value, "config addr")?),
                 "rescan" => overrides.rescan = Some(parse_bool(value, "config rescan")?),
+                "incremental_rescan" => {
+                    overrides.no_incremental_rescan =
+                        Some(!parse_bool(value, "config incremental_rescan")?)
+                }
+                "no_incremental_rescan" => {
+                    overrides.no_incremental_rescan =
+                        Some(parse_bool(value, "config no_incremental_rescan")?)
+                }
+                "scan_once" => overrides.scan_once = Some(parse_bool(value, "config scan_once")?),
                 value => {
                     return Err(anyhow!(
                         "{}:{}: unknown config key `{value}`",
@@ -547,6 +619,14 @@ impl ConfigOverrides {
 
         if let Some(rescan) = self.rescan {
             config.rescan = rescan;
+        }
+
+        if let Some(no_incremental_rescan) = self.no_incremental_rescan {
+            config.no_incremental_rescan = no_incremental_rescan;
+        }
+
+        if let Some(scan_once) = self.scan_once {
+            config.scan_once = scan_once;
         }
     }
 }
@@ -613,6 +693,8 @@ mod tests {
         assert_eq!(config.database, PathBuf::from(".musicata/musicata.db"));
         assert_eq!(config.addr.to_string(), "127.0.0.1:3030");
         assert!(!config.rescan);
+        assert!(!config.no_incremental_rescan);
+        assert!(!config.scan_once);
     }
 
     #[test]
@@ -625,6 +707,8 @@ mod tests {
             database = "/from/file.db"
             addr = "127.0.0.1:4000"
             rescan = false
+            incremental_rescan = false
+            scan_once = false
             "#,
         );
         let env = HashMap::from([
@@ -636,6 +720,11 @@ mod tests {
             ("MUSICATA_DATABASE".to_string(), "/from/env.db".to_string()),
             ("MUSICATA_ADDR".to_string(), "127.0.0.1:5000".to_string()),
             ("MUSICATA_RESCAN".to_string(), "false".to_string()),
+            (
+                "MUSICATA_INCREMENTAL_RESCAN".to_string(),
+                "true".to_string(),
+            ),
+            ("MUSICATA_SCAN_ONCE".to_string(), "false".to_string()),
         ]);
         let config = Config::from_sources(
             [
@@ -646,6 +735,8 @@ mod tests {
                 "--addr".to_string(),
                 "127.0.0.1:6000".to_string(),
                 "--rescan".to_string(),
+                "--no-incremental-rescan".to_string(),
+                "--scan-once".to_string(),
             ],
             |name| env.get(name).cloned(),
         )
@@ -655,6 +746,8 @@ mod tests {
         assert_eq!(config.database, PathBuf::from("/from/cli.db"));
         assert_eq!(config.addr.to_string(), "127.0.0.1:6000");
         assert!(config.rescan);
+        assert!(config.no_incremental_rescan);
+        assert!(config.scan_once);
     }
 
     #[tokio::test]

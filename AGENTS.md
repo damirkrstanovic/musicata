@@ -18,7 +18,8 @@ Use Cargo from the repository root:
 
 - `cargo run -p musicata-server` starts the prototype server at `127.0.0.1:3030` and scans `testdata`.
 - `cargo run -p musicata-server -- --library /path/to/music --addr 127.0.0.1:3031` runs against another library or port.
-- `cargo run -p musicata-server -- --config musicata.example.conf` runs with a config file; environment overrides use `MUSICATA_LIBRARY`, `MUSICATA_DATABASE`, `MUSICATA_ADDR`, and `MUSICATA_RESCAN`.
+- `cargo run -p musicata-server -- --config musicata.example.conf` runs with a config file; environment overrides use `MUSICATA_LIBRARY`, `MUSICATA_DATABASE`, `MUSICATA_ADDR`, `MUSICATA_RESCAN`, and `MUSICATA_INCREMENTAL_RESCAN`.
+- `cargo run -p musicata-server -- --scan-once` runs the incremental scan/update path and exits without binding a server port.
 - `cargo test --offline` runs all unit tests without fetching dependencies.
 - `cargo fmt --all` formats the workspace.
 - `cargo check --offline` verifies the workspace quickly.
