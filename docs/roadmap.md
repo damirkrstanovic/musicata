@@ -90,9 +90,10 @@ Goal: make local-library quality good enough for real collections.
 
 Tasks:
 
-- Add Lofty for embedded audio tags.
+- [x] Add Lofty for embedded audio tags.
 - [x] Store observed metadata and canonical metadata separately.
 - Add metadata provenance per field: source, confidence, timestamp, and user approval state.
+- [x] Read embedded title, artist, album, year, and track number with folder-derived fallback.
 - Extract title, album, artist, album artist, track/disc numbers, dates, genres, composers, embedded artwork, lyrics, MusicBrainz IDs, and ISRCs where present.
 - [x] Preserve folder-derived fallback metadata for poorly tagged files.
 - Add MusicBrainz lookup by existing MBIDs.
@@ -276,6 +277,6 @@ Done when:
 
 The next implementation slice should be Milestone 3:
 
-1. Add Lofty for embedded audio tags once the crate is available in the build environment.
-2. Expand observations with field-level provenance: confidence, timestamp, and user approval state.
-3. Add tag-heavy fixtures for MP3, FLAC, and MP4/M4A.
+1. Expand observations with field-level provenance: confidence, timestamp, and user approval state.
+2. Add tag-heavy fixtures for MP3, FLAC, and MP4/M4A.
+3. Extend embedded extraction to album artist, disc numbers, genres, composers, lyrics, MusicBrainz IDs, and artwork.

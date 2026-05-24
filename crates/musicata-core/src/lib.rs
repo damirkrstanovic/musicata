@@ -3,6 +3,7 @@
 //! The initial implementation ships a local-disk provider, but the domain model
 //! deliberately describes music independently from the source that provided it.
 
+use lofty::{file::TaggedFileExt, prelude::Accessor, read_from_path};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -260,7 +261,10 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
 
     for file in files {
         let path = file.path;
-        let metadata = infer_track_metadata(&root, &path);
+        let folder_metadata = infer_track_metadata(&root, &path);
+        let embedded_metadata = read_embedded_metadata(&path, &mut scan_errors);
+        let metadata = canonical_metadata(embedded_metadata.as_ref(), &folder_metadata);
+        let observed_metadata = metadata_observations(embedded_metadata, &folder_metadata);
         let artist_id = stable_id("artist", &metadata.artist_name.to_ascii_lowercase());
         let album_key = format!(
             "{}::{}",
@@ -315,7 +319,7 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
                 provider_id: "local-disk".to_string(),
                 item_id: relative_path.clone(),
             },
-            observed_metadata: vec![TrackMetadataObservation::folder_path(&metadata)],
+            observed_metadata,
             title: metadata.title,
             artist_id,
             artist_name: metadata.artist_name,
@@ -416,6 +420,27 @@ impl TrackMetadataObservation {
             year: metadata.year,
             track_number: metadata.track_number,
         }
+    }
+
+    fn embedded_tag(tag: &lofty::tag::Tag) -> Option<Self> {
+        let observation = Self {
+            source: "embedded_tag".to_string(),
+            title: clean_optional_tag_value(tag.title().as_deref()),
+            artist_name: clean_optional_tag_value(tag.artist().as_deref()),
+            album_title: clean_optional_tag_value(tag.album().as_deref()),
+            year: tag.date().map(|date| date.year),
+            track_number: tag.track().and_then(u32_to_u16),
+        };
+
+        observation.has_metadata().then_some(observation)
+    }
+
+    fn has_metadata(&self) -> bool {
+        self.title.is_some()
+            || self.artist_name.is_some()
+            || self.album_title.is_some()
+            || self.year.is_some()
+            || self.track_number.is_some()
     }
 }
 
@@ -562,6 +587,64 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
+fn read_embedded_metadata(
+    path: &Path,
+    scan_errors: &mut Vec<ScanIssue>,
+) -> Option<TrackMetadataObservation> {
+    let tagged_file = match read_from_path(path) {
+        Ok(tagged_file) => tagged_file,
+        Err(error) => {
+            scan_errors.push(ScanIssue {
+                path: path.display().to_string(),
+                message: format!("metadata read failed: {error}"),
+            });
+            return None;
+        }
+    };
+
+    tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+        .and_then(TrackMetadataObservation::embedded_tag)
+}
+
+fn metadata_observations(
+    embedded_metadata: Option<TrackMetadataObservation>,
+    folder_metadata: &TrackMetadata,
+) -> Vec<TrackMetadataObservation> {
+    let mut observations = Vec::new();
+
+    if let Some(embedded_metadata) = embedded_metadata {
+        observations.push(embedded_metadata);
+    }
+
+    observations.push(TrackMetadataObservation::folder_path(folder_metadata));
+    observations
+}
+
+fn canonical_metadata(
+    embedded_metadata: Option<&TrackMetadataObservation>,
+    folder_metadata: &TrackMetadata,
+) -> TrackMetadata {
+    TrackMetadata {
+        title: embedded_metadata
+            .and_then(|metadata| metadata.title.clone())
+            .unwrap_or_else(|| folder_metadata.title.clone()),
+        artist_name: embedded_metadata
+            .and_then(|metadata| metadata.artist_name.clone())
+            .unwrap_or_else(|| folder_metadata.artist_name.clone()),
+        album_title: embedded_metadata
+            .and_then(|metadata| metadata.album_title.clone())
+            .unwrap_or_else(|| folder_metadata.album_title.clone()),
+        year: embedded_metadata
+            .and_then(|metadata| metadata.year)
+            .or(folder_metadata.year),
+        track_number: embedded_metadata
+            .and_then(|metadata| metadata.track_number)
+            .or(folder_metadata.track_number),
+    }
+}
+
 fn infer_track_metadata(root: &Path, path: &Path) -> TrackMetadata {
     let stem = path
         .file_stem()
@@ -633,6 +716,16 @@ fn clean_title(value: &str) -> String {
     } else {
         cleaned
     }
+}
+
+fn clean_optional_tag_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(|value| value.trim().replace('_', " "))
+        .filter(|value| !value.is_empty())
+}
+
+fn u32_to_u16(value: u32) -> Option<u16> {
+    u16::try_from(value).ok()
 }
 
 fn find_album_artwork(album_dir: &Path) -> Option<PathBuf> {
@@ -799,7 +892,13 @@ mod tests {
                 .iter()
                 .any(|album| album.artwork_url.is_some())
         );
-        assert!(library.scan_errors.is_empty());
+        assert!(!library.scan_errors.is_empty());
+        assert!(
+            library
+                .scan_errors
+                .iter()
+                .all(|issue| issue.message.contains("metadata read failed"))
+        );
         assert!(
             library
                 .tracks
@@ -849,6 +948,33 @@ mod tests {
 
         assert_eq!(first_track.provider.item_id, second_track.provider.item_id);
         assert_ne!(first_track.id, second_track.id);
+    }
+
+    #[test]
+    fn canonical_metadata_prefers_embedded_tags_with_folder_fallbacks() {
+        let folder = TrackMetadata {
+            title: "Folder Title".to_string(),
+            artist_name: "Folder Artist".to_string(),
+            album_title: "Folder Album".to_string(),
+            year: Some(1994),
+            track_number: Some(7),
+        };
+        let embedded = TrackMetadataObservation {
+            source: "embedded_tag".to_string(),
+            title: Some("Embedded Title".to_string()),
+            artist_name: None,
+            album_title: Some("Embedded Album".to_string()),
+            year: None,
+            track_number: Some(2),
+        };
+
+        let canonical = canonical_metadata(Some(&embedded), &folder);
+
+        assert_eq!(canonical.title, "Embedded Title");
+        assert_eq!(canonical.artist_name, "Folder Artist");
+        assert_eq!(canonical.album_title, "Embedded Album");
+        assert_eq!(canonical.year, Some(1994));
+        assert_eq!(canonical.track_number, Some(2));
     }
 
     struct TestFixture {
