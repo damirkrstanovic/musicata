@@ -70,7 +70,8 @@ Tasks:
 - [x] Add incremental rescan detection on startup.
 - [x] Add explicit incremental rescan command with `--scan-once`.
 - [x] Add explicit incremental rescan API.
-- Track content hash where useful.
+- [x] Track content hash where useful.
+- [x] Add explicit migration steps beyond schema version 1.
 
 Done when:
 
@@ -272,7 +273,6 @@ Done when:
 
 The next implementation slice should be Milestone 2:
 
-1. Add content hashes where useful.
-2. Add explicit migration steps beyond schema version 1.
-3. Keep local file paths out of canonical IDs as the schema grows.
-4. Start Milestone 3 metadata extraction once the remaining persistence cleanup is done.
+1. Keep local file paths out of canonical IDs as the schema grows.
+2. Start Milestone 3 metadata extraction once the remaining persistence cleanup is done.
+3. Add a small API documentation page before external clients consume the native routes.

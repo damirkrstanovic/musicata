@@ -42,26 +42,27 @@ impl Database {
     }
 
     async fn migrate(&self) -> Result<()> {
-        for statement in MIGRATION_001 {
-            sqlx::query(statement).execute(&self.pool).await?;
+        let version = user_version(&self.pool).await?;
+
+        if version < 1 {
+            for statement in MIGRATION_001 {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 1).await?;
         }
-        ensure_column(
-            &self.pool,
-            "tracks",
-            "file_size_bytes",
-            "ALTER TABLE tracks ADD COLUMN file_size_bytes INTEGER",
-        )
-        .await?;
-        ensure_column(
-            &self.pool,
-            "tracks",
-            "modified_at_unix_seconds",
-            "ALTER TABLE tracks ADD COLUMN modified_at_unix_seconds INTEGER",
-        )
-        .await?;
-        sqlx::query("PRAGMA user_version = 1")
-            .execute(&self.pool)
-            .await?;
+
+        if version < 2 {
+            for migration in MIGRATION_002_TRACK_COLUMNS {
+                ensure_column(
+                    &self.pool,
+                    "tracks",
+                    migration.column,
+                    migration.alter_statement,
+                )
+                .await?;
+            }
+            set_user_version(&self.pool, 2).await?;
+        }
 
         Ok(())
     }
@@ -120,7 +121,7 @@ impl Database {
 
             for track in &library.tracks {
                 sqlx::query(
-                    "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, extension, file_size_bytes, modified_at_unix_seconds, relative_path, stream_url, path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, extension, file_size_bytes, modified_at_unix_seconds, content_hash, relative_path, stream_url, path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 )
                 .bind(&track.id)
                 .bind(&track.provider.provider_id)
@@ -135,6 +136,7 @@ impl Database {
                 .bind(&track.extension)
                 .bind(track.file_size_bytes.map(u64_to_i64).transpose()?)
                 .bind(track.modified_at_unix_seconds)
+                .bind(&track.content_hash)
                 .bind(&track.relative_path)
                 .bind(&track.stream_url)
                 .bind(path_to_string(&track.path))
@@ -188,7 +190,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         let track_rows = sqlx::query(
-            "SELECT id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, extension, file_size_bytes, modified_at_unix_seconds, relative_path, stream_url, path FROM tracks ORDER BY artist_name, year, album_title, track_number, title",
+            "SELECT id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, extension, file_size_bytes, modified_at_unix_seconds, content_hash, relative_path, stream_url, path FROM tracks ORDER BY artist_name, year, album_title, track_number, title",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -243,6 +245,7 @@ impl Database {
                     "file_size_bytes",
                 )?,
                 modified_at_unix_seconds: row.try_get("modified_at_unix_seconds")?,
+                content_hash: row.try_get("content_hash")?,
                 relative_path: row.try_get("relative_path")?,
                 stream_url: row.try_get("stream_url")?,
                 path: PathBuf::from(row.try_get::<String, _>("path")?),
@@ -269,7 +272,7 @@ impl Database {
 
     pub async fn detect_library_changes(&self, scanned: &Library) -> Result<LibraryChangeSet> {
         let rows = sqlx::query(
-            "SELECT provider_item_id, file_size_bytes, modified_at_unix_seconds FROM tracks ORDER BY provider_item_id",
+            "SELECT provider_item_id, file_size_bytes, modified_at_unix_seconds, content_hash FROM tracks ORDER BY provider_item_id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -292,6 +295,7 @@ impl Database {
                         "file_size_bytes",
                     )?,
                     modified_at_unix_seconds: row.try_get("modified_at_unix_seconds")?,
+                    content_hash: row.try_get("content_hash")?,
                 },
             );
         }
@@ -305,6 +309,7 @@ impl Database {
                     TrackFingerprint {
                         file_size_bytes: track.file_size_bytes,
                         modified_at_unix_seconds: track.modified_at_unix_seconds,
+                        content_hash: track.content_hash.clone(),
                     },
                 )
             })
@@ -340,10 +345,11 @@ impl LibraryChangeSet {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct TrackFingerprint {
     file_size_bytes: Option<u64>,
     modified_at_unix_seconds: Option<i64>,
+    content_hash: Option<String>,
 }
 
 const MIGRATION_001: &[&str] = &[
@@ -382,6 +388,7 @@ const MIGRATION_001: &[&str] = &[
         extension TEXT NOT NULL,
         file_size_bytes INTEGER,
         modified_at_unix_seconds INTEGER,
+        content_hash TEXT,
         relative_path TEXT NOT NULL,
         stream_url TEXT NOT NULL,
         path TEXT NOT NULL
@@ -395,6 +402,38 @@ const MIGRATION_001: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id)",
     "CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id)",
 ];
+
+struct ColumnMigration {
+    column: &'static str,
+    alter_statement: &'static str,
+}
+
+const MIGRATION_002_TRACK_COLUMNS: &[ColumnMigration] = &[
+    ColumnMigration {
+        column: "file_size_bytes",
+        alter_statement: "ALTER TABLE tracks ADD COLUMN file_size_bytes INTEGER",
+    },
+    ColumnMigration {
+        column: "modified_at_unix_seconds",
+        alter_statement: "ALTER TABLE tracks ADD COLUMN modified_at_unix_seconds INTEGER",
+    },
+    ColumnMigration {
+        column: "content_hash",
+        alter_statement: "ALTER TABLE tracks ADD COLUMN content_hash TEXT",
+    },
+];
+
+async fn user_version(pool: &SqlitePool) -> Result<i64> {
+    let row = sqlx::query("PRAGMA user_version").fetch_one(pool).await?;
+    Ok(row.try_get(0)?)
+}
+
+async fn set_user_version(pool: &SqlitePool, version: i64) -> Result<()> {
+    sqlx::query(&format!("PRAGMA user_version = {version}"))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
 
 fn now_unix_seconds() -> i64 {
     SystemTime::now()
@@ -480,6 +519,7 @@ mod tests {
             loaded.tracks[0].modified_at_unix_seconds,
             Some(1_800_000_000)
         );
+        assert_eq!(loaded.tracks[0].content_hash, Some("abc123".to_string()));
         assert_eq!(loaded.scan_errors.len(), 1);
         assert_eq!(loaded.scan_errors[0].message, "permission denied");
 
@@ -512,7 +552,7 @@ mod tests {
         database.save_library(&library).await.expect("save library");
 
         let mut changed = library.clone();
-        changed.tracks[0].file_size_bytes = Some(4321);
+        changed.tracks[0].content_hash = Some("def456".to_string());
         changed.tracks.push(Track {
             id: "track_2".to_string(),
             provider: ProviderMapping {
@@ -529,6 +569,7 @@ mod tests {
             extension: "mp3".to_string(),
             file_size_bytes: Some(10),
             modified_at_unix_seconds: Some(1_800_000_100),
+            content_hash: Some("new789".to_string()),
             relative_path: "album/new-song.mp3".to_string(),
             stream_url: "/api/tracks/track_2/stream".to_string(),
             path: PathBuf::from("/music/album/new-song.mp3"),
@@ -591,6 +632,7 @@ mod tests {
                 extension: "mp3".to_string(),
                 file_size_bytes: Some(1234),
                 modified_at_unix_seconds: Some(1_800_000_000),
+                content_hash: Some("abc123".to_string()),
                 relative_path: "album/song.mp3".to_string(),
                 stream_url: "/api/tracks/track_1/stream".to_string(),
                 path: PathBuf::from("/music/album/song.mp3"),

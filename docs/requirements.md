@@ -35,7 +35,7 @@ Initial stack direction:
 
 Non-Rust exceptions are allowed for browser-required pieces such as CSS, PWA manifest files, and a minimal service worker.
 
-Current implementation note: the server now uses Axum, Tokio, Serde, and `tracing` for the HTTP/API layer. Persistence, search indexing, and metadata extraction crates are still future milestones.
+Current implementation note: the server now uses Axum, Tokio, Serde, `tracing`, and SQLite persistence. Search indexing and metadata extraction crates are still future milestones.
 
 ## Core Components
 

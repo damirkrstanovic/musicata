@@ -4,12 +4,14 @@
 //! deliberately describes music independently from the source that provided it.
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     error::Error,
     fmt::{self, Display},
     fs,
     hash::{Hash, Hasher},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -163,6 +165,7 @@ pub struct Track {
     pub extension: String,
     pub file_size_bytes: Option<u64>,
     pub modified_at_unix_seconds: Option<i64>,
+    pub content_hash: Option<String>,
     pub relative_path: String,
     pub stream_url: String,
     #[serde(skip)]
@@ -303,6 +306,7 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
             extension,
             file_size_bytes: file.file_size_bytes,
             modified_at_unix_seconds: file.modified_at_unix_seconds,
+            content_hash: file.content_hash,
             relative_path,
             stream_url: format!("/api/tracks/{track_id}/stream"),
             path,
@@ -370,6 +374,7 @@ struct DiscoveredAudioFile {
     path: PathBuf,
     file_size_bytes: Option<u64>,
     modified_at_unix_seconds: Option<i64>,
+    content_hash: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -460,8 +465,19 @@ fn collect_audio_files(
                         path,
                         file_size_bytes: None,
                         modified_at_unix_seconds: None,
+                        content_hash: None,
                     });
                     continue;
+                }
+            };
+            let content_hash = match hash_file_contents(&path) {
+                Ok(hash) => Some(hash),
+                Err(source) => {
+                    scan_errors.push(ScanIssue {
+                        path: path.display().to_string(),
+                        message: source.to_string(),
+                    });
+                    None
                 }
             };
             files.push(DiscoveredAudioFile {
@@ -471,6 +487,7 @@ fn collect_audio_files(
                     .modified()
                     .ok()
                     .and_then(system_time_to_unix_seconds),
+                content_hash,
             });
         }
     }
@@ -482,6 +499,34 @@ fn system_time_to_unix_seconds(time: std::time::SystemTime) -> Option<i64> {
     time.duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+}
+
+fn hash_file_contents(path: &Path) -> Result<String, std::io::Error> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hex_lower(&hasher.finalize()))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+
+    output
 }
 
 fn infer_track_metadata(root: &Path, path: &Path) -> TrackMetadata {
@@ -678,6 +723,10 @@ mod tests {
                 .iter()
                 .all(|track| track.file_size_bytes == Some(0))
         );
+        assert!(library.tracks.iter().all(|track| {
+            track.content_hash.as_deref()
+                == Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        }));
     }
 
     #[test]
