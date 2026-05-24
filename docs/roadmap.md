@@ -54,7 +54,7 @@ Done when:
 
 ## Milestone 2: Persistent Library Database
 
-Status: in progress.
+Status: complete.
 
 Goal: stop rebuilding the entire library only in memory.
 
@@ -63,7 +63,7 @@ Tasks:
 - [x] Add SQLite via SQLx.
 - [x] Add initial schema migration.
 - [x] Store providers, provider items, artists, albums, tracks, artwork paths, and scan state.
-- Keep provider mappings separate from canonical entities.
+- [x] Keep provider mappings separate from canonical entities.
 - [x] Add full rescan trigger with `--rescan` and `MUSICATA_RESCAN`.
 - [x] Track file size, modified time, and scan errors in SQLite.
 - [x] Set initial SQLite schema version with `PRAGMA user_version`.
@@ -72,6 +72,7 @@ Tasks:
 - [x] Add explicit incremental rescan API.
 - [x] Track content hash where useful.
 - [x] Add explicit migration steps beyond schema version 1.
+- [x] Keep local file paths out of canonical track IDs.
 
 Done when:
 
@@ -271,8 +272,8 @@ Done when:
 
 ## Immediate Next Steps
 
-The next implementation slice should be Milestone 2:
+The next implementation slice should be Milestone 3:
 
-1. Keep local file paths out of canonical IDs as the schema grows.
-2. Start Milestone 3 metadata extraction once the remaining persistence cleanup is done.
-3. Add a small API documentation page before external clients consume the native routes.
+1. Add Lofty for embedded audio tags.
+2. Store observed metadata separately from canonical metadata.
+3. Keep folder-derived metadata as a fallback for poorly tagged files.

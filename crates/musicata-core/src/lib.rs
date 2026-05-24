@@ -245,6 +245,7 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
     let mut tracks = Vec::new();
     let mut album_builders: BTreeMap<String, AlbumBuilder> = BTreeMap::new();
     let mut artist_builders: BTreeMap<String, ArtistBuilder> = BTreeMap::new();
+    let mut track_id_counts = BTreeMap::new();
 
     for file in files {
         let path = file.path;
@@ -257,12 +258,19 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
         );
         let album_id = stable_id("album", &album_key);
         let relative_path = relative_display_path(&root, &path);
-        let track_id = stable_id("track", &relative_path);
         let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
+        let track_identity = build_track_identity(
+            &metadata,
+            &extension,
+            file.file_size_bytes,
+            file.modified_at_unix_seconds,
+            file.content_hash.as_deref(),
+        );
+        let track_id = unique_track_id(&track_identity, &mut track_id_counts);
 
         album_builders
             .entry(album_id.clone())
@@ -308,7 +316,7 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
             modified_at_unix_seconds: file.modified_at_unix_seconds,
             content_hash: file.content_hash,
             relative_path,
-            stream_url: format!("/api/tracks/{track_id}/stream"),
+            stream_url: format!("/api/tracks/{}/stream", track_id),
             path,
         });
     }
@@ -648,6 +656,56 @@ fn relative_display_path(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+fn build_track_identity(
+    metadata: &TrackMetadata,
+    extension: &str,
+    file_size_bytes: Option<u64>,
+    modified_at_unix_seconds: Option<i64>,
+    content_hash: Option<&str>,
+) -> String {
+    let source_identity = content_hash
+        .map(|hash| format!("sha256:{hash}"))
+        .unwrap_or_else(|| {
+            format!(
+                "unhashed:size={}:modified={}",
+                file_size_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                modified_at_unix_seconds
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            )
+        });
+
+    format!(
+        "{}::artist={}::album={}::title={}::year={}::track={}::extension={}",
+        source_identity,
+        metadata.artist_name.to_ascii_lowercase(),
+        metadata.album_title.to_ascii_lowercase(),
+        metadata.title.to_ascii_lowercase(),
+        metadata
+            .year
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        metadata
+            .track_number
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        extension
+    )
+}
+
+fn unique_track_id(identity: &str, counts: &mut BTreeMap<String, usize>) -> String {
+    let count = counts.entry(identity.to_string()).or_default();
+    let id = if *count == 0 {
+        stable_id("track", identity)
+    } else {
+        stable_id("track", &format!("{identity}::duplicate={count}"))
+    };
+    *count += 1;
+    id
+}
+
 fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool {
     value.to_ascii_lowercase().contains(needle)
 }
@@ -746,6 +804,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_track_id_uses_content_identity() {
+        let fixture = TestFixture::new("identity");
+        let path = "1994 - Paramparcad/Darkwood Dub - Brzi Vavilon.mp3";
+        fixture.write_bytes(path, b"first version");
+        let first = scan_local_library(&fixture.root).expect("scan fixture");
+        let first_track = first.tracks.first().expect("first track");
+
+        fixture.write_bytes(path, b"second version");
+        let second = scan_local_library(&fixture.root).expect("scan fixture");
+        let second_track = second.tracks.first().expect("second track");
+
+        assert_eq!(first_track.provider.item_id, second_track.provider.item_id);
+        assert_ne!(first_track.id, second_track.id);
+    }
+
     struct TestFixture {
         root: PathBuf,
     }
@@ -762,9 +836,13 @@ mod tests {
         }
 
         fn write(&self, relative_path: &str) {
+            self.write_bytes(relative_path, &[]);
+        }
+
+        fn write_bytes(&self, relative_path: &str, contents: &[u8]) {
             let path = self.root.join(relative_path);
             fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture dir");
-            fs::write(path, []).expect("write fixture file");
+            fs::write(path, contents).expect("write fixture file");
         }
     }
 
