@@ -102,6 +102,8 @@ Tasks:
 - Add safe metadata review/apply UI before bulk changes.
 - Add artwork selection and cache behavior.
 - Keep tag write-back disabled by default.
+- [x] Add generated MP3 tag fixture for scanner tests.
+- Add generated FLAC and MP4/M4A tag fixtures.
 - Add test fixtures for tag-heavy and poorly tagged files.
 
 Done when:
@@ -278,6 +280,6 @@ Done when:
 
 The next implementation slice should be Milestone 3:
 
-1. Add tag-heavy fixtures for MP3, FLAC, and MP4/M4A.
+1. Add generated FLAC and MP4/M4A tag fixtures.
 2. Extend embedded extraction to album artist, disc numbers, genres, composers, lyrics, MusicBrainz IDs, and artwork.
 3. Add field-level provenance and metadata review/apply API shapes before building the UI.

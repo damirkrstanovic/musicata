@@ -3,7 +3,7 @@
 //! The initial implementation ships a local-disk provider, but the domain model
 //! deliberately describes music independently from the source that provided it.
 
-use lofty::{file::TaggedFileExt, prelude::Accessor, read_from_path};
+use lofty::{config::ParseOptions, file::TaggedFileExt, prelude::Accessor, probe::Probe};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -622,7 +622,10 @@ fn read_embedded_metadata(
     scan_errors: &mut Vec<ScanIssue>,
     observed_at_unix_seconds: i64,
 ) -> Option<TrackMetadataObservation> {
-    let tagged_file = match read_from_path(path) {
+    let tagged_file = match Probe::open(path)
+        .map(|probe| probe.options(ParseOptions::new().read_properties(false)))
+        .and_then(Probe::read)
+    {
         Ok(tagged_file) => tagged_file,
         Err(error) => {
             scan_errors.push(ScanIssue {
@@ -896,6 +899,11 @@ impl Hasher for StableHasher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lofty::{
+        config::WriteOptions,
+        prelude::TagExt,
+        tag::{ItemKey, Tag, TagType},
+    };
     use std::{fs, time::SystemTime};
 
     #[test]
@@ -1015,6 +1023,51 @@ mod tests {
         assert_eq!(canonical.track_number, Some(2));
     }
 
+    #[test]
+    fn scans_embedded_mp3_metadata_fixture() {
+        let fixture = TestFixture::new("embedded-mp3");
+        fixture.write_tagged_mp3(
+            "1994 - Folder Album/Folder Artist - Folder Title.mp3",
+            TaggedFixtureMetadata {
+                title: "Embedded Title",
+                artist: "Embedded Artist",
+                album: "Embedded Album",
+                year: 2001,
+                track_number: 9,
+            },
+        );
+        let library = scan_local_library(&fixture.root).expect("scan fixture");
+        let track = library.tracks.first().expect("track");
+
+        assert_eq!(track.title, "Embedded Title");
+        assert_eq!(track.artist_name, "Embedded Artist");
+        assert_eq!(track.album_title, "Embedded Album");
+        assert_eq!(track.year, Some(2001));
+        assert_eq!(track.track_number, Some(9));
+        assert!(
+            track
+                .observed_metadata
+                .iter()
+                .any(|observation| observation.source == "embedded_tag"
+                    && observation.confidence == 0.95)
+        );
+        assert!(
+            track
+                .observed_metadata
+                .iter()
+                .any(|observation| observation.source == "folder_path"
+                    && observation.confidence == 0.55)
+        );
+    }
+
+    struct TaggedFixtureMetadata {
+        title: &'static str,
+        artist: &'static str,
+        album: &'static str,
+        year: u16,
+        track_number: u16,
+    }
+
     struct TestFixture {
         root: PathBuf,
     }
@@ -1039,6 +1092,30 @@ mod tests {
             fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture dir");
             fs::write(path, contents).expect("write fixture file");
         }
+
+        fn write_tagged_mp3(&self, relative_path: &str, metadata: TaggedFixtureMetadata) {
+            let path = self.root.join(relative_path);
+            fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture dir");
+
+            let mut tag = Tag::new(TagType::Id3v2);
+            tag.insert_text(ItemKey::TrackTitle, metadata.title.to_string());
+            tag.insert_text(ItemKey::TrackArtist, metadata.artist.to_string());
+            tag.insert_text(ItemKey::AlbumTitle, metadata.album.to_string());
+            tag.insert_text(ItemKey::RecordingDate, metadata.year.to_string());
+            tag.insert_text(ItemKey::TrackNumber, metadata.track_number.to_string());
+
+            let mut bytes = Vec::new();
+            tag.dump_to(&mut bytes, WriteOptions::default())
+                .expect("write fixture tag");
+            bytes.extend_from_slice(&minimal_mpeg_frame());
+            fs::write(path, bytes).expect("write fixture file");
+        }
+    }
+
+    fn minimal_mpeg_frame() -> [u8; 417] {
+        let mut frame = [0_u8; 417];
+        frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
+        frame
     }
 
     impl Drop for TestFixture {
