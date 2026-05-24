@@ -69,7 +69,7 @@ Tasks:
 - [x] Set initial SQLite schema version with `PRAGMA user_version`.
 - [x] Add incremental rescan detection on startup.
 - [x] Add explicit incremental rescan command with `--scan-once`.
-- Add explicit incremental rescan API.
+- [x] Add explicit incremental rescan API.
 - Track content hash where useful.
 
 Done when:
@@ -272,7 +272,7 @@ Done when:
 
 The next implementation slice should be Milestone 2:
 
-1. Add an incremental rescan API.
-2. Add content hashes where useful.
-3. Add explicit migration steps beyond schema version 1.
-4. Keep local file paths out of canonical IDs as the schema grows.
+1. Add content hashes where useful.
+2. Add explicit migration steps beyond schema version 1.
+3. Keep local file paths out of canonical IDs as the schema grows.
+4. Start Milestone 3 metadata extraction once the remaining persistence cleanup is done.

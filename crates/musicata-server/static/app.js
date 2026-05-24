@@ -29,6 +29,14 @@ async function api(path) {
   return response.json();
 }
 
+async function apiPost(path) {
+  const response = await fetch(path, { method: "POST" });
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+  return response.json();
+}
+
 async function loadLibrary() {
   try {
     const [summary, albums, tracks] = await Promise.all([
@@ -46,6 +54,24 @@ async function loadLibrary() {
     renderTracks(tracks);
   } catch (error) {
     els.trackList.innerHTML = `<p class="error">Failed to load library: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function rescanLibrary() {
+  const label = els.refresh.textContent;
+  els.refresh.disabled = true;
+  els.refresh.textContent = "Scanning";
+
+  try {
+    const result = await apiPost("/api/library/rescan");
+    await loadLibrary();
+    const status = result.updated ? "" : " (unchanged)";
+    els.summary.textContent = `${result.summary.track_count} tracks, ${result.summary.album_count} albums${status}`;
+  } catch (error) {
+    els.trackList.innerHTML = `<p class="error">Rescan failed: ${escapeHtml(error.message)}</p>`;
+  } finally {
+    els.refresh.disabled = false;
+    els.refresh.textContent = label;
   }
 }
 
@@ -180,7 +206,7 @@ function escapeHtml(value) {
 }
 
 els.search.addEventListener("input", debounce(search, 180));
-els.refresh.addEventListener("click", loadLibrary);
+els.refresh.addEventListener("click", rescanLibrary);
 els.prev.addEventListener("click", () => playNext(-1));
 els.next.addEventListener("click", () => playNext(1));
 els.audio.addEventListener("ended", () => playNext(1));
@@ -215,4 +241,3 @@ function debounce(fn, delay) {
     timer = setTimeout(() => fn(...args), delay);
   };
 }
-

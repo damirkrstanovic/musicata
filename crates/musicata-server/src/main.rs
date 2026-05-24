@@ -10,18 +10,22 @@ use axum::{
     },
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
-use musicata_core::{Library, LocalDiskProvider, MusicProvider};
+use musicata_core::{Library, LibrarySummary, LocalDiskProvider, MusicProvider};
 use musicata_storage::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use tokio::sync::{Mutex, RwLock};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
 struct AppState {
-    library: Arc<Library>,
+    library: Arc<RwLock<Library>>,
+    database: Database,
+    provider: LocalDiskProvider,
+    rescan_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -43,15 +47,13 @@ async fn main() -> Result<()> {
     let database = Database::connect(&config.database)
         .await
         .with_context(|| format!("failed to open database {}", config.database.display()))?;
-    let library = Arc::new(
-        load_or_scan_library(
-            &database,
-            &provider,
-            config.rescan,
-            !config.no_incremental_rescan,
-        )
-        .await?,
-    );
+    let library = load_or_scan_library(
+        &database,
+        &provider,
+        config.rescan,
+        !config.no_incremental_rescan,
+    )
+    .await?;
 
     tracing::info!(
         artists = library.artists.len(),
@@ -71,7 +73,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to bind {}", config.addr))?;
 
     tracing::info!("listening on http://{}", config.addr);
-    axum::serve(listener, app(library))
+    axum::serve(listener, app(library, database, provider))
         .await
         .context("server failed")?;
 
@@ -131,7 +133,7 @@ async fn load_or_scan_library(
     Ok(scanned)
 }
 
-fn app(library: Arc<Library>) -> Router {
+fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
@@ -140,6 +142,7 @@ fn app(library: Arc<Library>) -> Router {
         .route("/sw.js", get(service_worker))
         .route("/api/health", get(health))
         .route("/api/library/summary", get(library_summary))
+        .route("/api/library/rescan", post(rescan_library))
         .route("/api/artists", get(artists))
         .route("/api/albums", get(albums))
         .route("/api/tracks", get(tracks))
@@ -148,7 +151,12 @@ fn app(library: Arc<Library>) -> Router {
         .route("/api/albums/{id}/artwork", get(album_artwork))
         .fallback(fallback)
         .layer(middleware::from_fn(log_request))
-        .with_state(AppState { library })
+        .with_state(AppState {
+            library: Arc::new(RwLock::new(library)),
+            database,
+            provider,
+            rescan_lock: Arc::new(Mutex::new(())),
+        })
 }
 
 async fn log_request(request: Request, next: Next) -> Response {
@@ -207,27 +215,84 @@ async fn fallback() -> AppError {
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let library = state.library.read().await;
+
     Json(json!({
         "status": "ok",
-        "provider": state.library.provider_id,
-        "tracks": state.library.tracks.len(),
+        "provider": library.provider_id,
+        "tracks": library.tracks.len(),
     }))
 }
 
 async fn library_summary(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.library.summary())
+    let library = state.library.read().await;
+    Json(library.summary())
+}
+
+#[derive(Debug, Deserialize)]
+struct RescanQuery {
+    force: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct RescanResponse {
+    changed: bool,
+    updated: bool,
+    forced: bool,
+    added: usize,
+    removed: usize,
+    modified: usize,
+    summary: LibrarySummary,
+}
+
+async fn rescan_library(
+    State(state): State<AppState>,
+    Query(query): Query<RescanQuery>,
+) -> Result<Json<RescanResponse>, AppError> {
+    let _guard = state.rescan_lock.lock().await;
+    let forced = query.force.unwrap_or(false);
+    let provider = state.provider.clone();
+    let scanned = tokio::task::spawn_blocking(move || provider.scan())
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?
+        .map_err(|error| AppError::internal(error.to_string()))?;
+    let changes = state.database.detect_library_changes(&scanned).await?;
+    let changed = changes.has_changes();
+    let updated = forced || changed;
+
+    let summary = if updated {
+        let summary = scanned.summary();
+        state.database.save_library(&scanned).await?;
+        *state.library.write().await = scanned;
+        summary
+    } else {
+        state.library.read().await.summary()
+    };
+
+    Ok(Json(RescanResponse {
+        changed,
+        updated,
+        forced,
+        added: changes.added,
+        removed: changes.removed,
+        modified: changes.modified,
+        summary,
+    }))
 }
 
 async fn artists(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.library.artists.clone())
+    let library = state.library.read().await;
+    Json(library.artists.clone())
 }
 
 async fn albums(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.library.albums.clone())
+    let library = state.library.read().await;
+    Json(library.albums.clone())
 }
 
 async fn tracks(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.library.tracks.clone())
+    let library = state.library.read().await;
+    Json(library.tracks.clone())
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,7 +305,8 @@ async fn search(
     Query(query): Query<SearchQuery>,
 ) -> impl IntoResponse {
     let q = query.q.unwrap_or_default();
-    Json(state.library.search(&q))
+    let library = state.library.read().await;
+    Json(library.search(&q))
 }
 
 async fn stream_track(
@@ -248,10 +314,13 @@ async fn stream_track(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let track = state
-        .library
-        .track(&id)
-        .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?;
+    let track = {
+        let library = state.library.read().await;
+        library
+            .track(&id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?
+    };
     let bytes = tokio::fs::read(&track.path).await?;
     let content_type = audio_content_type(&track.extension);
 
@@ -266,19 +335,21 @@ async fn album_artwork(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
-    let album = state
-        .library
-        .album(&id)
-        .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
-    let path = album
-        .artwork_path
-        .as_ref()
-        .ok_or_else(|| AppError::not_found(format!("album has no artwork: {id}")))?;
+    let path = {
+        let library = state.library.read().await;
+        let album = library
+            .album(&id)
+            .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
+        album
+            .artwork_path
+            .clone()
+            .ok_or_else(|| AppError::not_found(format!("album has no artwork: {id}")))?
+    };
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default();
-    let bytes = tokio::fs::read(path).await?;
+    let bytes = tokio::fs::read(&path).await?;
 
     Response::builder()
         .status(StatusCode::OK)
@@ -383,25 +454,31 @@ impl AppError {
             message: message.into(),
         }
     }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
+            message: message.into(),
+        }
+    }
 }
 
 impl From<std::io::Error> for AppError {
     fn from(error: std::io::Error) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "internal_error",
-            message: error.to_string(),
-        }
+        Self::internal(error.to_string())
     }
 }
 
 impl From<axum::http::Error> for AppError {
     fn from(error: axum::http::Error) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "internal_error",
-            message: error.to_string(),
-        }
+        Self::internal(error.to_string())
+    }
+}
+
+impl From<anyhow::Error> for AppError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::internal(error.to_string())
     }
 }
 
@@ -673,8 +750,9 @@ mod tests {
             header::{CONTENT_TYPE, RANGE},
         },
     };
-    use musicata_core::{Library, scan_local_library};
-    use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::SystemTime};
+    use musicata_core::{Library, LocalDiskProvider, scan_local_library};
+    use musicata_storage::Database;
+    use std::{collections::HashMap, fs, path::PathBuf, time::SystemTime};
     use tower::ServiceExt;
 
     #[test]
@@ -753,7 +831,7 @@ mod tests {
     #[tokio::test]
     async fn serves_library_summary_json() {
         let fixture = TestFixture::new("summary");
-        let app = app(Arc::new(fixture.library()));
+        let app = fixture.app().await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -772,7 +850,7 @@ mod tests {
     #[tokio::test]
     async fn serves_health_json() {
         let fixture = TestFixture::new("health");
-        let app = app(Arc::new(fixture.library()));
+        let app = fixture.app().await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -791,7 +869,7 @@ mod tests {
     #[tokio::test]
     async fn serves_search_results_json() {
         let fixture = TestFixture::new("search");
-        let app = app(Arc::new(fixture.library()));
+        let app = fixture.app().await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -809,9 +887,9 @@ mod tests {
     #[tokio::test]
     async fn serves_track_stream_ranges() {
         let fixture = TestFixture::new("stream");
-        let library = Arc::new(fixture.library());
+        let library = fixture.library();
         let track_id = library.tracks.first().expect("track").id.clone();
-        let app = app(library);
+        let app = fixture.app_with_library(library).await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -832,7 +910,7 @@ mod tests {
     #[tokio::test]
     async fn serves_album_artwork() {
         let fixture = TestFixture::new("artwork");
-        let library = Arc::new(fixture.library());
+        let library = fixture.library();
         let album_id = library
             .albums
             .iter()
@@ -840,7 +918,7 @@ mod tests {
             .expect("album artwork")
             .id
             .clone();
-        let app = app(library);
+        let app = fixture.app_with_library(library).await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -867,7 +945,7 @@ mod tests {
     #[tokio::test]
     async fn serves_stable_error_envelopes() {
         let fixture = TestFixture::new("missing");
-        let app = app(Arc::new(fixture.library()));
+        let app = fixture.app().await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -883,6 +961,43 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body.contains(r#""code":"not_found""#));
         assert!(body.contains(r#""message":"route not found""#));
+    }
+
+    #[tokio::test]
+    async fn rescans_library_and_updates_state() {
+        let fixture = TestFixture::new("rescan");
+        let app = fixture.app().await;
+        fixture.write("1998 - Elektro Pionir/Darkwood Dub - Treci Talas.mp3");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/library/rescan")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(response.into_body()).await;
+
+        assert!(body.contains(r#""changed":true"#));
+        assert!(body.contains(r#""added":1"#));
+        assert!(body.contains(r#""track_count":4"#));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/library/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(response.into_body()).await;
+
+        assert!(body.contains(r#""track_count":4"#));
     }
 
     async fn body_text(body: Body) -> String {
@@ -911,6 +1026,22 @@ mod tests {
 
         fn library(&self) -> Library {
             scan_local_library(&self.root).expect("scan fixture")
+        }
+
+        async fn app(&self) -> axum::Router {
+            let library = self.library();
+            self.app_with_library(library).await
+        }
+
+        async fn app_with_library(&self, library: Library) -> axum::Router {
+            let database = Database::connect(self.root.join("musicata.db"))
+                .await
+                .expect("connect fixture database");
+            database
+                .save_library(&library)
+                .await
+                .expect("save fixture library");
+            app(library, database, LocalDiskProvider::new(&self.root))
         }
 
         fn write(&self, relative_path: &str) {

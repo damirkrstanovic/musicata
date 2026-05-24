@@ -80,6 +80,7 @@ MUSICATA_LIBRARY=/path/to/music MUSICATA_DATABASE=.musicata/musicata.db MUSICATA
 
 On first run the server scans the configured library and stores the result in SQLite. Later runs load from the database unless `--rescan` or `MUSICATA_RESCAN=true` is set.
 By default, startup performs a lightweight incremental rescan check using provider item IDs, file sizes, and modified timestamps. Use `--no-incremental-rescan` to load only from the database.
+The running server can also rescan through `POST /api/library/rescan`; add `?force=true` to rewrite the stored library even when no changes are detected.
 Use `--scan-once` for a non-server scan/update command:
 
 ```sh
@@ -91,6 +92,7 @@ Useful endpoints:
 
 - `GET /` web controller.
 - `GET /api/library/summary` library counts.
+- `POST /api/library/rescan` scan the configured provider and update the database when files changed.
 - `GET /api/tracks` provider-neutral track list.
 - `GET /api/search?q=darkwood` simple library search.
 - `GET /api/tracks/{id}/stream` audio stream with basic byte-range support.
