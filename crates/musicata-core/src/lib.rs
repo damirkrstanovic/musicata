@@ -155,6 +155,7 @@ pub struct Album {
 pub struct Track {
     pub id: String,
     pub provider: ProviderMapping,
+    pub observed_metadata: Vec<TrackMetadataObservation>,
     pub title: String,
     pub artist_id: String,
     pub artist_name: String,
@@ -182,6 +183,16 @@ pub struct ScanIssue {
 pub struct ProviderMapping {
     pub provider_id: String,
     pub item_id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TrackMetadataObservation {
+    pub source: String,
+    pub title: Option<String>,
+    pub artist_name: Option<String>,
+    pub album_title: Option<String>,
+    pub year: Option<u16>,
+    pub track_number: Option<u16>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -304,6 +315,7 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
                 provider_id: "local-disk".to_string(),
                 item_id: relative_path.clone(),
             },
+            observed_metadata: vec![TrackMetadataObservation::folder_path(&metadata)],
             title: metadata.title,
             artist_id,
             artist_name: metadata.artist_name,
@@ -392,6 +404,19 @@ struct TrackMetadata {
     album_title: String,
     year: Option<u16>,
     track_number: Option<u16>,
+}
+
+impl TrackMetadataObservation {
+    fn folder_path(metadata: &TrackMetadata) -> Self {
+        Self {
+            source: "folder_path".to_string(),
+            title: Some(metadata.title.clone()),
+            artist_name: Some(metadata.artist_name.clone()),
+            album_title: Some(metadata.album_title.clone()),
+            year: metadata.year,
+            track_number: metadata.track_number,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -784,6 +809,12 @@ mod tests {
         assert!(library.tracks.iter().all(|track| {
             track.content_hash.as_deref()
                 == Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        }));
+        assert!(library.tracks.iter().all(|track| {
+            track
+                .observed_metadata
+                .iter()
+                .any(|observation| observation.source == "folder_path")
         }));
     }
 

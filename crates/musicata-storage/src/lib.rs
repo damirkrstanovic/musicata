@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use musicata_core::{Album, Artist, Library, ProviderMapping, ScanIssue, Track};
+use musicata_core::{
+    Album, Artist, Library, ProviderMapping, ScanIssue, Track, TrackMetadataObservation,
+};
 use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -64,6 +66,13 @@ impl Database {
             set_user_version(&self.pool, 2).await?;
         }
 
+        if version < 3 {
+            for statement in MIGRATION_003 {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 3).await?;
+        }
+
         Ok(())
     }
 
@@ -72,6 +81,9 @@ impl Database {
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
 
         let result = async {
+            sqlx::query("DELETE FROM track_metadata_observations")
+                .execute(&mut *conn)
+                .await?;
             sqlx::query("DELETE FROM tracks").execute(&mut *conn).await?;
             sqlx::query("DELETE FROM scan_errors")
                 .execute(&mut *conn)
@@ -142,6 +154,21 @@ impl Database {
                 .bind(path_to_string(&track.path))
                 .execute(&mut *conn)
                 .await?;
+
+                for observation in &track.observed_metadata {
+                    sqlx::query(
+                        "INSERT INTO track_metadata_observations (track_id, source, title, artist_name, album_title, year, track_number) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    )
+                    .bind(&track.id)
+                    .bind(&observation.source)
+                    .bind(&observation.title)
+                    .bind(&observation.artist_name)
+                    .bind(&observation.album_title)
+                    .bind(observation.year.map(i64::from))
+                    .bind(observation.track_number.map(i64::from))
+                    .execute(&mut *conn)
+                    .await?;
+                }
             }
 
             for issue in &library.scan_errors {
@@ -194,6 +221,11 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await?;
+        let observation_rows = sqlx::query(
+            "SELECT track_id, source, title, artist_name, album_title, year, track_number FROM track_metadata_observations ORDER BY track_id, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         let scan_error_rows = sqlx::query("SELECT path, message FROM scan_errors ORDER BY id")
             .fetch_all(&self.pool)
             .await?;
@@ -224,10 +256,32 @@ impl Database {
             });
         }
 
+        let mut observations_by_track: BTreeMap<String, Vec<TrackMetadataObservation>> =
+            BTreeMap::new();
+        for row in observation_rows {
+            let track_id: String = row.try_get("track_id")?;
+            observations_by_track
+                .entry(track_id)
+                .or_default()
+                .push(TrackMetadataObservation {
+                    source: row.try_get("source")?,
+                    title: row.try_get("title")?,
+                    artist_name: row.try_get("artist_name")?,
+                    album_title: row.try_get("album_title")?,
+                    year: optional_i64_to_u16(row.try_get("year")?, "year")?,
+                    track_number: optional_i64_to_u16(
+                        row.try_get("track_number")?,
+                        "track_number",
+                    )?,
+                });
+        }
+
         let mut tracks = Vec::with_capacity(track_rows.len());
         for row in track_rows {
+            let id: String = row.try_get("id")?;
             tracks.push(Track {
-                id: row.try_get("id")?,
+                observed_metadata: observations_by_track.remove(&id).unwrap_or_default(),
+                id,
                 provider: ProviderMapping {
                     provider_id: row.try_get("provider_id")?,
                     item_id: row.try_get("provider_item_id")?,
@@ -272,7 +326,7 @@ impl Database {
 
     pub async fn detect_library_changes(&self, scanned: &Library) -> Result<LibraryChangeSet> {
         let rows = sqlx::query(
-            "SELECT provider_item_id, file_size_bytes, modified_at_unix_seconds, content_hash FROM tracks ORDER BY provider_item_id",
+            "SELECT id, provider_item_id, file_size_bytes, modified_at_unix_seconds, content_hash FROM tracks ORDER BY provider_item_id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -285,8 +339,30 @@ impl Database {
             });
         }
 
+        let observation_rows = sqlx::query(
+            "SELECT track_id, source, title, artist_name, album_title, year, track_number FROM track_metadata_observations ORDER BY track_id, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut stored_observations: BTreeMap<String, String> = BTreeMap::new();
+        for row in observation_rows {
+            let track_id: String = row.try_get("track_id")?;
+            let observation = TrackMetadataObservation {
+                source: row.try_get("source")?,
+                title: row.try_get("title")?,
+                artist_name: row.try_get("artist_name")?,
+                album_title: row.try_get("album_title")?,
+                year: optional_i64_to_u16(row.try_get("year")?, "year")?,
+                track_number: optional_i64_to_u16(row.try_get("track_number")?, "track_number")?,
+            };
+            stored_observations.entry(track_id).or_default().push_str(
+                &metadata_observations_fingerprint(std::slice::from_ref(&observation)),
+            );
+        }
+
         let mut stored = BTreeMap::new();
         for row in rows {
+            let track_id: String = row.try_get("id")?;
             stored.insert(
                 row.try_get::<String, _>("provider_item_id")?,
                 TrackFingerprint {
@@ -296,6 +372,9 @@ impl Database {
                     )?,
                     modified_at_unix_seconds: row.try_get("modified_at_unix_seconds")?,
                     content_hash: row.try_get("content_hash")?,
+                    metadata_observations: stored_observations
+                        .remove(&track_id)
+                        .unwrap_or_default(),
                 },
             );
         }
@@ -310,6 +389,9 @@ impl Database {
                         file_size_bytes: track.file_size_bytes,
                         modified_at_unix_seconds: track.modified_at_unix_seconds,
                         content_hash: track.content_hash.clone(),
+                        metadata_observations: metadata_observations_fingerprint(
+                            &track.observed_metadata,
+                        ),
                     },
                 )
             })
@@ -350,6 +432,50 @@ struct TrackFingerprint {
     file_size_bytes: Option<u64>,
     modified_at_unix_seconds: Option<i64>,
     content_hash: Option<String>,
+    metadata_observations: String,
+}
+
+fn metadata_observations_fingerprint(observations: &[TrackMetadataObservation]) -> String {
+    let mut fingerprint = String::new();
+
+    for observation in observations {
+        push_fingerprint_part(&mut fingerprint, &observation.source);
+        push_fingerprint_part(
+            &mut fingerprint,
+            observation.title.as_deref().unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            observation.artist_name.as_deref().unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            observation.album_title.as_deref().unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            &observation
+                .year
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            &observation
+                .track_number
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
+    }
+
+    fingerprint
+}
+
+fn push_fingerprint_part(fingerprint: &mut String, value: &str) {
+    fingerprint.push_str(&value.len().to_string());
+    fingerprint.push(':');
+    fingerprint.push_str(value);
+    fingerprint.push(';');
 }
 
 const MIGRATION_001: &[&str] = &[
@@ -398,9 +524,21 @@ const MIGRATION_001: &[&str] = &[
         path TEXT NOT NULL,
         message TEXT NOT NULL
     )",
+    "CREATE TABLE IF NOT EXISTS track_metadata_observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        track_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        title TEXT,
+        artist_name TEXT,
+        album_title TEXT,
+        year INTEGER,
+        track_number INTEGER,
+        FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+    )",
     "CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id)",
     "CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id)",
     "CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id)",
+    "CREATE INDEX IF NOT EXISTS idx_track_metadata_observations_track_id ON track_metadata_observations(track_id)",
 ];
 
 struct ColumnMigration {
@@ -421,6 +559,21 @@ const MIGRATION_002_TRACK_COLUMNS: &[ColumnMigration] = &[
         column: "content_hash",
         alter_statement: "ALTER TABLE tracks ADD COLUMN content_hash TEXT",
     },
+];
+
+const MIGRATION_003: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS track_metadata_observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        track_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        title TEXT,
+        artist_name TEXT,
+        album_title TEXT,
+        year INTEGER,
+        track_number INTEGER,
+        FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_track_metadata_observations_track_id ON track_metadata_observations(track_id)",
 ];
 
 async fn user_version(pool: &SqlitePool) -> Result<i64> {
@@ -490,7 +643,9 @@ async fn ensure_column(
 #[cfg(test)]
 mod tests {
     use super::Database;
-    use musicata_core::{Album, Artist, Library, ProviderMapping, ScanIssue, Track};
+    use musicata_core::{
+        Album, Artist, Library, ProviderMapping, ScanIssue, Track, TrackMetadataObservation,
+    };
     use std::{
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
@@ -520,6 +675,12 @@ mod tests {
             Some(1_800_000_000)
         );
         assert_eq!(loaded.tracks[0].content_hash, Some("abc123".to_string()));
+        assert_eq!(loaded.tracks[0].observed_metadata.len(), 1);
+        assert_eq!(loaded.tracks[0].observed_metadata[0].source, "folder_path");
+        assert_eq!(
+            loaded.tracks[0].observed_metadata[0].title,
+            Some("Song".to_string())
+        );
         assert_eq!(loaded.scan_errors.len(), 1);
         assert_eq!(loaded.scan_errors[0].message, "permission denied");
 
@@ -551,6 +712,16 @@ mod tests {
         let library = fixture_library();
         database.save_library(&library).await.expect("save library");
 
+        let mut metadata_changed = library.clone();
+        metadata_changed.tracks[0].observed_metadata[0].title = Some("Retagged".to_string());
+        let changes = database
+            .detect_library_changes(&metadata_changed)
+            .await
+            .expect("detect changes");
+        assert_eq!(changes.added, 0);
+        assert_eq!(changes.removed, 0);
+        assert_eq!(changes.modified, 1);
+
         let mut changed = library.clone();
         changed.tracks[0].content_hash = Some("def456".to_string());
         changed.tracks.push(Track {
@@ -559,6 +730,7 @@ mod tests {
                 provider_id: "local-disk".to_string(),
                 item_id: "album/new-song.mp3".to_string(),
             },
+            observed_metadata: vec![fixture_observation("New Song", 2)],
             title: "New Song".to_string(),
             artist_id: "artist_1".to_string(),
             artist_name: "Artist".to_string(),
@@ -622,6 +794,7 @@ mod tests {
                     provider_id: "local-disk".to_string(),
                     item_id: "album/song.mp3".to_string(),
                 },
+                observed_metadata: vec![fixture_observation("Song", 1)],
                 title: "Song".to_string(),
                 artist_id: "artist_1".to_string(),
                 artist_name: "Artist".to_string(),
@@ -641,6 +814,17 @@ mod tests {
                 path: "/music/bad".to_string(),
                 message: "permission denied".to_string(),
             }],
+        }
+    }
+
+    fn fixture_observation(title: &str, track_number: u16) -> TrackMetadataObservation {
+        TrackMetadataObservation {
+            source: "folder_path".to_string(),
+            title: Some(title.to_string()),
+            artist_name: Some("Artist".to_string()),
+            album_title: Some("Album".to_string()),
+            year: Some(2026),
+            track_number: Some(track_number),
         }
     }
 

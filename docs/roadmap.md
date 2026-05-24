@@ -84,15 +84,17 @@ Done when:
 
 ## Milestone 3: Metadata Extraction And Updates
 
+Status: in progress.
+
 Goal: make local-library quality good enough for real collections.
 
 Tasks:
 
 - Add Lofty for embedded audio tags.
-- Store observed metadata and canonical metadata separately.
+- [x] Store observed metadata and canonical metadata separately.
 - Add metadata provenance per field: source, confidence, timestamp, and user approval state.
 - Extract title, album, artist, album artist, track/disc numbers, dates, genres, composers, embedded artwork, lyrics, MusicBrainz IDs, and ISRCs where present.
-- Preserve folder-derived fallback metadata for poorly tagged files.
+- [x] Preserve folder-derived fallback metadata for poorly tagged files.
 - Add MusicBrainz lookup by existing MBIDs.
 - Add MusicBrainz candidate search for unmatched albums and tracks.
 - Add safe metadata review/apply UI before bulk changes.
@@ -274,6 +276,6 @@ Done when:
 
 The next implementation slice should be Milestone 3:
 
-1. Add Lofty for embedded audio tags.
-2. Store observed metadata separately from canonical metadata.
-3. Keep folder-derived metadata as a fallback for poorly tagged files.
+1. Add Lofty for embedded audio tags once the crate is available in the build environment.
+2. Expand observations with field-level provenance: confidence, timestamp, and user approval state.
+3. Add tag-heavy fixtures for MP3, FLAC, and MP4/M4A.
