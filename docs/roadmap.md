@@ -101,7 +101,7 @@ Tasks:
 - [x] Add MusicBrainz lookup by existing MBIDs.
 - [x] Add MusicBrainz candidate search for unmatched albums and tracks.
 - [x] Add metadata review/apply API shapes before building the UI.
-- Add safe metadata review/apply UI before bulk changes.
+- [x] Add safe metadata review/apply UI before bulk changes.
 - Add artwork selection and cache behavior.
 - Keep tag write-back disabled by default.
 - [x] Add generated MP3 tag fixture for scanner tests.
@@ -284,6 +284,6 @@ Done when:
 
 The next implementation slice should be Milestone 3:
 
-1. Add safe metadata review/apply UI before bulk changes.
-2. Add artwork selection and cache behavior.
-3. Keep tag write-back disabled by default while documenting future opt-in write-back.
+1. Add artwork selection and cache behavior.
+2. Keep tag write-back disabled by default while documenting future opt-in write-back.
+3. Add metadata-based browse filters for genre, year, and composer.
