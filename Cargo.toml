@@ -23,3 +23,4 @@ tokio-stream = { version = "0.1.18", features = ["time"] }
 tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+ureq = { version = "2.12.1", default-features = false, features = ["json", "tls"] }

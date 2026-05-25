@@ -1,3 +1,5 @@
+mod musicbrainz;
+
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
@@ -18,6 +20,7 @@ use musicata_core::{
     MusicProvider, Track, TrackMetadataFieldObservation,
 };
 use musicata_storage::Database;
+use musicbrainz::{MusicBrainzClient, MusicBrainzTrackLookupResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -43,6 +46,7 @@ struct AppState {
     library: Arc<RwLock<Library>>,
     database: Database,
     provider: LocalDiskProvider,
+    musicbrainz: MusicBrainzClient,
     rescan_lock: Arc<Mutex<()>>,
     playback_sessions: Arc<RwLock<BTreeMap<String, PlaybackSession>>>,
     next_playback_session: Arc<AtomicU64>,
@@ -189,6 +193,10 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
             "/api/tracks/{id}/metadata/review/fields",
             patch(update_track_metadata_field_review),
         )
+        .route(
+            "/api/tracks/{id}/metadata/musicbrainz",
+            get(track_musicbrainz_lookup),
+        )
         .route("/api/tracks/{id}/stream", get(stream_track))
         .route("/api/albums/{id}/artwork", get(album_artwork))
         .fallback(fallback)
@@ -197,6 +205,7 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
             library: Arc::new(RwLock::new(library)),
             database,
             provider,
+            musicbrainz: MusicBrainzClient::default(),
             rescan_lock: Arc::new(Mutex::new(())),
             playback_sessions: Arc::new(RwLock::new(BTreeMap::new())),
             next_playback_session: Arc::new(AtomicU64::new(1)),
@@ -539,6 +548,26 @@ fn metadata_field_matches(
         && field.observed_at_unix_seconds == update.observed_at_unix_seconds
         && field.field_name == update.field_name
         && field.value == update.value
+}
+
+async fn track_musicbrainz_lookup(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<MusicBrainzTrackLookupResponse>, AppError> {
+    let track = {
+        let library = state.library.read().await;
+        library
+            .track(&id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?
+    };
+
+    let musicbrainz = state.musicbrainz.clone();
+    let lookup = tokio::task::spawn_blocking(move || musicbrainz.lookup_track(&track))
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+
+    Ok(Json(lookup))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1234,6 +1263,31 @@ mod tests {
         let body = body_text(response.into_body()).await;
 
         assert!(body.contains(r#""approval_state":"approved""#));
+    }
+
+    #[tokio::test]
+    async fn musicbrainz_lookup_returns_empty_result_without_existing_mbids() {
+        let fixture = TestFixture::new("musicbrainz-empty");
+        let library = fixture.library();
+        let track_id = library.tracks.first().expect("track").id.clone();
+        let app = fixture.app_with_library(library).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/tracks/{track_id}/metadata/musicbrainz"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_text(response.into_body()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""targets":[]"#));
+        assert!(body.contains(r#""recordings":[]"#));
+        assert!(body.contains(r#""issues":[]"#));
     }
 
     #[tokio::test]

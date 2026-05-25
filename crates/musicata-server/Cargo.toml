@@ -16,6 +16,7 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
