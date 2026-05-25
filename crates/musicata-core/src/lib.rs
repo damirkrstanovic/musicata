@@ -20,6 +20,8 @@ use std::{
 
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav"];
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
+const LYRIC_SIDECARS: &[(&str, &str, f32)] =
+    &[("lrc", "sidecar_lrc", 0.9), ("txt", "sidecar_txt", 0.8)];
 // Full-file hashing is too expensive for first imports of mounted multi-GB libraries.
 // Keep synchronous hashes for tiny files and move deep fingerprinting to a later worker.
 const INLINE_CONTENT_HASH_LIMIT_BYTES: u64 = 1024 * 1024;
@@ -389,9 +391,11 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
         let folder_metadata = infer_track_metadata(&root, &path);
         let embedded_metadata =
             read_embedded_metadata(&path, &mut scan_errors, observed_at_unix_seconds);
+        let sidecar_lyrics = read_sidecar_lyrics(&path, &mut scan_errors, observed_at_unix_seconds);
         let metadata = canonical_metadata(embedded_metadata.as_ref(), &folder_metadata);
         let observed_metadata = metadata_observations(
             embedded_metadata,
+            sidecar_lyrics,
             &folder_metadata,
             observed_at_unix_seconds,
         );
@@ -595,8 +599,8 @@ impl TrackMetadataObservation {
             disc_total: tag.disk_total().and_then(u32_to_u16),
             genres: clean_tag_values(tag.get_strings(ItemKey::Genre)),
             composers: clean_tag_values(tag.get_strings(ItemKey::Composer)),
-            lyrics: clean_tag_value(tag, ItemKey::Lyrics)
-                .or_else(|| clean_tag_value(tag, ItemKey::UnsyncLyrics)),
+            lyrics: clean_tag_lyrics_value(tag, ItemKey::Lyrics)
+                .or_else(|| clean_tag_lyrics_value(tag, ItemKey::UnsyncLyrics)),
             musicbrainz_recording_id: clean_tag_value(tag, ItemKey::MusicBrainzRecordingId),
             musicbrainz_track_id: clean_tag_value(tag, ItemKey::MusicBrainzTrackId),
             musicbrainz_release_id: clean_tag_value(tag, ItemKey::MusicBrainzReleaseId),
@@ -613,6 +617,43 @@ impl TrackMetadataObservation {
         observation
             .has_metadata()
             .then(|| observation.with_default_field_observations())
+    }
+
+    fn sidecar_lyrics(
+        source: &str,
+        confidence: f32,
+        lyrics: String,
+        observed_at_unix_seconds: i64,
+    ) -> Self {
+        Self {
+            source: source.to_string(),
+            confidence,
+            observed_at_unix_seconds,
+            approval_state: MetadataApprovalState::Observed,
+            field_observations: Vec::new(),
+            title: None,
+            artist_name: None,
+            album_artist_name: None,
+            album_title: None,
+            recording_date: None,
+            year: None,
+            track_number: None,
+            track_total: None,
+            disc_number: None,
+            disc_total: None,
+            genres: Vec::new(),
+            composers: Vec::new(),
+            lyrics: Some(lyrics),
+            musicbrainz_recording_id: None,
+            musicbrainz_track_id: None,
+            musicbrainz_release_id: None,
+            musicbrainz_release_group_id: None,
+            musicbrainz_artist_id: None,
+            musicbrainz_release_artist_id: None,
+            isrc: None,
+            embedded_artwork_count: 0,
+        }
+        .with_default_field_observations()
     }
 
     pub fn effective_field_observations(&self) -> Vec<TrackMetadataFieldObservation> {
@@ -959,8 +1000,41 @@ fn read_embedded_metadata(
         .and_then(|tag| TrackMetadataObservation::embedded_tag(tag, observed_at_unix_seconds))
 }
 
+fn read_sidecar_lyrics(
+    path: &Path,
+    scan_errors: &mut Vec<ScanIssue>,
+    observed_at_unix_seconds: i64,
+) -> Option<TrackMetadataObservation> {
+    for (extension, source, confidence) in LYRIC_SIDECARS {
+        let sidecar_path = path.with_extension(extension);
+        if !sidecar_path.exists() {
+            continue;
+        }
+
+        match fs::read_to_string(&sidecar_path) {
+            Ok(contents) => {
+                if let Some(lyrics) = clean_optional_lyrics_value(Some(&contents)) {
+                    return Some(TrackMetadataObservation::sidecar_lyrics(
+                        source,
+                        *confidence,
+                        lyrics,
+                        observed_at_unix_seconds,
+                    ));
+                }
+            }
+            Err(source) => scan_errors.push(ScanIssue {
+                path: sidecar_path.display().to_string(),
+                message: format!("sidecar lyrics read failed: {source}"),
+            }),
+        }
+    }
+
+    None
+}
+
 fn metadata_observations(
     embedded_metadata: Option<TrackMetadataObservation>,
+    sidecar_lyrics: Option<TrackMetadataObservation>,
     folder_metadata: &TrackMetadata,
     observed_at_unix_seconds: i64,
 ) -> Vec<TrackMetadataObservation> {
@@ -968,6 +1042,10 @@ fn metadata_observations(
 
     if let Some(embedded_metadata) = embedded_metadata {
         observations.push(embedded_metadata);
+    }
+
+    if let Some(sidecar_lyrics) = sidecar_lyrics {
+        observations.push(sidecar_lyrics);
     }
 
     observations.push(TrackMetadataObservation::folder_path(
@@ -1083,6 +1161,10 @@ fn clean_tag_value(tag: &lofty::tag::Tag, key: ItemKey) -> Option<String> {
     clean_optional_tag_value(tag.get_string(key))
 }
 
+fn clean_tag_lyrics_value(tag: &lofty::tag::Tag, key: ItemKey) -> Option<String> {
+    clean_optional_lyrics_value(tag.get_string(key))
+}
+
 fn first_clean_tag_value(tag: &lofty::tag::Tag, key: ItemKey) -> Option<String> {
     clean_tag_values(tag.get_strings(key)).into_iter().next()
 }
@@ -1097,6 +1179,13 @@ fn clean_tag_values<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
     }
 
     cleaned
+}
+
+fn clean_optional_lyrics_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(|value| value.replace("\r\n", "\n").replace('\r', "\n"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn u32_to_u16(value: u32) -> Option<u16> {
@@ -1718,6 +1807,88 @@ mod tests {
                 && field.confidence == 0.95
                 && field.approval_state == MetadataApprovalState::Observed
         }));
+    }
+
+    #[test]
+    fn scans_lrc_sidecar_lyrics_fixture() {
+        let fixture = TestFixture::new("sidecar-lrc");
+        fixture.write_tagged_mp3(
+            "1994 - Folder Album/01 Folder Artist - Folder Title.mp3",
+            TaggedFixtureMetadata {
+                title: "Tagged Title",
+                artist: "Tagged Artist",
+                album: "Tagged Album",
+                year: 1994,
+                track_number: 1,
+            },
+        );
+        fixture.write_bytes(
+            "1994 - Folder Album/01 Folder Artist - Folder Title.lrc",
+            b"\r\n[00:01.00]First_line\r\n[00:02.00]Second line\r\n",
+        );
+        fixture.write_bytes(
+            "1994 - Folder Album/01 Folder Artist - Folder Title.txt",
+            b"Plain fallback",
+        );
+        let library = scan_local_library(&fixture.root).expect("scan fixture");
+        let track = library.tracks.first().expect("track");
+        let observation = track
+            .observed_metadata
+            .iter()
+            .find(|observation| observation.source == "sidecar_lrc")
+            .expect("sidecar observation");
+
+        assert_eq!(
+            observation.lyrics,
+            Some("[00:01.00]First_line\n[00:02.00]Second line".to_string())
+        );
+        assert_eq!(observation.confidence, 0.9);
+        assert!(
+            track
+                .observed_metadata
+                .iter()
+                .all(|observation| observation.source != "sidecar_txt")
+        );
+        assert!(observation.field_observations.iter().any(|field| {
+            field.field_name == "lyrics"
+                && field.value
+                    == MetadataFieldValue::Text(
+                        "[00:01.00]First_line\n[00:02.00]Second line".to_string(),
+                    )
+                && field.source == "sidecar_lrc"
+        }));
+    }
+
+    #[test]
+    fn scans_txt_sidecar_lyrics_fixture() {
+        let fixture = TestFixture::new("sidecar-txt");
+        fixture.write_tagged_mp3(
+            "1994 - Folder Album/02 Folder Artist - Folder Title.mp3",
+            TaggedFixtureMetadata {
+                title: "Tagged Title",
+                artist: "Tagged Artist",
+                album: "Tagged Album",
+                year: 1994,
+                track_number: 2,
+            },
+        );
+        fixture.write_bytes(
+            "1994 - Folder Album/02 Folder Artist - Folder Title.txt",
+            b"Plain line one\rPlain_line_two\n",
+        );
+        let library = scan_local_library(&fixture.root).expect("scan fixture");
+        let track = library.tracks.first().expect("track");
+        let observation = track
+            .observed_metadata
+            .iter()
+            .find(|observation| observation.source == "sidecar_txt")
+            .expect("sidecar observation");
+
+        assert_eq!(
+            observation.lyrics,
+            Some("Plain line one\nPlain_line_two".to_string())
+        );
+        assert_eq!(observation.confidence, 0.8);
     }
 
     #[test]

@@ -104,6 +104,7 @@ Tasks:
 - [x] Add safe metadata review/apply UI before bulk changes.
 - [x] Add artwork selection and cache behavior.
 - [x] Add Cover Art Archive artwork enrichment behind explicit candidate review.
+- [x] Add sidecar `.lrc` and `.txt` lyric observations.
 - [x] Keep tag write-back disabled by default.
 - [x] Add generated MP3 tag fixture for scanner tests.
 - [x] Add generated FLAC and MP4/M4A tag fixtures.
@@ -286,6 +287,6 @@ Done when:
 
 The next implementation slice should continue metadata enrichment, then move into Milestone 4:
 
-1. Add lyrics extraction for sidecar and embedded lyrics.
-2. Add album detail and artist detail endpoints.
-3. Add artist detail endpoints.
+1. Add album detail endpoints.
+2. Add artist detail endpoints.
+3. Add pagination and sorting to API endpoints.

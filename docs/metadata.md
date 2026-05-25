@@ -220,6 +220,8 @@ Lyrics priority:
 4. Adjacent `.txt` lyrics.
 5. Optional LRCLIB lookup.
 
+Current implementation: Musicata stores embedded Lofty lyrics and adjacent same-stem `.lrc` or `.txt` sidecar lyrics as observed metadata. Sidecar `.lrc` files are preferred over `.txt` files when both exist. LRCLIB lookup remains future work.
+
 LRCLIB can fetch plain and synchronized lyrics by track title, artist, album, and duration. Its docs recommend a User-Agent even though no API key is required.
 
 ## User Experience
@@ -246,11 +248,12 @@ Avoid a one-click "fix everything" workflow. Music libraries contain personal ch
 4. Add MusicBrainz lookup by existing MBIDs.
 5. Add MusicBrainz candidate search for unmatched albums.
 6. Add Cover Art Archive artwork enrichment behind explicit review.
-7. Add user review/apply UI.
-8. Add optional tag write-back for FLAC, MP3, and M4A.
-9. Add AcoustID/Chromaprint matching.
-10. Add LRCLIB lyrics enrichment.
-11. Add advanced metadata sources and automatic refresh policies.
+7. Add sidecar `.lrc` and `.txt` lyric observations.
+8. Add user review/apply UI.
+9. Add optional tag write-back for FLAC, MP3, and M4A.
+10. Add AcoustID/Chromaprint matching.
+11. Add LRCLIB lyrics enrichment.
+12. Add advanced metadata sources and automatic refresh policies.
 
 ## Recommendation
 
