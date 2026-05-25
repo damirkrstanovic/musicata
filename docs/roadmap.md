@@ -94,7 +94,7 @@ Tasks:
 - [x] Add Lofty for embedded audio tags.
 - [x] Store observed metadata and canonical metadata separately.
 - [x] Add metadata observation provenance: source, confidence, timestamp, and user approval state.
-- Add field-level provenance and review state for individual metadata values.
+- [x] Add field-level provenance and review state for individual metadata values.
 - [x] Read embedded title, artist, album, year, and track number with folder-derived fallback.
 - [x] Extract title, album, artist, album artist, track/disc numbers, dates, genres, composers, embedded artwork, lyrics, MusicBrainz IDs, and ISRCs into observed metadata where present.
 - [x] Preserve folder-derived fallback metadata for poorly tagged files.
@@ -147,6 +147,7 @@ Tasks:
 - Add WebSocket state updates for controllers.
 - Treat the browser player as the first player provider.
 - Add playback session state and now-playing history.
+- [x] Stop browser playback when the server-bound playback session heartbeat is lost.
 
 Done when:
 
@@ -282,6 +283,6 @@ Done when:
 
 The next implementation slice should be Milestone 3:
 
-1. Add generated FLAC and MP4/M4A tag fixtures.
-2. Extend embedded extraction to album artist, disc numbers, genres, composers, lyrics, MusicBrainz IDs, and artwork.
-3. Add field-level provenance and metadata review/apply API shapes before building the UI.
+1. Add metadata review/apply API shapes before building the UI.
+2. Add MusicBrainz lookup by existing MBIDs.
+3. Add MusicBrainz candidate search for unmatched albums and tracks.
