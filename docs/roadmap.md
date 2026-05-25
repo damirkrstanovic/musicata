@@ -105,7 +105,7 @@ Tasks:
 - [x] Add generated MP3 tag fixture for scanner tests.
 - [x] Add generated FLAC and MP4/M4A tag fixtures.
 - [x] Add generated tag-heavy embedded metadata fixture.
-- Add poorly tagged file fixtures for metadata review cases.
+- [x] Add generated poorly tagged file fixture for folder fallback coverage.
 
 Done when:
 

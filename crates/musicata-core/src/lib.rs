@@ -1171,6 +1171,32 @@ mod tests {
     }
 
     #[test]
+    fn partial_embedded_tags_keep_folder_fallbacks() {
+        let fixture = TestFixture::new("partial-embedded");
+        fixture
+            .write_partially_tagged_mp3("1994 - Folder Album/07 Folder Artist - Folder Title.mp3");
+        let library = scan_local_library(&fixture.root).expect("scan fixture");
+        let track = library.tracks.first().expect("track");
+        let embedded_observation = track
+            .observed_metadata
+            .iter()
+            .find(|observation| observation.source == "embedded_tag")
+            .expect("embedded observation");
+
+        assert_eq!(track.title, "Only Embedded Title");
+        assert_eq!(track.artist_name, "Folder Artist");
+        assert_eq!(track.album_title, "Folder Album");
+        assert_eq!(track.year, Some(1994));
+        assert_eq!(track.track_number, Some(7));
+        assert_eq!(
+            embedded_observation.title,
+            Some("Only Embedded Title".to_string())
+        );
+        assert_eq!(embedded_observation.artist_name, None);
+        assert_eq!(embedded_observation.album_title, None);
+    }
+
+    #[test]
     fn scans_embedded_flac_metadata_fixture() {
         let fixture = TestFixture::new("embedded-flac");
         fixture.write_tagged_flac(
@@ -1372,6 +1398,20 @@ mod tests {
             let mut bytes = Vec::new();
             tag.dump_to(&mut bytes, WriteOptions::default())
                 .expect("write fixture tag");
+            bytes.extend_from_slice(&minimal_mpeg_frame());
+            fs::write(path, bytes).expect("write fixture file");
+        }
+
+        fn write_partially_tagged_mp3(&self, relative_path: &str) {
+            let path = self.root.join(relative_path);
+            fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture dir");
+
+            let mut tag = Tag::new(TagType::Id3v2);
+            tag.set_title("Only Embedded Title".to_string());
+
+            let mut bytes = Vec::new();
+            tag.dump_to(&mut bytes, WriteOptions::default())
+                .expect("write id3v2 tag");
             bytes.extend_from_slice(&minimal_mpeg_frame());
             fs::write(path, bytes).expect("write fixture file");
         }
