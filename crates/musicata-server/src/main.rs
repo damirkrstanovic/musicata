@@ -11,9 +11,12 @@ use axum::{
     middleware::{self, Next},
     response::sse::{Event, KeepAlive, Sse},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
-use musicata_core::{Library, LibrarySummary, LocalDiskProvider, MusicProvider};
+use musicata_core::{
+    Library, LibrarySummary, LocalDiskProvider, MetadataApprovalState, MetadataFieldValue,
+    MusicProvider, Track, TrackMetadataFieldObservation,
+};
 use musicata_storage::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -178,6 +181,14 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
         .route("/api/albums", get(albums))
         .route("/api/tracks", get(tracks))
         .route("/api/search", get(search))
+        .route(
+            "/api/tracks/{id}/metadata/review",
+            get(track_metadata_review),
+        )
+        .route(
+            "/api/tracks/{id}/metadata/review/fields",
+            patch(update_track_metadata_field_review),
+        )
         .route("/api/tracks/{id}/stream", get(stream_track))
         .route("/api/albums/{id}/artwork", get(album_artwork))
         .fallback(fallback)
@@ -388,6 +399,148 @@ async fn tracks(State(state): State<AppState>) -> impl IntoResponse {
     Json(library.tracks.clone())
 }
 
+#[derive(Debug, Serialize)]
+struct TrackMetadataReviewResponse {
+    track_id: String,
+    canonical: TrackCanonicalMetadataResponse,
+    observations: Vec<MetadataObservationReviewResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct TrackCanonicalMetadataResponse {
+    title: String,
+    artist_name: String,
+    album_title: String,
+    year: Option<u16>,
+    track_number: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetadataObservationReviewResponse {
+    source: String,
+    confidence: f32,
+    observed_at_unix_seconds: i64,
+    approval_state: MetadataApprovalState,
+    fields: Vec<TrackMetadataFieldObservation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataFieldReviewUpdate {
+    source: String,
+    observed_at_unix_seconds: i64,
+    field_name: String,
+    value: MetadataFieldValue,
+    approval_state: MetadataApprovalState,
+}
+
+async fn track_metadata_review(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TrackMetadataReviewResponse>, AppError> {
+    let library = state.library.read().await;
+    let track = library
+        .track(&id)
+        .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?;
+
+    Ok(Json(metadata_review_response(track)))
+}
+
+async fn update_track_metadata_field_review(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(update): Json<MetadataFieldReviewUpdate>,
+) -> Result<Json<TrackMetadataReviewResponse>, AppError> {
+    let (updated_library, response) = {
+        let library = state.library.read().await;
+        let mut updated_library = library.clone();
+        let track = updated_library
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == id)
+            .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?;
+
+        update_metadata_field_approval(track, &update)?;
+        let response = metadata_review_response(track);
+        (updated_library, response)
+    };
+
+    state.database.save_library(&updated_library).await?;
+    *state.library.write().await = updated_library;
+
+    Ok(Json(response))
+}
+
+fn metadata_review_response(track: &Track) -> TrackMetadataReviewResponse {
+    TrackMetadataReviewResponse {
+        track_id: track.id.clone(),
+        canonical: TrackCanonicalMetadataResponse {
+            title: track.title.clone(),
+            artist_name: track.artist_name.clone(),
+            album_title: track.album_title.clone(),
+            year: track.year,
+            track_number: track.track_number,
+        },
+        observations: track
+            .observed_metadata
+            .iter()
+            .map(|observation| MetadataObservationReviewResponse {
+                source: observation.source.clone(),
+                confidence: observation.confidence,
+                observed_at_unix_seconds: observation.observed_at_unix_seconds,
+                approval_state: observation.approval_state.clone(),
+                fields: observation.effective_field_observations(),
+            })
+            .collect(),
+    }
+}
+
+fn update_metadata_field_approval(
+    track: &mut Track,
+    update: &MetadataFieldReviewUpdate,
+) -> Result<(), AppError> {
+    let mut matched_field = None;
+
+    for (observation_index, observation) in track.observed_metadata.iter_mut().enumerate() {
+        if observation.field_observations.is_empty() {
+            observation.field_observations = observation.effective_field_observations();
+        }
+
+        for (field_index, field) in observation.field_observations.iter().enumerate() {
+            if metadata_field_matches(field, update) {
+                if matched_field.is_some() {
+                    return Err(AppError::bad_request(format!(
+                        "metadata field selector is ambiguous for track: {}",
+                        track.id
+                    )));
+                }
+                matched_field = Some((observation_index, field_index));
+            }
+        }
+    }
+
+    let Some((observation_index, field_index)) = matched_field else {
+        return Err(AppError::not_found(format!(
+            "metadata field not found for track: {}",
+            track.id
+        )));
+    };
+
+    track.observed_metadata[observation_index].field_observations[field_index].approval_state =
+        update.approval_state.clone();
+
+    Ok(())
+}
+
+fn metadata_field_matches(
+    field: &TrackMetadataFieldObservation,
+    update: &MetadataFieldReviewUpdate,
+) -> bool {
+    field.source == update.source
+        && field.observed_at_unix_seconds == update.observed_at_unix_seconds
+        && field.field_name == update.field_name
+        && field.value == update.value
+}
+
 #[derive(Debug, Deserialize)]
 struct StreamQuery {
     playback_session: Option<String>,
@@ -574,6 +727,14 @@ impl AppError {
         Self {
             status: StatusCode::NOT_FOUND,
             code: "not_found",
+            message: message.into(),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_request",
             message: message.into(),
         }
     }
@@ -1005,6 +1166,74 @@ mod tests {
         let body = body_text(response.into_body()).await;
 
         assert!(body.contains("Vavilon"));
+    }
+
+    #[tokio::test]
+    async fn metadata_review_api_updates_field_approval() {
+        let fixture = TestFixture::new("metadata-review");
+        let library = fixture.library();
+        let track = library.tracks.first().expect("track").clone();
+        let field = track
+            .observed_metadata
+            .iter()
+            .flat_map(|observation| observation.field_observations.iter())
+            .find(|field| field.source == "folder_path" && field.field_name == "title")
+            .expect("title field")
+            .clone();
+        let app = fixture.app_with_library(library).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/tracks/{}/metadata/review", track.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(response.into_body()).await;
+
+        assert!(body.contains(r#""canonical""#));
+        assert!(body.contains(r#""field_name":"title""#));
+
+        let update = serde_json::json!({
+            "source": field.source,
+            "observed_at_unix_seconds": field.observed_at_unix_seconds,
+            "field_name": field.field_name,
+            "value": field.value,
+            "approval_state": "approved"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/tracks/{}/metadata/review/fields", track.id))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_text(response.into_body()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""approval_state":"approved""#));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/tracks/{}/metadata/review", track.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(response.into_body()).await;
+
+        assert!(body.contains(r#""approval_state":"approved""#));
     }
 
     #[tokio::test]

@@ -100,6 +100,7 @@ Tasks:
 - [x] Preserve folder-derived fallback metadata for poorly tagged files.
 - Add MusicBrainz lookup by existing MBIDs.
 - Add MusicBrainz candidate search for unmatched albums and tracks.
+- [x] Add metadata review/apply API shapes before building the UI.
 - Add safe metadata review/apply UI before bulk changes.
 - Add artwork selection and cache behavior.
 - Keep tag write-back disabled by default.
@@ -283,6 +284,6 @@ Done when:
 
 The next implementation slice should be Milestone 3:
 
-1. Add metadata review/apply API shapes before building the UI.
-2. Add MusicBrainz lookup by existing MBIDs.
-3. Add MusicBrainz candidate search for unmatched albums and tracks.
+1. Add MusicBrainz lookup by existing MBIDs.
+2. Add MusicBrainz candidate search for unmatched albums and tracks.
+3. Add safe metadata review/apply UI before bulk changes.
