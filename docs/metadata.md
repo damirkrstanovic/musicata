@@ -200,6 +200,8 @@ Artwork priority:
 
 Store artwork as assets with source, dimensions, MIME type, hash, and relation to album/release/release group. Do not embed new artwork into files unless the user explicitly chooses write-back.
 
+Current implementation: Musicata reviews local artwork files, lets the user select an album candidate in the web controller, and serves selected artwork with asset-keyed URLs plus HTTP cache validators. Embedded artwork extraction and Cover Art Archive enrichment remain future candidate sources.
+
 ## Lyrics
 
 Lyrics priority:
@@ -253,4 +255,3 @@ For Musicata, the best first implementation is **safe enrichment, not retagging*
 - keep a revision trail.
 
 This is the best fit for a Roon-like server because playback, browsing, and recommendations can use enriched metadata immediately without forcing destructive changes onto the user's music files.
-

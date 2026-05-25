@@ -8,7 +8,10 @@ use axum::{
     extract::{Path, Query, State},
     http::{
         HeaderMap, StatusCode,
-        header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE},
+        header::{
+            ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+            IF_NONE_MATCH, RANGE,
+        },
     },
     middleware::{self, Next},
     response::sse::{Event, KeepAlive, Sse},
@@ -17,7 +20,8 @@ use axum::{
 };
 use musicata_core::{
     Library, LibrarySummary, LocalDiskProvider, MetadataApprovalState, MetadataFieldValue,
-    MusicProvider, Track, TrackMetadataFieldObservation,
+    MusicProvider, Track, TrackMetadataFieldObservation, album_artwork_url, artwork_asset_id,
+    find_album_artwork_candidates,
 };
 use musicata_storage::Database;
 use musicbrainz::{
@@ -43,6 +47,7 @@ use tokio_stream::{Stream, StreamExt, wrappers::IntervalStream};
 use tracing_subscriber::EnvFilter;
 
 const PLAYBACK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const ARTWORK_CACHE_CONTROL: &str = "public, max-age=86400, must-revalidate";
 
 #[derive(Clone)]
 struct AppState {
@@ -190,6 +195,15 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
             "/api/albums/{id}/metadata/musicbrainz/candidates",
             get(album_musicbrainz_candidates),
         )
+        .route("/api/albums/{id}/artwork/review", get(album_artwork_review))
+        .route(
+            "/api/albums/{id}/artwork/candidates/{artwork_id}",
+            get(album_artwork_candidate),
+        )
+        .route(
+            "/api/albums/{id}/artwork",
+            get(album_artwork).patch(update_album_artwork),
+        )
         .route("/api/tracks", get(tracks))
         .route("/api/search", get(search))
         .route(
@@ -209,7 +223,6 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
             get(track_musicbrainz_candidates),
         )
         .route("/api/tracks/{id}/stream", get(stream_track))
-        .route("/api/albums/{id}/artwork", get(album_artwork))
         .fallback(fallback)
         .layer(middleware::from_fn(log_request))
         .with_state(AppState {
@@ -451,6 +464,43 @@ struct MetadataFieldReviewUpdate {
     field_name: String,
     value: MetadataFieldValue,
     approval_state: MetadataApprovalState,
+}
+
+#[derive(Clone, Debug)]
+struct AlbumArtworkCandidate {
+    id: String,
+    path: PathBuf,
+    file_name: String,
+    mime_type: String,
+    file_size_bytes: Option<u64>,
+    modified_at_unix_seconds: Option<i64>,
+    selected: bool,
+    rank: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct AlbumArtworkReviewResponse {
+    album_id: String,
+    selected_artwork_id: Option<String>,
+    selected_artwork_url: Option<String>,
+    candidates: Vec<AlbumArtworkCandidateResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct AlbumArtworkCandidateResponse {
+    id: String,
+    source: &'static str,
+    file_name: String,
+    mime_type: String,
+    file_size_bytes: Option<u64>,
+    modified_at_unix_seconds: Option<i64>,
+    selected: bool,
+    preview_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlbumArtworkSelectionUpdate {
+    artwork_id: String,
 }
 
 async fn track_metadata_review(
@@ -706,9 +756,57 @@ fn now_unix_seconds() -> i64 {
         .unwrap_or_default()
 }
 
+async fn album_artwork_review(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<AlbumArtworkReviewResponse>, AppError> {
+    let library = state.library.read().await;
+    Ok(Json(album_artwork_review_response(&library, &id)?))
+}
+
+async fn update_album_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(update): Json<AlbumArtworkSelectionUpdate>,
+) -> Result<Json<AlbumArtworkReviewResponse>, AppError> {
+    let (updated_library, response) = {
+        let library = state.library.read().await;
+        let mut updated_library = library.clone();
+        let candidate = album_artwork_candidates(&updated_library, &id)?
+            .into_iter()
+            .find(|candidate| candidate.id == update.artwork_id)
+            .ok_or_else(|| {
+                AppError::not_found(format!(
+                    "unknown artwork candidate for album {id}: {}",
+                    update.artwork_id
+                ))
+            })?;
+        let album = updated_library
+            .albums
+            .iter_mut()
+            .find(|album| album.id == id)
+            .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
+
+        album.artwork_path = Some(candidate.path);
+        album.artwork_url = Some(album_artwork_url(
+            &album.id,
+            album.artwork_path.as_ref().unwrap(),
+        ));
+
+        let response = album_artwork_review_response(&updated_library, &id)?;
+        (updated_library, response)
+    };
+
+    state.database.save_library(&updated_library).await?;
+    *state.library.write().await = updated_library;
+
+    Ok(Json(response))
+}
+
 async fn album_artwork(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let path = {
         let library = state.library.read().await;
@@ -720,18 +818,195 @@ async fn album_artwork(
             .clone()
             .ok_or_else(|| AppError::not_found(format!("album has no artwork: {id}")))?
     };
+
+    serve_artwork(path, headers).await
+}
+
+async fn album_artwork_candidate(
+    State(state): State<AppState>,
+    Path((id, artwork_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let path = {
+        let library = state.library.read().await;
+        album_artwork_candidates(&library, &id)?
+            .into_iter()
+            .find(|candidate| candidate.id == artwork_id)
+            .map(|candidate| candidate.path)
+            .ok_or_else(|| {
+                AppError::not_found(format!(
+                    "unknown artwork candidate for album {id}: {artwork_id}"
+                ))
+            })?
+    };
+
+    serve_artwork(path, headers).await
+}
+
+fn album_artwork_review_response(
+    library: &Library,
+    album_id: &str,
+) -> Result<AlbumArtworkReviewResponse, AppError> {
+    let album = library
+        .album(album_id)
+        .ok_or_else(|| AppError::not_found(format!("unknown album: {album_id}")))?;
+    let candidates = album_artwork_candidates(library, album_id)?;
+
+    Ok(AlbumArtworkReviewResponse {
+        album_id: album_id.to_string(),
+        selected_artwork_id: album
+            .artwork_path
+            .as_ref()
+            .map(|path| artwork_asset_id(path)),
+        selected_artwork_url: album
+            .artwork_path
+            .as_ref()
+            .map(|path| album_artwork_url(album_id, path)),
+        candidates: candidates
+            .into_iter()
+            .map(|candidate| AlbumArtworkCandidateResponse {
+                preview_url: format!(
+                    "/api/albums/{album_id}/artwork/candidates/{}?asset={}",
+                    candidate.id, candidate.id
+                ),
+                id: candidate.id,
+                source: "local_file",
+                file_name: candidate.file_name,
+                mime_type: candidate.mime_type,
+                file_size_bytes: candidate.file_size_bytes,
+                modified_at_unix_seconds: candidate.modified_at_unix_seconds,
+                selected: candidate.selected,
+            })
+            .collect(),
+    })
+}
+
+fn album_artwork_candidates(
+    library: &Library,
+    album_id: &str,
+) -> Result<Vec<AlbumArtworkCandidate>, AppError> {
+    let album = library
+        .album(album_id)
+        .ok_or_else(|| AppError::not_found(format!("unknown album: {album_id}")))?;
+    let selected_id = album
+        .artwork_path
+        .as_ref()
+        .map(|path| artwork_asset_id(path));
+    let mut paths = Vec::new();
+
+    if let Some(path) = album.artwork_path.as_ref() {
+        push_unique_path(&mut paths, path.clone());
+    }
+
+    for track in library
+        .tracks
+        .iter()
+        .filter(|track| track.album_id == album_id)
+    {
+        if let Some(parent) = track.path.parent() {
+            for path in find_album_artwork_candidates(parent) {
+                push_unique_path(&mut paths, path);
+            }
+        }
+    }
+
+    let mut candidates = paths
+        .into_iter()
+        .enumerate()
+        .map(|(rank, path)| album_artwork_candidate_from_path(path, selected_id.as_deref(), rank))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .selected
+            .cmp(&left.selected)
+            .then_with(|| left.rank.cmp(&right.rank))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    Ok(candidates)
+}
+
+fn album_artwork_candidate_from_path(
+    path: PathBuf,
+    selected_id: Option<&str>,
+    rank: usize,
+) -> AlbumArtworkCandidate {
+    let id = artwork_asset_id(&path);
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default();
+    let metadata = fs::metadata(&path).ok();
+
+    AlbumArtworkCandidate {
+        selected: selected_id == Some(id.as_str()),
+        id,
+        file_name: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("artwork")
+            .to_string(),
+        mime_type: image_content_type(extension).to_string(),
+        file_size_bytes: metadata.as_ref().map(|metadata| metadata.len()),
+        modified_at_unix_seconds: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(system_time_to_unix_seconds),
+        path,
+        rank,
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+async fn serve_artwork(path: PathBuf, headers: HeaderMap) -> Result<Response, AppError> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    let _metadata = tokio::fs::metadata(&path).await?;
+    let etag = format!("\"{}\"", artwork_asset_id(&path));
+
+    if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(CACHE_CONTROL, ARTWORK_CACHE_CONTROL)
+            .header(ETAG, etag)
+            .body(Body::empty())
+            .map_err(AppError::from);
+    }
+
     let bytes = tokio::fs::read(&path).await?;
 
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, image_content_type(extension))
         .header(CONTENT_LENGTH, bytes.len().to_string())
+        .header(CACHE_CONTROL, ARTWORK_CACHE_CONTROL)
+        .header(ETAG, etag)
         .body(Body::from(bytes))
         .map_err(AppError::from)
+}
+
+fn etag_matches(value: Option<&axum::http::HeaderValue>, etag: &str) -> bool {
+    value
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == etag || candidate == "*")
+        })
+}
+
+fn system_time_to_unix_seconds(time: SystemTime) -> Option<i64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs() as i64)
 }
 
 fn ranged_response(
@@ -1125,12 +1400,12 @@ fn init_logging() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, app, parse_range};
+    use super::{ARTWORK_CACHE_CONTROL, Config, app, parse_range};
     use axum::{
         body::{Body, to_bytes},
         http::{
             Request, StatusCode,
-            header::{CONTENT_TYPE, RANGE},
+            header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE},
         },
     };
     use musicata_core::{Library, LocalDiskProvider, scan_local_library};
@@ -1497,6 +1772,7 @@ mod tests {
             .clone();
         let app = fixture.app_with_library(library).await;
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/albums/{album_id}/artwork"))
@@ -1512,11 +1788,119 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
+        let cache_control = response
+            .headers()
+            .get(CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type, "image/jpeg");
+        assert_eq!(cache_control, ARTWORK_CACHE_CONTROL);
+        assert!(!etag.is_empty());
         assert!(!body.is_empty());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/albums/{album_id}/artwork"))
+                    .header(IF_NONE_MATCH, etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn reviews_and_selects_album_artwork() {
+        let fixture = TestFixture::new("artwork-selection");
+        let library = fixture.library();
+        let album_id = library
+            .albums
+            .iter()
+            .find(|album| album.artwork_url.is_some())
+            .expect("album artwork")
+            .id
+            .clone();
+        let app = fixture.app_with_library(library).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/albums/{album_id}/artwork/review"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let review: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let candidates = review["candidates"].as_array().expect("candidates");
+        assert!(candidates.len() >= 2);
+        let front = candidates
+            .iter()
+            .find(|candidate| candidate["file_name"] == "front.png")
+            .expect("front candidate");
+        let front_id = front["id"].as_str().expect("front id").to_string();
+
+        let update = serde_json::json!({ "artwork_id": front_id });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/albums/{album_id}/artwork"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let review: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            review["selected_artwork_id"].as_str().unwrap_or_default(),
+            front_id
+        );
+        assert!(
+            review["selected_artwork_url"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&front_id)
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/albums/{album_id}/artwork"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(content_type, "image/png");
     }
 
     #[tokio::test]
@@ -1597,6 +1981,7 @@ mod tests {
             fixture.write("1994 - Paramparcad/Darkwood Dub - Brzi Vavilon.mp3");
             fixture.write("1994 - Paramparcad/Darkwood Dub - Spori Vavilon.mp3");
             fixture.write("1994 - Paramparcad/cover.jpg");
+            fixture.write("1994 - Paramparcad/front.png");
             fixture.write("1996 - U Nedogled/Darkwood Dub - U Nedogled.mp3");
             fixture
         }

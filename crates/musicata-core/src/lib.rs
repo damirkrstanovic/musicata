@@ -412,7 +412,7 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
             let artwork_url = album
                 .artwork_path
                 .as_ref()
-                .map(|_| format!("/api/albums/{}/artwork", album.id));
+                .map(|path| album_artwork_url(&album.id, path));
             Album {
                 id: album.id,
                 title: album.title,
@@ -1031,8 +1031,37 @@ fn u32_to_u16(value: u32) -> Option<u16> {
     u16::try_from(value).ok()
 }
 
-fn find_album_artwork(album_dir: &Path) -> Option<PathBuf> {
-    let entries = fs::read_dir(album_dir).ok()?;
+pub fn album_artwork_url(album_id: &str, path: &Path) -> String {
+    format!(
+        "/api/albums/{album_id}/artwork?asset={}",
+        artwork_asset_id(path)
+    )
+}
+
+pub fn artwork_asset_id(path: &Path) -> String {
+    let mut identity = path.to_string_lossy().to_string();
+
+    if let Ok(metadata) = fs::metadata(path) {
+        identity.push('|');
+        identity.push_str(&metadata.len().to_string());
+        identity.push('|');
+        identity.push_str(
+            &metadata
+                .modified()
+                .ok()
+                .and_then(system_time_to_unix_seconds)
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
+    }
+
+    stable_id("artwork", &identity)
+}
+
+pub fn find_album_artwork_candidates(album_dir: &Path) -> Vec<PathBuf> {
+    let Some(entries) = fs::read_dir(album_dir).ok() else {
+        return Vec::new();
+    };
     let mut images = Vec::new();
 
     for entry in entries.flatten() {
@@ -1042,21 +1071,31 @@ fn find_album_artwork(album_dir: &Path) -> Option<PathBuf> {
         }
     }
 
-    images.sort_by_key(|path| {
-        let name = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        match name.as_str() {
-            "cover" => 0,
-            "folder" => 1,
-            "front" => 2,
-            _ => 3,
-        }
+    images.sort_by(|left, right| {
+        artwork_priority(left)
+            .cmp(&artwork_priority(right))
+            .then_with(|| left.cmp(right))
     });
 
-    images.into_iter().next()
+    images
+}
+
+fn find_album_artwork(album_dir: &Path) -> Option<PathBuf> {
+    find_album_artwork_candidates(album_dir).into_iter().next()
+}
+
+fn artwork_priority(path: &Path) -> u8 {
+    let name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "cover" => 0,
+        "folder" => 1,
+        "front" => 2,
+        _ => 3,
+    }
 }
 
 fn has_extension(path: &Path, extensions: &[&str]) -> bool {
@@ -1201,6 +1240,13 @@ mod tests {
                 .iter()
                 .any(|album| album.artwork_url.is_some())
         );
+        assert!(
+            library
+                .albums
+                .iter()
+                .filter_map(|album| album.artwork_url.as_deref())
+                .any(|url| url.contains("?asset=artwork_"))
+        );
         assert!(!library.scan_errors.is_empty());
         assert!(
             library
@@ -1224,6 +1270,30 @@ mod tests {
                 .iter()
                 .any(|observation| observation.source == "folder_path")
         }));
+    }
+
+    #[test]
+    fn finds_album_artwork_candidates_in_priority_order() {
+        let fixture = TestFixture::new("artwork-candidates");
+        fixture.write("Album/back.jpg");
+        fixture.write("Album/front.png");
+        fixture.write("Album/folder.webp");
+        fixture.write("Album/cover.jpg");
+
+        let names = find_album_artwork_candidates(&fixture.root.join("Album"))
+            .into_iter()
+            .map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec!["cover.jpg", "folder.webp", "front.png", "back.jpg"]
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ const SERVER_EVENT_TIMEOUT_MS = 3500;
 
 const state = {
   albums: [],
+  visibleAlbums: [],
   tracks: [],
   visibleTracks: [],
   currentIndex: -1,
@@ -21,6 +22,9 @@ const state = {
   metadataTrackCandidates: null,
   metadataAlbumCandidates: null,
   metadataCandidateLoading: "",
+  metadataArtworkReview: null,
+  metadataArtworkError: "",
+  metadataArtworkLoading: false,
 };
 
 const els = {
@@ -122,12 +126,14 @@ async function rescanLibrary() {
 }
 
 function renderAlbums(albums) {
+  state.visibleAlbums = albums;
   els.albums.innerHTML = "";
 
   for (const album of albums) {
     const button = document.createElement("button");
     button.className = "album";
     button.type = "button";
+    button.dataset.albumId = album.id;
     button.innerHTML = `
       ${album.artwork_url ? `<img src="${album.artwork_url}" alt="">` : `<span class="album-placeholder"></span>`}
       <span>
@@ -431,6 +437,16 @@ async function albumCandidatesApi(albumId) {
   return api(`/api/albums/${encodeURIComponent(albumId)}/metadata/musicbrainz/candidates?limit=5`);
 }
 
+async function albumArtworkReviewApi(albumId) {
+  return api(`/api/albums/${encodeURIComponent(albumId)}/artwork/review`);
+}
+
+async function selectAlbumArtworkApi(albumId, artworkId) {
+  return apiPatch(`/api/albums/${encodeURIComponent(albumId)}/artwork`, {
+    artwork_id: artworkId,
+  });
+}
+
 async function openMetadata(trackId) {
   state.metadataTrackId = trackId;
   state.metadataReview = null;
@@ -438,6 +454,9 @@ async function openMetadata(trackId) {
   state.metadataTrackCandidates = null;
   state.metadataAlbumCandidates = null;
   state.metadataCandidateLoading = "";
+  state.metadataArtworkReview = null;
+  state.metadataArtworkError = "";
+  state.metadataArtworkLoading = false;
   markMetadataTrack();
   renderMetadataPanel();
 
@@ -456,6 +475,11 @@ async function openMetadata(trackId) {
       renderMetadataPanel();
     }
   }
+
+  const track = metadataTrack();
+  if (state.metadataTrackId === trackId && track?.album_id) {
+    loadAlbumArtworkReview(track.album_id, trackId);
+  }
 }
 
 function closeMetadata() {
@@ -465,6 +489,9 @@ function closeMetadata() {
   state.metadataTrackCandidates = null;
   state.metadataAlbumCandidates = null;
   state.metadataCandidateLoading = "";
+  state.metadataArtworkReview = null;
+  state.metadataArtworkError = "";
+  state.metadataArtworkLoading = false;
   markMetadataTrack();
   renderMetadataPanel();
 }
@@ -494,6 +521,7 @@ function renderMetadataPanel() {
   }
 
   els.metadataBody.append(renderCanonicalMetadata(state.metadataReview.canonical));
+  els.metadataBody.append(renderArtworkReview(track));
   els.metadataBody.append(renderObservedMetadata(state.metadataReview.observations));
   els.metadataBody.append(renderMusicBrainzCandidates(track));
 }
@@ -506,6 +534,139 @@ function renderCanonicalMetadata(canonical) {
   appendMetadataRow(section, "Year", canonical.year);
   appendMetadataRow(section, "Track", canonical.track_number);
   return section;
+}
+
+function renderArtworkReview(track) {
+  const section = metadataSection("Album artwork");
+
+  if (state.metadataArtworkLoading) {
+    section.append(element("p", "empty", "Loading artwork."));
+  }
+
+  if (state.metadataArtworkError) {
+    section.append(element("p", "error", state.metadataArtworkError));
+  }
+
+  const review = state.metadataArtworkReview;
+  if (!review && !state.metadataArtworkLoading) {
+    section.append(element("p", "empty", "No artwork review."));
+    return section;
+  }
+
+  const candidates = review?.candidates || [];
+  if (candidates.length === 0 && !state.metadataArtworkLoading) {
+    section.append(element("p", "empty", "No local artwork candidates."));
+    return section;
+  }
+
+  for (const candidate of candidates) {
+    section.append(renderArtworkCandidate(track.album_id, candidate));
+  }
+
+  return section;
+}
+
+function renderArtworkCandidate(albumId, candidate) {
+  const row = element("div", "artwork-row");
+
+  if (candidate.preview_url) {
+    const image = document.createElement("img");
+    image.className = "artwork-thumb";
+    image.src = candidate.preview_url;
+    image.alt = "";
+    row.append(image);
+  } else {
+    row.append(element("span", "artwork-placeholder", ""));
+  }
+
+  const details = element("div", "artwork-details");
+  details.append(element("strong", "", candidate.file_name));
+
+  const meta = element("div", "metadata-source");
+  meta.append(
+    element("span", "", candidate.mime_type),
+    element("span", "", bytesText(candidate.file_size_bytes)),
+    element("span", candidate.selected ? "metadata-state state-approved" : "metadata-state", candidate.selected ? "Selected" : "Available"),
+  );
+  details.append(meta);
+
+  const actions = element("div", "metadata-actions");
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = candidate.selected ? "Selected" : "Select";
+  button.disabled = candidate.selected || state.metadataArtworkLoading;
+  button.classList.toggle("active", candidate.selected);
+  button.addEventListener("click", () => selectAlbumArtwork(albumId, candidate.id));
+  actions.append(button);
+  details.append(actions);
+
+  row.append(details);
+  return row;
+}
+
+async function loadAlbumArtworkReview(albumId, trackId = state.metadataTrackId) {
+  state.metadataArtworkLoading = true;
+  state.metadataArtworkError = "";
+  renderMetadataPanel();
+
+  try {
+    const review = await albumArtworkReviewApi(albumId);
+    if (state.metadataTrackId === trackId && metadataTrack()?.album_id === albumId) {
+      state.metadataArtworkReview = review;
+    }
+  } catch (error) {
+    if (state.metadataTrackId === trackId) {
+      state.metadataArtworkError = `Artwork review failed: ${error.message}`;
+    }
+  } finally {
+    if (state.metadataTrackId === trackId) {
+      state.metadataArtworkLoading = false;
+      renderMetadataPanel();
+    }
+  }
+}
+
+async function selectAlbumArtwork(albumId, artworkId) {
+  const trackId = state.metadataTrackId;
+  state.metadataArtworkLoading = true;
+  state.metadataArtworkError = "";
+  renderMetadataPanel();
+
+  try {
+    const review = await selectAlbumArtworkApi(albumId, artworkId);
+    if (state.metadataTrackId === trackId && metadataTrack()?.album_id === albumId) {
+      state.metadataArtworkReview = review;
+      updateAlbumArtwork(albumId, review.selected_artwork_url);
+    }
+  } catch (error) {
+    if (state.metadataTrackId === trackId) {
+      state.metadataArtworkError = `Artwork selection failed: ${error.message}`;
+    }
+  } finally {
+    if (state.metadataTrackId === trackId) {
+      state.metadataArtworkLoading = false;
+      renderMetadataPanel();
+    }
+  }
+}
+
+function updateAlbumArtwork(albumId, artworkUrl) {
+  const album = state.albums.find((item) => item.id === albumId);
+  if (album) {
+    album.artwork_url = artworkUrl;
+  }
+
+  for (const visibleAlbum of state.visibleAlbums) {
+    if (visibleAlbum.id === albumId) {
+      visibleAlbum.artwork_url = artworkUrl;
+    }
+  }
+  renderAlbums(state.visibleAlbums);
+
+  const currentTrack = state.visibleTracks[state.currentIndex];
+  if (currentTrack?.album_id === albumId) {
+    updateNowPlaying(currentTrack);
+  }
 }
 
 function renderObservedMetadata(observations) {
@@ -817,6 +978,19 @@ function durationText(lengthMs) {
   const seconds = Math.round(lengthMs / 1000);
   const minutes = Math.floor(seconds / 60);
   return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function bytesText(value) {
+  if (!value) {
+    return "0 B";
+  }
+  if (value < 1024) {
+    return `${value} B`;
+  }
+  if (value < 1024 * 1024) {
+    return `${Math.round(value / 102.4) / 10} KB`;
+  }
+  return `${Math.round(value / 1024 / 102.4) / 10} MB`;
 }
 
 function cleanParts(values) {

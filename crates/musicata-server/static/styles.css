@@ -385,6 +385,30 @@ h1 {
   grid-template-columns: minmax(0, 1fr);
 }
 
+.artwork-row {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(48, 54, 64, 0.75);
+}
+
+.artwork-thumb,
+.artwork-placeholder {
+  width: 64px;
+  height: 64px;
+  border-radius: 6px;
+  object-fit: cover;
+  background: #2a3039;
+}
+
+.artwork-details {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
 .candidate-row a {
   color: var(--accent-strong);
   overflow-wrap: anywhere;
