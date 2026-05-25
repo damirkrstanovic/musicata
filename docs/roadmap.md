@@ -131,7 +131,8 @@ Tasks:
 - Add pagination and sorting to API endpoints.
 - Add browse endpoints for artists, albums, tracks, genres, years, folders, and recently added music.
 - [x] Add metadata-based browse filters for genre, year, and composer.
-- Add album detail and artist detail endpoints.
+- [x] Add album detail endpoints.
+- Add artist detail endpoints.
 - Support accent-insensitive and case-insensitive search where practical.
 
 Done when:
@@ -287,6 +288,6 @@ Done when:
 
 The next implementation slice should continue metadata enrichment, then move into Milestone 4:
 
-1. Add album detail endpoints.
-2. Add artist detail endpoints.
-3. Add pagination and sorting to API endpoints.
+1. Add artist detail endpoints.
+2. Add pagination and sorting to API endpoints.
+3. Add browse endpoints for folders and recently added music.

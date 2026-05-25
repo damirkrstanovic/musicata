@@ -19,7 +19,7 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use musicata_core::{
-    BrowseFilter, Library, LibrarySummary, LocalDiskProvider, MetadataApprovalState,
+    Album, Artist, BrowseFilter, Library, LibrarySummary, LocalDiskProvider, MetadataApprovalState,
     MetadataFieldValue, MusicProvider, Track, TrackMetadataFieldObservation, album_artwork_url,
     artwork_asset_id, find_album_artwork_candidates,
 };
@@ -197,6 +197,7 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
         )
         .route("/api/artists", get(artists))
         .route("/api/albums", get(albums))
+        .route("/api/albums/{id}", get(album_detail))
         .route("/api/browse", get(browse))
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
@@ -436,6 +437,41 @@ async fn artists(State(state): State<AppState>) -> impl IntoResponse {
 async fn albums(State(state): State<AppState>) -> impl IntoResponse {
     let library = state.library.read().await;
     Json(library.albums.clone())
+}
+
+#[derive(Debug, Serialize)]
+struct AlbumDetailResponse {
+    album: Album,
+    artist: Option<Artist>,
+    tracks: Vec<Track>,
+}
+
+async fn album_detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<AlbumDetailResponse>, AppError> {
+    let library = state.library.read().await;
+    let album = library
+        .album(&id)
+        .cloned()
+        .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
+    let artist = library
+        .artists
+        .iter()
+        .find(|artist| artist.id == album.artist_id)
+        .cloned();
+    let tracks = library
+        .tracks
+        .iter()
+        .filter(|track| track.album_id == id)
+        .cloned()
+        .collect();
+
+    Ok(Json(AlbumDetailResponse {
+        album,
+        artist,
+        tracks,
+    }))
 }
 
 async fn browse(State(state): State<AppState>) -> impl IntoResponse {
@@ -1594,6 +1630,65 @@ mod tests {
 
         assert!(body.contains(r#""track_count":3"#));
         assert!(body.contains(r#""album_count":2"#));
+    }
+
+    #[tokio::test]
+    async fn serves_album_detail_json() {
+        let fixture = TestFixture::new("album-detail");
+        let library = fixture.library();
+        let album = library
+            .albums
+            .iter()
+            .find(|album| album.title == "Paramparcad")
+            .expect("album")
+            .clone();
+        let app = fixture.app_with_library(library).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/albums/{}", album.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_text(response.into_body()).await;
+        let value: serde_json::Value = serde_json::from_str(&body).expect("album detail json");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["album"]["id"], album.id);
+        assert_eq!(value["artist"]["name"], "Darkwood Dub");
+        assert_eq!(value["tracks"].as_array().expect("tracks").len(), 2);
+        assert!(
+            value["tracks"]
+                .as_array()
+                .expect("tracks")
+                .iter()
+                .all(|track| track["album_id"] == album.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_album_detail_returns_not_found() {
+        let fixture = TestFixture::new("missing-album-detail");
+        let app = fixture.app().await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/albums/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_text(response.into_body()).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("unknown album: missing"));
     }
 
     #[tokio::test]
