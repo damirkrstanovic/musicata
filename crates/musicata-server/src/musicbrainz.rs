@@ -5,12 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 const DEFAULT_MUSICBRAINZ_BASE_URL: &str = "https://musicbrainz.org/ws/2";
+const DEFAULT_COVER_ART_ARCHIVE_BASE_URL: &str = "https://coverartarchive.org";
 const MUSICBRAINZ_TIMEOUT: Duration = Duration::from_secs(10);
 const MUSICBRAINZ_REQUEST_INTERVAL: Duration = Duration::from_millis(1100);
 
 #[derive(Clone)]
 pub struct MusicBrainzClient {
     base_url: String,
+    cover_art_archive_base_url: String,
     http: ureq::Agent,
 }
 
@@ -34,6 +36,7 @@ impl MusicBrainzClient {
 
         Self {
             base_url: base_url.into(),
+            cover_art_archive_base_url: DEFAULT_COVER_ART_ARCHIVE_BASE_URL.to_string(),
             http,
         }
     }
@@ -176,6 +179,46 @@ impl MusicBrainzClient {
         response
     }
 
+    pub fn cover_art_archive_candidates(
+        &self,
+        album: &Album,
+        tracks: &[Track],
+        limit: usize,
+    ) -> CoverArtArchiveCandidateResponse {
+        let limit = limit.clamp(1, 25);
+        let targets = cover_art_archive_targets(tracks, &self.cover_art_archive_base_url);
+        let mut response = CoverArtArchiveCandidateResponse {
+            album_id: album.id.clone(),
+            targets: targets.clone(),
+            searched: false,
+            skipped_reason: None,
+            candidates: Vec::new(),
+            issues: Vec::new(),
+        };
+
+        if targets.is_empty() {
+            response.skipped_reason =
+                Some("album has no MusicBrainz release or release-group identifiers".to_string());
+            return response;
+        }
+
+        response.searched = true;
+        for (index, target) in targets.into_iter().take(limit).enumerate() {
+            if index > 0 {
+                std::thread::sleep(MUSICBRAINZ_REQUEST_INTERVAL);
+            }
+
+            match self.fetch_cover_art_archive(&target) {
+                Ok(mut candidates) => response.candidates.append(&mut candidates),
+                Err(message) => response
+                    .issues
+                    .push(CoverArtArchiveIssue { target, message }),
+            }
+        }
+
+        response
+    }
+
     fn fetch_target(
         &self,
         target: &MusicBrainzLookupTarget,
@@ -213,11 +256,34 @@ impl MusicBrainzClient {
             .into_json::<Value>()
             .map_err(|error| error.to_string())
     }
+
+    fn fetch_cover_art_archive(
+        &self,
+        target: &CoverArtArchiveTarget,
+    ) -> Result<Vec<CoverArtArchiveCandidate>, String> {
+        let response = self
+            .http
+            .get(&target.lookup_url)
+            .call()
+            .map_err(cover_art_archive_request_error)?;
+        let value = response
+            .into_json::<Value>()
+            .map_err(|error| error.to_string())?;
+
+        Ok(cover_art_archive_candidates(target, &value))
+    }
 }
 
 fn musicbrainz_request_error(error: ureq::Error) -> String {
     match error {
         ureq::Error::Status(status, _) => format!("MusicBrainz returned HTTP {status}"),
+        ureq::Error::Transport(error) => error.to_string(),
+    }
+}
+
+fn cover_art_archive_request_error(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(status, _) => format!("Cover Art Archive returned HTTP {status}"),
         ureq::Error::Transport(error) => error.to_string(),
     }
 }
@@ -296,6 +362,59 @@ pub struct MusicBrainzReleaseCandidate {
     pub artist_credit: Vec<String>,
     pub release_group: Option<MusicBrainzLinkedReleaseGroup>,
     pub media: Vec<MusicBrainzMedium>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CoverArtArchiveCandidateResponse {
+    pub album_id: String,
+    pub targets: Vec<CoverArtArchiveTarget>,
+    pub searched: bool,
+    pub skipped_reason: Option<String>,
+    pub candidates: Vec<CoverArtArchiveCandidate>,
+    pub issues: Vec<CoverArtArchiveIssue>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CoverArtArchiveTarget {
+    pub entity_type: CoverArtArchiveEntityType,
+    pub mbid: String,
+    pub lookup_url: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverArtArchiveEntityType {
+    Release,
+    ReleaseGroup,
+}
+
+impl CoverArtArchiveEntityType {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::ReleaseGroup => "release-group",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CoverArtArchiveCandidate {
+    pub id: String,
+    pub entity_type: CoverArtArchiveEntityType,
+    pub mbid: String,
+    pub image_url: String,
+    pub thumbnail_url: Option<String>,
+    pub front: bool,
+    pub back: bool,
+    pub approved: bool,
+    pub comment: Option<String>,
+    pub edit_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CoverArtArchiveIssue {
+    pub target: CoverArtArchiveTarget,
+    pub message: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -506,6 +625,35 @@ pub fn musicbrainz_lookup_targets(track: &Track, base_url: &str) -> Vec<MusicBra
         .collect()
 }
 
+pub fn cover_art_archive_targets(tracks: &[Track], base_url: &str) -> Vec<CoverArtArchiveTarget> {
+    let mut ids: BTreeMap<CoverArtArchiveEntityType, BTreeSet<String>> = BTreeMap::new();
+
+    for track in tracks {
+        for observation in &track.observed_metadata {
+            insert_cover_art_archive_ids(
+                &mut ids,
+                CoverArtArchiveEntityType::Release,
+                observation.musicbrainz_release_id.as_deref(),
+            );
+            insert_cover_art_archive_ids(
+                &mut ids,
+                CoverArtArchiveEntityType::ReleaseGroup,
+                observation.musicbrainz_release_group_id.as_deref(),
+            );
+        }
+    }
+
+    ids.into_iter()
+        .flat_map(|(entity_type, ids)| {
+            ids.into_iter().map(move |mbid| CoverArtArchiveTarget {
+                entity_type,
+                lookup_url: cover_art_archive_url(base_url, entity_type, &mbid),
+                mbid,
+            })
+        })
+        .collect()
+}
+
 pub fn musicbrainz_track_candidate_query(track: &Track) -> String {
     let mut parts = Vec::new();
 
@@ -600,6 +748,20 @@ fn insert_musicbrainz_ids(
     }
 }
 
+fn insert_cover_art_archive_ids(
+    ids: &mut BTreeMap<CoverArtArchiveEntityType, BTreeSet<String>>,
+    entity_type: CoverArtArchiveEntityType,
+    value: Option<&str>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+
+    for mbid in split_musicbrainz_ids(value) {
+        ids.entry(entity_type).or_default().insert(mbid);
+    }
+}
+
 fn split_musicbrainz_ids(value: &str) -> Vec<String> {
     value
         .split(|character: char| {
@@ -647,6 +809,19 @@ fn is_musicbrainz_id(value: &str) -> bool {
 fn musicbrainz_entity_url(
     base_url: &str,
     entity_type: MusicBrainzEntityType,
+    mbid: &str,
+) -> String {
+    format!(
+        "{}/{}/{}",
+        base_url.trim_end_matches('/'),
+        entity_type.path(),
+        mbid
+    )
+}
+
+fn cover_art_archive_url(
+    base_url: &str,
+    entity_type: CoverArtArchiveEntityType,
     mbid: &str,
 ) -> String {
     format!(
@@ -773,6 +948,72 @@ fn release_candidates(value: &Value) -> Vec<MusicBrainzReleaseCandidate> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn cover_art_archive_candidates(
+    target: &CoverArtArchiveTarget,
+    value: &Value,
+) -> Vec<CoverArtArchiveCandidate> {
+    value
+        .get("images")
+        .and_then(Value::as_array)
+        .map(|images| {
+            images
+                .iter()
+                .filter_map(|image| {
+                    let image_url = string_field(image, "image")?;
+                    Some(CoverArtArchiveCandidate {
+                        id: format!(
+                            "{}:{}:{}",
+                            target.entity_type.path(),
+                            target.mbid,
+                            image_id(image).unwrap_or_else(|| image_url.clone())
+                        ),
+                        entity_type: target.entity_type,
+                        mbid: target.mbid.clone(),
+                        image_url,
+                        thumbnail_url: thumbnail_url(image),
+                        front: image
+                            .get("front")
+                            .and_then(Value::as_bool)
+                            .unwrap_or_default(),
+                        back: image
+                            .get("back")
+                            .and_then(Value::as_bool)
+                            .unwrap_or_default(),
+                        approved: image
+                            .get("approved")
+                            .and_then(Value::as_bool)
+                            .unwrap_or_default(),
+                        comment: string_field(image, "comment"),
+                        edit_url: string_field(image, "edit"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn image_id(value: &Value) -> Option<String> {
+    value
+        .get("id")
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .or_else(|| value.as_u64().map(|value| value.to_string()))
+        })
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn thumbnail_url(value: &Value) -> Option<String> {
+    let thumbnails = value.get("thumbnails")?;
+    for key in ["500", "large", "250", "small", "1200"] {
+        if let Some(url) = string_field(thumbnails, key) {
+            return Some(url);
+        }
+    }
+    None
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {
@@ -1025,6 +1266,67 @@ mod tests {
         assert_eq!(releases.len(), 1);
         assert_eq!(releases[0].score, Some(96));
         assert_eq!(releases[0].media[0].track_count, Some(9));
+    }
+
+    #[test]
+    fn builds_and_normalizes_cover_art_archive_candidates() {
+        let track = fixture_track();
+        let targets =
+            cover_art_archive_targets(std::slice::from_ref(&track), "https://coverart.test");
+
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().any(|target| {
+            target.entity_type == CoverArtArchiveEntityType::Release
+                && target.lookup_url == format!("https://coverart.test/release/{RELEASE_ID}")
+        }));
+        assert!(targets.iter().any(|target| {
+            target.entity_type == CoverArtArchiveEntityType::ReleaseGroup
+                && target.lookup_url
+                    == format!("https://coverart.test/release-group/{RELEASE_GROUP_ID}")
+        }));
+
+        let value = serde_json::json!({
+            "images": [
+                {
+                    "id": 123,
+                    "image": "https://archive.test/full.jpg",
+                    "front": true,
+                    "back": false,
+                    "approved": true,
+                    "comment": "Front",
+                    "edit": "https://musicbrainz.test/edit/1",
+                    "thumbnails": {
+                        "small": "https://archive.test/small.jpg",
+                        "500": "https://archive.test/500.jpg"
+                    }
+                }
+            ]
+        });
+        let candidates = cover_art_archive_candidates(&targets[0], &value);
+
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].front);
+        assert!(candidates[0].approved);
+        assert_eq!(
+            candidates[0].thumbnail_url.as_deref(),
+            Some("https://archive.test/500.jpg")
+        );
+    }
+
+    #[test]
+    fn skips_cover_art_archive_without_release_ids() {
+        let client = MusicBrainzClient::new("https://musicbrainz.test/ws/2");
+        let album = fixture_album();
+        let mut track = fixture_track();
+        track.observed_metadata[0].musicbrainz_release_id = None;
+        track.observed_metadata[0].musicbrainz_release_group_id = None;
+        let response = client.cover_art_archive_candidates(&album, &[track], 5);
+
+        assert!(!response.searched);
+        assert_eq!(
+            response.skipped_reason.as_deref(),
+            Some("album has no MusicBrainz release or release-group identifiers")
+        );
     }
 
     fn fixture_album() -> Album {

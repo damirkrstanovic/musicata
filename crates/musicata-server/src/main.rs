@@ -25,7 +25,7 @@ use musicata_core::{
 };
 use musicata_storage::Database;
 use musicbrainz::{
-    MusicBrainzAlbumCandidateSearchResponse, MusicBrainzClient,
+    CoverArtArchiveCandidateResponse, MusicBrainzAlbumCandidateSearchResponse, MusicBrainzClient,
     MusicBrainzTrackCandidateSearchResponse, MusicBrainzTrackLookupResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -201,6 +201,10 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
             get(album_musicbrainz_candidates),
+        )
+        .route(
+            "/api/albums/{id}/artwork/cover-art-archive/candidates",
+            get(album_cover_art_archive_candidates),
         )
         .route("/api/albums/{id}/artwork/review", get(album_artwork_review))
         .route(
@@ -709,6 +713,38 @@ async fn album_musicbrainz_candidates(
     let musicbrainz = state.musicbrainz.clone();
     let candidates = tokio::task::spawn_blocking(move || {
         musicbrainz.search_album_candidates(&album, &album_tracks, limit)
+    })
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+
+    Ok(Json(candidates))
+}
+
+async fn album_cover_art_archive_candidates(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CandidateSearchQuery>,
+) -> Result<Json<CoverArtArchiveCandidateResponse>, AppError> {
+    let (album, tracks) = {
+        let library = state.library.read().await;
+        let album = library
+            .album(&id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
+        let tracks = library
+            .tracks
+            .iter()
+            .filter(|track| track.album_id == id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        (album, tracks)
+    };
+
+    let limit = query.limit.unwrap_or(10);
+    let musicbrainz = state.musicbrainz.clone();
+    let candidates = tokio::task::spawn_blocking(move || {
+        musicbrainz.cover_art_archive_candidates(&album, &tracks, limit)
     })
     .await
     .map_err(|error| AppError::internal(error.to_string()))?;
@@ -2042,6 +2078,32 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(content_type, "image/png");
+    }
+
+    #[tokio::test]
+    async fn cover_art_archive_candidates_require_musicbrainz_ids() {
+        let fixture = TestFixture::new("cover-art-archive");
+        let library = fixture.library();
+        let album_id = library.albums.first().expect("album").id.clone();
+        let app = fixture.app_with_library(library).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/albums/{album_id}/artwork/cover-art-archive/candidates"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_text(response.into_body()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""searched":false"#));
+        assert!(body.contains("no MusicBrainz release or release-group identifiers"));
     }
 
     #[tokio::test]

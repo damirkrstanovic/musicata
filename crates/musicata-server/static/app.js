@@ -27,6 +27,9 @@ const state = {
   metadataArtworkReview: null,
   metadataArtworkError: "",
   metadataArtworkLoading: false,
+  metadataCoverArtCandidates: null,
+  metadataCoverArtError: "",
+  metadataCoverArtLoading: false,
 };
 
 const els = {
@@ -550,6 +553,10 @@ async function albumArtworkReviewApi(albumId) {
   return api(`/api/albums/${encodeURIComponent(albumId)}/artwork/review`);
 }
 
+async function coverArtArchiveCandidatesApi(albumId) {
+  return api(`/api/albums/${encodeURIComponent(albumId)}/artwork/cover-art-archive/candidates?limit=10`);
+}
+
 async function selectAlbumArtworkApi(albumId, artworkId) {
   return apiPatch(`/api/albums/${encodeURIComponent(albumId)}/artwork`, {
     artwork_id: artworkId,
@@ -566,6 +573,9 @@ async function openMetadata(trackId) {
   state.metadataArtworkReview = null;
   state.metadataArtworkError = "";
   state.metadataArtworkLoading = false;
+  state.metadataCoverArtCandidates = null;
+  state.metadataCoverArtError = "";
+  state.metadataCoverArtLoading = false;
   markMetadataTrack();
   renderMetadataPanel();
 
@@ -601,6 +611,9 @@ function closeMetadata() {
   state.metadataArtworkReview = null;
   state.metadataArtworkError = "";
   state.metadataArtworkLoading = false;
+  state.metadataCoverArtCandidates = null;
+  state.metadataCoverArtError = "";
+  state.metadataCoverArtLoading = false;
   markMetadataTrack();
   renderMetadataPanel();
 }
@@ -647,6 +660,16 @@ function renderCanonicalMetadata(canonical) {
 
 function renderArtworkReview(track) {
   const section = metadataSection("Album artwork");
+  const actions = element("div", "candidate-actions");
+  const coverArtButton = document.createElement("button");
+  coverArtButton.type = "button";
+  coverArtButton.textContent = state.metadataCoverArtLoading
+    ? "Loading Cover Art Archive"
+    : "Cover Art Archive";
+  coverArtButton.disabled = state.metadataCoverArtLoading;
+  coverArtButton.addEventListener("click", () => loadCoverArtArchiveCandidates(track.album_id));
+  actions.append(coverArtButton);
+  section.append(actions);
 
   if (state.metadataArtworkLoading) {
     section.append(element("p", "empty", "Loading artwork."));
@@ -655,21 +678,28 @@ function renderArtworkReview(track) {
   if (state.metadataArtworkError) {
     section.append(element("p", "error", state.metadataArtworkError));
   }
+  if (state.metadataCoverArtError) {
+    section.append(element("p", "error", state.metadataCoverArtError));
+  }
 
   const review = state.metadataArtworkReview;
-  if (!review && !state.metadataArtworkLoading) {
+  const coverArt = state.metadataCoverArtCandidates;
+  if (!review && !state.metadataArtworkLoading && !coverArt) {
     section.append(element("p", "empty", "No artwork review."));
     return section;
   }
 
   const candidates = review?.candidates || [];
-  if (candidates.length === 0 && !state.metadataArtworkLoading) {
+  if (candidates.length === 0 && !state.metadataArtworkLoading && !coverArt) {
     section.append(element("p", "empty", "No local artwork candidates."));
     return section;
   }
 
   for (const candidate of candidates) {
     section.append(renderArtworkCandidate(track.album_id, candidate));
+  }
+  if (coverArt) {
+    section.append(renderCoverArtArchiveResponse(coverArt));
   }
 
   return section;
@@ -713,6 +743,75 @@ function renderArtworkCandidate(albumId, candidate) {
   return row;
 }
 
+function renderCoverArtArchiveResponse(response) {
+  const result = element("div", "candidate-result");
+  result.append(element("h3", "", "Cover Art Archive"));
+
+  if (response.skipped_reason) {
+    result.append(element("p", "empty", response.skipped_reason));
+  }
+  for (const issue of response.issues || []) {
+    result.append(element("p", "error", issue.message));
+  }
+
+  const candidates = response.candidates || [];
+  if (candidates.length === 0) {
+    result.append(element("p", "empty", "No Cover Art Archive candidates."));
+    return result;
+  }
+
+  for (const candidate of candidates) {
+    result.append(renderCoverArtArchiveCandidate(candidate));
+  }
+
+  return result;
+}
+
+function renderCoverArtArchiveCandidate(candidate) {
+  const row = element("div", "artwork-row");
+  const image = document.createElement("img");
+  image.className = "artwork-thumb";
+  image.src = candidate.thumbnail_url || candidate.image_url;
+  image.alt = "";
+  row.append(image);
+
+  const details = element("div", "artwork-details");
+  details.append(element("strong", "", coverArtArchiveLabel(candidate)));
+
+  const meta = element("div", "metadata-source");
+  meta.append(
+    element("span", "", metadataLabel(candidate.entity_type)),
+    element("span", "", candidate.approved ? "Approved" : "Unapproved"),
+    element("span", "", candidate.front ? "Front" : candidate.back ? "Back" : "Other"),
+  );
+  details.append(meta);
+
+  const actions = element("div", "metadata-actions");
+  const link = document.createElement("a");
+  link.href = candidate.image_url;
+  link.target = "_blank";
+  link.rel = "noreferrer";
+  link.textContent = "Open";
+  actions.append(link);
+  details.append(actions);
+
+  row.append(details);
+  return row;
+}
+
+function coverArtArchiveLabel(candidate) {
+  if (candidate.comment) {
+    return candidate.comment;
+  }
+  if (candidate.front) {
+    return "Front cover";
+  }
+  if (candidate.back) {
+    return "Back cover";
+  }
+  return "Artwork";
+}
+
 async function loadAlbumArtworkReview(albumId, trackId = state.metadataTrackId) {
   state.metadataArtworkLoading = true;
   state.metadataArtworkError = "";
@@ -730,6 +829,29 @@ async function loadAlbumArtworkReview(albumId, trackId = state.metadataTrackId) 
   } finally {
     if (state.metadataTrackId === trackId) {
       state.metadataArtworkLoading = false;
+      renderMetadataPanel();
+    }
+  }
+}
+
+async function loadCoverArtArchiveCandidates(albumId) {
+  const trackId = state.metadataTrackId;
+  state.metadataCoverArtLoading = true;
+  state.metadataCoverArtError = "";
+  renderMetadataPanel();
+
+  try {
+    const response = await coverArtArchiveCandidatesApi(albumId);
+    if (state.metadataTrackId === trackId && metadataTrack()?.album_id === albumId) {
+      state.metadataCoverArtCandidates = response;
+    }
+  } catch (error) {
+    if (state.metadataTrackId === trackId) {
+      state.metadataCoverArtError = `Cover Art Archive failed: ${error.message}`;
+    }
+  } finally {
+    if (state.metadataTrackId === trackId) {
+      state.metadataCoverArtLoading = false;
       renderMetadataPanel();
     }
   }

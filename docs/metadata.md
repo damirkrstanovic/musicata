@@ -208,7 +208,7 @@ Artwork priority:
 
 Store artwork as assets with source, dimensions, MIME type, hash, and relation to album/release/release group. Do not embed new artwork into files unless the user explicitly chooses write-back.
 
-Current implementation: Musicata reviews local artwork files, lets the user select an album candidate in the web controller, and serves selected artwork with asset-keyed URLs plus HTTP cache validators. Embedded artwork extraction and Cover Art Archive enrichment remain future candidate sources.
+Current implementation: Musicata reviews local artwork files, lets the user select an album candidate in the web controller, serves selected artwork with asset-keyed URLs plus HTTP cache validators, and can fetch Cover Art Archive candidates on demand for MusicBrainz-linked albums. Cover Art Archive candidates are review-only for now; selecting and caching remote artwork as a local asset remains future work. Embedded artwork extraction remains a future candidate source.
 
 ## Lyrics
 
@@ -245,7 +245,7 @@ Avoid a one-click "fix everything" workflow. Music libraries contain personal ch
 3. Add metadata provenance and per-field source tracking.
 4. Add MusicBrainz lookup by existing MBIDs.
 5. Add MusicBrainz candidate search for unmatched albums.
-6. Add Cover Art Archive artwork enrichment.
+6. Add Cover Art Archive artwork enrichment behind explicit review.
 7. Add user review/apply UI.
 8. Add optional tag write-back for FLAC, MP3, and M4A.
 9. Add AcoustID/Chromaprint matching.

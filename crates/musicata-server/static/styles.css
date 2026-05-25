@@ -365,17 +365,20 @@ h1 {
 }
 
 .metadata-actions button,
-.candidate-actions button {
+.candidate-actions button,
+.metadata-actions a {
   border: 1px solid var(--line);
   border-radius: 6px;
   background: transparent;
   color: var(--text);
   padding: 6px 8px;
   cursor: pointer;
+  text-decoration: none;
 }
 
 .metadata-actions button:hover,
-.candidate-actions button:hover {
+.candidate-actions button:hover,
+.metadata-actions a:hover {
   border-color: var(--accent);
 }
 

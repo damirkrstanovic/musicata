@@ -97,6 +97,7 @@ Useful endpoints:
 - `GET /api/tracks?genre=Dub&year=2004&composer=Name` filtered track list.
 - `GET /api/browse` metadata facets for genre, year, and composer.
 - `GET /api/search?q=darkwood` simple library search.
+- `GET /api/albums/{id}/artwork/cover-art-archive/candidates` reviewed remote artwork candidates for MusicBrainz-linked albums.
 - `GET /api/metadata/write-back` current file tag write-back policy.
 - `GET /api/tracks/{id}/stream` audio stream with basic byte-range support.
 
