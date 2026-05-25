@@ -1,4 +1,4 @@
-use musicata_core::Track;
+use musicata_core::{Album, Track};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,6 +69,113 @@ impl MusicBrainzClient {
         lookup
     }
 
+    pub fn search_track_candidates(
+        &self,
+        track: &Track,
+        limit: usize,
+    ) -> MusicBrainzTrackCandidateSearchResponse {
+        let limit = limit.clamp(1, 25);
+        let existing_targets = musicbrainz_lookup_targets(track, &self.base_url);
+        let query = musicbrainz_track_candidate_query(track);
+        let search_url = musicbrainz_search_url(
+            &self.base_url,
+            MusicBrainzSearchEntityType::Recording,
+            &query,
+            limit,
+        );
+        let mut response = MusicBrainzTrackCandidateSearchResponse {
+            track_id: track.id.clone(),
+            query,
+            search_url,
+            searched: false,
+            skipped_reason: None,
+            candidates: Vec::new(),
+            issues: Vec::new(),
+        };
+
+        if !existing_targets.is_empty() {
+            response.skipped_reason = Some("track already has MusicBrainz identifiers".to_string());
+            return response;
+        }
+
+        if response.query.is_empty() {
+            response.issues.push(MusicBrainzSearchIssue {
+                entity_type: MusicBrainzSearchEntityType::Recording,
+                message: "track has no searchable metadata".to_string(),
+            });
+            return response;
+        }
+
+        response.searched = true;
+        match self.fetch_search(
+            MusicBrainzSearchEntityType::Recording,
+            &response.query,
+            limit,
+        ) {
+            Ok(value) => {
+                response.candidates = recording_candidates(&value);
+            }
+            Err(message) => response.issues.push(MusicBrainzSearchIssue {
+                entity_type: MusicBrainzSearchEntityType::Recording,
+                message,
+            }),
+        }
+
+        response
+    }
+
+    pub fn search_album_candidates(
+        &self,
+        album: &Album,
+        tracks: &[Track],
+        limit: usize,
+    ) -> MusicBrainzAlbumCandidateSearchResponse {
+        let limit = limit.clamp(1, 25);
+        let query = musicbrainz_album_candidate_query(album);
+        let search_url = musicbrainz_search_url(
+            &self.base_url,
+            MusicBrainzSearchEntityType::Release,
+            &query,
+            limit,
+        );
+        let mut response = MusicBrainzAlbumCandidateSearchResponse {
+            album_id: album.id.clone(),
+            query,
+            search_url,
+            searched: false,
+            skipped_reason: None,
+            candidates: Vec::new(),
+            issues: Vec::new(),
+        };
+
+        if album_has_existing_release_mbid(tracks) {
+            response.skipped_reason =
+                Some("album already has MusicBrainz release identifiers".to_string());
+            return response;
+        }
+
+        if response.query.is_empty() {
+            response.issues.push(MusicBrainzSearchIssue {
+                entity_type: MusicBrainzSearchEntityType::Release,
+                message: "album has no searchable metadata".to_string(),
+            });
+            return response;
+        }
+
+        response.searched = true;
+        match self.fetch_search(MusicBrainzSearchEntityType::Release, &response.query, limit) {
+            Ok(value) => {
+                response.candidates = release_candidates(&value);
+            }
+            Err(message) => response.issues.push(MusicBrainzSearchIssue {
+                entity_type: MusicBrainzSearchEntityType::Release,
+                message,
+            }),
+        }
+
+        response
+    }
+
     fn fetch_target(
         &self,
         target: &MusicBrainzLookupTarget,
@@ -84,6 +191,27 @@ impl MusicBrainzClient {
             .into_json::<Value>()
             .map_err(|error| error.to_string())?;
         normalize_musicbrainz_document(target, &value)
+    }
+
+    fn fetch_search(
+        &self,
+        entity_type: MusicBrainzSearchEntityType,
+        query: &str,
+        limit: usize,
+    ) -> Result<Value, String> {
+        let url = musicbrainz_search_endpoint(&self.base_url, entity_type);
+        let response = self
+            .http
+            .get(&url)
+            .query("fmt", "json")
+            .query("query", query)
+            .query("limit", &limit.to_string())
+            .call()
+            .map_err(musicbrainz_request_error)?;
+
+        response
+            .into_json::<Value>()
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -118,6 +246,78 @@ impl MusicBrainzTrackLookupResponse {
             MusicBrainzDocument::Artist(artist) => self.artists.push(artist),
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MusicBrainzTrackCandidateSearchResponse {
+    pub track_id: String,
+    pub query: String,
+    pub search_url: String,
+    pub searched: bool,
+    pub skipped_reason: Option<String>,
+    pub candidates: Vec<MusicBrainzRecordingCandidate>,
+    pub issues: Vec<MusicBrainzSearchIssue>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MusicBrainzAlbumCandidateSearchResponse {
+    pub album_id: String,
+    pub query: String,
+    pub search_url: String,
+    pub searched: bool,
+    pub skipped_reason: Option<String>,
+    pub candidates: Vec<MusicBrainzReleaseCandidate>,
+    pub issues: Vec<MusicBrainzSearchIssue>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MusicBrainzRecordingCandidate {
+    pub id: String,
+    pub score: Option<u64>,
+    pub title: Option<String>,
+    pub disambiguation: Option<String>,
+    pub length_ms: Option<u64>,
+    pub first_release_date: Option<String>,
+    pub artist_credit: Vec<String>,
+    pub isrcs: Vec<String>,
+    pub releases: Vec<MusicBrainzLinkedRelease>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MusicBrainzReleaseCandidate {
+    pub id: String,
+    pub score: Option<u64>,
+    pub title: Option<String>,
+    pub disambiguation: Option<String>,
+    pub date: Option<String>,
+    pub country: Option<String>,
+    pub status: Option<String>,
+    pub barcode: Option<String>,
+    pub artist_credit: Vec<String>,
+    pub release_group: Option<MusicBrainzLinkedReleaseGroup>,
+    pub media: Vec<MusicBrainzMedium>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MusicBrainzSearchEntityType {
+    Recording,
+    Release,
+}
+
+impl MusicBrainzSearchEntityType {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Recording => "recording",
+            Self::Release => "release",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MusicBrainzSearchIssue {
+    pub entity_type: MusicBrainzSearchEntityType,
+    pub message: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -306,6 +506,86 @@ pub fn musicbrainz_lookup_targets(track: &Track, base_url: &str) -> Vec<MusicBra
         .collect()
 }
 
+pub fn musicbrainz_track_candidate_query(track: &Track) -> String {
+    let mut parts = Vec::new();
+
+    push_musicbrainz_query_field(&mut parts, "recording", &track.title);
+    push_musicbrainz_query_field(&mut parts, "artist", &track.artist_name);
+    push_musicbrainz_query_field(&mut parts, "release", &track.album_title);
+    if let Some(year) = track.year {
+        parts.push(format!("date:{year}"));
+    }
+
+    parts.join(" AND ")
+}
+
+pub fn musicbrainz_album_candidate_query(album: &Album) -> String {
+    let mut parts = Vec::new();
+
+    push_musicbrainz_query_field(&mut parts, "release", &album.title);
+    push_musicbrainz_query_field(&mut parts, "artist", &album.artist_name);
+    if let Some(year) = album.year {
+        parts.push(format!("date:{year}"));
+    }
+
+    parts.join(" AND ")
+}
+
+fn push_musicbrainz_query_field(parts: &mut Vec<String>, field: &str, value: &str) {
+    let value = value.trim();
+    if value.is_empty() || value == "Unknown Artist" || value == "Unknown Album" {
+        return;
+    }
+
+    parts.push(format!("{field}:\"{}\"", escape_musicbrainz_query(value)));
+}
+
+fn escape_musicbrainz_query(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn album_has_existing_release_mbid(tracks: &[Track]) -> bool {
+    tracks.iter().any(|track| {
+        track.observed_metadata.iter().any(|observation| {
+            observation.musicbrainz_release_id.is_some()
+                || observation.musicbrainz_release_group_id.is_some()
+        })
+    })
+}
+
+fn musicbrainz_search_endpoint(base_url: &str, entity_type: MusicBrainzSearchEntityType) -> String {
+    format!("{}/{}", base_url.trim_end_matches('/'), entity_type.path())
+}
+
+fn musicbrainz_search_url(
+    base_url: &str,
+    entity_type: MusicBrainzSearchEntityType,
+    query: &str,
+    limit: usize,
+) -> String {
+    format!(
+        "{}?query={}&fmt=json&limit={limit}",
+        musicbrainz_search_endpoint(base_url, entity_type),
+        percent_encode(query)
+    )
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::new();
+
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte))
+            }
+            b' ' => encoded.push_str("%20"),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+
+    encoded
+}
+
 fn insert_musicbrainz_ids(
     ids: &mut BTreeMap<MusicBrainzEntityType, BTreeSet<String>>,
     entity_type: MusicBrainzEntityType,
@@ -443,6 +723,58 @@ fn normalize_musicbrainz_document(
     })
 }
 
+fn recording_candidates(value: &Value) -> Vec<MusicBrainzRecordingCandidate> {
+    value
+        .get("recordings")
+        .and_then(Value::as_array)
+        .map(|recordings| {
+            recordings
+                .iter()
+                .filter_map(|recording| {
+                    Some(MusicBrainzRecordingCandidate {
+                        id: string_field(recording, "id")?,
+                        score: recording.get("score").and_then(Value::as_u64),
+                        title: string_field(recording, "title"),
+                        disambiguation: string_field(recording, "disambiguation"),
+                        length_ms: recording.get("length").and_then(Value::as_u64),
+                        first_release_date: string_field(recording, "first-release-date"),
+                        artist_credit: artist_credit(recording),
+                        isrcs: string_array_field(recording, "isrcs"),
+                        releases: linked_releases(recording.get("releases")),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn release_candidates(value: &Value) -> Vec<MusicBrainzReleaseCandidate> {
+    value
+        .get("releases")
+        .and_then(Value::as_array)
+        .map(|releases| {
+            releases
+                .iter()
+                .filter_map(|release| {
+                    Some(MusicBrainzReleaseCandidate {
+                        id: string_field(release, "id")?,
+                        score: release.get("score").and_then(Value::as_u64),
+                        title: string_field(release, "title"),
+                        disambiguation: string_field(release, "disambiguation"),
+                        date: string_field(release, "date"),
+                        country: string_field(release, "country"),
+                        status: string_field(release, "status"),
+                        barcode: string_field(release, "barcode"),
+                        artist_credit: artist_credit(release),
+                        release_group: release.get("release-group").and_then(linked_release_group),
+                        media: media(release.get("media")),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn string_field(value: &Value, field: &str) -> Option<String> {
     value
         .get(field)
@@ -537,7 +869,9 @@ fn media(value: Option<&Value>) -> Vec<MusicBrainzMedium> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use musicata_core::{MetadataApprovalState, ProviderMapping, Track, TrackMetadataObservation};
+    use musicata_core::{
+        Album, MetadataApprovalState, ProviderMapping, Track, TrackMetadataObservation,
+    };
     use std::path::PathBuf;
 
     const RECORDING_ID: &str = "e3e2ace1-1312-4f76-94b8-e6c7d969b730";
@@ -604,6 +938,106 @@ mod tests {
         assert_eq!(recording.artist_credit, vec!["Darkwood Dub"]);
         assert_eq!(recording.isrcs, vec!["USRC17607839"]);
         assert_eq!(recording.releases[0].title.as_deref(), Some("Paramparcad"));
+    }
+
+    #[test]
+    fn builds_track_and_album_candidate_queries() {
+        let mut track = fixture_track();
+        track.observed_metadata.clear();
+        let album = fixture_album();
+
+        assert_eq!(
+            musicbrainz_track_candidate_query(&track),
+            "recording:\"Brzi Vavilon\" AND artist:\"Darkwood Dub\" AND release:\"Paramparcad\" AND date:1994"
+        );
+        assert_eq!(
+            musicbrainz_album_candidate_query(&album),
+            "release:\"Paramparcad\" AND artist:\"Darkwood Dub\" AND date:1994"
+        );
+        assert_eq!(
+            musicbrainz_search_url(
+                "https://musicbrainz.test/ws/2",
+                MusicBrainzSearchEntityType::Recording,
+                &musicbrainz_track_candidate_query(&track),
+                5,
+            ),
+            "https://musicbrainz.test/ws/2/recording?query=recording%3A%22Brzi%20Vavilon%22%20AND%20artist%3A%22Darkwood%20Dub%22%20AND%20release%3A%22Paramparcad%22%20AND%20date%3A1994&fmt=json&limit=5"
+        );
+    }
+
+    #[test]
+    fn skips_candidate_search_when_existing_mbids_identify_track_or_album() {
+        let client = MusicBrainzClient::new("https://musicbrainz.test/ws/2");
+        let track = fixture_track();
+        let album = fixture_album();
+
+        let track_search = client.search_track_candidates(&track, 5);
+        assert!(!track_search.searched);
+        assert_eq!(
+            track_search.skipped_reason.as_deref(),
+            Some("track already has MusicBrainz identifiers")
+        );
+
+        let album_search = client.search_album_candidates(&album, &[track], 5);
+        assert!(!album_search.searched);
+        assert_eq!(
+            album_search.skipped_reason.as_deref(),
+            Some("album already has MusicBrainz release identifiers")
+        );
+    }
+
+    #[test]
+    fn normalizes_candidate_search_json() {
+        let value = serde_json::json!({
+            "recordings": [
+                {
+                    "id": RECORDING_ID,
+                    "score": 98,
+                    "title": "Brzi Vavilon",
+                    "length": 245000,
+                    "artist-credit": [{ "name": "Darkwood Dub" }],
+                    "releases": [{ "id": RELEASE_ID, "title": "Paramparcad", "date": "1994" }]
+                }
+            ],
+            "releases": [
+                {
+                    "id": RELEASE_ID,
+                    "score": 96,
+                    "title": "Paramparcad",
+                    "date": "1994",
+                    "artist-credit": [{ "name": "Darkwood Dub" }],
+                    "release-group": {
+                        "id": RELEASE_GROUP_ID,
+                        "title": "Paramparcad",
+                        "primary-type": "Album"
+                    },
+                    "media": [{ "position": 1, "format": "CD", "track-count": 9 }]
+                }
+            ]
+        });
+
+        let recordings = recording_candidates(&value);
+        assert_eq!(recordings.len(), 1);
+        assert_eq!(recordings[0].score, Some(98));
+        assert_eq!(recordings[0].artist_credit, vec!["Darkwood Dub"]);
+
+        let releases = release_candidates(&value);
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].score, Some(96));
+        assert_eq!(releases[0].media[0].track_count, Some(9));
+    }
+
+    fn fixture_album() -> Album {
+        Album {
+            id: "album_1".to_string(),
+            title: "Paramparcad".to_string(),
+            artist_id: "artist_1".to_string(),
+            artist_name: "Darkwood Dub".to_string(),
+            year: Some(1994),
+            track_count: 1,
+            artwork_url: None,
+            artwork_path: None,
+        }
     }
 
     fn fixture_track() -> Track {

@@ -20,7 +20,10 @@ use musicata_core::{
     MusicProvider, Track, TrackMetadataFieldObservation,
 };
 use musicata_storage::Database;
-use musicbrainz::{MusicBrainzClient, MusicBrainzTrackLookupResponse};
+use musicbrainz::{
+    MusicBrainzAlbumCandidateSearchResponse, MusicBrainzClient,
+    MusicBrainzTrackCandidateSearchResponse, MusicBrainzTrackLookupResponse,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -183,6 +186,10 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
         )
         .route("/api/artists", get(artists))
         .route("/api/albums", get(albums))
+        .route(
+            "/api/albums/{id}/metadata/musicbrainz/candidates",
+            get(album_musicbrainz_candidates),
+        )
         .route("/api/tracks", get(tracks))
         .route("/api/search", get(search))
         .route(
@@ -196,6 +203,10 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
         .route(
             "/api/tracks/{id}/metadata/musicbrainz",
             get(track_musicbrainz_lookup),
+        )
+        .route(
+            "/api/tracks/{id}/metadata/musicbrainz/candidates",
+            get(track_musicbrainz_candidates),
         )
         .route("/api/tracks/{id}/stream", get(stream_track))
         .route("/api/albums/{id}/artwork", get(album_artwork))
@@ -568,6 +579,65 @@ async fn track_musicbrainz_lookup(
         .map_err(|error| AppError::internal(error.to_string()))?;
 
     Ok(Json(lookup))
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidateSearchQuery {
+    limit: Option<usize>,
+}
+
+async fn track_musicbrainz_candidates(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CandidateSearchQuery>,
+) -> Result<Json<MusicBrainzTrackCandidateSearchResponse>, AppError> {
+    let track = {
+        let library = state.library.read().await;
+        library
+            .track(&id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?
+    };
+
+    let limit = query.limit.unwrap_or(5);
+    let musicbrainz = state.musicbrainz.clone();
+    let candidates =
+        tokio::task::spawn_blocking(move || musicbrainz.search_track_candidates(&track, limit))
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?;
+
+    Ok(Json(candidates))
+}
+
+async fn album_musicbrainz_candidates(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CandidateSearchQuery>,
+) -> Result<Json<MusicBrainzAlbumCandidateSearchResponse>, AppError> {
+    let (album, album_tracks) = {
+        let library = state.library.read().await;
+        let album = library
+            .album(&id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
+        let album_tracks = library
+            .tracks
+            .iter()
+            .filter(|track| track.album_id == id)
+            .cloned()
+            .collect::<Vec<_>>();
+        (album, album_tracks)
+    };
+
+    let limit = query.limit.unwrap_or(5);
+    let musicbrainz = state.musicbrainz.clone();
+    let candidates = tokio::task::spawn_blocking(move || {
+        musicbrainz.search_album_candidates(&album, &album_tracks, limit)
+    })
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+
+    Ok(Json(candidates))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1288,6 +1358,57 @@ mod tests {
         assert!(body.contains(r#""targets":[]"#));
         assert!(body.contains(r#""recordings":[]"#));
         assert!(body.contains(r#""issues":[]"#));
+    }
+
+    #[tokio::test]
+    async fn musicbrainz_candidate_routes_skip_items_with_existing_mbids() {
+        let fixture = TestFixture::new("musicbrainz-candidates");
+        let mut library = fixture.library();
+        let track = library.tracks.first_mut().expect("track");
+        track.observed_metadata[0].musicbrainz_recording_id =
+            Some("e3e2ace1-1312-4f76-94b8-e6c7d969b730".to_string());
+        track.observed_metadata[0].musicbrainz_release_id =
+            Some("d08ef3f3-7c5d-4a1f-a28d-d81bead9e165".to_string());
+        let track_id = track.id.clone();
+        let album_id = track.album_id.clone();
+        let app = fixture.app_with_library(library).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/tracks/{track_id}/metadata/musicbrainz/candidates"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_text(response.into_body()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""searched":false"#));
+        assert!(body.contains("track already has MusicBrainz identifiers"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/albums/{album_id}/metadata/musicbrainz/candidates"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_text(response.into_body()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""searched":false"#));
+        assert!(body.contains("album already has MusicBrainz release identifiers"));
     }
 
     #[tokio::test]

@@ -99,7 +99,7 @@ Tasks:
 - [x] Extract title, album, artist, album artist, track/disc numbers, dates, genres, composers, embedded artwork, lyrics, MusicBrainz IDs, and ISRCs into observed metadata where present.
 - [x] Preserve folder-derived fallback metadata for poorly tagged files.
 - [x] Add MusicBrainz lookup by existing MBIDs.
-- Add MusicBrainz candidate search for unmatched albums and tracks.
+- [x] Add MusicBrainz candidate search for unmatched albums and tracks.
 - [x] Add metadata review/apply API shapes before building the UI.
 - Add safe metadata review/apply UI before bulk changes.
 - Add artwork selection and cache behavior.
@@ -284,6 +284,6 @@ Done when:
 
 The next implementation slice should be Milestone 3:
 
-1. Add MusicBrainz candidate search for unmatched albums and tracks.
-2. Add safe metadata review/apply UI before bulk changes.
-3. Add artwork selection and cache behavior.
+1. Add safe metadata review/apply UI before bulk changes.
+2. Add artwork selection and cache behavior.
+3. Keep tag write-back disabled by default while documenting future opt-in write-back.
