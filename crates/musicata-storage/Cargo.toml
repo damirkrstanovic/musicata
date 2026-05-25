@@ -8,8 +8,8 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 musicata-core = { path = "../musicata-core" }
+serde_json.workspace = true
 sqlx.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-

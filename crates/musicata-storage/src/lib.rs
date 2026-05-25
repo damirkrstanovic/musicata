@@ -87,6 +87,19 @@ impl Database {
             set_user_version(&self.pool, 4).await?;
         }
 
+        if version < 5 {
+            for migration in MIGRATION_005_METADATA_OBSERVATION_VALUE_COLUMNS {
+                ensure_column(
+                    &self.pool,
+                    "track_metadata_observations",
+                    migration.column,
+                    migration.alter_statement,
+                )
+                .await?;
+            }
+            set_user_version(&self.pool, 5).await?;
+        }
+
         Ok(())
     }
 
@@ -171,7 +184,19 @@ impl Database {
 
                 for observation in &track.observed_metadata {
                     sqlx::query(
-                        "INSERT INTO track_metadata_observations (track_id, source, confidence, observed_at_unix_seconds, approval_state, title, artist_name, album_title, year, track_number) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        "INSERT INTO track_metadata_observations (
+                            track_id, source, confidence, observed_at_unix_seconds, approval_state,
+                            title, artist_name, album_artist_name, album_title, recording_date,
+                            year, track_number, track_total, disc_number, disc_total, genres,
+                            composers, lyrics, musicbrainz_recording_id, musicbrainz_track_id,
+                            musicbrainz_release_id, musicbrainz_release_group_id,
+                            musicbrainz_artist_id, musicbrainz_release_artist_id, isrc,
+                            embedded_artwork_count
+                        ) VALUES (
+                            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                            ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                            ?25, ?26
+                        )",
                     )
                     .bind(&track.id)
                     .bind(&observation.source)
@@ -180,9 +205,25 @@ impl Database {
                     .bind(approval_state_to_str(&observation.approval_state))
                     .bind(&observation.title)
                     .bind(&observation.artist_name)
+                    .bind(&observation.album_artist_name)
                     .bind(&observation.album_title)
+                    .bind(&observation.recording_date)
                     .bind(observation.year.map(i64::from))
                     .bind(observation.track_number.map(i64::from))
+                    .bind(observation.track_total.map(i64::from))
+                    .bind(observation.disc_number.map(i64::from))
+                    .bind(observation.disc_total.map(i64::from))
+                    .bind(metadata_values_to_json(&observation.genres)?)
+                    .bind(metadata_values_to_json(&observation.composers)?)
+                    .bind(&observation.lyrics)
+                    .bind(&observation.musicbrainz_recording_id)
+                    .bind(&observation.musicbrainz_track_id)
+                    .bind(&observation.musicbrainz_release_id)
+                    .bind(&observation.musicbrainz_release_group_id)
+                    .bind(&observation.musicbrainz_artist_id)
+                    .bind(&observation.musicbrainz_release_artist_id)
+                    .bind(&observation.isrc)
+                    .bind(usize_to_i64(observation.embedded_artwork_count)?)
                     .execute(&mut *conn)
                     .await?;
                 }
@@ -239,7 +280,13 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         let observation_rows = sqlx::query(
-            "SELECT track_id, source, confidence, observed_at_unix_seconds, approval_state, title, artist_name, album_title, year, track_number FROM track_metadata_observations ORDER BY track_id, id",
+            "SELECT track_id, source, confidence, observed_at_unix_seconds, approval_state,
+                title, artist_name, album_artist_name, album_title, recording_date, year,
+                track_number, track_total, disc_number, disc_total, genres, composers, lyrics,
+                musicbrainz_recording_id, musicbrainz_track_id, musicbrainz_release_id,
+                musicbrainz_release_group_id, musicbrainz_artist_id, musicbrainz_release_artist_id,
+                isrc, embedded_artwork_count
+            FROM track_metadata_observations ORDER BY track_id, id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -287,11 +334,30 @@ impl Database {
                     approval_state: approval_state_from_str(row.try_get("approval_state")?),
                     title: row.try_get("title")?,
                     artist_name: row.try_get("artist_name")?,
+                    album_artist_name: row.try_get("album_artist_name")?,
                     album_title: row.try_get("album_title")?,
+                    recording_date: row.try_get("recording_date")?,
                     year: optional_i64_to_u16(row.try_get("year")?, "year")?,
                     track_number: optional_i64_to_u16(
                         row.try_get("track_number")?,
                         "track_number",
+                    )?,
+                    track_total: optional_i64_to_u16(row.try_get("track_total")?, "track_total")?,
+                    disc_number: optional_i64_to_u16(row.try_get("disc_number")?, "disc_number")?,
+                    disc_total: optional_i64_to_u16(row.try_get("disc_total")?, "disc_total")?,
+                    genres: metadata_values_from_json(row.try_get("genres")?, "genres")?,
+                    composers: metadata_values_from_json(row.try_get("composers")?, "composers")?,
+                    lyrics: row.try_get("lyrics")?,
+                    musicbrainz_recording_id: row.try_get("musicbrainz_recording_id")?,
+                    musicbrainz_track_id: row.try_get("musicbrainz_track_id")?,
+                    musicbrainz_release_id: row.try_get("musicbrainz_release_id")?,
+                    musicbrainz_release_group_id: row.try_get("musicbrainz_release_group_id")?,
+                    musicbrainz_artist_id: row.try_get("musicbrainz_artist_id")?,
+                    musicbrainz_release_artist_id: row.try_get("musicbrainz_release_artist_id")?,
+                    isrc: row.try_get("isrc")?,
+                    embedded_artwork_count: i64_to_usize(
+                        row.try_get("embedded_artwork_count")?,
+                        "embedded_artwork_count",
                     )?,
                 });
         }
@@ -360,7 +426,13 @@ impl Database {
         }
 
         let observation_rows = sqlx::query(
-            "SELECT track_id, source, confidence, observed_at_unix_seconds, approval_state, title, artist_name, album_title, year, track_number FROM track_metadata_observations ORDER BY track_id, id",
+            "SELECT track_id, source, confidence, observed_at_unix_seconds, approval_state,
+                title, artist_name, album_artist_name, album_title, recording_date, year,
+                track_number, track_total, disc_number, disc_total, genres, composers, lyrics,
+                musicbrainz_recording_id, musicbrainz_track_id, musicbrainz_release_id,
+                musicbrainz_release_group_id, musicbrainz_artist_id, musicbrainz_release_artist_id,
+                isrc, embedded_artwork_count
+            FROM track_metadata_observations ORDER BY track_id, id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -374,9 +446,28 @@ impl Database {
                 approval_state: approval_state_from_str(row.try_get("approval_state")?),
                 title: row.try_get("title")?,
                 artist_name: row.try_get("artist_name")?,
+                album_artist_name: row.try_get("album_artist_name")?,
                 album_title: row.try_get("album_title")?,
+                recording_date: row.try_get("recording_date")?,
                 year: optional_i64_to_u16(row.try_get("year")?, "year")?,
                 track_number: optional_i64_to_u16(row.try_get("track_number")?, "track_number")?,
+                track_total: optional_i64_to_u16(row.try_get("track_total")?, "track_total")?,
+                disc_number: optional_i64_to_u16(row.try_get("disc_number")?, "disc_number")?,
+                disc_total: optional_i64_to_u16(row.try_get("disc_total")?, "disc_total")?,
+                genres: metadata_values_from_json(row.try_get("genres")?, "genres")?,
+                composers: metadata_values_from_json(row.try_get("composers")?, "composers")?,
+                lyrics: row.try_get("lyrics")?,
+                musicbrainz_recording_id: row.try_get("musicbrainz_recording_id")?,
+                musicbrainz_track_id: row.try_get("musicbrainz_track_id")?,
+                musicbrainz_release_id: row.try_get("musicbrainz_release_id")?,
+                musicbrainz_release_group_id: row.try_get("musicbrainz_release_group_id")?,
+                musicbrainz_artist_id: row.try_get("musicbrainz_artist_id")?,
+                musicbrainz_release_artist_id: row.try_get("musicbrainz_release_artist_id")?,
+                isrc: row.try_get("isrc")?,
+                embedded_artwork_count: i64_to_usize(
+                    row.try_get("embedded_artwork_count")?,
+                    "embedded_artwork_count",
+                )?,
             };
             stored_observations.entry(track_id).or_default().push_str(
                 &metadata_observations_fingerprint(std::slice::from_ref(&observation)),
@@ -482,7 +573,15 @@ fn metadata_observations_fingerprint(observations: &[TrackMetadataObservation]) 
         );
         push_fingerprint_part(
             &mut fingerprint,
+            observation.album_artist_name.as_deref().unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
             observation.album_title.as_deref().unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            observation.recording_date.as_deref().unwrap_or_default(),
         );
         push_fingerprint_part(
             &mut fingerprint,
@@ -497,6 +596,83 @@ fn metadata_observations_fingerprint(observations: &[TrackMetadataObservation]) 
                 .track_number
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            &observation
+                .track_total
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            &observation
+                .disc_number
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            &observation
+                .disc_total
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
+        push_fingerprint_part(&mut fingerprint, &observation.genres.join("\n"));
+        push_fingerprint_part(&mut fingerprint, &observation.composers.join("\n"));
+        push_fingerprint_part(
+            &mut fingerprint,
+            observation.lyrics.as_deref().unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            observation
+                .musicbrainz_recording_id
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            observation
+                .musicbrainz_track_id
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            observation
+                .musicbrainz_release_id
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            observation
+                .musicbrainz_release_group_id
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            observation
+                .musicbrainz_artist_id
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            observation
+                .musicbrainz_release_artist_id
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            observation.isrc.as_deref().unwrap_or_default(),
+        );
+        push_fingerprint_part(
+            &mut fingerprint,
+            &observation.embedded_artwork_count.to_string(),
         );
     }
 
@@ -565,9 +741,25 @@ const MIGRATION_001: &[&str] = &[
         approval_state TEXT NOT NULL DEFAULT 'observed',
         title TEXT,
         artist_name TEXT,
+        album_artist_name TEXT,
         album_title TEXT,
+        recording_date TEXT,
         year INTEGER,
         track_number INTEGER,
+        track_total INTEGER,
+        disc_number INTEGER,
+        disc_total INTEGER,
+        genres TEXT,
+        composers TEXT,
+        lyrics TEXT,
+        musicbrainz_recording_id TEXT,
+        musicbrainz_track_id TEXT,
+        musicbrainz_release_id TEXT,
+        musicbrainz_release_group_id TEXT,
+        musicbrainz_artist_id TEXT,
+        musicbrainz_release_artist_id TEXT,
+        isrc TEXT,
+        embedded_artwork_count INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
     )",
     "CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id)",
@@ -606,9 +798,25 @@ const MIGRATION_003: &[&str] = &[
         approval_state TEXT NOT NULL DEFAULT 'observed',
         title TEXT,
         artist_name TEXT,
+        album_artist_name TEXT,
         album_title TEXT,
+        recording_date TEXT,
         year INTEGER,
         track_number INTEGER,
+        track_total INTEGER,
+        disc_number INTEGER,
+        disc_total INTEGER,
+        genres TEXT,
+        composers TEXT,
+        lyrics TEXT,
+        musicbrainz_recording_id TEXT,
+        musicbrainz_track_id TEXT,
+        musicbrainz_release_id TEXT,
+        musicbrainz_release_group_id TEXT,
+        musicbrainz_artist_id TEXT,
+        musicbrainz_release_artist_id TEXT,
+        isrc TEXT,
+        embedded_artwork_count INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
     )",
     "CREATE INDEX IF NOT EXISTS idx_track_metadata_observations_track_id ON track_metadata_observations(track_id)",
@@ -626,6 +834,73 @@ const MIGRATION_004_METADATA_OBSERVATION_COLUMNS: &[ColumnMigration] = &[
     ColumnMigration {
         column: "approval_state",
         alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN approval_state TEXT NOT NULL DEFAULT 'observed'",
+    },
+];
+
+const MIGRATION_005_METADATA_OBSERVATION_VALUE_COLUMNS: &[ColumnMigration] = &[
+    ColumnMigration {
+        column: "album_artist_name",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN album_artist_name TEXT",
+    },
+    ColumnMigration {
+        column: "recording_date",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN recording_date TEXT",
+    },
+    ColumnMigration {
+        column: "track_total",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN track_total INTEGER",
+    },
+    ColumnMigration {
+        column: "disc_number",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN disc_number INTEGER",
+    },
+    ColumnMigration {
+        column: "disc_total",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN disc_total INTEGER",
+    },
+    ColumnMigration {
+        column: "genres",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN genres TEXT",
+    },
+    ColumnMigration {
+        column: "composers",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN composers TEXT",
+    },
+    ColumnMigration {
+        column: "lyrics",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN lyrics TEXT",
+    },
+    ColumnMigration {
+        column: "musicbrainz_recording_id",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN musicbrainz_recording_id TEXT",
+    },
+    ColumnMigration {
+        column: "musicbrainz_track_id",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN musicbrainz_track_id TEXT",
+    },
+    ColumnMigration {
+        column: "musicbrainz_release_id",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN musicbrainz_release_id TEXT",
+    },
+    ColumnMigration {
+        column: "musicbrainz_release_group_id",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN musicbrainz_release_group_id TEXT",
+    },
+    ColumnMigration {
+        column: "musicbrainz_artist_id",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN musicbrainz_artist_id TEXT",
+    },
+    ColumnMigration {
+        column: "musicbrainz_release_artist_id",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN musicbrainz_release_artist_id TEXT",
+    },
+    ColumnMigration {
+        column: "isrc",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN isrc TEXT",
+    },
+    ColumnMigration {
+        column: "embedded_artwork_count",
+        alter_statement: "ALTER TABLE track_metadata_observations ADD COLUMN embedded_artwork_count INTEGER NOT NULL DEFAULT 0",
     },
 ];
 
@@ -678,6 +953,32 @@ fn f64_to_f32(value: f64, field: &str) -> Result<f32> {
 
 fn u64_to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).context("file size does not fit in SQLite INTEGER")
+}
+
+fn usize_to_i64(value: usize) -> Result<i64> {
+    i64::try_from(value).context("value does not fit in SQLite INTEGER")
+}
+
+fn metadata_values_to_json(values: &[String]) -> Result<Option<String>> {
+    if values.is_empty() {
+        Ok(None)
+    } else {
+        serde_json::to_string(values)
+            .map(Some)
+            .context("failed to serialize metadata values")
+    }
+}
+
+fn metadata_values_from_json(value: Option<String>, field: &str) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    serde_json::from_str(&value).with_context(|| format!("invalid {field} metadata values"))
 }
 
 fn approval_state_to_str(state: &MetadataApprovalState) -> &'static str {
@@ -767,6 +1068,29 @@ mod tests {
         assert_eq!(
             loaded.tracks[0].observed_metadata[0].title,
             Some("Song".to_string())
+        );
+        assert_eq!(
+            loaded.tracks[0].observed_metadata[0].album_artist_name,
+            Some("Album Artist".to_string())
+        );
+        assert_eq!(
+            loaded.tracks[0].observed_metadata[0].recording_date,
+            Some("2026-02-03".to_string())
+        );
+        assert_eq!(loaded.tracks[0].observed_metadata[0].track_total, Some(9));
+        assert_eq!(loaded.tracks[0].observed_metadata[0].disc_number, Some(1));
+        assert_eq!(loaded.tracks[0].observed_metadata[0].disc_total, Some(2));
+        assert_eq!(
+            loaded.tracks[0].observed_metadata[0].genres,
+            vec!["Dub", "Electronic"]
+        );
+        assert_eq!(
+            loaded.tracks[0].observed_metadata[0].musicbrainz_recording_id,
+            Some("recording-id".to_string())
+        );
+        assert_eq!(
+            loaded.tracks[0].observed_metadata[0].embedded_artwork_count,
+            1
         );
         assert_eq!(loaded.scan_errors.len(), 1);
         assert_eq!(loaded.scan_errors[0].message, "permission denied");
@@ -912,9 +1236,25 @@ mod tests {
             approval_state: MetadataApprovalState::Observed,
             title: Some(title.to_string()),
             artist_name: Some("Artist".to_string()),
+            album_artist_name: Some("Album Artist".to_string()),
             album_title: Some("Album".to_string()),
+            recording_date: Some("2026-02-03".to_string()),
             year: Some(2026),
             track_number: Some(track_number),
+            track_total: Some(9),
+            disc_number: Some(1),
+            disc_total: Some(2),
+            genres: vec!["Dub".to_string(), "Electronic".to_string()],
+            composers: vec!["Composer".to_string()],
+            lyrics: Some("Lyrics".to_string()),
+            musicbrainz_recording_id: Some("recording-id".to_string()),
+            musicbrainz_track_id: Some("track-id".to_string()),
+            musicbrainz_release_id: Some("release-id".to_string()),
+            musicbrainz_release_group_id: Some("release-group-id".to_string()),
+            musicbrainz_artist_id: Some("artist-id".to_string()),
+            musicbrainz_release_artist_id: Some("release-artist-id".to_string()),
+            isrc: Some("USRC17607839".to_string()),
+            embedded_artwork_count: 1,
         }
     }
 

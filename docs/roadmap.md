@@ -95,7 +95,7 @@ Tasks:
 - [x] Add metadata observation provenance: source, confidence, timestamp, and user approval state.
 - Add field-level provenance and review state for individual metadata values.
 - [x] Read embedded title, artist, album, year, and track number with folder-derived fallback.
-- Extract title, album, artist, album artist, track/disc numbers, dates, genres, composers, embedded artwork, lyrics, MusicBrainz IDs, and ISRCs where present.
+- [x] Extract title, album, artist, album artist, track/disc numbers, dates, genres, composers, embedded artwork, lyrics, MusicBrainz IDs, and ISRCs into observed metadata where present.
 - [x] Preserve folder-derived fallback metadata for poorly tagged files.
 - Add MusicBrainz lookup by existing MBIDs.
 - Add MusicBrainz candidate search for unmatched albums and tracks.
@@ -103,8 +103,9 @@ Tasks:
 - Add artwork selection and cache behavior.
 - Keep tag write-back disabled by default.
 - [x] Add generated MP3 tag fixture for scanner tests.
-- Add generated FLAC and MP4/M4A tag fixtures.
-- Add test fixtures for tag-heavy and poorly tagged files.
+- [x] Add generated FLAC and MP4/M4A tag fixtures.
+- [x] Add generated tag-heavy embedded metadata fixture.
+- Add poorly tagged file fixtures for metadata review cases.
 
 Done when:
 
