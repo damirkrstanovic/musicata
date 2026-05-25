@@ -71,6 +71,7 @@ Tasks:
 - [x] Add explicit incremental rescan command with `--scan-once`.
 - [x] Add explicit incremental rescan API.
 - [x] Track content hash where useful.
+- Add non-blocking deep fingerprinting for large files so first import does not require reading every byte before saving.
 - [x] Add explicit migration steps beyond schema version 1.
 - [x] Keep local file paths out of canonical track IDs.
 

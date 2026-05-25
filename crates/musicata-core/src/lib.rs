@@ -20,6 +20,9 @@ use std::{
 
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav"];
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
+// Full-file hashing is too expensive for first imports of mounted multi-GB libraries.
+// Keep synchronous hashes for tiny files and move deep fingerprinting to a later worker.
+const INLINE_CONTENT_HASH_LIMIT_BYTES: u64 = 1024 * 1024;
 
 pub trait MusicProvider {
     fn provider_id(&self) -> &str;
@@ -624,8 +627,8 @@ fn collect_audio_files(
                     continue;
                 }
             };
-            let content_hash = match hash_file_contents(&path) {
-                Ok(hash) => Some(hash),
+            let content_hash = match hash_file_contents_if_small(&path, file_metadata.len()) {
+                Ok(hash) => hash,
                 Err(source) => {
                     scan_errors.push(ScanIssue {
                         path: path.display().to_string(),
@@ -662,7 +665,14 @@ fn current_unix_seconds() -> i64 {
         .unwrap_or_default()
 }
 
-fn hash_file_contents(path: &Path) -> Result<String, std::io::Error> {
+fn hash_file_contents_if_small(
+    path: &Path,
+    file_size_bytes: u64,
+) -> Result<Option<String>, std::io::Error> {
+    if file_size_bytes > INLINE_CONTENT_HASH_LIMIT_BYTES {
+        return Ok(None);
+    }
+
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -675,7 +685,7 @@ fn hash_file_contents(path: &Path) -> Result<String, std::io::Error> {
         hasher.update(&buffer[..read]);
     }
 
-    Ok(hex_lower(&hasher.finalize()))
+    Ok(Some(hex_lower(&hasher.finalize())))
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -1085,6 +1095,21 @@ mod tests {
 
         assert_eq!(first_track.provider.item_id, second_track.provider.item_id);
         assert_ne!(first_track.id, second_track.id);
+    }
+
+    #[test]
+    fn skips_inline_content_hash_for_large_files() {
+        let fixture = TestFixture::new("large-hash");
+        let contents = vec![0_u8; INLINE_CONTENT_HASH_LIMIT_BYTES as usize + 1];
+        fixture.write_bytes(
+            "1994 - Paramparcad/Darkwood Dub - Brzi Vavilon.mp3",
+            &contents,
+        );
+        let library = scan_local_library(&fixture.root).expect("scan fixture");
+        let track = library.tracks.first().expect("track");
+
+        assert_eq!(track.file_size_bytes, Some(contents.len() as u64));
+        assert_eq!(track.content_hash, None);
     }
 
     #[test]
