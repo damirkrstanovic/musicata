@@ -143,6 +143,14 @@ When enabled:
 
 Do not write tags for read-only, remote, or provider-backed sources that do not declare write support.
 
+Current implementation:
+
+- `GET /api/metadata/write-back` returns the disabled write-back policy.
+- `POST /api/metadata/write-back` returns `403 write_back_disabled`.
+- Metadata review, artwork selection, and enrichment update only Musicata's database.
+
+Future opt-in write-back must require all of the following: provider-declared write support, per-library configuration, a per-operation preview diff, selected fields only, and a metadata snapshot that can support rollback.
+
 ## Tag Format Strategy
 
 Use Picard-compatible tag names and MBID fields where practical so files remain useful outside Musicata.

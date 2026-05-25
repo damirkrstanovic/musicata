@@ -48,6 +48,8 @@ use tracing_subscriber::EnvFilter;
 
 const PLAYBACK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const ARTWORK_CACHE_CONTROL: &str = "public, max-age=86400, must-revalidate";
+const TAG_WRITE_BACK_DISABLED_REASON: &str =
+    "File tag write-back is disabled. Musicata currently updates only its database.";
 
 #[derive(Clone)]
 struct AppState {
@@ -180,6 +182,10 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
         .route("/api/health", get(health))
         .route("/api/library/summary", get(library_summary))
         .route("/api/library/rescan", post(rescan_library))
+        .route(
+            "/api/metadata/write-back",
+            get(metadata_write_back_policy).post(reject_metadata_write_back),
+        )
         .route("/api/playback/sessions", post(create_playback_session))
         .route(
             "/api/playback/sessions/{id}",
@@ -503,6 +509,17 @@ struct AlbumArtworkSelectionUpdate {
     artwork_id: String,
 }
 
+#[derive(Debug, Serialize)]
+struct MetadataWriteBackPolicyResponse {
+    enabled: bool,
+    supports_file_tag_write_back: bool,
+    supports_file_rename: bool,
+    supports_artwork_write_back: bool,
+    requires_preview: bool,
+    reason: &'static str,
+    future_enablement: Vec<&'static str>,
+}
+
 async fn track_metadata_review(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -707,6 +724,27 @@ async fn search(
     let q = query.q.unwrap_or_default();
     let library = state.library.read().await;
     Json(library.search(&q))
+}
+
+async fn metadata_write_back_policy() -> impl IntoResponse {
+    Json(MetadataWriteBackPolicyResponse {
+        enabled: false,
+        supports_file_tag_write_back: false,
+        supports_file_rename: false,
+        supports_artwork_write_back: false,
+        requires_preview: true,
+        reason: TAG_WRITE_BACK_DISABLED_REASON,
+        future_enablement: vec![
+            "provider must declare write support",
+            "library config must opt in",
+            "operation must include a preview diff",
+            "operation must create a restorable metadata snapshot",
+        ],
+    })
+}
+
+async fn reject_metadata_write_back() -> AppError {
+    AppError::write_back_disabled(TAG_WRITE_BACK_DISABLED_REASON)
 }
 
 async fn stream_track(
@@ -1109,6 +1147,14 @@ impl AppError {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_request",
+            message: message.into(),
+        }
+    }
+
+    fn write_back_disabled(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "write_back_disabled",
             message: message.into(),
         }
     }
@@ -1540,6 +1586,46 @@ mod tests {
         let body = body_text(response.into_body()).await;
 
         assert!(body.contains("Vavilon"));
+    }
+
+    #[tokio::test]
+    async fn metadata_write_back_policy_is_disabled() {
+        let fixture = TestFixture::new("write-back");
+        let app = fixture.app().await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metadata/write-back")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_text(response.into_body()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""enabled":false"#));
+        assert!(body.contains(r#""requires_preview":true"#));
+        assert!(body.contains("provider must declare write support"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/metadata/write-back")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_text(response.into_body()).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains(r#""code":"write_back_disabled""#));
+        assert!(body.contains("currently updates only its database"));
     }
 
     #[tokio::test]

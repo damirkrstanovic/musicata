@@ -103,7 +103,7 @@ Tasks:
 - [x] Add metadata review/apply API shapes before building the UI.
 - [x] Add safe metadata review/apply UI before bulk changes.
 - [x] Add artwork selection and cache behavior.
-- Keep tag write-back disabled by default.
+- [x] Keep tag write-back disabled by default.
 - [x] Add generated MP3 tag fixture for scanner tests.
 - [x] Add generated FLAC and MP4/M4A tag fixtures.
 - [x] Add generated tag-heavy embedded metadata fixture.
@@ -284,6 +284,6 @@ Done when:
 
 The next implementation slice should be Milestone 3:
 
-1. Keep tag write-back disabled by default while documenting future opt-in write-back.
-2. Add metadata-based browse filters for genre, year, and composer.
-3. Add Cover Art Archive artwork enrichment behind explicit candidate review.
+1. Add metadata-based browse filters for genre, year, and composer.
+2. Add Cover Art Archive artwork enrichment behind explicit candidate review.
+3. Add lyrics extraction for sidecar and embedded lyrics.
