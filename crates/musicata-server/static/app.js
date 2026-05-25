@@ -50,6 +50,7 @@ const els = {
   prev: document.querySelector("#prev"),
   next: document.querySelector("#next"),
   playPause: document.querySelector("#play-pause"),
+  metadataPanel: document.querySelector("#metadata-panel"),
   metadataTitle: document.querySelector("#metadata-title"),
   metadataBody: document.querySelector("#metadata-body"),
   metadataClose: document.querySelector("#metadata-close"),
@@ -620,6 +621,7 @@ function closeMetadata() {
 
 function renderMetadataPanel() {
   const track = metadataTrack();
+  els.metadataPanel.classList.toggle("open", Boolean(state.metadataTrackId));
   els.metadataTitle.textContent = track?.title || "No track selected";
   els.metadataBody.innerHTML = "";
 
