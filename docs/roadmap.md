@@ -128,6 +128,7 @@ Tasks:
 - Add Tantivy for full-text search.
 - Add pagination and sorting to API endpoints.
 - Add browse endpoints for artists, albums, tracks, genres, years, folders, and recently added music.
+- [x] Add metadata-based browse filters for genre, year, and composer.
 - Add album detail and artist detail endpoints.
 - Support accent-insensitive and case-insensitive search where practical.
 
@@ -282,8 +283,8 @@ Done when:
 
 ## Immediate Next Steps
 
-The next implementation slice should be Milestone 3:
+The next implementation slice should continue metadata enrichment, then move into Milestone 4:
 
-1. Add metadata-based browse filters for genre, year, and composer.
-2. Add Cover Art Archive artwork enrichment behind explicit candidate review.
-3. Add lyrics extraction for sidecar and embedded lyrics.
+1. Add Cover Art Archive artwork enrichment behind explicit candidate review.
+2. Add lyrics extraction for sidecar and embedded lyrics.
+3. Add album detail and artist detail endpoints.

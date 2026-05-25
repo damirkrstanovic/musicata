@@ -5,6 +5,8 @@ const SERVER_EVENT_TIMEOUT_MS = 3500;
 const state = {
   albums: [],
   visibleAlbums: [],
+  browse: { genres: [], years: [], composers: [] },
+  browseFilter: { genre: "", year: "", composer: "" },
   tracks: [],
   visibleTracks: [],
   currentIndex: -1,
@@ -30,6 +32,10 @@ const state = {
 const els = {
   summary: document.querySelector("#summary"),
   search: document.querySelector("#search"),
+  browseGenre: document.querySelector("#browse-genre"),
+  browseYear: document.querySelector("#browse-year"),
+  browseComposer: document.querySelector("#browse-composer"),
+  browseClear: document.querySelector("#browse-clear"),
   albums: document.querySelector("#albums"),
   trackList: document.querySelector("#track-list"),
   viewTitle: document.querySelector("#view-title"),
@@ -82,21 +88,48 @@ async function searchApi(query, signal) {
   return response.json();
 }
 
+function tracksApi(filter = {}) {
+  const params = new URLSearchParams();
+  if (filter.genre) {
+    params.set("genre", filter.genre);
+  }
+  if (filter.year) {
+    params.set("year", filter.year);
+  }
+  if (filter.composer) {
+    params.set("composer", filter.composer);
+  }
+  return api(`/api/tracks${params.size ? `?${params}` : ""}`);
+}
+
+function browseApi() {
+  return api("/api/browse");
+}
+
 async function loadLibrary() {
   try {
-    const [summary, albums, tracks] = await Promise.all([
+    const [summary, albums, tracks, browse] = await Promise.all([
       api("/api/library/summary"),
       api("/api/albums"),
-      api("/api/tracks"),
+      tracksApi(),
+      browseApi(),
     ]);
 
     state.albums = albums;
     state.tracks = tracks;
-    state.visibleTracks = tracks;
+    state.browse = browse;
     els.summary.textContent = `${summary.track_count} tracks, ${summary.album_count} albums`;
-    els.viewTitle.textContent = "Tracks";
-    renderAlbums(albums);
-    renderTracks(tracks);
+    renderBrowseFilters();
+
+    if (hasBrowseFilter()) {
+      await applyBrowseFilter({ clearSearch: false });
+    } else {
+      state.visibleTracks = tracks;
+      els.viewTitle.textContent = "Tracks";
+      renderAlbums(albums);
+      renderTracks(tracks);
+    }
+
     if (state.metadataTrackId && !tracks.some((track) => track.id === state.metadataTrackId)) {
       closeMetadata();
     } else {
@@ -149,6 +182,82 @@ function renderAlbums(albums) {
     });
     els.albums.append(button);
   }
+}
+
+function renderBrowseFilters() {
+  renderBrowseSelect(els.browseGenre, "All genres", state.browse.genres, state.browseFilter.genre);
+  renderBrowseSelect(els.browseYear, "All years", state.browse.years, state.browseFilter.year);
+  renderBrowseSelect(els.browseComposer, "All composers", state.browse.composers, state.browseFilter.composer);
+  els.browseClear.disabled = !hasBrowseFilter();
+}
+
+function renderBrowseSelect(select, emptyLabel, facets, selectedValue) {
+  select.innerHTML = "";
+  const empty = document.createElement("option");
+  empty.value = "";
+  empty.textContent = emptyLabel;
+  select.append(empty);
+
+  for (const facet of facets) {
+    const option = document.createElement("option");
+    option.value = String(facet.value);
+    option.textContent = `${facet.value} (${facet.track_count})`;
+    select.append(option);
+  }
+
+  select.value = selectedValue || "";
+}
+
+async function applyBrowseFilter(options = {}) {
+  const clearSearch = options.clearSearch !== false;
+  state.browseFilter = currentBrowseFilter();
+  renderBrowseFilters();
+
+  if (clearSearch) {
+    state.searchController?.abort();
+    state.searchController = null;
+    els.search.value = "";
+  }
+
+  if (!hasBrowseFilter()) {
+    state.visibleTracks = state.tracks;
+    els.viewTitle.textContent = "Tracks";
+    renderAlbums(state.albums);
+    renderTracks(state.tracks);
+    return;
+  }
+
+  try {
+    const tracks = await tracksApi(state.browseFilter);
+    state.visibleTracks = tracks;
+    els.viewTitle.textContent = browseTitle(state.browseFilter, tracks.length);
+    renderAlbums(albumsForTracks(tracks));
+    renderTracks(tracks);
+  } catch (error) {
+    els.trackList.innerHTML = `<p class="error">Browse failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function currentBrowseFilter() {
+  return {
+    genre: els.browseGenre.value,
+    year: els.browseYear.value,
+    composer: els.browseComposer.value,
+  };
+}
+
+function clearBrowseFilter() {
+  state.browseFilter = { genre: "", year: "", composer: "" };
+  renderBrowseFilters();
+}
+
+function hasBrowseFilter(filter = state.browseFilter) {
+  return Boolean(filter.genre || filter.year || filter.composer);
+}
+
+function browseTitle(filter, trackCount) {
+  const parts = cleanParts([filter.genre, filter.year, filter.composer]);
+  return `Browse: ${parts.join(" / ")} (${trackCount} tracks)`;
 }
 
 function renderTracks(tracks) {
@@ -1021,11 +1130,19 @@ async function search() {
   if (!query) {
     state.searchController?.abort();
     state.searchController = null;
+    if (hasBrowseFilter()) {
+      await applyBrowseFilter({ clearSearch: false });
+      return;
+    }
     state.visibleTracks = state.tracks;
     els.viewTitle.textContent = "Tracks";
     renderAlbums(state.albums);
     renderTracks(state.tracks);
     return;
+  }
+
+  if (hasBrowseFilter()) {
+    clearBrowseFilter();
   }
 
   state.searchController?.abort();
@@ -1059,6 +1176,11 @@ function searchAlbums(results) {
   return state.albums.filter((album) => albumIds.has(album.id));
 }
 
+function albumsForTracks(tracks) {
+  const albumIds = new Set(tracks.map((track) => track.album_id));
+  return state.albums.filter((album) => albumIds.has(album.id));
+}
+
 function playNext(offset) {
   if (state.visibleTracks.length === 0) {
     return;
@@ -1082,6 +1204,13 @@ function escapeHtml(value) {
 els.search.addEventListener("input", debounce(search, 180));
 els.search.addEventListener("search", search);
 els.search.addEventListener("change", search);
+els.browseGenre.addEventListener("change", () => applyBrowseFilter());
+els.browseYear.addEventListener("change", () => applyBrowseFilter());
+els.browseComposer.addEventListener("change", () => applyBrowseFilter());
+els.browseClear.addEventListener("click", () => {
+  clearBrowseFilter();
+  applyBrowseFilter();
+});
 els.refresh.addEventListener("click", rescanLibrary);
 els.metadataClose.addEventListener("click", closeMetadata);
 els.prev.addEventListener("click", () => playNext(-1));

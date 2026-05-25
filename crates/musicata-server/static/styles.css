@@ -26,7 +26,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -77,17 +78,20 @@ h1 {
 .brand p,
 .eyebrow,
 .now-text span,
-.search span {
+.search span,
+.browse-filters span {
   color: var(--muted);
   font-size: 0.85rem;
 }
 
-.search {
+.search,
+.browse-filters label {
   display: grid;
   gap: 8px;
 }
 
-.search input {
+.search input,
+.browse-filters select {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -97,8 +101,18 @@ h1 {
   outline: none;
 }
 
-.search input:focus {
+.search input:focus,
+.browse-filters select:focus {
   border-color: var(--accent);
+}
+
+.browse-filters {
+  display: grid;
+  gap: 10px;
+}
+
+.browse-filters .ghost-button {
+  width: 100%;
 }
 
 .section {
@@ -113,7 +127,7 @@ h1 {
 .album-list {
   display: grid;
   gap: 8px;
-  max-height: calc(100vh - 230px);
+  max-height: calc(100vh - 450px);
   overflow: auto;
   padding-right: 4px;
 }
@@ -194,6 +208,12 @@ h1 {
 .ghost-button:hover,
 .player-controls button:hover {
   border-color: var(--accent);
+}
+
+.ghost-button:disabled {
+  color: var(--muted);
+  cursor: default;
+  opacity: 0.65;
 }
 
 .track-list {

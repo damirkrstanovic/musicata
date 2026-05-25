@@ -9,7 +9,7 @@ use lofty::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt::{self, Display},
     fs,
@@ -124,6 +124,52 @@ impl Library {
             albums,
             tracks,
         }
+    }
+
+    pub fn browse_index(&self) -> BrowseIndex {
+        let mut genres = BTreeMap::new();
+        let mut years = BTreeMap::new();
+        let mut composers = BTreeMap::new();
+
+        for track in &self.tracks {
+            for genre in track_genres(track) {
+                *genres.entry(genre).or_insert(0) += 1;
+            }
+            if let Some(year) = track.year {
+                *years.entry(year).or_insert(0) += 1;
+            }
+            for composer in track_composers(track) {
+                *composers.entry(composer).or_insert(0) += 1;
+            }
+        }
+
+        BrowseIndex {
+            genres: genres
+                .into_iter()
+                .map(|(value, track_count)| BrowseTextFacet { value, track_count })
+                .collect(),
+            years: years
+                .into_iter()
+                .rev()
+                .map(|(value, track_count)| BrowseYearFacet { value, track_count })
+                .collect(),
+            composers: composers
+                .into_iter()
+                .map(|(value, track_count)| BrowseTextFacet { value, track_count })
+                .collect(),
+        }
+    }
+
+    pub fn browse_tracks(&self, filter: &BrowseFilter) -> Vec<Track> {
+        self.tracks
+            .iter()
+            .filter(|track| {
+                filter.year.is_none_or(|year| track.year == Some(year))
+                    && text_filter_matches(filter.genre.as_deref(), track_genres(track))
+                    && text_filter_matches(filter.composer.as_deref(), track_composers(track))
+            })
+            .cloned()
+            .collect()
     }
 }
 
@@ -254,6 +300,32 @@ pub struct SearchResults {
     pub artists: Vec<Artist>,
     pub albums: Vec<Album>,
     pub tracks: Vec<Track>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BrowseFilter {
+    pub genre: Option<String>,
+    pub year: Option<u16>,
+    pub composer: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct BrowseIndex {
+    pub genres: Vec<BrowseTextFacet>,
+    pub years: Vec<BrowseYearFacet>,
+    pub composers: Vec<BrowseTextFacet>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BrowseTextFacet {
+    pub value: String,
+    pub track_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BrowseYearFacet {
+    pub value: u16,
+    pub track_count: usize,
 }
 
 #[derive(Debug)]
@@ -1170,6 +1242,36 @@ fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool {
     value.to_ascii_lowercase().contains(needle)
 }
 
+fn text_filter_matches(filter: Option<&str>, values: BTreeSet<String>) -> bool {
+    let Some(filter) = filter.map(str::trim).filter(|filter| !filter.is_empty()) else {
+        return true;
+    };
+
+    values
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(filter))
+}
+
+fn track_genres(track: &Track) -> BTreeSet<String> {
+    track
+        .observed_metadata
+        .iter()
+        .flat_map(|observation| observation.genres.iter())
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .collect()
+}
+
+fn track_composers(track: &Track) -> BTreeSet<String> {
+    track
+        .observed_metadata
+        .iter()
+        .flat_map(|observation| observation.composers.iter())
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .collect()
+}
+
 fn stable_id(prefix: &str, value: &str) -> String {
     let mut hasher = StableHasher::default();
     value.hash(&mut hasher);
@@ -1311,6 +1413,64 @@ mod tests {
                 .iter()
                 .any(|track| track.title.contains("Vavilon"))
         );
+    }
+
+    #[test]
+    fn browse_index_and_filters_metadata_facets() {
+        let fixture = TestFixture::new("browse");
+        fixture.write_rich_tagged_mp3("2004 - Rich Album/Rich Artist - Rich Title.mp3");
+        fixture.write_tagged_mp3(
+            "1994 - Plain Album/Plain Artist - Plain Title.mp3",
+            TaggedFixtureMetadata {
+                title: "Plain Title",
+                artist: "Plain Artist",
+                album: "Plain Album",
+                year: 1994,
+                track_number: 1,
+            },
+        );
+        let library = scan_local_library(&fixture.root).expect("scan fixture");
+        let index = library.browse_index();
+
+        assert!(
+            index
+                .genres
+                .iter()
+                .any(|facet| { facet.value == "Dub" && facet.track_count == 1 })
+        );
+        assert!(
+            index
+                .composers
+                .iter()
+                .any(|facet| { facet.value == "Composer Two" && facet.track_count == 1 })
+        );
+        assert!(
+            index
+                .years
+                .iter()
+                .any(|facet| { facet.value == 2004 && facet.track_count == 1 })
+        );
+
+        let by_genre = library.browse_tracks(&BrowseFilter {
+            genre: Some("dub".to_string()),
+            ..BrowseFilter::default()
+        });
+        assert_eq!(by_genre.len(), 1);
+        assert_eq!(by_genre[0].title, "Rich Title");
+
+        let by_year = library.browse_tracks(&BrowseFilter {
+            year: Some(1994),
+            ..BrowseFilter::default()
+        });
+        assert_eq!(by_year.len(), 1);
+        assert_eq!(by_year[0].title, "Plain Title");
+
+        let no_match = library.browse_tracks(&BrowseFilter {
+            year: Some(1994),
+            composer: Some("Composer Two".to_string()),
+            ..BrowseFilter::default()
+        });
+        assert!(no_match.is_empty());
     }
 
     #[test]

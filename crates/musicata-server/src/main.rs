@@ -19,9 +19,9 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use musicata_core::{
-    Library, LibrarySummary, LocalDiskProvider, MetadataApprovalState, MetadataFieldValue,
-    MusicProvider, Track, TrackMetadataFieldObservation, album_artwork_url, artwork_asset_id,
-    find_album_artwork_candidates,
+    BrowseFilter, Library, LibrarySummary, LocalDiskProvider, MetadataApprovalState,
+    MetadataFieldValue, MusicProvider, Track, TrackMetadataFieldObservation, album_artwork_url,
+    artwork_asset_id, find_album_artwork_candidates,
 };
 use musicata_storage::Database;
 use musicbrainz::{
@@ -197,6 +197,7 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
         )
         .route("/api/artists", get(artists))
         .route("/api/albums", get(albums))
+        .route("/api/browse", get(browse))
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
             get(album_musicbrainz_candidates),
@@ -433,9 +434,17 @@ async fn albums(State(state): State<AppState>) -> impl IntoResponse {
     Json(library.albums.clone())
 }
 
-async fn tracks(State(state): State<AppState>) -> impl IntoResponse {
+async fn browse(State(state): State<AppState>) -> impl IntoResponse {
     let library = state.library.read().await;
-    Json(library.tracks.clone())
+    Json(library.browse_index())
+}
+
+async fn tracks(
+    State(state): State<AppState>,
+    Query(filter): Query<BrowseFilter>,
+) -> impl IntoResponse {
+    let library = state.library.read().await;
+    Json(library.browse_tracks(&filter))
 }
 
 #[derive(Debug, Serialize)]
@@ -1586,6 +1595,52 @@ mod tests {
         let body = body_text(response.into_body()).await;
 
         assert!(body.contains("Vavilon"));
+    }
+
+    #[tokio::test]
+    async fn serves_browse_facets_and_filtered_tracks() {
+        let fixture = TestFixture::new("browse");
+        let mut library = fixture.library();
+        let track = library
+            .tracks
+            .iter_mut()
+            .find(|track| track.title.contains("Brzi"))
+            .expect("browse track");
+        track.observed_metadata[0].genres.push("Dub".to_string());
+        track.observed_metadata[0]
+            .composers
+            .push("Composer One".to_string());
+        let app = fixture.app_with_library(library).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/browse")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(response.into_body()).await;
+
+        assert!(body.contains(r#""value":"Dub""#));
+        assert!(body.contains(r#""value":"Composer One""#));
+        assert!(body.contains(r#""value":1994"#));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tracks?genre=Dub&composer=Composer%20One&year=1994")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(response.into_body()).await;
+
+        assert!(body.contains("Brzi Vavilon"));
+        assert!(!body.contains("Spori Vavilon"));
     }
 
     #[tokio::test]
