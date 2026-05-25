@@ -43,6 +43,7 @@ const els = {
   trackList: document.querySelector("#track-list"),
   viewTitle: document.querySelector("#view-title"),
   refresh: document.querySelector("#refresh"),
+  player: document.querySelector(".player"),
   audio: document.querySelector("#audio"),
   nowArt: document.querySelector("#now-art"),
   nowTitle: document.querySelector("#now-title"),
@@ -342,6 +343,7 @@ function stopPlayback(message) {
   els.nowSubtitle.textContent = message || "Select a track to start browser playback.";
   els.nowArt.src = "";
   els.nowArt.hidden = true;
+  updatePlayerLayout(false, false);
   markActiveTrack();
 
   if ("mediaSession" in navigator) {
@@ -409,19 +411,27 @@ function streamUrlForSession(streamUrl, sessionId) {
 
 function updateNowPlaying(track) {
   const album = state.albums.find((item) => item.id === track.album_id);
+  const artworkUrl = album?.artwork_url || "";
   els.nowTitle.textContent = track.title;
   els.nowSubtitle.textContent = `${track.artist_name} - ${track.album_title}`;
-  els.nowArt.src = album?.artwork_url || "";
-  els.nowArt.hidden = !album?.artwork_url;
+  els.nowArt.src = artworkUrl;
+  els.nowArt.hidden = !artworkUrl;
+  updatePlayerLayout(Boolean(artworkUrl), true);
 
   if ("mediaSession" in navigator) {
     navigator.mediaSession.metadata = new MediaMetadata({
       title: track.title,
       artist: track.artist_name,
       album: track.album_title,
-      artwork: album?.artwork_url ? [{ src: album.artwork_url }] : [],
+      artwork: artworkUrl ? [{ src: artworkUrl }] : [],
     });
   }
+}
+
+function updatePlayerLayout(hasArtwork, hasAudio) {
+  els.player.classList.toggle("no-art", !hasArtwork);
+  els.player.classList.toggle("no-audio", !hasAudio);
+  els.audio.hidden = !hasAudio;
 }
 
 function startPlaybackServerMonitor() {
