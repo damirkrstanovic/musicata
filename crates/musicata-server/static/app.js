@@ -3,6 +3,7 @@ const state = {
   tracks: [],
   visibleTracks: [],
   currentIndex: -1,
+  searchController: null,
 };
 
 const els = {
@@ -31,6 +32,14 @@ async function api(path) {
 
 async function apiPost(path) {
   const response = await fetch(path, { method: "POST" });
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+  return response.json();
+}
+
+async function searchApi(query, signal) {
+  const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`, { signal });
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
   }
@@ -169,20 +178,44 @@ function markActiveTrack() {
 async function search() {
   const query = els.search.value.trim();
   if (!query) {
+    state.searchController?.abort();
+    state.searchController = null;
     state.visibleTracks = state.tracks;
     els.viewTitle.textContent = "Tracks";
+    renderAlbums(state.albums);
     renderTracks(state.tracks);
     return;
   }
 
+  state.searchController?.abort();
+  const controller = new AbortController();
+  state.searchController = controller;
+
   try {
-    const results = await api(`/api/search?q=${encodeURIComponent(query)}`);
+    const results = await searchApi(query, controller.signal);
+    if (state.searchController !== controller) {
+      return;
+    }
+
     state.visibleTracks = results.tracks;
-    els.viewTitle.textContent = `Search: ${query}`;
+    els.viewTitle.textContent = `Search: ${query} (${results.tracks.length} tracks, ${results.albums.length} albums, ${results.artists.length} artists)`;
+    renderAlbums(searchAlbums(results));
     renderTracks(results.tracks);
   } catch (error) {
+    if (error.name === "AbortError") {
+      return;
+    }
     els.trackList.innerHTML = `<p class="error">Search failed: ${escapeHtml(error.message)}</p>`;
   }
+}
+
+function searchAlbums(results) {
+  const albumIds = new Set(results.albums.map((album) => album.id));
+  for (const track of results.tracks) {
+    albumIds.add(track.album_id);
+  }
+
+  return state.albums.filter((album) => albumIds.has(album.id));
 }
 
 function playNext(offset) {
@@ -206,6 +239,8 @@ function escapeHtml(value) {
 }
 
 els.search.addEventListener("input", debounce(search, 180));
+els.search.addEventListener("search", search);
+els.search.addEventListener("change", search);
 els.refresh.addEventListener("click", rescanLibrary);
 els.prev.addEventListener("click", () => playNext(-1));
 els.next.addEventListener("click", () => playNext(1));
