@@ -6,7 +6,7 @@
 use lofty::{
     config::ParseOptions, file::TaggedFileExt, prelude::Accessor, probe::Probe, tag::ItemKey,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -197,6 +197,7 @@ pub struct TrackMetadataObservation {
     pub confidence: f32,
     pub observed_at_unix_seconds: i64,
     pub approval_state: MetadataApprovalState,
+    pub field_observations: Vec<TrackMetadataFieldObservation>,
     pub title: Option<String>,
     pub artist_name: Option<String>,
     pub album_artist_name: Option<String>,
@@ -220,7 +221,26 @@ pub struct TrackMetadataObservation {
     pub embedded_artwork_count: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Serialize)]
+pub struct TrackMetadataFieldObservation {
+    pub source: String,
+    pub field_name: String,
+    pub value: MetadataFieldValue,
+    pub confidence: f32,
+    pub observed_at_unix_seconds: i64,
+    pub approval_state: MetadataApprovalState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum MetadataFieldValue {
+    Text(String),
+    Number(u16),
+    TextList(Vec<String>),
+    Count(usize),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetadataApprovalState {
     Observed,
@@ -455,6 +475,7 @@ impl TrackMetadataObservation {
             confidence: 0.55,
             observed_at_unix_seconds,
             approval_state: MetadataApprovalState::Observed,
+            field_observations: Vec::new(),
             title: Some(metadata.title.clone()),
             artist_name: Some(metadata.artist_name.clone()),
             album_artist_name: None,
@@ -477,6 +498,7 @@ impl TrackMetadataObservation {
             isrc: None,
             embedded_artwork_count: 0,
         }
+        .with_default_field_observations()
     }
 
     fn embedded_tag(tag: &lofty::tag::Tag, observed_at_unix_seconds: i64) -> Option<Self> {
@@ -488,6 +510,7 @@ impl TrackMetadataObservation {
             confidence: 0.95,
             observed_at_unix_seconds,
             approval_state: MetadataApprovalState::Observed,
+            field_observations: Vec::new(),
             title: clean_optional_tag_value(tag.title().as_deref()),
             artist_name: clean_optional_tag_value(tag.artist().as_deref()),
             album_artist_name,
@@ -515,7 +538,17 @@ impl TrackMetadataObservation {
             embedded_artwork_count: tag.pictures().len(),
         };
 
-        observation.has_metadata().then_some(observation)
+        observation
+            .has_metadata()
+            .then(|| observation.with_default_field_observations())
+    }
+
+    pub fn effective_field_observations(&self) -> Vec<TrackMetadataFieldObservation> {
+        if self.field_observations.is_empty() {
+            self.default_field_observations()
+        } else {
+            self.field_observations.clone()
+        }
     }
 
     fn has_metadata(&self) -> bool {
@@ -540,6 +573,135 @@ impl TrackMetadataObservation {
             || self.musicbrainz_release_artist_id.is_some()
             || self.isrc.is_some()
             || self.embedded_artwork_count > 0
+    }
+
+    fn with_default_field_observations(mut self) -> Self {
+        self.field_observations = self.default_field_observations();
+        self
+    }
+
+    fn default_field_observations(&self) -> Vec<TrackMetadataFieldObservation> {
+        let mut fields = Vec::new();
+
+        self.push_text_field(&mut fields, "title", self.title.as_deref());
+        self.push_text_field(&mut fields, "artist_name", self.artist_name.as_deref());
+        self.push_text_field(
+            &mut fields,
+            "album_artist_name",
+            self.album_artist_name.as_deref(),
+        );
+        self.push_text_field(&mut fields, "album_title", self.album_title.as_deref());
+        self.push_text_field(
+            &mut fields,
+            "recording_date",
+            self.recording_date.as_deref(),
+        );
+        self.push_number_field(&mut fields, "year", self.year);
+        self.push_number_field(&mut fields, "track_number", self.track_number);
+        self.push_number_field(&mut fields, "track_total", self.track_total);
+        self.push_number_field(&mut fields, "disc_number", self.disc_number);
+        self.push_number_field(&mut fields, "disc_total", self.disc_total);
+        self.push_text_list_field(&mut fields, "genres", &self.genres);
+        self.push_text_list_field(&mut fields, "composers", &self.composers);
+        self.push_text_field(&mut fields, "lyrics", self.lyrics.as_deref());
+        self.push_text_field(
+            &mut fields,
+            "musicbrainz_recording_id",
+            self.musicbrainz_recording_id.as_deref(),
+        );
+        self.push_text_field(
+            &mut fields,
+            "musicbrainz_track_id",
+            self.musicbrainz_track_id.as_deref(),
+        );
+        self.push_text_field(
+            &mut fields,
+            "musicbrainz_release_id",
+            self.musicbrainz_release_id.as_deref(),
+        );
+        self.push_text_field(
+            &mut fields,
+            "musicbrainz_release_group_id",
+            self.musicbrainz_release_group_id.as_deref(),
+        );
+        self.push_text_field(
+            &mut fields,
+            "musicbrainz_artist_id",
+            self.musicbrainz_artist_id.as_deref(),
+        );
+        self.push_text_field(
+            &mut fields,
+            "musicbrainz_release_artist_id",
+            self.musicbrainz_release_artist_id.as_deref(),
+        );
+        self.push_text_field(&mut fields, "isrc", self.isrc.as_deref());
+
+        if self.embedded_artwork_count > 0 {
+            self.push_field(
+                &mut fields,
+                "embedded_artwork_count",
+                MetadataFieldValue::Count(self.embedded_artwork_count),
+            );
+        }
+
+        fields
+    }
+
+    fn push_text_field(
+        &self,
+        fields: &mut Vec<TrackMetadataFieldObservation>,
+        field_name: &str,
+        value: Option<&str>,
+    ) {
+        if let Some(value) = value {
+            self.push_field(
+                fields,
+                field_name,
+                MetadataFieldValue::Text(value.to_string()),
+            );
+        }
+    }
+
+    fn push_number_field(
+        &self,
+        fields: &mut Vec<TrackMetadataFieldObservation>,
+        field_name: &str,
+        value: Option<u16>,
+    ) {
+        if let Some(value) = value {
+            self.push_field(fields, field_name, MetadataFieldValue::Number(value));
+        }
+    }
+
+    fn push_text_list_field(
+        &self,
+        fields: &mut Vec<TrackMetadataFieldObservation>,
+        field_name: &str,
+        values: &[String],
+    ) {
+        if !values.is_empty() {
+            self.push_field(
+                fields,
+                field_name,
+                MetadataFieldValue::TextList(values.to_vec()),
+            );
+        }
+    }
+
+    fn push_field(
+        &self,
+        fields: &mut Vec<TrackMetadataFieldObservation>,
+        field_name: &str,
+        value: MetadataFieldValue,
+    ) {
+        fields.push(TrackMetadataFieldObservation {
+            source: self.source.clone(),
+            field_name: field_name.to_string(),
+            value,
+            confidence: self.confidence,
+            observed_at_unix_seconds: self.observed_at_unix_seconds,
+            approval_state: self.approval_state.clone(),
+        });
     }
 }
 
@@ -1126,6 +1288,7 @@ mod tests {
             confidence: 0.95,
             observed_at_unix_seconds: 1_800_000_000,
             approval_state: MetadataApprovalState::Observed,
+            field_observations: Vec::new(),
             title: Some("Embedded Title".to_string()),
             artist_name: None,
             album_artist_name: None,
@@ -1312,6 +1475,19 @@ mod tests {
         );
         assert_eq!(observation.isrc, Some("USRC17607839".to_string()));
         assert_eq!(observation.embedded_artwork_count, 1);
+        assert!(observation.field_observations.iter().any(|field| {
+            field.field_name == "genres"
+                && field.value
+                    == MetadataFieldValue::TextList(vec![
+                        "Dub".to_string(),
+                        "Electronic".to_string(),
+                    ])
+        }));
+        assert!(observation.field_observations.iter().all(|field| {
+            field.source == "embedded_tag"
+                && field.confidence == 0.95
+                && field.approval_state == MetadataApprovalState::Observed
+        }));
     }
 
     #[test]

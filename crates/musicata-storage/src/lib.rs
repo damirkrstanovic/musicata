@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use musicata_core::{
-    Album, Artist, Library, MetadataApprovalState, ProviderMapping, ScanIssue, Track,
-    TrackMetadataObservation,
+    Album, Artist, Library, MetadataApprovalState, MetadataFieldValue, ProviderMapping, ScanIssue,
+    Track, TrackMetadataFieldObservation, TrackMetadataObservation,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -100,6 +100,13 @@ impl Database {
             set_user_version(&self.pool, 5).await?;
         }
 
+        if version < 6 {
+            for statement in MIGRATION_006_METADATA_FIELD_OBSERVATIONS {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 6).await?;
+        }
+
         Ok(())
     }
 
@@ -108,6 +115,9 @@ impl Database {
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
 
         let result = async {
+            sqlx::query("DELETE FROM track_metadata_field_observations")
+                .execute(&mut *conn)
+                .await?;
             sqlx::query("DELETE FROM track_metadata_observations")
                 .execute(&mut *conn)
                 .await?;
@@ -183,7 +193,7 @@ impl Database {
                 .await?;
 
                 for observation in &track.observed_metadata {
-                    sqlx::query(
+                    let insert_result = sqlx::query(
                         "INSERT INTO track_metadata_observations (
                             track_id, source, confidence, observed_at_unix_seconds, approval_state,
                             title, artist_name, album_artist_name, album_title, recording_date,
@@ -226,6 +236,26 @@ impl Database {
                     .bind(usize_to_i64(observation.embedded_artwork_count)?)
                     .execute(&mut *conn)
                     .await?;
+                    let observation_id = insert_result.last_insert_rowid();
+
+                    for field_observation in observation.effective_field_observations() {
+                        sqlx::query(
+                            "INSERT INTO track_metadata_field_observations (
+                                observation_id, track_id, source, field_name, value_json, confidence,
+                                observed_at_unix_seconds, approval_state
+                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        )
+                        .bind(observation_id)
+                        .bind(&track.id)
+                        .bind(&field_observation.source)
+                        .bind(&field_observation.field_name)
+                        .bind(metadata_field_value_to_json(&field_observation.value)?)
+                        .bind(f64::from(field_observation.confidence))
+                        .bind(field_observation.observed_at_unix_seconds)
+                        .bind(approval_state_to_str(&field_observation.approval_state))
+                        .execute(&mut *conn)
+                        .await?;
+                    }
                 }
             }
 
@@ -280,13 +310,20 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         let observation_rows = sqlx::query(
-            "SELECT track_id, source, confidence, observed_at_unix_seconds, approval_state,
+            "SELECT id, track_id, source, confidence, observed_at_unix_seconds, approval_state,
                 title, artist_name, album_artist_name, album_title, recording_date, year,
                 track_number, track_total, disc_number, disc_total, genres, composers, lyrics,
                 musicbrainz_recording_id, musicbrainz_track_id, musicbrainz_release_id,
                 musicbrainz_release_group_id, musicbrainz_artist_id, musicbrainz_release_artist_id,
                 isrc, embedded_artwork_count
             FROM track_metadata_observations ORDER BY track_id, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let field_observation_rows = sqlx::query(
+            "SELECT observation_id, source, field_name, value_json, confidence,
+                observed_at_unix_seconds, approval_state
+            FROM track_metadata_field_observations ORDER BY observation_id, id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -320,46 +357,74 @@ impl Database {
             });
         }
 
+        let mut field_observations_by_observation: BTreeMap<
+            i64,
+            Vec<TrackMetadataFieldObservation>,
+        > = BTreeMap::new();
+        for row in field_observation_rows {
+            let source: String = row.try_get("source")?;
+            let observed_at_unix_seconds: i64 = row.try_get("observed_at_unix_seconds")?;
+            field_observations_by_observation
+                .entry(row.try_get("observation_id")?)
+                .or_default()
+                .push(TrackMetadataFieldObservation {
+                    source,
+                    field_name: row.try_get("field_name")?,
+                    value: metadata_field_value_from_json(row.try_get("value_json")?)?,
+                    confidence: f64_to_f32(row.try_get("confidence")?, "confidence")?,
+                    observed_at_unix_seconds,
+                    approval_state: approval_state_from_str(row.try_get("approval_state")?),
+                });
+        }
+
         let mut observations_by_track: BTreeMap<String, Vec<TrackMetadataObservation>> =
             BTreeMap::new();
         for row in observation_rows {
+            let observation_id: i64 = row.try_get("id")?;
             let track_id: String = row.try_get("track_id")?;
+            let source: String = row.try_get("source")?;
+            let observed_at_unix_seconds: i64 = row.try_get("observed_at_unix_seconds")?;
+            let field_observations = field_observations_by_observation
+                .remove(&observation_id)
+                .unwrap_or_default();
+            let mut observation = TrackMetadataObservation {
+                source,
+                confidence: f64_to_f32(row.try_get("confidence")?, "confidence")?,
+                observed_at_unix_seconds,
+                approval_state: approval_state_from_str(row.try_get("approval_state")?),
+                field_observations,
+                title: row.try_get("title")?,
+                artist_name: row.try_get("artist_name")?,
+                album_artist_name: row.try_get("album_artist_name")?,
+                album_title: row.try_get("album_title")?,
+                recording_date: row.try_get("recording_date")?,
+                year: optional_i64_to_u16(row.try_get("year")?, "year")?,
+                track_number: optional_i64_to_u16(row.try_get("track_number")?, "track_number")?,
+                track_total: optional_i64_to_u16(row.try_get("track_total")?, "track_total")?,
+                disc_number: optional_i64_to_u16(row.try_get("disc_number")?, "disc_number")?,
+                disc_total: optional_i64_to_u16(row.try_get("disc_total")?, "disc_total")?,
+                genres: metadata_values_from_json(row.try_get("genres")?, "genres")?,
+                composers: metadata_values_from_json(row.try_get("composers")?, "composers")?,
+                lyrics: row.try_get("lyrics")?,
+                musicbrainz_recording_id: row.try_get("musicbrainz_recording_id")?,
+                musicbrainz_track_id: row.try_get("musicbrainz_track_id")?,
+                musicbrainz_release_id: row.try_get("musicbrainz_release_id")?,
+                musicbrainz_release_group_id: row.try_get("musicbrainz_release_group_id")?,
+                musicbrainz_artist_id: row.try_get("musicbrainz_artist_id")?,
+                musicbrainz_release_artist_id: row.try_get("musicbrainz_release_artist_id")?,
+                isrc: row.try_get("isrc")?,
+                embedded_artwork_count: i64_to_usize(
+                    row.try_get("embedded_artwork_count")?,
+                    "embedded_artwork_count",
+                )?,
+            };
+            if observation.field_observations.is_empty() {
+                observation.field_observations = observation.effective_field_observations();
+            }
             observations_by_track
                 .entry(track_id)
                 .or_default()
-                .push(TrackMetadataObservation {
-                    source: row.try_get("source")?,
-                    confidence: f64_to_f32(row.try_get("confidence")?, "confidence")?,
-                    observed_at_unix_seconds: row.try_get("observed_at_unix_seconds")?,
-                    approval_state: approval_state_from_str(row.try_get("approval_state")?),
-                    title: row.try_get("title")?,
-                    artist_name: row.try_get("artist_name")?,
-                    album_artist_name: row.try_get("album_artist_name")?,
-                    album_title: row.try_get("album_title")?,
-                    recording_date: row.try_get("recording_date")?,
-                    year: optional_i64_to_u16(row.try_get("year")?, "year")?,
-                    track_number: optional_i64_to_u16(
-                        row.try_get("track_number")?,
-                        "track_number",
-                    )?,
-                    track_total: optional_i64_to_u16(row.try_get("track_total")?, "track_total")?,
-                    disc_number: optional_i64_to_u16(row.try_get("disc_number")?, "disc_number")?,
-                    disc_total: optional_i64_to_u16(row.try_get("disc_total")?, "disc_total")?,
-                    genres: metadata_values_from_json(row.try_get("genres")?, "genres")?,
-                    composers: metadata_values_from_json(row.try_get("composers")?, "composers")?,
-                    lyrics: row.try_get("lyrics")?,
-                    musicbrainz_recording_id: row.try_get("musicbrainz_recording_id")?,
-                    musicbrainz_track_id: row.try_get("musicbrainz_track_id")?,
-                    musicbrainz_release_id: row.try_get("musicbrainz_release_id")?,
-                    musicbrainz_release_group_id: row.try_get("musicbrainz_release_group_id")?,
-                    musicbrainz_artist_id: row.try_get("musicbrainz_artist_id")?,
-                    musicbrainz_release_artist_id: row.try_get("musicbrainz_release_artist_id")?,
-                    isrc: row.try_get("isrc")?,
-                    embedded_artwork_count: i64_to_usize(
-                        row.try_get("embedded_artwork_count")?,
-                        "embedded_artwork_count",
-                    )?,
-                });
+                .push(observation);
         }
 
         let mut tracks = Vec::with_capacity(track_rows.len());
@@ -426,7 +491,7 @@ impl Database {
         }
 
         let observation_rows = sqlx::query(
-            "SELECT track_id, source, confidence, observed_at_unix_seconds, approval_state,
+            "SELECT id, track_id, source, confidence, observed_at_unix_seconds, approval_state,
                 title, artist_name, album_artist_name, album_title, recording_date, year,
                 track_number, track_total, disc_number, disc_total, genres, composers, lyrics,
                 musicbrainz_recording_id, musicbrainz_track_id, musicbrainz_release_id,
@@ -436,14 +501,44 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await?;
+        let field_observation_rows = sqlx::query(
+            "SELECT observation_id, source, field_name, value_json, confidence,
+                observed_at_unix_seconds, approval_state
+            FROM track_metadata_field_observations ORDER BY observation_id, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut field_observations_by_observation: BTreeMap<
+            i64,
+            Vec<TrackMetadataFieldObservation>,
+        > = BTreeMap::new();
+        for row in field_observation_rows {
+            let source: String = row.try_get("source")?;
+            let observed_at_unix_seconds: i64 = row.try_get("observed_at_unix_seconds")?;
+            field_observations_by_observation
+                .entry(row.try_get("observation_id")?)
+                .or_default()
+                .push(TrackMetadataFieldObservation {
+                    source,
+                    field_name: row.try_get("field_name")?,
+                    value: metadata_field_value_from_json(row.try_get("value_json")?)?,
+                    confidence: f64_to_f32(row.try_get("confidence")?, "confidence")?,
+                    observed_at_unix_seconds,
+                    approval_state: approval_state_from_str(row.try_get("approval_state")?),
+                });
+        }
         let mut stored_observations: BTreeMap<String, String> = BTreeMap::new();
         for row in observation_rows {
+            let observation_id: i64 = row.try_get("id")?;
             let track_id: String = row.try_get("track_id")?;
-            let observation = TrackMetadataObservation {
+            let mut observation = TrackMetadataObservation {
                 source: row.try_get("source")?,
                 confidence: f64_to_f32(row.try_get("confidence")?, "confidence")?,
                 observed_at_unix_seconds: row.try_get("observed_at_unix_seconds")?,
                 approval_state: approval_state_from_str(row.try_get("approval_state")?),
+                field_observations: field_observations_by_observation
+                    .remove(&observation_id)
+                    .unwrap_or_default(),
                 title: row.try_get("title")?,
                 artist_name: row.try_get("artist_name")?,
                 album_artist_name: row.try_get("album_artist_name")?,
@@ -469,6 +564,9 @@ impl Database {
                     "embedded_artwork_count",
                 )?,
             };
+            if observation.field_observations.is_empty() {
+                observation.field_observations = observation.effective_field_observations();
+            }
             stored_observations.entry(track_id).or_default().push_str(
                 &metadata_observations_fingerprint(std::slice::from_ref(&observation)),
             );
@@ -674,6 +772,54 @@ fn metadata_observations_fingerprint(observations: &[TrackMetadataObservation]) 
             &mut fingerprint,
             &observation.embedded_artwork_count.to_string(),
         );
+
+        let field_observations = observation.effective_field_observations();
+        push_fingerprint_part(&mut fingerprint, &field_observations.len().to_string());
+        for field_observation in field_observations {
+            push_fingerprint_part(&mut fingerprint, &field_observation.source);
+            push_fingerprint_part(&mut fingerprint, &field_observation.field_name);
+            push_fingerprint_part(
+                &mut fingerprint,
+                &metadata_field_value_fingerprint(&field_observation.value),
+            );
+            push_fingerprint_part(&mut fingerprint, &field_observation.confidence.to_string());
+            push_fingerprint_part(
+                &mut fingerprint,
+                &field_observation.observed_at_unix_seconds.to_string(),
+            );
+            push_fingerprint_part(
+                &mut fingerprint,
+                approval_state_to_str(&field_observation.approval_state),
+            );
+        }
+    }
+
+    fingerprint
+}
+
+fn metadata_field_value_fingerprint(value: &MetadataFieldValue) -> String {
+    let mut fingerprint = String::new();
+
+    match value {
+        MetadataFieldValue::Text(value) => {
+            push_fingerprint_part(&mut fingerprint, "text");
+            push_fingerprint_part(&mut fingerprint, value);
+        }
+        MetadataFieldValue::Number(value) => {
+            push_fingerprint_part(&mut fingerprint, "number");
+            push_fingerprint_part(&mut fingerprint, &value.to_string());
+        }
+        MetadataFieldValue::TextList(values) => {
+            push_fingerprint_part(&mut fingerprint, "text_list");
+            push_fingerprint_part(&mut fingerprint, &values.len().to_string());
+            for value in values {
+                push_fingerprint_part(&mut fingerprint, value);
+            }
+        }
+        MetadataFieldValue::Count(value) => {
+            push_fingerprint_part(&mut fingerprint, "count");
+            push_fingerprint_part(&mut fingerprint, &value.to_string());
+        }
     }
 
     fingerprint
@@ -762,10 +908,25 @@ const MIGRATION_001: &[&str] = &[
         embedded_artwork_count INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
     )",
+    "CREATE TABLE IF NOT EXISTS track_metadata_field_observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        observation_id INTEGER NOT NULL,
+        track_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        field_name TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0,
+        observed_at_unix_seconds INTEGER NOT NULL DEFAULT 0,
+        approval_state TEXT NOT NULL DEFAULT 'observed',
+        FOREIGN KEY(observation_id) REFERENCES track_metadata_observations(id) ON DELETE CASCADE,
+        FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+    )",
     "CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id)",
     "CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id)",
     "CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id)",
     "CREATE INDEX IF NOT EXISTS idx_track_metadata_observations_track_id ON track_metadata_observations(track_id)",
+    "CREATE INDEX IF NOT EXISTS idx_track_metadata_field_observations_observation_id ON track_metadata_field_observations(observation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_track_metadata_field_observations_track_id ON track_metadata_field_observations(track_id)",
 ];
 
 struct ColumnMigration {
@@ -904,6 +1065,24 @@ const MIGRATION_005_METADATA_OBSERVATION_VALUE_COLUMNS: &[ColumnMigration] = &[
     },
 ];
 
+const MIGRATION_006_METADATA_FIELD_OBSERVATIONS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS track_metadata_field_observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        observation_id INTEGER NOT NULL,
+        track_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        field_name TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0,
+        observed_at_unix_seconds INTEGER NOT NULL DEFAULT 0,
+        approval_state TEXT NOT NULL DEFAULT 'observed',
+        FOREIGN KEY(observation_id) REFERENCES track_metadata_observations(id) ON DELETE CASCADE,
+        FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_track_metadata_field_observations_observation_id ON track_metadata_field_observations(observation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_track_metadata_field_observations_track_id ON track_metadata_field_observations(track_id)",
+];
+
 async fn user_version(pool: &SqlitePool) -> Result<i64> {
     let row = sqlx::query("PRAGMA user_version").fetch_one(pool).await?;
     Ok(row.try_get(0)?)
@@ -981,6 +1160,14 @@ fn metadata_values_from_json(value: Option<String>, field: &str) -> Result<Vec<S
     serde_json::from_str(&value).with_context(|| format!("invalid {field} metadata values"))
 }
 
+fn metadata_field_value_to_json(value: &MetadataFieldValue) -> Result<String> {
+    serde_json::to_string(value).context("failed to serialize metadata field value")
+}
+
+fn metadata_field_value_from_json(value: String) -> Result<MetadataFieldValue> {
+    serde_json::from_str(&value).context("invalid metadata field value")
+}
+
 fn approval_state_to_str(state: &MetadataApprovalState) -> &'static str {
     match state {
         MetadataApprovalState::Observed => "observed",
@@ -1022,8 +1209,8 @@ async fn ensure_column(
 mod tests {
     use super::Database;
     use musicata_core::{
-        Album, Artist, Library, MetadataApprovalState, ProviderMapping, ScanIssue, Track,
-        TrackMetadataObservation,
+        Album, Artist, Library, MetadataApprovalState, MetadataFieldValue, ProviderMapping,
+        ScanIssue, Track, TrackMetadataObservation,
     };
     use std::{
         path::PathBuf,
@@ -1092,6 +1279,20 @@ mod tests {
             loaded.tracks[0].observed_metadata[0].embedded_artwork_count,
             1
         );
+        let field_observations = &loaded.tracks[0].observed_metadata[0].field_observations;
+        assert!(field_observations.iter().any(|field| {
+            field.field_name == "title"
+                && field.value == MetadataFieldValue::Text("Song".to_string())
+                && field.approval_state == MetadataApprovalState::Observed
+        }));
+        assert!(field_observations.iter().any(|field| {
+            field.field_name == "genres"
+                && field.value
+                    == MetadataFieldValue::TextList(vec![
+                        "Dub".to_string(),
+                        "Electronic".to_string(),
+                    ])
+        }));
         assert_eq!(loaded.scan_errors.len(), 1);
         assert_eq!(loaded.scan_errors[0].message, "permission denied");
 
@@ -1127,6 +1328,19 @@ mod tests {
         metadata_changed.tracks[0].observed_metadata[0].title = Some("Retagged".to_string());
         let changes = database
             .detect_library_changes(&metadata_changed)
+            .await
+            .expect("detect changes");
+        assert_eq!(changes.added, 0);
+        assert_eq!(changes.removed, 0);
+        assert_eq!(changes.modified, 1);
+
+        let mut review_changed = library.clone();
+        review_changed.tracks[0].observed_metadata[0].field_observations =
+            review_changed.tracks[0].observed_metadata[0].effective_field_observations();
+        review_changed.tracks[0].observed_metadata[0].field_observations[0].approval_state =
+            MetadataApprovalState::Approved;
+        let changes = database
+            .detect_library_changes(&review_changed)
             .await
             .expect("detect changes");
         assert_eq!(changes.added, 0);
@@ -1234,6 +1448,7 @@ mod tests {
             confidence: 0.55,
             observed_at_unix_seconds: 1_800_000_000,
             approval_state: MetadataApprovalState::Observed,
+            field_observations: Vec::new(),
             title: Some(title.to_string()),
             artist_name: Some("Artist".to_string()),
             album_artist_name: Some("Album Artist".to_string()),
