@@ -813,3 +813,21 @@ audio {
   padding: 4px 0;
   font-size: 0.85rem;
 }
+
+/* Active player selector in the footer */
+.active-player-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.active-player-label select {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #101318;
+  color: var(--text);
+  padding: 4px 6px;
+  max-width: 160px;
+}

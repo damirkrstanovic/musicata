@@ -10,6 +10,9 @@ const state = {
   tracks: [],
   visibleTracks: [],
   currentIndex: -1,
+  activePlayerId: null,
+  activeStatus: "stopped",
+  activeNowTrackId: null,
   searchController: null,
   serverCheckTimer: 0,
   serverCheckPending: false,
@@ -51,6 +54,7 @@ const els = {
   prev: document.querySelector("#prev"),
   next: document.querySelector("#next"),
   playPause: document.querySelector("#play-pause"),
+  activePlayer: document.querySelector("#active-player"),
   metadataPanel: document.querySelector("#metadata-panel"),
   metadataTitle: document.querySelector("#metadata-title"),
   metadataBody: document.querySelector("#metadata-body"),
@@ -311,29 +315,27 @@ function renderTracks(tracks) {
   markMetadataTrack();
 }
 
+// Play the current track list on the active player, starting at `index`.
 async function playTrack(index) {
-  const track = state.visibleTracks[index];
-  if (!track) {
+  const tracks = state.visibleTracks;
+  if (tracks.length === 0 || !state.activePlayerId) {
     return;
   }
-
-  let session;
-  try {
-    session = await startPlaybackSession();
-  } catch (error) {
-    stopPlayback(`Unable to start playback: ${error.message}`);
-    return;
+  if (state.activePlayerId === browserPlayerId) {
+    claimBrowserOutput();
+    // Start the clicked track within this user gesture so the browser's autoplay
+    // policy lets it play; the server round-trip then keeps it in sync.
+    const track = tracks[index];
+    if (track) {
+      els.audio.src = track.stream_url;
+      els.audio.play().catch(() => {});
+    }
   }
-
-  if (!session) {
-    return;
+  const ids = tracks.map((track) => track.id);
+  await playerCommand(state.activePlayerId, { command: "play_tracks", track_ids: ids });
+  if (index > 0) {
+    await playerCommand(state.activePlayerId, { command: "play_queue_index", index });
   }
-
-  state.currentIndex = index;
-  els.audio.src = streamUrlForSession(track.stream_url, session.id);
-  els.audio.play().catch(() => {});
-  updateNowPlaying(track);
-  markActiveTrack();
 }
 
 function stopPlayback(message) {
@@ -531,7 +533,7 @@ function markActiveTrack() {
   for (const row of els.trackList.querySelectorAll(".track")) {
     row.classList.toggle(
       "active",
-      row.dataset.trackId === state.visibleTracks[state.currentIndex]?.id,
+      state.activeNowTrackId != null && row.dataset.trackId === state.activeNowTrackId,
     );
   }
 }
@@ -1353,44 +1355,26 @@ els.browseClear.addEventListener("click", () => {
 });
 els.refresh.addEventListener("click", rescanLibrary);
 els.metadataClose.addEventListener("click", closeMetadata);
-els.prev.addEventListener("click", () => playNext(-1));
-els.next.addEventListener("click", () => playNext(1));
-els.audio.addEventListener("ended", () => playNext(1));
-els.audio.addEventListener("error", () => {
-  if (els.audio.src) {
-    stopPlayback("The stream is unavailable. Playback was stopped.");
-  }
+// Footer transport targets the active player.
+els.prev.addEventListener("click", () => {
+  if (state.activePlayerId) playerCommand(state.activePlayerId, { command: "previous" });
 });
-els.audio.addEventListener("play", () => {
-  els.playPause.textContent = "Pause";
-  startPlaybackServerMonitor();
-  if ("mediaSession" in navigator) {
-    navigator.mediaSession.playbackState = "playing";
-  }
-});
-els.audio.addEventListener("pause", () => {
-  els.playPause.textContent = "Play";
-  stopPlaybackServerMonitor();
-  if ("mediaSession" in navigator) {
-    navigator.mediaSession.playbackState = "paused";
-  }
-});
-window.addEventListener("offline", () => {
-  if (els.audio.src) {
-    stopPlayback("Musicata server is unavailable. Playback was stopped.");
-  }
+els.next.addEventListener("click", () => {
+  if (state.activePlayerId) playerCommand(state.activePlayerId, { command: "next" });
 });
 els.playPause.addEventListener("click", () => {
-  if (els.audio.paused) {
-    if (!els.audio.src) {
-      playTrack(0);
-    } else {
-      els.audio.play().catch(() => {});
-    }
+  if (!state.activePlayerId) return;
+  if (state.activeStatus === "playing") {
+    playerCommand(state.activePlayerId, { command: "pause" });
+  } else if (state.activeNowTrackId) {
+    if (state.activePlayerId === browserPlayerId) claimBrowserOutput();
+    playerCommand(state.activePlayerId, { command: "play" });
   } else {
-    els.audio.pause();
+    // Nothing queued yet: start the current track list.
+    playTrack(0);
   }
 });
+els.activePlayer.addEventListener("change", () => setActivePlayer(els.activePlayer.value));
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
@@ -1441,6 +1425,7 @@ async function loadPlayers() {
     playerData = { players, zones };
     browserPlayerId = players.find((player) => player.kind === "browser")?.id ?? null;
     renderPlayers();
+    populateActivePlayerSelect(players);
   } catch (error) {
     playerEls.list.innerHTML = `<p class="error">Players unavailable: ${escapeHtml(error.message)}</p>`;
   }
@@ -1532,8 +1517,15 @@ function openPlayerSocket(id) {
         const suffix = id === browserPlayerId && browserOutput ? " (playing here)" : "";
         node.textContent = nowPlayingText(playback) + suffix;
       }
-      if (id === browserPlayerId && browserOutput) {
+      if (
+        id === browserPlayerId &&
+        browserOutput &&
+        state.activePlayerId === browserPlayerId
+      ) {
         driveBrowserAudio(playback);
+      }
+      if (id === state.activePlayerId) {
+        updateFooterFromState(playback);
       }
     } catch {
       /* ignore malformed frames */
@@ -1545,7 +1537,8 @@ function openPlayerSocket(id) {
 
 // ---- Browser-player audio output ------------------------------------------
 
-const browserAudio = document.querySelector("#browser-audio");
+// The browser player renders through the footer audio element.
+const browserAudio = els.audio;
 const TAB_ID = Math.random().toString(36).slice(2);
 let browserPlayerId = null;
 let browserOutput = false;
@@ -1628,6 +1621,94 @@ async function playerCommand(id, command) {
   } catch (error) {
     console.error("player command failed", error);
   }
+}
+
+// ---- Active player (footer + main list target) ----------------------------
+
+function savedActivePlayer() {
+  try {
+    return localStorage.getItem("musicata-active-player");
+  } catch {
+    return null;
+  }
+}
+
+function populateActivePlayerSelect(players) {
+  if (!els.activePlayer) return;
+  els.activePlayer.innerHTML = players
+    .map(
+      (player) =>
+        `<option value="${escapeHtml(player.id)}">${escapeHtml(player.name)}${player.online ? "" : " (offline)"}</option>`,
+    )
+    .join("");
+  const saved = savedActivePlayer();
+  const active =
+    players.find((player) => player.id === saved)?.id ||
+    browserPlayerId ||
+    players[0]?.id ||
+    null;
+  if (active) {
+    setActivePlayer(active);
+  }
+}
+
+function setActivePlayer(id) {
+  if (!id) return;
+  state.activePlayerId = id;
+  if (els.activePlayer && els.activePlayer.value !== id) {
+    els.activePlayer.value = id;
+  }
+  try {
+    localStorage.setItem("musicata-active-player", id);
+  } catch {
+    /* ignore */
+  }
+  if (id !== browserPlayerId) {
+    // A remote player renders its own audio; this tab must stay silent.
+    els.audio.pause();
+  }
+  refreshActivePlayerFooter();
+}
+
+async function refreshActivePlayerFooter() {
+  if (!state.activePlayerId) return;
+  try {
+    const playback = await api(
+      `/api/players/${encodeURIComponent(state.activePlayerId)}/state`,
+    );
+    updateFooterFromState(playback);
+  } catch {
+    state.activeStatus = "stopped";
+    state.activeNowTrackId = null;
+    els.playPause.textContent = "Play";
+    markActiveTrack();
+  }
+}
+
+function updateFooterFromState(playback) {
+  state.activeStatus = playback.status;
+  const now = playback.now_playing;
+  state.activeNowTrackId = now?.track_id ?? null;
+  if (now) {
+    els.nowTitle.textContent = now.title || "Unknown";
+    els.nowSubtitle.textContent = [now.artist, now.album].filter(Boolean).join(" — ");
+  } else {
+    els.nowTitle.textContent = "Nothing playing";
+    els.nowSubtitle.textContent =
+      state.activePlayerId === browserPlayerId
+        ? "Pick a track to play in this browser."
+        : "Select a track to play on this player.";
+  }
+  els.playPause.textContent = playback.status === "playing" ? "Pause" : "Play";
+  if ("mediaSession" in navigator) {
+    navigator.mediaSession.playbackState =
+      playback.status === "playing"
+        ? "playing"
+        : playback.status === "paused"
+          ? "paused"
+          : "none";
+  }
+  markActiveTrack();
 }
 
 if (playerEls.list) {

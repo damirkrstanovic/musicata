@@ -99,12 +99,15 @@
           <span id="now-subtitle">Select a track to start browser playback.</span>
         </div>
         <div class="player-controls">
+          <label class="active-player-label">
+            <span>Player</span>
+            <select id="active-player"></select>
+          </label>
           <button id="prev" type="button">Prev</button>
           <button id="play-pause" type="button">Play</button>
           <button id="next" type="button">Next</button>
         </div>
-        <audio id="audio" preload="metadata" controls hidden></audio>
-        <audio id="browser-audio" preload="none" hidden></audio>
+        <audio id="audio" preload="none" hidden></audio>
       </footer>
     </main>
     <script src="/app.js" defer></script>
