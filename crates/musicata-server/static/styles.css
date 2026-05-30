@@ -469,6 +469,175 @@ h1 {
   text-align: right;
 }
 
+/* Per-row actions: favorite heart, add/remove, metadata. */
+.track-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  justify-self: end;
+  padding-right: 6px;
+}
+
+.icon-toggle {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1rem;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
+}
+
+.icon-toggle:hover {
+  color: var(--text);
+  background: var(--panel-strong);
+}
+
+.icon-toggle.heart.on {
+  color: var(--accent-strong);
+}
+
+/* Sidebar section header with an inline action (Playlists). */
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.section-head h2 {
+  margin: 0;
+}
+
+.ghost-button.mini {
+  padding: 1px 9px;
+  font-size: 1.05rem;
+  line-height: 1.2;
+  border-radius: 7px;
+}
+
+.playlist-list {
+  display: grid;
+  gap: 2px;
+}
+
+.muted-hint {
+  color: var(--muted);
+  font-size: 0.8rem;
+  padding: 2px;
+}
+
+.playlist-item {
+  display: flex;
+  align-items: center;
+  border-radius: 7px;
+}
+
+.playlist-item:hover {
+  background: var(--panel-strong);
+}
+
+.playlist-item.is-active {
+  background: var(--accent-soft);
+}
+
+.playlist-item .pl-open {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  padding: 7px 8px;
+  cursor: pointer;
+}
+
+.pl-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.88rem;
+}
+
+.pl-count {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--muted);
+  flex: none;
+}
+
+.playlist-item.is-active .pl-name {
+  color: var(--accent-strong);
+}
+
+.pl-del {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 4px 8px;
+  font-size: 0.8rem;
+  opacity: 0;
+}
+
+.playlist-item:hover .pl-del {
+  opacity: 1;
+}
+
+.pl-del:hover {
+  color: var(--danger);
+}
+
+/* Add-to-playlist popover. */
+.add-menu {
+  position: fixed;
+  z-index: 80;
+  min-width: 200px;
+  max-width: 224px;
+  max-height: 50vh;
+  overflow: auto;
+  padding: 4px;
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 24px 50px -24px rgba(0, 0, 0, 0.8);
+  animation: queue-rise 0.14s ease;
+}
+
+.add-menu-item {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.add-menu-item:hover {
+  background: rgba(215, 180, 106, 0.12);
+}
+
+.add-menu-item.new {
+  border-top: 1px solid var(--line);
+  color: var(--accent-strong);
+  margin-top: 2px;
+}
+
 .metadata-panel {
   position: absolute;
   inset: 0;

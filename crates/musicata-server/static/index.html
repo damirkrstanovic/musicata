@@ -40,6 +40,7 @@
 
         <nav class="library-nav" aria-label="Views">
           <button class="nav-link is-active" type="button" data-view="library">Tracks</button>
+          <button class="nav-link" type="button" data-view="favorites">Favorites</button>
           <button class="nav-link" type="button" data-view="recent">Recently played</button>
           <button class="nav-link" type="button" data-view="most">Most played</button>
         </nav>
@@ -61,6 +62,14 @@
             </label>
             <button id="browse-clear" class="ghost-button" type="button">Clear</button>
           </div>
+        </section>
+
+        <section class="section">
+          <div class="section-head">
+            <h2>Playlists</h2>
+            <button id="new-playlist" class="ghost-button mini" type="button" title="New playlist">＋</button>
+          </div>
+          <div id="playlists" class="playlist-list"></div>
         </section>
 
         <section class="section">

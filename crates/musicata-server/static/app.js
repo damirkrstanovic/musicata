@@ -8,6 +8,10 @@ const state = {
   view: "library",
   librarySignature: null,
   lastNow: {},
+  favoriteTrackIds: new Set(),
+  playlists: [],
+  currentPlaylistId: null,
+  addMenu: null,
   activePlayerId: null,
   activeStatus: "stopped",
   activeNowTrackId: null,
@@ -41,6 +45,8 @@ const els = {
   browseComposer: document.querySelector("#browse-composer"),
   browseClear: document.querySelector("#browse-clear"),
   albums: document.querySelector("#albums"),
+  playlists: document.querySelector("#playlists"),
+  newPlaylist: document.querySelector("#new-playlist"),
   trackList: document.querySelector("#track-list"),
   navLinks: Array.from(document.querySelectorAll(".library-nav .nav-link")),
   viewTitle: document.querySelector("#view-title"),
@@ -365,9 +371,15 @@ async function setView(view) {
   markNavActive(view);
   clearInterval(recentRefreshTimer);
   recentRefreshTimer = 0;
+  state.currentPlaylistId = null;
+  renderPlaylistsSidebar();
 
   if (view === "library") {
     await applyBrowseFilter({ clearSearch: false });
+    return;
+  }
+  if (view === "favorites") {
+    await openFavoritesView();
     return;
   }
 
@@ -466,22 +478,264 @@ function renderTracks(tracks, options = {}) {
       statEl.textContent = stat;
     }
 
+    const actions = document.createElement("div");
+    actions.className = "track-actions";
+
+    // Favorite heart.
+    const heart = document.createElement("button");
+    heart.type = "button";
+    heart.className = "icon-toggle heart";
+    heart.title = "Favorite";
+    const favored = state.favoriteTrackIds.has(track.id);
+    heart.classList.toggle("on", favored);
+    heart.textContent = favored ? "♥" : "♡";
+    heart.setAttribute("aria-pressed", String(favored));
+    heart.addEventListener("click", () => toggleFavorite(track.id, heart));
+
+    // Context action: remove (in a playlist view) or add-to-playlist (elsewhere).
+    const context = document.createElement("button");
+    context.type = "button";
+    context.className = "icon-toggle";
+    if (options.playlistId) {
+      context.textContent = "✕";
+      context.title = "Remove from playlist";
+      context.addEventListener("click", () => removeFromPlaylist(options.playlistId, index));
+    } else {
+      context.textContent = "＋";
+      context.title = "Add to playlist";
+      context.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openAddToPlaylist(track.id, context);
+      });
+    }
+
     const metadataButton = document.createElement("button");
     metadataButton.className = "track-action";
     metadataButton.type = "button";
     metadataButton.textContent = "Metadata";
     metadataButton.addEventListener("click", () => openMetadata(track.id));
 
+    actions.append(heart, context, metadataButton);
+
     if (statEl) {
-      row.append(playButton, statEl, metadataButton);
+      row.append(playButton, statEl, actions);
     } else {
-      row.append(playButton, metadataButton);
+      row.append(playButton, actions);
     }
     els.trackList.append(row);
   }
 
   markActiveTrack();
   markMetadataTrack();
+}
+
+// ---- Favorites + playlists ----
+
+async function loadFavoriteIds() {
+  try {
+    const favorites = await api("/api/favorites");
+    state.favoriteTrackIds = new Set((favorites.tracks || []).map((track) => track.id));
+  } catch {
+    /* keep whatever we had */
+  }
+}
+
+// Reflect the favorite set onto already-rendered heart buttons.
+function refreshHearts() {
+  for (const row of els.trackList.querySelectorAll(".track")) {
+    const heart = row.querySelector(".heart");
+    if (!heart) continue;
+    const on = state.favoriteTrackIds.has(row.dataset.trackId);
+    heart.classList.toggle("on", on);
+    heart.textContent = on ? "♥" : "♡";
+    heart.setAttribute("aria-pressed", String(on));
+  }
+}
+
+async function toggleFavorite(trackId, button) {
+  const on = state.favoriteTrackIds.has(trackId);
+  try {
+    await apiJson(`/api/favorites/track/${encodeURIComponent(trackId)}`, on ? "DELETE" : "PUT");
+  } catch {
+    return;
+  }
+  if (on) state.favoriteTrackIds.delete(trackId);
+  else state.favoriteTrackIds.add(trackId);
+  if (button) {
+    const now = !on;
+    button.classList.toggle("on", now);
+    button.textContent = now ? "♥" : "♡";
+    button.setAttribute("aria-pressed", String(now));
+  }
+  if (state.view === "favorites" && on) openFavoritesView();
+}
+
+async function openFavoritesView() {
+  markNavActive("favorites");
+  state.currentPlaylistId = null;
+  renderPlaylistsSidebar();
+  els.viewTitle.textContent = "Favorites";
+  renderLoading(6);
+  try {
+    const favorites = await api("/api/favorites");
+    state.favoriteTrackIds = new Set((favorites.tracks || []).map((track) => track.id));
+    state.visibleTracks = favorites.tracks;
+    if (favorites.tracks.length === 0) {
+      els.trackList.innerHTML = `<p class="empty">No favorites yet — tap ♡ on a track.</p>`;
+    } else {
+      renderTracks(favorites.tracks);
+    }
+  } catch (error) {
+    els.trackList.innerHTML = `<p class="error">Failed to load favorites: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function loadPlaylists() {
+  try {
+    state.playlists = await api("/api/playlists");
+  } catch {
+    state.playlists = [];
+  }
+  renderPlaylistsSidebar();
+}
+
+function renderPlaylistsSidebar() {
+  els.playlists.innerHTML = "";
+  if (!state.playlists.length) {
+    els.playlists.innerHTML = `<p class="muted-hint">No playlists yet.</p>`;
+    return;
+  }
+  for (const playlist of state.playlists) {
+    const row = document.createElement("div");
+    row.className = "playlist-item" + (playlist.id === state.currentPlaylistId ? " is-active" : "");
+
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "pl-open";
+    open.innerHTML = `<span class="pl-name">${escapeHtml(playlist.name)}</span><span class="pl-count">${playlist.song_count}</span>`;
+    open.addEventListener("click", () => openPlaylistView(playlist.id));
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "pl-del";
+    del.title = "Delete playlist";
+    del.textContent = "✕";
+    del.addEventListener("click", (event) => {
+      event.stopPropagation();
+      deletePlaylist(playlist.id, playlist.name);
+    });
+
+    row.append(open, del);
+    els.playlists.append(row);
+  }
+}
+
+async function openPlaylistView(id) {
+  for (const link of els.navLinks) link.classList.remove("is-active");
+  state.view = "playlist";
+  state.currentPlaylistId = id;
+  renderPlaylistsSidebar();
+  closeDrawerOnMobile();
+  renderLoading(6);
+  try {
+    const detail = await api(`/api/playlists/${encodeURIComponent(id)}`);
+    state.visibleTracks = detail.tracks;
+    els.viewTitle.textContent = detail.name;
+    if (detail.tracks.length === 0) {
+      els.trackList.innerHTML = `<p class="empty">This playlist is empty — add tracks with ＋.</p>`;
+    } else {
+      renderTracks(detail.tracks, { playlistId: id });
+    }
+  } catch (error) {
+    els.trackList.innerHTML = `<p class="error">Failed to load playlist: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function createPlaylist(name, trackIds) {
+  const body = { name };
+  if (trackIds) body.track_ids = trackIds;
+  const detail = await apiJson("/api/playlists", "POST", body);
+  await loadPlaylists();
+  return detail;
+}
+
+async function addTrackToPlaylist(playlistId, trackId) {
+  await apiJson(`/api/playlists/${encodeURIComponent(playlistId)}`, "PATCH", {
+    add_track_ids: [trackId],
+  });
+  await loadPlaylists();
+}
+
+async function removeFromPlaylist(playlistId, index) {
+  try {
+    await apiJson(`/api/playlists/${encodeURIComponent(playlistId)}`, "PATCH", {
+      remove_indices: [index],
+    });
+    openPlaylistView(playlistId);
+  } catch {
+    /* ignore */
+  }
+}
+
+async function deletePlaylist(id, name) {
+  if (!window.confirm(`Delete playlist "${name}"?`)) return;
+  try {
+    await apiJson(`/api/playlists/${encodeURIComponent(id)}`, "DELETE");
+  } catch {
+    return;
+  }
+  if (state.currentPlaylistId === id) {
+    state.currentPlaylistId = null;
+    setView("library");
+  }
+  await loadPlaylists();
+}
+
+// Small popover to add a track to an existing or new playlist.
+function openAddToPlaylist(trackId, anchor) {
+  closeAddMenu();
+  const menu = document.createElement("div");
+  menu.className = "add-menu";
+  for (const playlist of state.playlists) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "add-menu-item";
+    item.textContent = playlist.name;
+    item.addEventListener("click", async () => {
+      closeAddMenu();
+      await addTrackToPlaylist(playlist.id, trackId);
+    });
+    menu.append(item);
+  }
+  const create = document.createElement("button");
+  create.type = "button";
+  create.className = "add-menu-item new";
+  create.textContent = "New playlist…";
+  create.addEventListener("click", async () => {
+    closeAddMenu();
+    const name = window.prompt("Playlist name");
+    if (name && name.trim()) await createPlaylist(name.trim(), [trackId]);
+  });
+  menu.append(create);
+
+  document.body.append(menu);
+  const rect = anchor.getBoundingClientRect();
+  menu.style.top = `${rect.bottom + 4}px`;
+  menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 228))}px`;
+  state.addMenu = menu;
+  setTimeout(() => document.addEventListener("click", onAddMenuOutside), 0);
+}
+
+function closeAddMenu() {
+  if (state.addMenu) {
+    state.addMenu.remove();
+    state.addMenu = null;
+    document.removeEventListener("click", onAddMenuOutside);
+  }
+}
+
+function onAddMenuOutside(event) {
+  if (state.addMenu && !state.addMenu.contains(event.target)) closeAddMenu();
 }
 
 // Compact relative time like "just now", "5m", "3h", "2d" from a Unix timestamp.
@@ -1337,6 +1591,13 @@ for (const link of els.navLinks) {
     closeDrawerOnMobile();
   });
 }
+els.newPlaylist.addEventListener("click", async () => {
+  const name = window.prompt("Playlist name");
+  if (name && name.trim()) {
+    const detail = await createPlaylist(name.trim());
+    if (detail) openPlaylistView(detail.id);
+  }
+});
 // Auto-refresh the library: poll for filesystem changes and re-check on focus, so
 // there is no manual refresh button.
 const LIBRARY_SYNC_INTERVAL = 20000;
@@ -1483,6 +1744,8 @@ if ("serviceWorker" in navigator) {
 
 renderLoading();
 loadLibrary();
+loadPlaylists();
+loadFavoriteIds().then(refreshHearts);
 
 function debounce(fn, delay) {
   let timer = 0;

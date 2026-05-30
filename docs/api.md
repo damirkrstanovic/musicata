@@ -53,6 +53,19 @@ fields/endpoints are additive within a version.
 | GET | `/api/history/recent?limit=` | Distinct tracks, most-recently-played first; each has `last_listened_at`. |
 | GET | `/api/history/most-played?limit=` | Tracks with a `play_count`. |
 
+### Playlists and favorites
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET | `/api/playlists` | List playlists (id, name, comment, song_count, timestamps). |
+| POST | `/api/playlists` | Create: `{ "name", "comment"?, "track_ids"? }`; returns the playlist with its tracks. |
+| GET | `/api/playlists/{id}` | Playlist with its ordered `tracks`. |
+| PATCH | `/api/playlists/{id}` | `name`/`comment` to edit; `track_ids` to replace/reorder; or `add_track_ids` + `remove_indices`. |
+| DELETE | `/api/playlists/{id}` | Delete a playlist. |
+| GET | `/api/favorites` | Starred `{ tracks, albums, artists }`. |
+| PUT | `/api/favorites/{kind}/{id}` | Star (`kind` = `track`/`album`/`artist`). |
+| DELETE | `/api/favorites/{kind}/{id}` | Unstar. |
+
 ### Players and zones
 
 | Method | Path | Purpose |
@@ -180,7 +193,11 @@ missing parameter, `40` wrong username/password, `70` not found.
 | `getCoverArt` | Image bytes for an album or song `id`. |
 | `stream` / `download` | Audio bytes for a song `id` (supports `Range`). |
 | `scrobble` | Records a listen (`submission=true`) into Musicata's history. |
-| `getUser`, `getPlaylists`, `getStarred`/`getStarred2`, `star`/`unstar`/`setRating` | Minimal/empty responses so clients connect cleanly. |
+| `getPlaylists` / `getPlaylist` | List playlists / one playlist with entries. |
+| `createPlaylist` / `updatePlaylist` / `deletePlaylist` | Create (name + `songId`s), edit (`songIdToAdd`/`songIndexToRemove`), delete. |
+| `star` / `unstar` | Star/unstar by `id` (song/album/artist), `albumId`, or `artistId`. |
+| `getStarred` / `getStarred2` | Starred artists, albums, and songs. |
+| `getUser` | Reports stream/download/scrobble roles. |
 
 IDs are Musicata's own (`artist_…`, `album_…`, `track_…`); clients treat them as
 opaque. `coverArt` on albums and songs is the album id.
@@ -191,6 +208,6 @@ opaque. `coverArt` on albums and songs is the album id.
   an approximate average `bitRate`. Libraries scanned before this was added populate
   duration on their next rescan (or a forced `--rescan`).
 - No transcoding: `stream` returns the original file.
-- Playlists, favorites/ratings, and play-queue sync are not implemented yet (they need
-  data models Musicata doesn't have); those endpoints are absent or return empty.
+- Numeric ratings (`setRating`) and play-queue sync (`savePlayQueue`) aren't stored yet;
+  internet radio, shares, and the jukebox are not implemented.
 - Starring/ratings/playlists are not persisted yet.

@@ -295,6 +295,13 @@ Goal: turn playback behavior into useful local discovery without compromising pr
 
 Tasks:
 
+- [x] Manual playlists and favorites (a foundation for the stats/smart-playlist work
+  below). User-created playlists (ordered, CRUD) and favorites (starred tracks/albums/
+  artists) are persisted (migration v13) and exposed three ways: the native API
+  (`/api/playlists`, `/api/favorites`), the web app (Playlists sidebar with create/
+  delete/add/remove, a per-track ♥ toggle, and a Favorites view), and the OpenSubsonic
+  API (get/create/update/deletePlaylist, star/unstar, getStarred/2, `starred` flags) —
+  verified against the real Supersonic client.
 - Record playback events: started, progress, completed, skipped, paused, resumed, loved, disliked, rated, queued, and playlist changes.
 - Use the ListenBrainz completion rule as a default: count a listen after half the track or 4 minutes, whichever is lower.
 - Persist history per user, track, player/zone, session, and playback source.
