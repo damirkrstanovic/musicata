@@ -1955,8 +1955,46 @@ function openPlayerSocket(id) {
       /* ignore malformed frames */
     }
   };
-  socket.onclose = () => playerSockets.delete(id);
+  socket.onclose = () => handlePlayerSocketClosed(id);
+  // An error fires before close on a failed/lost connection; force the close path.
+  socket.onerror = () => {
+    try {
+      socket.close();
+    } catch {
+      /* already closing */
+    }
+  };
   playerSockets.set(id, socket);
+}
+
+// The player WebSocket dropped (server down or restarting). If this tab was rendering
+// the browser player's audio, stop it — don't keep playing a stream the server can no
+// longer control. Then try to reconnect so controls recover when the server returns.
+function handlePlayerSocketClosed(id) {
+  playerSockets.delete(id);
+
+  if (id === browserPlayerId && browserOutput && browserAudio && !browserAudio.paused) {
+    browserAudio.pause();
+    state.playerStatus[id] = "stopped";
+    if (state.activePlayerId === browserPlayerId) {
+      state.activeStatus = "stopped";
+      els.playPause.textContent = "▶";
+      els.miniPlay.textContent = "▶";
+      els.transport.dataset.status = "stopped";
+    }
+    updateSwitchIndicator();
+  }
+
+  scheduleSocketReconnect(id);
+}
+
+function scheduleSocketReconnect(id) {
+  setTimeout(() => {
+    const stillRegistered = (playerData.players || []).some((player) => player.id === id);
+    if (stillRegistered && !playerSockets.has(id)) {
+      openPlayerSocket(id);
+    }
+  }, 3000);
 }
 
 // ---- Browser-player audio output ------------------------------------------
