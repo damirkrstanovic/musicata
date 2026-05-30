@@ -202,6 +202,22 @@ Player provider design decisions (see also Milestone 10):
   desktop players but cannot reliably choose what plays. Emulating LMS/SlimProto
   or AirPlay (à la Music Assistant) is much later.
 
+Player UX (follow-up — the current panel is functional but minimal):
+
+- Refine **adding** players: validate/probe the address on submit and show
+  connection status, surface clear errors, and consider discovery instead of a
+  raw `host:port` field.
+- Refine **showing** players: a clearer list/now-playing/queue view, online and
+  per-zone grouping, album art, elapsed/seek position, and volume display.
+- Refine **controlling** players: a proper transport bar (seek slider, volume,
+  repeat/shuffle toggles, queue view with reorder/remove) rather than plain
+  buttons; an active-player selector shared with the main now-playing footer.
+- Add the **local web browser as a player provider** so the in-page `<audio>`
+  element is a first-class player in the same registry/registry UI — selectable
+  and controllable like MPD, and synced across tabs.
+- Fold the player controls into the main player footer and the Milestone 6 web
+  controller upgrade so players are a first-class part of the UI, not a side panel.
+
 Done when:
 
 - Two browser tabs stay synchronized as controllers.
