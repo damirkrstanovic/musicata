@@ -794,7 +794,11 @@ async fn handle_browser_frame(browser: &BrowserPlayer, text: &str) {
                 .get("elapsed_seconds")
                 .and_then(|value| value.as_f64())
             {
-                browser.report_progress(elapsed).await;
+                let duration = value
+                    .get("duration_seconds")
+                    .and_then(|value| value.as_f64())
+                    .filter(|duration| duration.is_finite() && *duration > 0.0);
+                browser.report_progress(elapsed, duration).await;
             }
         }
         _ => {}

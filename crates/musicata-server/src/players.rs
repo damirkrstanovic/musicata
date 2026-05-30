@@ -524,6 +524,7 @@ struct BrowserState {
     queue: Vec<QueueItem>,
     position: Option<usize>,
     elapsed_seconds: Option<f64>,
+    duration_seconds: Option<f64>,
     volume: Option<u8>,
     repeat: RepeatMode,
     shuffle: bool,
@@ -555,7 +556,7 @@ impl BrowserPlayer {
                 .position
                 .and_then(|index| state.queue.get(index).cloned()),
             elapsed_seconds: state.elapsed_seconds,
-            duration_seconds: None,
+            duration_seconds: state.duration_seconds,
             volume: state.volume,
             repeat: state.repeat,
             shuffle: state.shuffle,
@@ -585,6 +586,7 @@ impl BrowserPlayer {
                         other => other,
                     };
                     state.elapsed_seconds = Some(0.0);
+                    state.duration_seconds = None;
                 }
                 PlayerCommand::Seek { position_seconds } => {
                     state.elapsed_seconds = Some(position_seconds);
@@ -603,6 +605,7 @@ impl BrowserPlayer {
                         state.position = Some(index);
                         state.status = PlaybackStatus::Playing;
                         state.elapsed_seconds = Some(0.0);
+                        state.duration_seconds = None;
                     }
                 }
                 PlayerCommand::PlayTracks { track_ids } => {
@@ -613,6 +616,7 @@ impl BrowserPlayer {
                     } else {
                         PlaybackStatus::Playing
                     };
+                    state.duration_seconds = None;
                     state.elapsed_seconds = Some(0.0);
                 }
                 PlayerCommand::Enqueue { track_ids } => {
@@ -641,9 +645,15 @@ impl BrowserPlayer {
         self.broadcast().await;
     }
 
-    /// The output tab reports its real playback position (for controllers).
-    pub async fn report_progress(&self, elapsed_seconds: f64) {
-        self.state.lock().await.elapsed_seconds = Some(elapsed_seconds);
+    /// The output tab reports its real playback position and track duration.
+    pub async fn report_progress(&self, elapsed_seconds: f64, duration_seconds: Option<f64>) {
+        {
+            let mut state = self.state.lock().await;
+            state.elapsed_seconds = Some(elapsed_seconds);
+            if let Some(duration) = duration_seconds {
+                state.duration_seconds = Some(duration);
+            }
+        }
         self.broadcast().await;
     }
 }
@@ -656,6 +666,7 @@ fn advance(state: &mut BrowserState, stop_at_end: bool) {
         return;
     };
     state.elapsed_seconds = Some(0.0);
+    state.duration_seconds = None;
     if index + 1 < state.queue.len() {
         state.position = Some(index + 1);
     } else if state.repeat == RepeatMode::All && !state.queue.is_empty() {

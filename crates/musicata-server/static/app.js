@@ -1512,14 +1512,24 @@ function browserSocketSend(message) {
   }
 }
 
+function reportBrowserProgress() {
+  if (!browserOutput) return;
+  const duration = Number.isFinite(browserAudio.duration) ? browserAudio.duration : null;
+  browserSocketSend({
+    type: "progress",
+    elapsed_seconds: browserAudio.currentTime,
+    duration_seconds: duration,
+  });
+}
+
 if (browserAudio) {
   browserAudio.addEventListener("ended", () => {
     if (browserOutput) browserSocketSend({ type: "ended" });
   });
+  // Report duration as soon as it's known so the seek bar gets a real length.
+  browserAudio.addEventListener("loadedmetadata", reportBrowserProgress);
   browserProgressTimer = setInterval(() => {
-    if (browserOutput && !browserAudio.paused) {
-      browserSocketSend({ type: "progress", elapsed_seconds: browserAudio.currentTime });
-    }
+    if (browserOutput && !browserAudio.paused) reportBrowserProgress();
   }, 1000);
 }
 
