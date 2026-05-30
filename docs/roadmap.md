@@ -189,13 +189,13 @@ Tasks:
   One tab "owns" output at a time (coordinated client-side); refining handoff and
   folding it into the main footer is part of the player UX follow-up.
 - [x] Add now-playing history. Each player's state broadcast is watched by a
-  per-player recorder that confirms a listen using the ListenBrainz rule (half the
-  track or four minutes, whichever is lower) and only counts time the player was
-  actually playing, so pauses and skips don't inflate it — this works for both the
-  per-second browser reports and MPD's sparse idle updates. Listens persist to a
-  `listens` table (migration v11) and are kept for a rolling 30-day window (pruned
-  hourly). `GET /api/history/recent` returns distinct tracks with their last-listen
-  time; `/api/history/most-played` returns tracks with play counts. In the web app,
+  per-player recorder that records a play the moment a (different) track starts
+  playing — so a track shows up in history as soon as you play it (progress ticks,
+  pauses, resumes, and seeks on the same track don't re-record; switching tracks
+  does). Plays persist to a `listens` table (migration v11) and are kept for a
+  rolling 30-day window (pruned hourly). `GET /api/history/recent` returns distinct
+  tracks with their last-listen time; `/api/history/most-played` returns tracks with
+  play counts. In the web app,
   "Recently played" shows relative times and is refreshed eagerly (it's a cheap
   indexed read — a 5s poll while open plus track-change events), while "Most played"
   shows play counts and, being a full aggregation, is loaded on demand and cached

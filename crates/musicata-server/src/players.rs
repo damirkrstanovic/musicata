@@ -105,91 +105,51 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// The ListenBrainz completion rule: a play counts once it has accumulated at least
-/// half the track's duration, capped at 4 minutes. When the duration is unknown we
-/// fall back to the 4-minute cap so long streams still register.
-const LISTEN_CAP_SECONDS: f64 = 240.0;
-
-fn qualifies_as_listen(played_seconds: f64, duration_seconds: Option<f64>) -> bool {
-    let threshold = match duration_seconds {
-        Some(duration) if duration > 0.0 => (duration / 2.0).min(LISTEN_CAP_SECONDS),
-        _ => LISTEN_CAP_SECONDS,
-    };
-    played_seconds >= threshold
-}
-
-/// Tracks one player's playback over time to decide when a play becomes a confirmed
-/// listen. It accumulates wall-clock time only across intervals where the player was
-/// reported as playing (so pauses don't inflate it) and fires exactly once per track,
-/// the moment the accumulated time crosses the completion threshold. This works for
-/// both the per-second browser reports and MPD's sparse idle-driven updates: at a
-/// track change MPD's full play interval is added before the threshold check.
+/// Watches one player's state stream and decides when a track counts as played. A
+/// play is recorded the moment a (different) track becomes the current track while the
+/// player is playing — i.e. as soon as you start it. Progress ticks, pauses, resumes,
+/// and seeks on the same track don't re-record; switching to another track does.
 #[derive(Default)]
-struct ListenTracker {
-    track_id: Option<String>,
-    duration_seconds: Option<f64>,
-    played_seconds: f64,
-    started_at: i64,
-    last_observed_at: Option<i64>,
-    last_was_playing: bool,
-    counted: bool,
+struct PlayTracker {
+    last_played: Option<String>,
 }
 
-impl ListenTracker {
-    /// Feed a state observed at wall-clock `now`. Returns `Some((track_id, started_at))`
-    /// exactly once, when the current track first qualifies as a listen.
-    fn observe(&mut self, state: &PlaybackState, now: i64) -> Option<(String, i64)> {
-        // Attribute the just-elapsed interval to the current track if it was playing.
-        if self.last_was_playing
-            && let Some(last) = self.last_observed_at
-        {
-            self.played_seconds += (now - last).max(0) as f64;
+impl PlayTracker {
+    /// Returns the track id to record as a play, or `None` if this state doesn't start
+    /// a new track.
+    fn observe(&mut self, state: &PlaybackState) -> Option<String> {
+        if state.status != PlaybackStatus::Playing {
+            return None;
         }
-
-        let mut listen = None;
-        if !self.counted
-            && let Some(track_id) = self.track_id.clone()
-            && qualifies_as_listen(self.played_seconds, self.duration_seconds)
-        {
-            self.counted = true;
-            listen = Some((track_id, self.started_at));
+        let current = state
+            .now_playing
+            .as_ref()
+            .and_then(|n| n.track_id.clone())?;
+        if self.last_played.as_deref() == Some(current.as_str()) {
+            return None;
         }
-
-        let current = state.now_playing.as_ref().and_then(|n| n.track_id.clone());
-        if current != self.track_id {
-            self.track_id = current;
-            self.duration_seconds = state.duration_seconds;
-            self.played_seconds = 0.0;
-            self.started_at = now;
-            self.counted = false;
-        } else if self.duration_seconds.is_none() {
-            // Duration may arrive a beat after the track does (e.g. browser metadata).
-            self.duration_seconds = state.duration_seconds;
-        }
-
-        self.last_observed_at = Some(now);
-        self.last_was_playing = state.status == PlaybackStatus::Playing;
-        listen
+        self.last_played = Some(current.clone());
+        Some(current)
     }
 }
 
-/// Spawns the per-player task that consumes its state broadcast and records listens.
+/// Spawns the per-player task that consumes its state broadcast and records plays.
 fn spawn_listen_recorder(
     player_id: String,
     mut states: broadcast::Receiver<PlaybackState>,
     database: Database,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tracker = ListenTracker::default();
+        let mut tracker = PlayTracker::default();
         loop {
             match states.recv().await {
                 Ok(state) => {
-                    if let Some((track_id, started_at)) = tracker.observe(&state, now_unix())
+                    if let Some(track_id) = tracker.observe(&state)
                         && let Err(error) = database
-                            .record_listen(&track_id, &player_id, started_at)
+                            .record_listen(&track_id, &player_id, now_unix())
                             .await
                     {
-                        tracing::warn!(%player_id, %track_id, %error, "failed to record listen");
+                        tracing::warn!(%player_id, %track_id, %error, "failed to record play");
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -858,16 +818,24 @@ fn reindex_after_move(pos: usize, from: usize, to: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use musicata_core::{Album, Artist, Library, ProviderMapping, Track};
+    use std::path::PathBuf;
 
-    fn playing(track_id: &str, duration: Option<f64>) -> PlaybackState {
+    fn playing(track_id: &str) -> PlaybackState {
         PlaybackState {
             status: PlaybackStatus::Playing,
             now_playing: Some(QueueItem {
                 track_id: Some(track_id.to_string()),
                 ..Default::default()
             }),
-            duration_seconds: duration,
             ..Default::default()
+        }
+    }
+
+    fn paused(track_id: &str) -> PlaybackState {
+        PlaybackState {
+            status: PlaybackStatus::Paused,
+            ..playing(track_id)
         }
     }
 
@@ -879,81 +847,161 @@ mod tests {
     }
 
     #[test]
-    fn completion_threshold_is_half_capped_at_four_minutes() {
-        // Short track: half its length.
-        assert!(!qualifies_as_listen(89.0, Some(180.0)));
-        assert!(qualifies_as_listen(90.0, Some(180.0)));
-        // Long track: capped at four minutes, not half.
-        assert!(!qualifies_as_listen(239.0, Some(1200.0)));
-        assert!(qualifies_as_listen(240.0, Some(1200.0)));
-        // Unknown duration falls back to the four-minute cap.
-        assert!(!qualifies_as_listen(239.0, None));
-        assert!(qualifies_as_listen(240.0, None));
+    fn records_a_play_when_a_new_track_starts() {
+        let mut tracker = PlayTracker::default();
+        assert_eq!(tracker.observe(&playing("a")), Some("a".to_string()));
     }
 
     #[test]
-    fn records_a_listen_once_when_the_track_plays_past_the_threshold() {
-        let mut tracker = ListenTracker::default();
-        // Track starts at t=0 (180s long -> 90s threshold).
-        assert_eq!(tracker.observe(&playing("a", Some(180.0)), 0), None);
-        // Still short of the threshold at t=80.
-        assert_eq!(tracker.observe(&playing("a", Some(180.0)), 80), None);
-        // Crosses 90s at t=100 -> one listen, stamped with the start time.
-        assert_eq!(
-            tracker.observe(&playing("a", Some(180.0)), 100),
-            Some(("a".to_string(), 0))
-        );
-        // Does not fire again for the same play.
-        assert_eq!(tracker.observe(&playing("a", Some(180.0)), 150), None);
+    fn does_not_rerecord_the_same_track_on_progress_pause_or_resume() {
+        let mut tracker = PlayTracker::default();
+        assert_eq!(tracker.observe(&playing("a")), Some("a".to_string()));
+        assert_eq!(tracker.observe(&playing("a")), None); // progress tick
+        assert_eq!(tracker.observe(&paused("a")), None); // pause
+        assert_eq!(tracker.observe(&playing("a")), None); // resume same track
     }
 
     #[test]
-    fn skipping_before_the_threshold_records_nothing() {
-        let mut tracker = ListenTracker::default();
-        assert_eq!(tracker.observe(&playing("a", Some(180.0)), 0), None);
-        // Skips to a new track at t=30, well before 90s.
-        assert_eq!(tracker.observe(&playing("b", Some(180.0)), 30), None);
-        // The new track then plays past its own threshold.
-        assert_eq!(
-            tracker.observe(&playing("b", Some(180.0)), 130),
-            Some(("b".to_string(), 30))
-        );
+    fn records_again_after_switching_to_another_track() {
+        let mut tracker = PlayTracker::default();
+        assert_eq!(tracker.observe(&playing("a")), Some("a".to_string()));
+        assert_eq!(tracker.observe(&playing("b")), Some("b".to_string()));
+        // Returning to a previously played track is a new play.
+        assert_eq!(tracker.observe(&playing("a")), Some("a".to_string()));
     }
 
     #[test]
-    fn paused_time_does_not_count_toward_a_listen() {
-        let mut tracker = ListenTracker::default();
-        assert_eq!(tracker.observe(&playing("a", Some(180.0)), 0), None);
-        // Pause at t=40 (40s of real play so far).
-        let paused = PlaybackState {
-            status: PlaybackStatus::Paused,
-            now_playing: Some(QueueItem {
-                track_id: Some("a".to_string()),
-                ..Default::default()
-            }),
-            duration_seconds: Some(180.0),
-            ..Default::default()
+    fn ignores_stopped_and_idle_states() {
+        let mut tracker = PlayTracker::default();
+        assert_eq!(tracker.observe(&stopped()), None);
+        assert_eq!(tracker.observe(&paused("a")), None);
+    }
+
+    fn temp_db(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("musicata-{name}-{nanos}.db"))
+    }
+
+    fn library_with_tracks(count: usize) -> Library {
+        let artist = Artist {
+            id: "artist_1".to_string(),
+            name: "Artist".to_string(),
+            album_count: 1,
+            track_count: count,
         };
-        assert_eq!(tracker.observe(&paused, 40), None);
-        // Resume at t=1000 after a long pause: the paused gap is not counted.
-        assert_eq!(tracker.observe(&playing("a", Some(180.0)), 1000), None);
-        // 50 more seconds of play reaches 90s total -> listen.
-        assert_eq!(
-            tracker.observe(&playing("a", Some(180.0)), 1050),
-            Some(("a".to_string(), 0))
+        let album = Album {
+            id: "album_1".to_string(),
+            title: "Album".to_string(),
+            artist_id: "artist_1".to_string(),
+            artist_name: "Artist".to_string(),
+            year: Some(2026),
+            track_count: count,
+            artwork_url: None,
+            artwork_path: None,
+        };
+        let tracks = (1..=count)
+            .map(|i| Track {
+                id: format!("track_{i}"),
+                provider: ProviderMapping {
+                    provider_id: "local-disk".to_string(),
+                    item_id: format!("album/{i}.mp3"),
+                },
+                observed_metadata: Vec::new(),
+                title: format!("Song {i}"),
+                artist_id: "artist_1".to_string(),
+                artist_name: "Artist".to_string(),
+                album_id: "album_1".to_string(),
+                album_title: "Album".to_string(),
+                year: Some(2026),
+                track_number: Some(i as u16),
+                disc_number: None,
+                extension: "mp3".to_string(),
+                file_size_bytes: Some(1),
+                modified_at_unix_seconds: Some(1),
+                content_hash: Some(format!("h{i}")),
+                relative_path: format!("album/{i}.mp3"),
+                stream_url: format!("/api/tracks/track_{i}/stream"),
+                added_at_unix_seconds: None,
+                path: PathBuf::from(format!("/music/album/{i}.mp3")),
+            })
+            .collect();
+        Library {
+            provider_id: "local-disk".to_string(),
+            source_root: "/music".to_string(),
+            artists: vec![artist],
+            albums: vec![album],
+            tracks,
+            scan_errors: Vec::new(),
+        }
+    }
+
+    async fn play(handle: &PlayerHandle, database: &Database, track_id: &str) {
+        handle
+            .execute(
+                PlayerCommand::PlayTracks {
+                    track_ids: vec![track_id.to_string()],
+                },
+                database,
+                "http://localhost",
+            )
+            .await
+            .expect("play command");
+    }
+
+    /// The recorder runs in a background task, so poll the history until it has at
+    /// least `expected` rows (or fail after a generous timeout). Returns track ids,
+    /// most-recent first.
+    async fn wait_for_recent(database: &Database, expected: usize) -> Vec<String> {
+        for _ in 0..200 {
+            let recent = database.recently_played(50).await.expect("recent");
+            if recent.len() >= expected {
+                return recent.into_iter().map(|(track, _)| track.id).collect();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let recent = database.recently_played(50).await.expect("recent");
+        panic!(
+            "recently_played reached only {} of {expected} rows",
+            recent.len()
         );
     }
 
-    #[test]
-    fn stopping_resets_without_recording() {
-        let mut tracker = ListenTracker::default();
-        assert_eq!(tracker.observe(&playing("a", Some(180.0)), 0), None);
-        assert_eq!(tracker.observe(&stopped(), 30), None);
-        // A fresh play of the same track starts its own clock.
-        assert_eq!(tracker.observe(&playing("a", Some(180.0)), 40), None);
-        assert_eq!(
-            tracker.observe(&playing("a", Some(180.0)), 135),
-            Some(("a".to_string(), 40))
-        );
+    // End-to-end through the real player + recorder wiring: play one track, then four
+    // more, and confirm each played track lands in Recently played.
+    #[tokio::test]
+    async fn recently_played_reflects_each_played_track() {
+        let db_path = temp_db("recent-plays");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = library_with_tracks(5);
+        database.save_library(&mut library).await.expect("save");
+
+        let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
+            .await
+            .expect("manager");
+        let browser = manager
+            .get(BROWSER_PLAYER_ID)
+            .await
+            .expect("browser player present");
+
+        // Play one track -> exactly one entry, and it's that track.
+        play(&browser, &database, "track_1").await;
+        let recent = wait_for_recent(&database, 1).await;
+        assert_eq!(recent, vec!["track_1".to_string()]);
+
+        // Play four more distinct tracks -> all five present.
+        for id in ["track_2", "track_3", "track_4", "track_5"] {
+            play(&browser, &database, id).await;
+        }
+        let recent = wait_for_recent(&database, 5).await;
+        let found: std::collections::BTreeSet<&str> = recent.iter().map(String::as_str).collect();
+        for id in ["track_1", "track_2", "track_3", "track_4", "track_5"] {
+            assert!(found.contains(id), "recent missing {id}; got {recent:?}");
+        }
+        assert_eq!(recent.len(), 5, "expected exactly five distinct tracks");
+
+        let _ = std::fs::remove_file(db_path);
     }
 }
