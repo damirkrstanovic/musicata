@@ -176,6 +176,17 @@ pub struct Album {
     pub artwork_path: Option<PathBuf>,
 }
 
+/// An internet radio station — a named external stream. The first non-library music
+/// source (see docs/plugins.md).
+#[derive(Clone, Debug, Serialize)]
+pub struct RadioStation {
+    pub id: String,
+    pub name: String,
+    pub stream_url: String,
+    pub homepage_url: Option<String>,
+    pub created_at_unix_seconds: i64,
+}
+
 /// A user-created playlist. Its tracks are stored separately (ordered) and returned
 /// with the detail view.
 #[derive(Clone, Debug, Serialize)]
@@ -415,16 +426,41 @@ pub enum PlayerCommand {
     Stop,
     Next,
     Previous,
-    Seek { position_seconds: f64 },
-    SetVolume { volume: u8 },
-    SetRepeat { mode: RepeatMode },
-    SetShuffle { enabled: bool },
+    Seek {
+        position_seconds: f64,
+    },
+    SetVolume {
+        volume: u8,
+    },
+    SetRepeat {
+        mode: RepeatMode,
+    },
+    SetShuffle {
+        enabled: bool,
+    },
     Clear,
-    PlayTracks { track_ids: Vec<String> },
-    Enqueue { track_ids: Vec<String> },
-    PlayQueueIndex { index: usize },
-    RemoveQueueItem { index: usize },
-    MoveQueueItem { from: usize, to: usize },
+    PlayTracks {
+        track_ids: Vec<String>,
+    },
+    Enqueue {
+        track_ids: Vec<String>,
+    },
+    PlayQueueIndex {
+        index: usize,
+    },
+    RemoveQueueItem {
+        index: usize,
+    },
+    MoveQueueItem {
+        from: usize,
+        to: usize,
+    },
+    /// Play an external stream directly (e.g. an internet radio station). Unlike
+    /// `PlayTracks`, the URL is not a library track and needs no resolution.
+    PlayStream {
+        url: String,
+        title: String,
+    },
 }
 
 #[derive(Debug)]

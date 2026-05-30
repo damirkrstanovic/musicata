@@ -528,6 +528,8 @@ async fn apply_command(
         }
         PlayerCommand::RemoveQueueItem { index } => connection.delete_index(*index).await,
         PlayerCommand::MoveQueueItem { from, to } => connection.move_item(*from, *to).await,
+        // Radio/external streams: MPD plays the URL directly and reads its own metadata.
+        PlayerCommand::PlayStream { url, .. } => connection.replace_queue(&[url.clone()]).await,
     }
 }
 
@@ -698,6 +700,20 @@ impl BrowserPlayer {
                 }
                 PlayerCommand::RemoveQueueItem { index } => remove_queue_item(&mut state, index),
                 PlayerCommand::MoveQueueItem { from, to } => move_queue_item(&mut state, from, to),
+                PlayerCommand::PlayStream { url, title } => {
+                    state.queue = vec![QueueItem {
+                        track_id: None,
+                        title,
+                        artist: String::new(),
+                        album: String::new(),
+                        stream_url: url,
+                        artwork_url: None,
+                    }];
+                    state.position = Some(0);
+                    state.status = PlaybackStatus::Playing;
+                    state.duration_seconds = None;
+                    state.elapsed_seconds = Some(0.0);
+                }
             }
         }
         self.broadcast().await;

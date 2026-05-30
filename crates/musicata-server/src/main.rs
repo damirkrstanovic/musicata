@@ -26,8 +26,8 @@ use axum::{
 use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, Library, LibrarySummary, LocalDiskProvider,
     MetadataApprovalState, MetadataFieldValue, MusicProvider, PlaybackState, Player, PlayerCommand,
-    Playlist, SearchResults, Track, TrackMetadataFieldObservation, Zone, album_artwork_url,
-    artwork_asset_id, find_album_artwork_candidates,
+    Playlist, RadioStation, SearchResults, Track, TrackMetadataFieldObservation, Zone,
+    album_artwork_url, artwork_asset_id, find_album_artwork_candidates,
 };
 use musicata_storage::Database;
 use musicbrainz::{
@@ -371,7 +371,10 @@ fn app(
         .route("/api/browse/recently-added", get(recently_added))
         .route("/api/history/recent", get(recently_played))
         .route("/api/history/most-played", get(most_played))
-        .route("/api/playlists", get(list_playlists_route).post(create_playlist_route))
+        .route(
+            "/api/playlists",
+            get(list_playlists_route).post(create_playlist_route),
+        )
         .route(
             "/api/playlists/{id}",
             get(playlist_detail)
@@ -383,6 +386,8 @@ fn app(
             "/api/favorites/{kind}/{id}",
             put(star_favorite).delete(unstar_favorite),
         )
+        .route("/api/radio", get(list_radio).post(create_radio))
+        .route("/api/radio/{id}", patch(update_radio).delete(delete_radio))
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
             get(album_musicbrainz_candidates),
@@ -1191,13 +1196,12 @@ struct UpdatePlaylistRequest {
 async fn list_playlists_route(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Playlist>>, AppError> {
-    Ok(Json(state.database.list_playlists().await.map_err(db_error)?))
+    Ok(Json(
+        state.database.list_playlists().await.map_err(db_error)?,
+    ))
 }
 
-async fn playlist_detail_response(
-    state: &AppState,
-    id: &str,
-) -> Result<PlaylistDetail, AppError> {
+async fn playlist_detail_response(state: &AppState, id: &str) -> Result<PlaylistDetail, AppError> {
     let playlist = state
         .database
         .playlist(id)
@@ -1248,7 +1252,12 @@ async fn update_playlist_route(
     if request.name.is_some() || request.comment.is_some() {
         state
             .database
-            .update_playlist_meta(&id, request.name.as_deref(), request.comment.as_deref(), now)
+            .update_playlist_meta(
+                &id,
+                request.name.as_deref(),
+                request.comment.as_deref(),
+                now,
+            )
             .await
             .map_err(db_error)?;
     }
@@ -1260,7 +1269,11 @@ async fn update_playlist_route(
             .await
             .map_err(db_error)?;
     } else if request.add_track_ids.is_some() || request.remove_indices.is_some() {
-        let mut ids = state.database.playlist_track_ids(&id).await.map_err(db_error)?;
+        let mut ids = state
+            .database
+            .playlist_track_ids(&id)
+            .await
+            .map_err(db_error)?;
         if let Some(remove) = request.remove_indices {
             let mut remove: Vec<usize> = remove;
             remove.sort_unstable();
@@ -1288,7 +1301,11 @@ async fn delete_playlist_route(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    state.database.delete_playlist(&id).await.map_err(db_error)?;
+    state
+        .database
+        .delete_playlist(&id)
+        .await
+        .map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1301,7 +1318,9 @@ struct FavoritesResponse {
     artists: Vec<Artist>,
 }
 
-async fn list_favorites(State(state): State<AppState>) -> Result<Json<FavoritesResponse>, AppError> {
+async fn list_favorites(
+    State(state): State<AppState>,
+) -> Result<Json<FavoritesResponse>, AppError> {
     Ok(Json(FavoritesResponse {
         tracks: state.database.starred_tracks().await.map_err(db_error)?,
         albums: state.database.starred_albums().await.map_err(db_error)?,
@@ -1313,7 +1332,9 @@ async fn list_favorites(State(state): State<AppState>) -> Result<Json<FavoritesR
 fn favorite_kind(kind: &str) -> Result<&str, AppError> {
     match kind {
         "track" | "album" | "artist" => Ok(kind),
-        other => Err(AppError::bad_request(format!("unknown favorite kind: {other}"))),
+        other => Err(AppError::bad_request(format!(
+            "unknown favorite kind: {other}"
+        ))),
     }
 }
 
@@ -1335,7 +1356,101 @@ async fn unstar_favorite(
     Path((kind, id)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let kind = favorite_kind(&kind)?;
-    state.database.clear_favorite(kind, &id).await.map_err(db_error)?;
+    state
+        .database
+        .clear_favorite(kind, &id)
+        .await
+        .map_err(db_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- Internet radio ----
+
+#[derive(Debug, Deserialize)]
+struct CreateRadioRequest {
+    name: String,
+    stream_url: String,
+    homepage_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateRadioRequest {
+    name: Option<String>,
+    stream_url: Option<String>,
+    homepage_url: Option<String>,
+}
+
+async fn list_radio(State(state): State<AppState>) -> Result<Json<Vec<RadioStation>>, AppError> {
+    Ok(Json(
+        state
+            .database
+            .list_radio_stations()
+            .await
+            .map_err(db_error)?,
+    ))
+}
+
+async fn create_radio(
+    State(state): State<AppState>,
+    Json(request): Json<CreateRadioRequest>,
+) -> Result<Json<RadioStation>, AppError> {
+    let name = request.name.trim();
+    let stream_url = request.stream_url.trim();
+    if name.is_empty() || stream_url.is_empty() {
+        return Err(AppError::bad_request("name and stream_url are required"));
+    }
+    let id = state
+        .database
+        .create_radio_station(
+            name,
+            stream_url,
+            request.homepage_url.as_deref(),
+            now_unix_seconds(),
+        )
+        .await
+        .map_err(db_error)?;
+    let station = state
+        .database
+        .radio_station(&id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| AppError::internal("station vanished after creation"))?;
+    Ok(Json(station))
+}
+
+async fn update_radio(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateRadioRequest>,
+) -> Result<Json<RadioStation>, AppError> {
+    state
+        .database
+        .update_radio_station(
+            &id,
+            request.name.as_deref(),
+            request.stream_url.as_deref(),
+            request.homepage_url.as_deref(),
+        )
+        .await
+        .map_err(db_error)?;
+    let station = state
+        .database
+        .radio_station(&id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| AppError::not_found(format!("unknown radio station: {id}")))?;
+    Ok(Json(station))
+}
+
+async fn delete_radio(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    state
+        .database
+        .delete_radio_station(&id)
+        .await
+        .map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3668,8 +3783,7 @@ mod tests {
     async fn subsonic_advertises_formpost_extension() {
         let fixture = TestFixture::new("ss-ext");
         let app = fixture.app().await;
-        let value =
-            subsonic_json(&app, &format!("getOpenSubsonicExtensions.view?{SS_AUTH}")).await;
+        let value = subsonic_json(&app, &format!("getOpenSubsonicExtensions.view?{SS_AUTH}")).await;
         let names: Vec<&str> = value["subsonic-response"]["openSubsonicExtensions"]
             .as_array()
             .expect("extensions")
@@ -3699,8 +3813,11 @@ mod tests {
             .as_str()
             .expect("artist id")
             .to_string();
-        let dir =
-            subsonic_json(&app, &format!("getMusicDirectory.view?{SS_AUTH}&id={artist_id}")).await;
+        let dir = subsonic_json(
+            &app,
+            &format!("getMusicDirectory.view?{SS_AUTH}&id={artist_id}"),
+        )
+        .await;
         let children = dir["subsonic-response"]["directory"]["child"]
             .as_array()
             .expect("children");
@@ -3717,8 +3834,11 @@ mod tests {
             .as_str()
             .expect("song id")
             .to_string();
-        let value =
-            subsonic_json(&app, &format!("getLyricsBySongId.view?{SS_AUTH}&id={song_id}")).await;
+        let value = subsonic_json(
+            &app,
+            &format!("getLyricsBySongId.view?{SS_AUTH}&id={song_id}"),
+        )
+        .await;
         // Whether or not the track has lyrics, the response is a well-formed lyricsList.
         assert_eq!(value["subsonic-response"]["status"], "ok");
         assert!(value["subsonic-response"]["lyricsList"].is_object());
@@ -3746,7 +3866,10 @@ mod tests {
             .await,
         )
         .unwrap();
-        let track_id = page["items"][0]["id"].as_str().expect("track id").to_string();
+        let track_id = page["items"][0]["id"]
+            .as_str()
+            .expect("track id")
+            .to_string();
 
         // Create a playlist containing that track.
         let created: serde_json::Value = serde_json::from_str(
@@ -3776,7 +3899,12 @@ mod tests {
         let list: serde_json::Value = serde_json::from_str(
             &body_text(
                 app.clone()
-                    .oneshot(Request::builder().uri("/api/playlists").body(Body::empty()).unwrap())
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/playlists")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
                     .await
                     .unwrap()
                     .into_body(),
@@ -3803,7 +3931,12 @@ mod tests {
         let favorites: serde_json::Value = serde_json::from_str(
             &body_text(
                 app.clone()
-                    .oneshot(Request::builder().uri("/api/favorites").body(Body::empty()).unwrap())
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/favorites")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
                     .await
                     .unwrap()
                     .into_body(),
@@ -3812,6 +3945,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(favorites["tracks"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn radio_native_and_subsonic() {
+        let fixture = TestFixture::new("radio");
+        let app = fixture.app().await;
+
+        // Create via the native API.
+        let created: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/radio")
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                r#"{"name":"Groove Salad","stream_url":"http://ice.somafm.com/groovesalad"}"#,
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(created["name"], "Groove Salad");
+
+        // Visible to a Subsonic client via getInternetRadioStations.
+        let stations =
+            subsonic_json(&app, &format!("getInternetRadioStations.view?{SS_AUTH}")).await;
+        let list = stations["subsonic-response"]["internetRadioStations"]["internetRadioStation"]
+            .as_array()
+            .expect("stations");
+        assert!(list.iter().any(|station| station["name"] == "Groove Salad"));
+        assert!(
+            list.iter()
+                .any(|station| station["streamUrl"] == "http://ice.somafm.com/groovesalad")
+        );
     }
 
     #[tokio::test]

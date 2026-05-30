@@ -12,6 +12,7 @@ const state = {
   playlists: [],
   currentPlaylistId: null,
   addMenu: null,
+  radio: [],
   activePlayerId: null,
   activeStatus: "stopped",
   activeNowTrackId: null,
@@ -47,6 +48,8 @@ const els = {
   albums: document.querySelector("#albums"),
   playlists: document.querySelector("#playlists"),
   newPlaylist: document.querySelector("#new-playlist"),
+  radio: document.querySelector("#radio"),
+  newRadio: document.querySelector("#new-radio"),
   trackList: document.querySelector("#track-list"),
   navLinks: Array.from(document.querySelectorAll(".library-nav .nav-link")),
   viewTitle: document.querySelector("#view-title"),
@@ -770,6 +773,77 @@ function closeAddMenu() {
 
 function onAddMenuOutside(event) {
   if (state.addMenu && !state.addMenu.contains(event.target)) closeAddMenu();
+}
+
+// ---- Internet radio ----
+
+async function loadRadio() {
+  try {
+    state.radio = await api("/api/radio");
+  } catch {
+    state.radio = [];
+  }
+  renderRadioSidebar();
+}
+
+function renderRadioSidebar() {
+  els.radio.innerHTML = "";
+  if (!state.radio.length) {
+    els.radio.innerHTML = `<p class="muted-hint">No stations yet.</p>`;
+    return;
+  }
+  for (const station of state.radio) {
+    const row = document.createElement("div");
+    row.className = "playlist-item";
+
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "pl-open";
+    open.innerHTML = `<span class="pl-name">${escapeHtml(station.name)}</span><span class="pl-count">▶</span>`;
+    open.title = "Play on the active player";
+    open.addEventListener("click", () => playRadio(station));
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "pl-del";
+    del.title = "Remove station";
+    del.textContent = "✕";
+    del.addEventListener("click", (event) => {
+      event.stopPropagation();
+      deleteRadio(station.id, station.name);
+    });
+
+    row.append(open, del);
+    els.radio.append(row);
+  }
+}
+
+function playRadio(station) {
+  if (!state.activePlayerId) return;
+  if (state.activePlayerId === browserPlayerId) {
+    claimBrowserOutput();
+    // Start within the user gesture so the browser's autoplay policy allows it.
+    if (browserAudio) {
+      browserAudio.src = station.stream_url;
+      browserAudio.play().catch(() => {});
+    }
+  }
+  playerCommand(state.activePlayerId, {
+    command: "play_stream",
+    url: station.stream_url,
+    title: station.name,
+  });
+  closeDrawerOnMobile();
+}
+
+async function deleteRadio(id, name) {
+  if (!window.confirm(`Remove station "${name}"?`)) return;
+  try {
+    await apiJson(`/api/radio/${encodeURIComponent(id)}`, "DELETE");
+  } catch {
+    return;
+  }
+  await loadRadio();
 }
 
 // Compact relative time like "just now", "5m", "3h", "2d" from a Unix timestamp.
@@ -1632,6 +1706,18 @@ els.newPlaylist.addEventListener("click", async () => {
     if (detail) openPlaylistView(detail.id);
   }
 });
+els.newRadio.addEventListener("click", async () => {
+  const name = window.prompt("Station name");
+  if (!name || !name.trim()) return;
+  const url = window.prompt("Stream URL (http…)");
+  if (!url || !url.trim()) return;
+  try {
+    await apiJson("/api/radio", "POST", { name: name.trim(), stream_url: url.trim() });
+    await loadRadio();
+  } catch {
+    /* ignore */
+  }
+});
 // Auto-refresh the library: poll for filesystem changes and re-check on focus, so
 // there is no manual refresh button.
 const LIBRARY_SYNC_INTERVAL = 20000;
@@ -1779,6 +1865,7 @@ if ("serviceWorker" in navigator) {
 renderLoading();
 loadLibrary();
 loadPlaylists();
+loadRadio();
 loadFavoriteIds().then(refreshHearts);
 
 function debounce(fn, delay) {

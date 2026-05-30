@@ -186,6 +186,10 @@ async fn handle(
         "createPlaylist" => create_playlist_ss(&state, format, &params, &all).await,
         "updatePlaylist" => update_playlist_ss(&state, format, &params, &all).await,
         "deletePlaylist" => delete_playlist_ss(&state, format, &params).await,
+        "getInternetRadioStations" => get_internet_radio(&state, format).await,
+        "createInternetRadioStation" => create_internet_radio(&state, format, &params).await,
+        "updateInternetRadioStation" => update_internet_radio(&state, format, &params).await,
+        "deleteInternetRadioStation" => delete_internet_radio(&state, format, &params).await,
         "getStarred" => get_starred(&state, format, "starred").await,
         "getStarred2" => get_starred(&state, format, "starred2").await,
         "star" => set_star(&state, format, &all, true).await,
@@ -337,7 +341,11 @@ async fn get_music_directory(
     };
 
     if let Ok(Some(album)) = state.database.album(id).await {
-        let tracks = state.database.tracks_for_album(id).await.unwrap_or_default();
+        let tracks = state
+            .database
+            .tracks_for_album(id)
+            .await
+            .unwrap_or_default();
         let children = songs_value(&tracks, &load_favorites(state).await);
         return ok_response(
             format,
@@ -349,7 +357,11 @@ async fn get_music_directory(
     }
 
     if let Ok(Some(artist)) = state.database.artist(id).await {
-        let albums = state.database.albums_for_artist(id).await.unwrap_or_default();
+        let albums = state
+            .database
+            .albums_for_artist(id)
+            .await
+            .unwrap_or_default();
         let children: Vec<Value> = albums
             .iter()
             .map(|album| {
@@ -408,7 +420,11 @@ async fn get_songs_by_genre(
         genre: Some(genre.clone()),
         ..Default::default()
     };
-    match state.database.list_tracks(&filter, None, count, offset).await {
+    match state
+        .database
+        .list_tracks(&filter, None, count, offset)
+        .await
+    {
         Ok((tracks, _)) => ok_response(
             format,
             map1(
@@ -422,7 +438,11 @@ async fn get_songs_by_genre(
 
 /// Legacy lyrics by artist/title. We match on title and return the first track's
 /// stored lyrics (empty element if none).
-async fn get_lyrics(state: &AppState, format: Format, params: &HashMap<String, String>) -> Response {
+async fn get_lyrics(
+    state: &AppState,
+    format: Format,
+    params: &HashMap<String, String>,
+) -> Response {
     let title = params.get("title").map(String::as_str).unwrap_or("").trim();
     let artist = params.get("artist").cloned().unwrap_or_default();
     let mut text = String::new();
@@ -504,7 +524,10 @@ async fn get_artist(
     let favorites = load_favorites(state).await;
     let mut value = artist_value(&artist, &favorites);
     if let Value::Object(map) = &mut value {
-        map.insert("album".to_string(), Value::Array(albums_value(&albums, &favorites)));
+        map.insert(
+            "album".to_string(),
+            Value::Array(albums_value(&albums, &favorites)),
+        );
     }
     ok_response(format, map1("artist", value))
 }
@@ -525,7 +548,10 @@ async fn get_album(state: &AppState, format: Format, params: &HashMap<String, St
     let favorites = load_favorites(state).await;
     let mut value = album_value(&album, &favorites);
     if let Value::Object(map) = &mut value {
-        map.insert("song".to_string(), Value::Array(songs_value(&tracks, &favorites)));
+        map.insert(
+            "song".to_string(),
+            Value::Array(songs_value(&tracks, &favorites)),
+        );
     }
     ok_response(format, map1("album", value))
 }
@@ -717,7 +743,10 @@ async fn playlist_response(state: &AppState, format: Format, id: &str) -> Respon
             let favorites = load_favorites(state).await;
             let mut value = playlist_value(&playlist);
             if let Value::Object(map) = &mut value {
-                map.insert("entry".into(), Value::Array(songs_value(&tracks, &favorites)));
+                map.insert(
+                    "entry".into(),
+                    Value::Array(songs_value(&tracks, &favorites)),
+                );
             }
             ok_response(format, map1("playlist", value))
         }
@@ -726,7 +755,11 @@ async fn playlist_response(state: &AppState, format: Format, id: &str) -> Respon
     }
 }
 
-async fn get_playlist(state: &AppState, format: Format, params: &HashMap<String, String>) -> Response {
+async fn get_playlist(
+    state: &AppState,
+    format: Format,
+    params: &HashMap<String, String>,
+) -> Response {
     let Some(id) = params.get("id") else {
         return error_response(format, 10, "Required parameter is missing.");
     };
@@ -745,7 +778,10 @@ async fn create_playlist_ss(
     // With a playlistId, createPlaylist replaces an existing playlist's tracks.
     if let Some(id) = params.get("playlistId") {
         if let Some(name) = params.get("name") {
-            let _ = state.database.update_playlist_meta(id, Some(name), None, now).await;
+            let _ = state
+                .database
+                .update_playlist_meta(id, Some(name), None, now)
+                .await;
         }
         if let Err(error) = state.database.set_playlist_tracks(id, &song_ids, now).await {
             return error_response(format, 0, &error.to_string());
@@ -756,7 +792,11 @@ async fn create_playlist_ss(
     let Some(name) = params.get("name") else {
         return error_response(format, 10, "Required parameter is missing.");
     };
-    match state.database.create_playlist(name, None, &song_ids, now).await {
+    match state
+        .database
+        .create_playlist(name, None, &song_ids, now)
+        .await
+    {
         Ok(id) => playlist_response(state, format, &id).await,
         Err(error) => error_response(format, 0, &error.to_string()),
     }
@@ -788,9 +828,15 @@ async fn update_playlist_ss(
     let removes = multi(all, "songIndexToRemove");
     let adds = multi(all, "songIdToAdd");
     if !removes.is_empty() || !adds.is_empty() {
-        let mut ids = state.database.playlist_track_ids(id).await.unwrap_or_default();
-        let mut indices: Vec<usize> =
-            removes.iter().filter_map(|value| value.parse().ok()).collect();
+        let mut ids = state
+            .database
+            .playlist_track_ids(id)
+            .await
+            .unwrap_or_default();
+        let mut indices: Vec<usize> = removes
+            .iter()
+            .filter_map(|value| value.parse().ok())
+            .collect();
         indices.sort_unstable();
         indices.dedup();
         for index in indices.into_iter().rev() {
@@ -820,6 +866,96 @@ async fn delete_playlist_ss(
     }
 }
 
+// ---- Internet radio -------------------------------------------------------
+
+async fn get_internet_radio(state: &AppState, format: Format) -> Response {
+    let stations = state
+        .database
+        .list_radio_stations()
+        .await
+        .unwrap_or_default();
+    let list: Vec<Value> = stations
+        .iter()
+        .map(|station| {
+            let mut map = Map::new();
+            map.insert("id".into(), json!(station.id));
+            map.insert("name".into(), json!(station.name));
+            map.insert("streamUrl".into(), json!(station.stream_url));
+            if let Some(home) = &station.homepage_url {
+                map.insert("homePageUrl".into(), json!(home));
+            }
+            Value::Object(map)
+        })
+        .collect();
+    ok_response(
+        format,
+        map1(
+            "internetRadioStations",
+            json!({ "internetRadioStation": list }),
+        ),
+    )
+}
+
+async fn create_internet_radio(
+    state: &AppState,
+    format: Format,
+    params: &HashMap<String, String>,
+) -> Response {
+    let (Some(name), Some(stream_url)) = (params.get("name"), params.get("streamUrl")) else {
+        return error_response(format, 10, "Required parameter is missing.");
+    };
+    match state
+        .database
+        .create_radio_station(
+            name,
+            stream_url,
+            params.get("homepageUrl").map(String::as_str),
+            crate::now_unix_seconds(),
+        )
+        .await
+    {
+        Ok(_) => ok_response(format, Map::new()),
+        Err(error) => error_response(format, 0, &error.to_string()),
+    }
+}
+
+async fn update_internet_radio(
+    state: &AppState,
+    format: Format,
+    params: &HashMap<String, String>,
+) -> Response {
+    let Some(id) = params.get("id") else {
+        return error_response(format, 10, "Required parameter is missing.");
+    };
+    match state
+        .database
+        .update_radio_station(
+            id,
+            params.get("name").map(String::as_str),
+            params.get("streamUrl").map(String::as_str),
+            params.get("homepageUrl").map(String::as_str),
+        )
+        .await
+    {
+        Ok(()) => ok_response(format, Map::new()),
+        Err(error) => error_response(format, 0, &error.to_string()),
+    }
+}
+
+async fn delete_internet_radio(
+    state: &AppState,
+    format: Format,
+    params: &HashMap<String, String>,
+) -> Response {
+    let Some(id) = params.get("id") else {
+        return error_response(format, 10, "Required parameter is missing.");
+    };
+    match state.database.delete_radio_station(id).await {
+        Ok(()) => ok_response(format, Map::new()),
+        Err(error) => error_response(format, 0, &error.to_string()),
+    }
+}
+
 // ---- Favorites (starred state) --------------------------------------------
 
 /// Favorited ids, loaded once per request so entity values can carry a `starred`
@@ -838,9 +974,27 @@ const STARRED_AT: &str = "2024-01-01T00:00:00Z";
 async fn load_favorites(state: &AppState) -> Favorites {
     let collect = |ids: Vec<String>| ids.into_iter().collect::<HashSet<_>>();
     Favorites {
-        tracks: collect(state.database.favorite_ids("track").await.unwrap_or_default()),
-        albums: collect(state.database.favorite_ids("album").await.unwrap_or_default()),
-        artists: collect(state.database.favorite_ids("artist").await.unwrap_or_default()),
+        tracks: collect(
+            state
+                .database
+                .favorite_ids("track")
+                .await
+                .unwrap_or_default(),
+        ),
+        albums: collect(
+            state
+                .database
+                .favorite_ids("album")
+                .await
+                .unwrap_or_default(),
+        ),
+        artists: collect(
+            state
+                .database
+                .favorite_ids("artist")
+                .await
+                .unwrap_or_default(),
+        ),
     }
 }
 
@@ -913,15 +1067,24 @@ async fn resolve_favorite_kind(state: &AppState, id: &str) -> &'static str {
 // ---- Entity → Subsonic value ----------------------------------------------
 
 fn songs_value(tracks: &[Track], favorites: &Favorites) -> Vec<Value> {
-    tracks.iter().map(|track| song_value(track, favorites)).collect()
+    tracks
+        .iter()
+        .map(|track| song_value(track, favorites))
+        .collect()
 }
 
 fn albums_value(albums: &[Album], favorites: &Favorites) -> Vec<Value> {
-    albums.iter().map(|album| album_value(album, favorites)).collect()
+    albums
+        .iter()
+        .map(|album| album_value(album, favorites))
+        .collect()
 }
 
 fn artists_value(artists: &[Artist], favorites: &Favorites) -> Vec<Value> {
-    artists.iter().map(|artist| artist_value(artist, favorites)).collect()
+    artists
+        .iter()
+        .map(|artist| artist_value(artist, favorites))
+        .collect()
 }
 
 fn artist_value(artist: &Artist, favorites: &Favorites) -> Value {

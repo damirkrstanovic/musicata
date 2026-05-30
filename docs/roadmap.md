@@ -372,7 +372,14 @@ Tasks:
 - Formalize `MusicProvider` capabilities.
 - Add provider configuration and provider lifecycle.
 - Keep local disk as the reference provider.
-- Add internet radio as the first non-library provider.
+- [x] Add internet radio as the first non-library provider. Stations (name + stream
+  URL + optional homepage) persist (migration v14) and are exposed via the native API
+  (`/api/radio`), the web app (a Radio sidebar section: add / play / remove), and the
+  OpenSubsonic internet-radio endpoints (get/create/update/deleteInternetRadioStation).
+  A new `PlayerCommand::PlayStream{url,title}` plays an external stream directly on the
+  browser and MPD players (no library resolution). This is the first source that isn't
+  a scanned library; the formal `MusicProvider` trait/registry generalization (see
+  docs/plugins.md) follows.
 - Evaluate plugin isolation: in-process Rust modules, subprocesses, WebAssembly, or external services.
 - Document legal/API constraints for Spotify, Tidal, Qobuz, and similar services before implementation.
 

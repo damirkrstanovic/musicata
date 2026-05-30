@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, BrowseTextFacet, BrowseYearFacet, Library,
     LibrarySummary, MetadataApprovalState, MetadataFieldValue, Playlist, ProviderMapping,
-    ScanIssue, SearchResults, Track, TrackMetadataFieldObservation, TrackMetadataObservation,
-    Zone,
+    RadioStation, ScanIssue, SearchResults, Track, TrackMetadataFieldObservation,
+    TrackMetadataObservation, Zone,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -174,6 +174,13 @@ impl Database {
                 sqlx::query(statement).execute(&self.pool).await?;
             }
             set_user_version(&self.pool, 13).await?;
+        }
+
+        if version < 14 {
+            for statement in MIGRATION_014_RADIO_STATIONS {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 14).await?;
         }
 
         Ok(())
@@ -1419,7 +1426,9 @@ impl Database {
         .bind(id)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(|row| Ok(row.try_get("track_id")?)).collect()
+        rows.iter()
+            .map(|row| Ok(row.try_get("track_id")?))
+            .collect()
     }
 
     pub async fn update_playlist_meta(
@@ -1430,12 +1439,14 @@ impl Database {
         now: i64,
     ) -> Result<()> {
         if let Some(name) = name {
-            sqlx::query("UPDATE playlists SET name = ?2, updated_at_unix_seconds = ?3 WHERE id = ?1")
-                .bind(id)
-                .bind(name)
-                .bind(now)
-                .execute(&self.pool)
-                .await?;
+            sqlx::query(
+                "UPDATE playlists SET name = ?2, updated_at_unix_seconds = ?3 WHERE id = ?1",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
         }
         if let Some(comment) = comment {
             sqlx::query(
@@ -1554,6 +1565,88 @@ impl Database {
         .await?;
         rows.iter().map(artist_from_row).collect()
     }
+
+    // ---- Internet radio stations ----
+
+    pub async fn create_radio_station(
+        &self,
+        name: &str,
+        stream_url: &str,
+        homepage_url: Option<&str>,
+        now: i64,
+    ) -> Result<String> {
+        let row = sqlx::query(
+            "INSERT INTO radio_stations (id, name, stream_url, homepage_url, created_at_unix_seconds)
+             VALUES (lower(hex(randomblob(12))), ?1, ?2, ?3, ?4) RETURNING id",
+        )
+        .bind(name)
+        .bind(stream_url)
+        .bind(homepage_url)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get("id")?)
+    }
+
+    pub async fn list_radio_stations(&self) -> Result<Vec<RadioStation>> {
+        let rows = sqlx::query(
+            "SELECT id, name, stream_url, homepage_url, created_at_unix_seconds
+             FROM radio_stations ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(radio_station_from_row).collect()
+    }
+
+    pub async fn radio_station(&self, id: &str) -> Result<Option<RadioStation>> {
+        let row = sqlx::query(
+            "SELECT id, name, stream_url, homepage_url, created_at_unix_seconds
+             FROM radio_stations WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(radio_station_from_row).transpose()
+    }
+
+    pub async fn update_radio_station(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        stream_url: Option<&str>,
+        homepage_url: Option<&str>,
+    ) -> Result<()> {
+        if let Some(name) = name {
+            sqlx::query("UPDATE radio_stations SET name = ?2 WHERE id = ?1")
+                .bind(id)
+                .bind(name)
+                .execute(&self.pool)
+                .await?;
+        }
+        if let Some(stream_url) = stream_url {
+            sqlx::query("UPDATE radio_stations SET stream_url = ?2 WHERE id = ?1")
+                .bind(id)
+                .bind(stream_url)
+                .execute(&self.pool)
+                .await?;
+        }
+        if let Some(homepage_url) = homepage_url {
+            sqlx::query("UPDATE radio_stations SET homepage_url = ?2 WHERE id = ?1")
+                .bind(id)
+                .bind(homepage_url)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn delete_radio_station(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM radio_stations WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 /// A persisted player registration (its live state lives in the player manager).
@@ -1615,6 +1708,16 @@ fn artist_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Artist> {
         name: row.try_get("name")?,
         album_count: i64_to_usize(row.try_get("album_count")?, "album_count")?,
         track_count: i64_to_usize(row.try_get("track_count")?, "track_count")?,
+    })
+}
+
+fn radio_station_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RadioStation> {
+    Ok(RadioStation {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        stream_url: row.try_get("stream_url")?,
+        homepage_url: row.try_get("homepage_url")?,
+        created_at_unix_seconds: row.try_get("created_at_unix_seconds")?,
     })
 }
 
@@ -2199,6 +2302,15 @@ const MIGRATION_013_PLAYLISTS_AND_FAVORITES: &[&str] = &[
     )",
 ];
 
+// Internet radio stations — the first non-library music source (see docs/plugins.md).
+const MIGRATION_014_RADIO_STATIONS: &[&str] = &["CREATE TABLE IF NOT EXISTS radio_stations (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        stream_url TEXT NOT NULL,
+        homepage_url TEXT,
+        created_at_unix_seconds INTEGER NOT NULL
+    )"];
+
 // Registered players and zones. Players are reported to the server (e.g. via the
 // web UI) and persisted so they survive restarts; a player optionally belongs to
 // a zone (a named group used as a control target).
@@ -2707,6 +2819,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn radio_stations_round_trip() {
+        let db_path = temp_db_path("radio");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        let id = database
+            .create_radio_station(
+                "SomaFM",
+                "http://ice.somafm.com/groovesalad",
+                Some("https://somafm.com"),
+                100,
+            )
+            .await
+            .expect("create");
+        let stations = database.list_radio_stations().await.expect("list");
+        assert_eq!(stations.len(), 1);
+        assert_eq!(stations[0].name, "SomaFM");
+        assert_eq!(stations[0].stream_url, "http://ice.somafm.com/groovesalad");
+
+        database
+            .update_radio_station(&id, Some("Groove Salad"), None, None)
+            .await
+            .expect("update");
+        let one = database
+            .radio_station(&id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(one.name, "Groove Salad");
+
+        database.delete_radio_station(&id).await.expect("delete");
+        assert!(database.list_radio_stations().await.unwrap().is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn playlists_and_favorites_round_trip() {
         let db_path = temp_db_path("playlists-favorites");
         let database = Database::connect(&db_path).await.expect("connect database");
@@ -2728,7 +2876,12 @@ mod tests {
 
         // Playlists: create with two tracks, in order.
         let id = database
-            .create_playlist("Mix", Some("notes"), &["track_2".into(), "track_1".into()], 100)
+            .create_playlist(
+                "Mix",
+                Some("notes"),
+                &["track_2".into(), "track_1".into()],
+                100,
+            )
             .await
             .expect("create playlist");
         let playlists = database.list_playlists().await.expect("list");
@@ -2761,7 +2914,10 @@ mod tests {
         database.set_favorite("track", "track_1", 1).await.unwrap();
         database.set_favorite("track", "track_1", 1).await.unwrap(); // idempotent
         database.set_favorite("album", "album_1", 2).await.unwrap();
-        database.set_favorite("artist", "artist_1", 3).await.unwrap();
+        database
+            .set_favorite("artist", "artist_1", 3)
+            .await
+            .unwrap();
         assert_eq!(database.starred_tracks().await.unwrap().len(), 1);
         assert_eq!(database.starred_albums().await.unwrap().len(), 1);
         assert_eq!(database.starred_artists().await.unwrap().len(), 1);
