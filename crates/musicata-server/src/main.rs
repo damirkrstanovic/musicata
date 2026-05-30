@@ -1,6 +1,7 @@
 mod mpd;
 mod musicbrainz;
 mod players;
+mod subsonic;
 
 use crate::players::{BrowserPlayer, PlayerHandle, PlayerManager};
 use anyhow::{Context, Result, anyhow};
@@ -66,6 +67,7 @@ struct AppState {
     most_played_cache: Arc<Mutex<Option<MostPlayedCache>>>,
     playback_sessions: Arc<RwLock<BTreeMap<String, PlaybackSession>>>,
     next_playback_session: Arc<AtomicU64>,
+    subsonic: subsonic::SubsonicAuth,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +88,11 @@ struct Config {
     /// Base URL MPD uses to fetch streams from this server, e.g.
     /// `http://127.0.0.1:3030`. Defaults to `http://<addr>`.
     public_url: Option<String>,
+    /// Username accepted by the OpenSubsonic API (`/rest`). Defaults to `musicata`.
+    subsonic_user: String,
+    /// Password for the OpenSubsonic API. When unset the API is unauthenticated
+    /// (any credentials accepted) — convenient on a trusted LAN, hardened in M12.
+    subsonic_password: Option<String>,
 }
 
 #[tokio::main]
@@ -157,10 +164,24 @@ async fn main() -> Result<()> {
         LISTEN_PRUNE_INTERVAL,
     ));
 
+    let subsonic_auth = subsonic::SubsonicAuth {
+        user: config.subsonic_user.clone(),
+        password: config.subsonic_password.clone(),
+    };
+    if subsonic_auth.password.is_none() {
+        tracing::warn!(
+            "OpenSubsonic API is unauthenticated (no subsonic_password set); any \
+             credentials are accepted — set --subsonic-password on untrusted networks"
+        );
+    }
+
     tracing::info!("listening on http://{}", config.addr);
-    axum::serve(listener, app(database, provider, players, rescan_lock))
-        .await
-        .context("server failed")?;
+    axum::serve(
+        listener,
+        app(database, provider, players, rescan_lock, subsonic_auth),
+    )
+    .await
+    .context("server failed")?;
 
     Ok(())
 }
@@ -293,8 +314,10 @@ fn app(
     provider: LocalDiskProvider,
     players: Arc<PlayerManager>,
     rescan_lock: Arc<Mutex<()>>,
+    subsonic_auth: subsonic::SubsonicAuth,
 ) -> Router {
     Router::new()
+        .merge(subsonic::routes())
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/styles.css", get(styles_css))
@@ -383,6 +406,7 @@ fn app(
             most_played_cache: Arc::new(Mutex::new(None)),
             playback_sessions: Arc::new(RwLock::new(BTreeMap::new())),
             next_playback_session: Arc::new(AtomicU64::new(1)),
+            subsonic: subsonic_auth,
         })
 }
 
@@ -463,8 +487,15 @@ async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>
         "status": "ok",
         "provider": provider,
         "tracks": tracks,
+        // Native API version (see docs/api.md). The `/api` surface is v1.
+        "api_version": NATIVE_API_VERSION,
+        "server_version": env!("CARGO_PKG_VERSION"),
     })))
 }
+
+/// Version of the native HTTP/WebSocket API exposed under `/api`. Documented in
+/// docs/api.md; bump on breaking changes to routes or payloads.
+const NATIVE_API_VERSION: &str = "1";
 
 async fn library_summary(State(state): State<AppState>) -> Result<Json<LibrarySummary>, AppError> {
     let summary = state
@@ -2040,6 +2071,8 @@ impl Config {
                 .transpose()?,
             mpd_addrs: env("MUSICATA_MPD").map(|value| parse_addr_list(&value)),
             public_url: env("MUSICATA_PUBLIC_URL"),
+            subsonic_user: env("MUSICATA_SUBSONIC_USER"),
+            subsonic_password: env("MUSICATA_SUBSONIC_PASSWORD"),
         }
         .apply_to(&mut config);
 
@@ -2062,6 +2095,8 @@ impl Default for Config {
             scan_once: false,
             mpd_addrs: Vec::new(),
             public_url: None,
+            subsonic_user: "musicata".to_string(),
+            subsonic_password: None,
         }
     }
 }
@@ -2077,6 +2112,8 @@ struct ConfigOverrides {
     scan_once: Option<bool>,
     mpd_addrs: Option<Vec<String>>,
     public_url: Option<String>,
+    subsonic_user: Option<String>,
+    subsonic_password: Option<String>,
 }
 
 impl ConfigOverrides {
@@ -2125,9 +2162,21 @@ impl ConfigOverrides {
                         .ok_or_else(|| anyhow!("--public-url requires a URL"))?;
                     overrides.public_url = Some(value);
                 }
+                "--subsonic-user" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--subsonic-user requires a username"))?;
+                    overrides.subsonic_user = Some(value);
+                }
+                "--subsonic-password" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--subsonic-password requires a password"))?;
+                    overrides.subsonic_password = Some(value);
+                }
                 "--help" | "-h" => {
                     println!(
-                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan] [--no-incremental-rescan] [--scan-once] [--mpd HOST:PORT[,HOST:PORT]] [--public-url URL]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN, MUSICATA_INCREMENTAL_RESCAN, MUSICATA_SCAN_ONCE, MUSICATA_MPD, MUSICATA_PUBLIC_URL\nConfig file keys: library, database, addr, rescan, incremental_rescan, scan_once, mpd, public_url\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
+                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan] [--no-incremental-rescan] [--scan-once] [--mpd HOST:PORT[,HOST:PORT]] [--public-url URL] [--subsonic-user USER] [--subsonic-password PASS]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN, MUSICATA_INCREMENTAL_RESCAN, MUSICATA_SCAN_ONCE, MUSICATA_MPD, MUSICATA_PUBLIC_URL, MUSICATA_SUBSONIC_USER, MUSICATA_SUBSONIC_PASSWORD\nConfig file keys: library, database, addr, rescan, incremental_rescan, scan_once, mpd, public_url, subsonic_user, subsonic_password\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
                     );
                     std::process::exit(0);
                 }
@@ -2173,6 +2222,8 @@ impl ConfigOverrides {
                 "scan_once" => overrides.scan_once = Some(parse_bool(value, "config scan_once")?),
                 "mpd" | "mpd_addrs" => overrides.mpd_addrs = Some(parse_addr_list(value)),
                 "public_url" => overrides.public_url = Some(value.to_string()),
+                "subsonic_user" => overrides.subsonic_user = Some(value.to_string()),
+                "subsonic_password" => overrides.subsonic_password = Some(value.to_string()),
                 value => {
                     return Err(anyhow!(
                         "{}:{}: unknown config key `{value}`",
@@ -2217,6 +2268,14 @@ impl ConfigOverrides {
 
         if let Some(public_url) = self.public_url {
             config.public_url = Some(public_url);
+        }
+
+        if let Some(subsonic_user) = self.subsonic_user {
+            config.subsonic_user = subsonic_user;
+        }
+
+        if let Some(subsonic_password) = self.subsonic_password {
+            config.subsonic_password = Some(subsonic_password);
         }
     }
 }
@@ -3369,6 +3428,159 @@ mod tests {
         String::from_utf8(to_bytes(body, usize::MAX).await.unwrap().to_vec()).unwrap()
     }
 
+    // ---- OpenSubsonic API ----
+    // The fixture configures Subsonic credentials u=u / p=p (see `app_with_library`).
+    const SS_AUTH: &str = "u=u&p=p&v=1.16.1&c=test&f=json";
+
+    async fn subsonic_json(app: &axum::Router, query: &str) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        serde_json::from_str(&body_text(response.into_body()).await).expect("subsonic json")
+    }
+
+    #[tokio::test]
+    async fn subsonic_ping_authenticates() {
+        let fixture = TestFixture::new("ss-ping");
+        let app = fixture.app().await;
+
+        let ok = subsonic_json(&app, "ping.view?u=u&p=p&f=json").await;
+        assert_eq!(ok["subsonic-response"]["status"], "ok");
+        assert_eq!(ok["subsonic-response"]["openSubsonic"], true);
+
+        let bad = subsonic_json(&app, "ping.view?u=u&p=wrong&f=json").await;
+        assert_eq!(bad["subsonic-response"]["status"], "failed");
+        assert_eq!(bad["subsonic-response"]["error"]["code"], 40);
+    }
+
+    #[tokio::test]
+    async fn subsonic_ping_renders_xml_by_default() {
+        let fixture = TestFixture::new("ss-xml");
+        let app = fixture.app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/ping.view?u=u&p=p")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = body_text(response.into_body()).await;
+        assert!(content_type.contains("xml"), "got {content_type}");
+        assert!(body.contains("<subsonic-response"));
+        assert!(body.contains("status=\"ok\""));
+    }
+
+    #[tokio::test]
+    async fn subsonic_getartists_indexes_artists() {
+        let fixture = TestFixture::new("ss-artists");
+        let app = fixture.app().await;
+        let value = subsonic_json(&app, &format!("getArtists.view?{SS_AUTH}")).await;
+        let index = value["subsonic-response"]["artists"]["index"]
+            .as_array()
+            .expect("index");
+        assert!(!index.is_empty());
+        let artist = &index[0]["artist"][0];
+        assert!(artist["id"].is_string());
+        assert!(artist["name"].is_string());
+    }
+
+    #[tokio::test]
+    async fn subsonic_search3_finds_songs() {
+        let fixture = TestFixture::new("ss-search");
+        let app = fixture.app().await;
+        let value = subsonic_json(&app, &format!("search3.view?{SS_AUTH}&query=vavilon")).await;
+        let songs = value["subsonic-response"]["searchResult3"]["song"]
+            .as_array()
+            .expect("song array");
+        assert!(!songs.is_empty(), "expected songs matching 'vavilon'");
+    }
+
+    #[tokio::test]
+    async fn subsonic_stream_serves_audio_bytes() {
+        let fixture = TestFixture::new("ss-stream");
+        let app = fixture.app().await;
+        let search = subsonic_json(&app, &format!("search3.view?{SS_AUTH}&query=vavilon")).await;
+        let song_id = search["subsonic-response"]["searchResult3"]["song"][0]["id"]
+            .as_str()
+            .expect("song id")
+            .to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/stream.view?{SS_AUTH}&id={song_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content_type.starts_with("audio/"), "got {content_type}");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subsonic_getcoverart_serves_image() {
+        let fixture = TestFixture::new("ss-cover");
+        let app = fixture.app().await;
+        // The "1994 - Paramparcad" album folder has cover art in the fixture.
+        let albums = subsonic_json(&app, &format!("getAlbumList2.view?{SS_AUTH}&size=50")).await;
+        let album_id = albums["subsonic-response"]["albumList2"]["album"]
+            .as_array()
+            .expect("albums")
+            .iter()
+            .find(|album| {
+                album["name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains("Paramparcad"))
+            })
+            .and_then(|album| album["id"].as_str())
+            .expect("paramparcad album id")
+            .to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/getCoverArt.view?{SS_AUTH}&id={album_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content_type.starts_with("image/"), "got {content_type}");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!bytes.is_empty());
+    }
+
     struct TestFixture {
         root: PathBuf,
     }
@@ -3415,6 +3627,10 @@ mod tests {
                 LocalDiskProvider::new(&self.root),
                 players,
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                crate::subsonic::SubsonicAuth {
+                    user: "u".to_string(),
+                    password: Some("p".to_string()),
+                },
             )
         }
 

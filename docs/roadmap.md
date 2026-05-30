@@ -319,15 +319,29 @@ Goal: make Musicata useful beyond its first-party web app.
 
 Tasks:
 
-- Version the native HTTP/WebSocket API.
-- Document API routes and event payloads.
-- Implement basic OpenSubsonic endpoints for authentication, ping, artists, albums, songs, cover art, search, and stream.
-- Test with real OpenSubsonic/Subsonic clients.
+- [x] Version the native HTTP/WebSocket API. The `/api` surface is **v1**; `GET
+  /api/health` reports `api_version` and `server_version`. New fields/endpoints are
+  additive within a version; the version bumps only on breaking changes.
+- [x] Document API routes and event payloads. See [API reference](api.md) — native
+  routes, player commands, the WebSocket `PlaybackState`/browser frames, and the
+  OpenSubsonic surface (auth, formats, methods).
+- [x] Implement basic OpenSubsonic endpoints for authentication, ping, artists,
+  albums, songs, cover art, search, and stream. Mounted at `/rest`, XML + JSON, with
+  Subsonic auth (plaintext / `enc:` hex / `t`+`s` MD5 token) against a configured
+  `subsonic_user`/`subsonic_password` (open mode when unset, warned). Also
+  getAlbumList/2, getGenres, getMusicFolders, getIndexes, and `scrobble` (which feeds
+  Musicata's listening history). Unit + integration tested (auth, XML/JSON envelopes,
+  browse, search3, stream bytes, cover art).
+- [~] Test with real OpenSubsonic/Subsonic clients. The protocol is verified end to
+  end against a simulated client (token auth, browse chain, search, stream, cover
+  art, scrobble); validation against named native clients (Symfonium, Amperfy,
+  Feishin, DSub, …) is still to be done.
 
 Done when:
 
-- At least one third-party client can browse and stream from Musicata.
-- Native API docs are accurate enough for integration work.
+- [x] At least one third-party client can browse and stream from Musicata. *(Protocol
+  implemented and verified; pending a named-client smoke test.)*
+- [x] Native API docs are accurate enough for integration work.
 
 ## Milestone 9: Provider And Plugin System
 

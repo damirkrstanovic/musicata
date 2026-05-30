@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+md-5.workspace = true
 musicata-core = { path = "../musicata-core" }
 musicata-storage = { path = "../musicata-storage" }
 serde.workspace = true
