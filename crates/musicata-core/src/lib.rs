@@ -307,6 +307,95 @@ pub struct BrowseYearFacet {
     pub track_count: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Player domain
+//
+// Provider-neutral types describing controllable playback endpoints (a player),
+// their live state, and the commands a controller can issue. The local-disk MPD
+// backend is the first concrete provider; these types do not depend on it.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackStatus {
+    #[default]
+    Stopped,
+    Playing,
+    Paused,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    All,
+    One,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct PlayerCapabilities {
+    pub seek: bool,
+    pub volume: bool,
+    pub repeat: bool,
+    pub shuffle: bool,
+    pub queue: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Player {
+    pub id: String,
+    pub name: String,
+    /// Backend kind, e.g. "mpd".
+    pub kind: String,
+    pub online: bool,
+    pub capabilities: PlayerCapabilities,
+}
+
+/// What a controller knows about a track queued on a player. `stream_url` is what
+/// the player actually fetches; `track_id` links back to the library when known.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct QueueItem {
+    pub track_id: Option<String>,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub stream_url: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PlaybackState {
+    pub status: PlaybackStatus,
+    pub now_playing: Option<QueueItem>,
+    pub elapsed_seconds: Option<f64>,
+    pub duration_seconds: Option<f64>,
+    pub volume: Option<u8>,
+    pub repeat: RepeatMode,
+    pub shuffle: bool,
+    pub queue: Vec<QueueItem>,
+    pub queue_position: Option<usize>,
+}
+
+/// A command issued to a player. `PlayTracks`/`Enqueue` reference library track
+/// ids; the server resolves them to stream URLs and metadata before dispatch.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "command")]
+pub enum PlayerCommand {
+    Play,
+    Pause,
+    Stop,
+    Next,
+    Previous,
+    Seek { position_seconds: f64 },
+    SetVolume { volume: u8 },
+    SetRepeat { mode: RepeatMode },
+    SetShuffle { enabled: bool },
+    Clear,
+    PlayTracks { track_ids: Vec<String> },
+    Enqueue { track_ids: Vec<String> },
+    PlayQueueIndex { index: usize },
+}
+
 #[derive(Debug)]
 pub enum ScanError {
     NotFound(PathBuf),

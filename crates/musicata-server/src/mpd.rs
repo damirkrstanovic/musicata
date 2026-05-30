@@ -1,0 +1,404 @@
+//! Minimal async client for the Music Player Daemon (MPD) control protocol.
+//!
+//! MPD speaks a line-based text protocol over TCP: the client writes a command
+//! line, the server replies with `key: value` lines terminated by `OK` (or an
+//! `ACK ...` error line). The [`idle`](MpdConnection::idle) command blocks until
+//! a subsystem changes, which we use to push live state to controllers without
+//! polling. Only the subset Musicata needs is implemented; responses are parsed
+//! by the pure functions at the bottom of this module so they can be unit tested.
+
+use anyhow::{Result, bail};
+use musicata_core::{PlaybackState, PlaybackStatus, QueueItem, RepeatMode};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+
+/// A single MPD connection. Not internally synchronized: callers serialize access
+/// (one connection for commands, a separate one for the blocking `idle` loop).
+pub struct MpdConnection {
+    reader: BufReader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
+}
+
+impl MpdConnection {
+    /// Connect and consume the `OK MPD <version>` greeting.
+    pub async fn connect(addr: &str) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
+        let (read, writer) = stream.into_split();
+        let mut connection = Self {
+            reader: BufReader::new(read),
+            writer,
+        };
+        let greeting = connection.read_line().await?;
+        if !greeting.starts_with("OK MPD") {
+            bail!("unexpected MPD greeting: {greeting}");
+        }
+        Ok(connection)
+    }
+
+    async fn read_line(&mut self) -> Result<String> {
+        let mut line = String::new();
+        let read = self.reader.read_line(&mut line).await?;
+        if read == 0 {
+            bail!("MPD connection closed");
+        }
+        Ok(line.trim_end().to_string())
+    }
+
+    /// Send one command and collect its `key: value` response pairs (order
+    /// preserved), returning an error if MPD replies with `ACK`.
+    pub async fn command(&mut self, command: &str) -> Result<Vec<(String, String)>> {
+        // Write the command and its newline in one call so the request reaches the
+        // server as a single line rather than two fragments.
+        self.writer
+            .write_all(format!("{command}\n").as_bytes())
+            .await?;
+        self.writer.flush().await?;
+        self.read_response().await
+    }
+
+    async fn read_response(&mut self) -> Result<Vec<(String, String)>> {
+        let mut pairs = Vec::new();
+        loop {
+            let line = self.read_line().await?;
+            if line == "OK" {
+                return Ok(pairs);
+            }
+            if let Some(error) = line.strip_prefix("ACK") {
+                bail!("MPD error:{error}");
+            }
+            if let Some((key, value)) = line.split_once(": ") {
+                pairs.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+
+    /// Block until one of the watched subsystems changes, returning their names.
+    pub async fn idle(&mut self) -> Result<Vec<String>> {
+        let pairs = self.command("idle player mixer playlist options").await?;
+        Ok(pairs
+            .into_iter()
+            .filter(|(key, _)| key == "changed")
+            .map(|(_, value)| value)
+            .collect())
+    }
+
+    /// Fetch the current player state (`status` + `currentsong` + queue).
+    pub async fn playback_state(&mut self) -> Result<PlaybackState> {
+        let status = self.command("status").await?;
+        let current = self.command("currentsong").await?;
+        let queue = self.command("playlistinfo").await?;
+        Ok(parse_playback_state(&status, &current, &queue))
+    }
+
+    pub async fn play(&mut self) -> Result<()> {
+        self.command("play").await?;
+        Ok(())
+    }
+
+    pub async fn play_index(&mut self, index: usize) -> Result<()> {
+        self.command(&format!("play {index}")).await?;
+        Ok(())
+    }
+
+    pub async fn pause(&mut self) -> Result<()> {
+        self.command("pause 1").await?;
+        Ok(())
+    }
+
+    pub async fn stop(&mut self) -> Result<()> {
+        self.command("stop").await?;
+        Ok(())
+    }
+
+    pub async fn next(&mut self) -> Result<()> {
+        self.command("next").await?;
+        Ok(())
+    }
+
+    pub async fn previous(&mut self) -> Result<()> {
+        self.command("previous").await?;
+        Ok(())
+    }
+
+    pub async fn seek(&mut self, position_seconds: f64) -> Result<()> {
+        self.command(&format!("seekcur {position_seconds}")).await?;
+        Ok(())
+    }
+
+    pub async fn set_volume(&mut self, volume: u8) -> Result<()> {
+        self.command(&format!("setvol {}", volume.min(100))).await?;
+        Ok(())
+    }
+
+    pub async fn set_repeat(&mut self, mode: RepeatMode) -> Result<()> {
+        let (repeat, single) = match mode {
+            RepeatMode::Off => (0, 0),
+            RepeatMode::All => (1, 0),
+            RepeatMode::One => (1, 1),
+        };
+        self.command(&format!("repeat {repeat}")).await?;
+        self.command(&format!("single {single}")).await?;
+        Ok(())
+    }
+
+    pub async fn set_shuffle(&mut self, enabled: bool) -> Result<()> {
+        self.command(&format!("random {}", u8::from(enabled)))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn clear(&mut self) -> Result<()> {
+        self.command("clear").await?;
+        Ok(())
+    }
+
+    pub async fn add(&mut self, uri: &str) -> Result<()> {
+        self.command(&format!("add {}", quote_arg(uri))).await?;
+        Ok(())
+    }
+
+    /// Replace the queue with `uris` and start playing from the first.
+    pub async fn replace_queue(&mut self, uris: &[String]) -> Result<()> {
+        self.clear().await?;
+        for uri in uris {
+            self.add(uri).await?;
+        }
+        if !uris.is_empty() {
+            self.play_index(0).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Quote an MPD command argument: wrap in double quotes, escaping `"` and `\`.
+fn quote_arg(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn find<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.as_str())
+}
+
+/// Extract the library track id from a Musicata stream URL of the form
+/// `.../api/tracks/{id}/stream`, if present.
+fn track_id_from_uri(uri: &str) -> Option<String> {
+    let rest = uri.split("/api/tracks/").nth(1)?;
+    let id = rest.strip_suffix("/stream").unwrap_or(rest);
+    let id = id.split('?').next().unwrap_or(id);
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+fn queue_item(pairs: &[(String, String)]) -> QueueItem {
+    let uri = find(pairs, "file").unwrap_or_default().to_string();
+    QueueItem {
+        track_id: track_id_from_uri(&uri),
+        title: find(pairs, "Title").unwrap_or_default().to_string(),
+        artist: find(pairs, "Artist").unwrap_or_default().to_string(),
+        album: find(pairs, "Album").unwrap_or_default().to_string(),
+        stream_url: uri,
+    }
+}
+
+/// Split a `playlistinfo` response (repeating objects, each starting at `file:`)
+/// into per-song pair groups.
+fn split_objects(pairs: &[(String, String)]) -> Vec<Vec<(String, String)>> {
+    let mut objects: Vec<Vec<(String, String)>> = Vec::new();
+    for pair in pairs {
+        if pair.0 == "file" {
+            objects.push(Vec::new());
+        }
+        if let Some(current) = objects.last_mut() {
+            current.push(pair.clone());
+        }
+    }
+    objects
+}
+
+/// Build a [`PlaybackState`] from parsed `status`, `currentsong`, and
+/// `playlistinfo` responses.
+fn parse_playback_state(
+    status: &[(String, String)],
+    current: &[(String, String)],
+    queue: &[(String, String)],
+) -> PlaybackState {
+    let repeat = find(status, "repeat") == Some("1");
+    let single = find(status, "single") == Some("1");
+    let repeat_mode = match (repeat, single) {
+        (true, true) => RepeatMode::One,
+        (true, false) => RepeatMode::All,
+        _ => RepeatMode::Off,
+    };
+    let now_playing = if current.is_empty() {
+        None
+    } else {
+        Some(queue_item(current))
+    };
+
+    PlaybackState {
+        status: match find(status, "state") {
+            Some("play") => PlaybackStatus::Playing,
+            Some("pause") => PlaybackStatus::Paused,
+            _ => PlaybackStatus::Stopped,
+        },
+        now_playing,
+        elapsed_seconds: find(status, "elapsed").and_then(|value| value.parse().ok()),
+        duration_seconds: find(status, "duration").and_then(|value| value.parse().ok()),
+        // MPD reports volume -1 when no mixer is available.
+        volume: find(status, "volume")
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|volume| *volume >= 0)
+            .map(|volume| volume as u8),
+        repeat: repeat_mode,
+        shuffle: find(status, "random") == Some("1"),
+        queue: split_objects(queue)
+            .iter()
+            .map(|object| queue_item(object))
+            .collect(),
+        queue_position: find(status, "song").and_then(|value| value.parse().ok()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn pairs(text: &str) -> Vec<(String, String)> {
+        text.lines()
+            .filter_map(|line| line.split_once(": "))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parses_status_current_and_queue() {
+        let status = pairs(
+            "volume: 80\nrepeat: 1\nsingle: 1\nrandom: 0\nstate: play\nsong: 0\nelapsed: 12.500\nduration: 200.000",
+        );
+        let current = pairs(
+            "file: http://host/api/tracks/track_abc/stream\nTitle: Brzi Vavilon\nArtist: Darkwood Dub\nAlbum: Paramparcad",
+        );
+        let queue = pairs(
+            "file: http://host/api/tracks/track_abc/stream\nTitle: Brzi Vavilon\nArtist: Darkwood Dub\nfile: http://host/api/tracks/track_def/stream\nTitle: Spori Vavilon\nArtist: Darkwood Dub",
+        );
+
+        let state = parse_playback_state(&status, &current, &queue);
+
+        assert_eq!(state.status, PlaybackStatus::Playing);
+        assert_eq!(state.repeat, RepeatMode::One);
+        assert!(!state.shuffle);
+        assert_eq!(state.volume, Some(80));
+        assert_eq!(state.elapsed_seconds, Some(12.5));
+        assert_eq!(state.duration_seconds, Some(200.0));
+        assert_eq!(state.queue_position, Some(0));
+        let now = state.now_playing.expect("now playing");
+        assert_eq!(now.title, "Brzi Vavilon");
+        assert_eq!(now.track_id.as_deref(), Some("track_abc"));
+        assert_eq!(state.queue.len(), 2);
+        assert_eq!(state.queue[1].track_id.as_deref(), Some("track_def"));
+    }
+
+    #[test]
+    fn missing_mixer_yields_no_volume() {
+        let status = pairs("volume: -1\nstate: stop");
+        let state = parse_playback_state(&status, &[], &[]);
+        assert_eq!(state.volume, None);
+        assert_eq!(state.status, PlaybackStatus::Stopped);
+        assert!(state.now_playing.is_none());
+    }
+
+    #[test]
+    fn quotes_arguments() {
+        assert_eq!(quote_arg("http://h/a/b"), "\"http://h/a/b\"");
+        assert_eq!(quote_arg("a \"b\" \\c"), "\"a \\\"b\\\" \\\\c\"");
+    }
+
+    #[test]
+    fn extracts_track_id_from_stream_url() {
+        assert_eq!(
+            track_id_from_uri("http://host:3030/api/tracks/track_9/stream"),
+            Some("track_9".to_string())
+        );
+        assert_eq!(track_id_from_uri("file:///music/song.mp3"), None);
+    }
+
+    /// A tiny fake MPD server that replays canned responses, used to exercise the
+    /// real TCP connect/command/parse path offline.
+    async fn fake_mpd(script: Vec<(&'static str, &'static str)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"OK MPD 0.23.0\n").await.unwrap();
+            let mut buffer = vec![0_u8; 1024];
+            let mut pending = String::new();
+            loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                pending.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                // Process only complete (newline-terminated) command lines.
+                while let Some(newline) = pending.find('\n') {
+                    let command: String = pending.drain(..=newline).collect();
+                    let command = command.trim_end();
+                    let reply = script
+                        .iter()
+                        .find(|(name, _)| command == *name)
+                        .map(|(_, reply)| *reply)
+                        .unwrap_or("");
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                    socket.write_all(b"OK\n").await.unwrap();
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn round_trips_commands_over_tcp() {
+        let addr = fake_mpd(vec![
+            ("clear", ""),
+            ("add \"http://host/api/tracks/track_1/stream\"", ""),
+            ("play 0", ""),
+            (
+                "status",
+                "volume: 50\nstate: play\nsong: 0\nrepeat: 0\nsingle: 0\nrandom: 0\n",
+            ),
+            (
+                "currentsong",
+                "file: http://host/api/tracks/track_1/stream\nTitle: Song\nArtist: Artist\n",
+            ),
+            (
+                "playlistinfo",
+                "file: http://host/api/tracks/track_1/stream\nTitle: Song\n",
+            ),
+        ])
+        .await;
+
+        let mut connection = MpdConnection::connect(&addr).await.expect("connect");
+        connection
+            .replace_queue(&["http://host/api/tracks/track_1/stream".to_string()])
+            .await
+            .expect("replace queue");
+        let state = connection.playback_state().await.expect("state");
+
+        assert_eq!(state.status, PlaybackStatus::Playing);
+        assert_eq!(state.volume, Some(50));
+        assert_eq!(
+            state.now_playing.expect("now playing").track_id.as_deref(),
+            Some("track_1")
+        );
+        assert_eq!(state.queue.len(), 1);
+    }
+}

@@ -164,17 +164,39 @@ Search design decisions:
 
 ## Milestone 5: Playback, Queues, And Zones
 
+Status: in progress.
+
 Goal: move from “play this URL in browser” to server-managed playback state.
 
 Tasks:
 
-- Add player registry and zone model.
-- Add queue model per player/zone.
-- Add commands: play, pause, stop, seek, next, previous, enqueue, reorder, clear, shuffle, repeat.
-- Add WebSocket state updates for controllers.
-- Treat the browser player as the first player provider.
-- Add playback session state and now-playing history.
+- [x] Add player registry (provider-neutral player domain types + a registry).
+- Add zone model.
+- Add queue model per player/zone. (MPD's own queue is currently driven directly;
+  a server-owned persistent queue is still to come.)
+- [x] Add commands: play, pause, stop, seek, next, previous, enqueue, clear,
+  shuffle, repeat. (Reorder still to do.)
+- [x] Add WebSocket state updates for controllers.
+- Treat the browser player as the first player provider. (The first concrete
+  provider is MPD; the browser provider is still to come.)
+- Add playback session state and now-playing history. (Live now-playing is
+  reported; durable history is still to come.)
 - [x] Stop browser playback when the server-bound playback session heartbeat is lost.
+
+Player provider design decisions (see also Milestone 10):
+
+- The first local player reuses **MPD** over its native TCP control protocol —
+  the de-facto "existing remote API" for headless Linux players — rather than a
+  bespoke audio backend. Control is driven by the `idle` command, which pushes
+  state changes so the UI stays current without polling.
+- MPD plays Musicata stream URLs (`/api/tracks/{id}/stream`), so MPD needs no
+  filesystem access and the same path works for any future networked player.
+- Controllers receive live state over a **WebSocket** (`/api/players/{id}/ws`);
+  commands go through the REST player API. MPD is configured via `--mpd`
+  (`host:port[,host:port]`) and `--public-url`.
+- MPRIS (D-Bus) is a future transport-only provider: it can pause/skip running
+  desktop players but cannot reliably choose what plays. Emulating LMS/SlimProto
+  or AirPlay (à la Music Assistant) is much later.
 
 Done when:
 

@@ -81,6 +81,15 @@ MUSICATA_LIBRARY=/path/to/music MUSICATA_DATABASE=.musicata/musicata.db MUSICATA
 On first run the server scans the configured library, reads embedded tags with Lofty, and stores canonical tracks plus provenance-aware observed metadata in SQLite. Later runs load from the database unless `--rescan` or `MUSICATA_RESCAN=true` is set.
 By default, startup performs a lightweight incremental rescan check using provider item IDs, file sizes, modified timestamps, and content hashes. Use `--no-incremental-rescan` to load only from the database.
 The running server can also rescan through `POST /api/library/rescan`; add `?force=true` to rewrite the stored library even when no changes are detected.
+
+To control a local MPD instance, point Musicata at it and tell it how MPD can reach this server for streams:
+
+```sh
+cargo run -p musicata-server -- --mpd 127.0.0.1:6600 --public-url http://127.0.0.1:3030
+# or: MUSICATA_MPD=127.0.0.1:6600 MUSICATA_PUBLIC_URL=http://127.0.0.1:3030
+```
+
+Musicata drives MPD over its native protocol, enqueues Musicata stream URLs, and pushes live state to controllers over a WebSocket. Multiple players: `--mpd host1:6600,host2:6600`.
 Use `--scan-once` for a non-server scan/update command:
 
 ```sh
@@ -100,6 +109,10 @@ Useful endpoints:
 - `GET /api/browse` metadata facets for genre, year, composer, and folder.
 - `GET /api/browse/recently-added` tracks ordered by when they entered the database.
 - `GET /api/search?q=darkwood&limit=50` ranked SQLite FTS5 search (tokenized, prefix, accent- and case-insensitive) across artists, albums, and tracks.
+- `GET /api/players` configured players (e.g. MPD) with capabilities and online state.
+- `GET /api/players/{id}/state` current playback state (status, now playing, queue, volume).
+- `POST /api/players/{id}/commands` issue a command, e.g. `{"command":"play_tracks","track_ids":["..."]}`, `{"command":"pause"}`, `{"command":"seek","position_seconds":30}`.
+- `GET /api/players/{id}/ws` WebSocket stream of live playback state.
 - `GET /api/albums/{id}/artwork/cover-art-archive/candidates` reviewed remote artwork candidates for MusicBrainz-linked albums.
 - `GET /api/metadata/write-back` current file tag write-back policy.
 - `GET /api/tracks/{id}/stream` audio stream with basic byte-range support.

@@ -1,10 +1,14 @@
+mod mpd;
 mod musicbrainz;
+mod players;
 
+use crate::players::{MpdPlayer, MpdPlayerConfig, PlayerManager};
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     body::Body,
     extract::Request,
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::{Path, Query, State},
     http::{
         HeaderMap, StatusCode,
@@ -20,8 +24,8 @@ use axum::{
 };
 use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, Library, LibrarySummary, LocalDiskProvider,
-    MetadataApprovalState, MetadataFieldValue, MusicProvider, SearchResults, Track,
-    TrackMetadataFieldObservation, album_artwork_url, artwork_asset_id,
+    MetadataApprovalState, MetadataFieldValue, MusicProvider, PlaybackState, Player, PlayerCommand,
+    SearchResults, Track, TrackMetadataFieldObservation, album_artwork_url, artwork_asset_id,
     find_album_artwork_candidates,
 };
 use musicata_storage::Database;
@@ -56,6 +60,7 @@ const TAG_WRITE_BACK_DISABLED_REASON: &str =
 struct AppState {
     database: Database,
     provider: LocalDiskProvider,
+    players: Arc<PlayerManager>,
     musicbrainz: MusicBrainzClient,
     rescan_lock: Arc<Mutex<()>>,
     playback_sessions: Arc<RwLock<BTreeMap<String, PlaybackSession>>>,
@@ -75,6 +80,11 @@ struct Config {
     rescan: bool,
     no_incremental_rescan: bool,
     scan_once: bool,
+    /// Comma-separated MPD player addresses (`host:port`) to control.
+    mpd_addrs: Vec<String>,
+    /// Base URL MPD uses to fetch streams from this server, e.g.
+    /// `http://127.0.0.1:3030`. Defaults to `http://<addr>`.
+    public_url: Option<String>,
 }
 
 #[tokio::main]
@@ -107,12 +117,27 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let public_url = config
+        .public_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{}", config.addr));
+    let player_configs = mpd_player_configs(&config.mpd_addrs);
+    if !player_configs.is_empty() {
+        tracing::info!(
+            players = player_configs.len(),
+            "registered MPD players: {}",
+            config.mpd_addrs.join(", ")
+        );
+    }
+    let players = Arc::new(PlayerManager::new(player_configs, public_url));
+    players.start(database.clone());
+
     let listener = tokio::net::TcpListener::bind(config.addr)
         .await
         .with_context(|| format!("failed to bind {}", config.addr))?;
 
     tracing::info!("listening on http://{}", config.addr);
-    axum::serve(listener, app(database, provider))
+    axum::serve(listener, app(database, provider, players))
         .await
         .context("server failed")?;
 
@@ -172,7 +197,7 @@ async fn load_or_scan_library(
     Ok(scanned)
 }
 
-fn app(database: Database, provider: LocalDiskProvider) -> Router {
+fn app(database: Database, provider: LocalDiskProvider, players: Arc<PlayerManager>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
@@ -195,6 +220,10 @@ fn app(database: Database, provider: LocalDiskProvider) -> Router {
             "/api/playback/sessions/{id}/events",
             get(playback_session_events),
         )
+        .route("/api/players", get(list_players))
+        .route("/api/players/{id}/state", get(player_state))
+        .route("/api/players/{id}/commands", post(player_command))
+        .route("/api/players/{id}/ws", get(player_ws))
         .route("/api/artists", get(artists))
         .route("/api/artists/{id}", get(artist_detail))
         .route("/api/albums", get(albums))
@@ -242,6 +271,7 @@ fn app(database: Database, provider: LocalDiskProvider) -> Router {
         .with_state(AppState {
             database,
             provider,
+            players,
             musicbrainz: MusicBrainzClient::default(),
             rescan_lock: Arc::new(Mutex::new(())),
             playback_sessions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -504,6 +534,85 @@ async fn albums(
         .await
         .map_err(db_error)?;
     Ok(Json(page_envelope(items, total, &query)))
+}
+
+async fn list_players(State(state): State<AppState>) -> Json<Vec<Player>> {
+    Json(state.players.descriptors())
+}
+
+async fn player_state(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PlaybackState>, AppError> {
+    let player = state
+        .players
+        .get(&id)
+        .ok_or_else(|| AppError::not_found(format!("unknown player: {id}")))?;
+    let playback = player.state(&state.database).await.map_err(db_error)?;
+    Ok(Json(playback))
+}
+
+async fn player_command(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(command): Json<PlayerCommand>,
+) -> Result<Json<PlaybackState>, AppError> {
+    let player = state
+        .players
+        .get(&id)
+        .ok_or_else(|| AppError::not_found(format!("unknown player: {id}")))?;
+    player
+        .execute(command, &state.database, state.players.public_base_url())
+        .await
+        .map_err(db_error)?;
+    let playback = player.state(&state.database).await.map_err(db_error)?;
+    Ok(Json(playback))
+}
+
+async fn player_ws(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    match state.players.get(&id) {
+        Some(player) => {
+            let database = state.database.clone();
+            upgrade.on_upgrade(move |socket| player_ws_loop(socket, player, database))
+        }
+        None => AppError::not_found(format!("unknown player: {id}")).into_response(),
+    }
+}
+
+/// Push player state to a controller: an initial snapshot, then every broadcast
+/// update (idle-driven or command-driven) until the socket closes.
+async fn player_ws_loop(mut socket: WebSocket, player: Arc<MpdPlayer>, database: Database) {
+    let mut updates = player.subscribe();
+
+    if let Ok(state) = player.state(&database).await
+        && let Ok(text) = serde_json::to_string(&state)
+        && socket.send(Message::Text(text.into())).await.is_err()
+    {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            update = updates.recv() => match update {
+                Ok(state) => {
+                    let text = serde_json::to_string(&state).unwrap_or_default();
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            incoming = socket.recv() => match incoming {
+                Some(Ok(_)) => {}
+                _ => break,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1535,6 +1644,8 @@ impl Config {
             scan_once: env("MUSICATA_SCAN_ONCE")
                 .map(|value| parse_bool(&value, "MUSICATA_SCAN_ONCE"))
                 .transpose()?,
+            mpd_addrs: env("MUSICATA_MPD").map(|value| parse_addr_list(&value)),
+            public_url: env("MUSICATA_PUBLIC_URL"),
         }
         .apply_to(&mut config);
 
@@ -1555,6 +1666,8 @@ impl Default for Config {
             rescan: false,
             no_incremental_rescan: false,
             scan_once: false,
+            mpd_addrs: Vec::new(),
+            public_url: None,
         }
     }
 }
@@ -1568,6 +1681,8 @@ struct ConfigOverrides {
     rescan: Option<bool>,
     no_incremental_rescan: Option<bool>,
     scan_once: Option<bool>,
+    mpd_addrs: Option<Vec<String>>,
+    public_url: Option<String>,
 }
 
 impl ConfigOverrides {
@@ -1604,9 +1719,21 @@ impl ConfigOverrides {
                 "--rescan" => overrides.rescan = Some(true),
                 "--no-incremental-rescan" => overrides.no_incremental_rescan = Some(true),
                 "--scan-once" => overrides.scan_once = Some(true),
+                "--mpd" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--mpd requires host:port[,host:port]"))?;
+                    overrides.mpd_addrs = Some(parse_addr_list(&value));
+                }
+                "--public-url" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--public-url requires a URL"))?;
+                    overrides.public_url = Some(value);
+                }
                 "--help" | "-h" => {
                     println!(
-                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan] [--no-incremental-rescan] [--scan-once]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN, MUSICATA_INCREMENTAL_RESCAN, MUSICATA_SCAN_ONCE\nConfig file keys: library, database, addr, rescan, incremental_rescan, scan_once\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
+                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan] [--no-incremental-rescan] [--scan-once] [--mpd HOST:PORT[,HOST:PORT]] [--public-url URL]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN, MUSICATA_INCREMENTAL_RESCAN, MUSICATA_SCAN_ONCE, MUSICATA_MPD, MUSICATA_PUBLIC_URL\nConfig file keys: library, database, addr, rescan, incremental_rescan, scan_once, mpd, public_url\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
                     );
                     std::process::exit(0);
                 }
@@ -1650,6 +1777,8 @@ impl ConfigOverrides {
                         Some(parse_bool(value, "config no_incremental_rescan")?)
                 }
                 "scan_once" => overrides.scan_once = Some(parse_bool(value, "config scan_once")?),
+                "mpd" | "mpd_addrs" => overrides.mpd_addrs = Some(parse_addr_list(value)),
+                "public_url" => overrides.public_url = Some(value.to_string()),
                 value => {
                     return Err(anyhow!(
                         "{}:{}: unknown config key `{value}`",
@@ -1687,7 +1816,44 @@ impl ConfigOverrides {
         if let Some(scan_once) = self.scan_once {
             config.scan_once = scan_once;
         }
+
+        if let Some(mpd_addrs) = self.mpd_addrs {
+            config.mpd_addrs = mpd_addrs;
+        }
+
+        if let Some(public_url) = self.public_url {
+            config.public_url = Some(public_url);
+        }
     }
+}
+
+/// Parse a comma-separated list of `host:port` addresses, trimming blanks.
+fn parse_addr_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Turn configured MPD addresses into player configs. A single player gets the
+/// id `mpd`; multiple get `mpd-1`, `mpd-2`, ...
+fn mpd_player_configs(addrs: &[String]) -> Vec<MpdPlayerConfig> {
+    let single = addrs.len() == 1;
+    addrs
+        .iter()
+        .enumerate()
+        .map(|(index, addr)| MpdPlayerConfig {
+            id: if single {
+                "mpd".to_string()
+            } else {
+                format!("mpd-{}", index + 1)
+            },
+            name: format!("MPD ({addr})"),
+            addr: addr.clone(),
+        })
+        .collect()
 }
 
 fn parse_addr(value: &str, source: &str) -> Result<SocketAddr> {
@@ -1724,7 +1890,7 @@ fn init_logging() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ARTWORK_CACHE_CONTROL, Config, app, parse_range};
+    use super::{ARTWORK_CACHE_CONTROL, Config, PlayerManager, app, parse_range};
     use axum::{
         body::{Body, to_bytes},
         http::{
@@ -1734,6 +1900,7 @@ mod tests {
     };
     use musicata_core::{Library, LocalDiskProvider, scan_local_library};
     use musicata_storage::Database;
+    use std::sync::Arc;
     use std::{collections::HashMap, fs, path::PathBuf, time::SystemTime};
     use tower::ServiceExt;
 
@@ -2679,7 +2846,11 @@ mod tests {
                 .save_library(&mut library)
                 .await
                 .expect("save fixture library");
-            app(database, LocalDiskProvider::new(&self.root))
+            let players = Arc::new(PlayerManager::new(
+                Vec::new(),
+                "http://127.0.0.1".to_string(),
+            ));
+            app(database, LocalDiskProvider::new(&self.root), players)
         }
 
         fn write(&self, relative_path: &str) {
