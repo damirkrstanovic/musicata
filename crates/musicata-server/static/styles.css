@@ -74,6 +74,13 @@ select {
   overflow-y: auto;
 }
 
+/* The sidebar scrolls as one column; its sections must keep their natural height.
+   Without this, a flex column with overflow shrinks children below their content
+   (notably in Firefox), so sections overlap. */
+.library-panel > * {
+  flex-shrink: 0;
+}
+
 .brand {
   display: flex;
   align-items: center;
@@ -153,8 +160,6 @@ h1 {
 .album-list {
   display: grid;
   gap: 8px;
-  max-height: calc(100vh - 450px);
-  overflow: auto;
   padding-right: 4px;
 }
 
@@ -1196,6 +1201,8 @@ h1 {
 }
 
 .queue-list {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 8px 14px 18px;
 }
