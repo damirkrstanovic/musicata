@@ -172,21 +172,33 @@ h1 {
   left: 11px;
   top: 50%;
   transform: translateY(-50%);
+  display: flex;
   color: var(--muted);
-  font-size: 1.05rem;
   pointer-events: none;
 }
 
 .search input {
   appearance: none;
   -webkit-appearance: none;
-  border-radius: 10px;
-  padding: 8px 12px 8px 33px;
-  font-size: 0.88rem;
+  border-radius: 8px;
+  border-color: transparent;
+  background: rgba(255, 255, 255, 0.04);
+  padding: 6px 12px 6px 31px;
+  font-size: 0.82rem;
+  height: 32px;
 }
 
 .search input::placeholder {
   color: var(--muted);
+  letter-spacing: 0.2px;
+}
+
+.search input:focus {
+  background: #101318;
+}
+
+.search:focus-within .search-icon {
+  color: var(--accent);
 }
 
 .search input::-webkit-search-cancel-button {
