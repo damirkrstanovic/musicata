@@ -195,8 +195,14 @@ Tasks:
   per-second browser reports and MPD's sparse idle updates. Listens persist to a
   `listens` table (migration v11); `GET /api/history/recent` and
   `/api/history/most-played` aggregate them, surfaced in the web app as "Recently
-  played" / "Most played" views. This is the foundation for Milestone 7.
+  played" / "Most played" views, which refresh live as tracks change. This is the
+  foundation for Milestone 7.
 - [x] Stop browser playback when the server-bound playback session heartbeat is lost.
+- [x] No manual refresh anywhere. The server re-scans the filesystem on a 30s timer
+  (incremental, so an unchanged library is cheap), and the web app polls the library
+  summary (and re-checks on focus), reloading only when the track/album counts change.
+  The history views also refresh on track-change events. The manual "Refresh" button
+  is gone.
 
 Player provider design decisions (see also Milestone 10):
 

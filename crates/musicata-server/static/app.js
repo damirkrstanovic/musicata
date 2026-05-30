@@ -6,6 +6,8 @@ const state = {
   tracks: [],
   visibleTracks: [],
   view: "library",
+  librarySignature: null,
+  lastNow: {},
   activePlayerId: null,
   activeStatus: "stopped",
   activeNowTrackId: null,
@@ -42,7 +44,6 @@ const els = {
   trackList: document.querySelector("#track-list"),
   navLinks: Array.from(document.querySelectorAll(".library-nav .nav-link")),
   viewTitle: document.querySelector("#view-title"),
-  refresh: document.querySelector("#refresh"),
   audio: document.querySelector("#audio"),
   nowTitle: document.querySelector("#now-title"),
   nowSubtitle: document.querySelector("#now-subtitle"),
@@ -165,14 +166,18 @@ async function loadLibrary() {
     state.tracks = tracks;
     state.browse = browse;
     els.summary.textContent = `${summary.track_count} tracks, ${summary.album_count} albums`;
+    state.librarySignature = `${summary.track_count}:${summary.album_count}`;
     renderBrowseFilters();
+    renderAlbums(albums);
 
-    if (hasBrowseFilter()) {
+    // Keep whatever view the user is on; only the library views re-render the center.
+    if (state.view === "recent" || state.view === "most") {
+      await loadHistoryView(state.view);
+    } else if (hasBrowseFilter()) {
       await applyBrowseFilter({ clearSearch: false });
     } else {
       state.visibleTracks = tracks;
       els.viewTitle.textContent = "Tracks";
-      renderAlbums(albums);
       renderTracks(tracks);
     }
 
@@ -186,21 +191,18 @@ async function loadLibrary() {
   }
 }
 
-async function rescanLibrary() {
-  const label = els.refresh.textContent;
-  els.refresh.disabled = true;
-  els.refresh.textContent = "Scanning";
-
+// Cheap poll: re-read the library only when its track/album counts changed (the
+// server rescans the filesystem on its own). This replaces the manual refresh
+// button — new or removed tracks surface without any user action.
+async function syncLibrary() {
   try {
-    const result = await apiPost("/api/library/rescan");
-    await loadLibrary();
-    const status = result.updated ? "" : " (unchanged)";
-    els.summary.textContent = `${result.summary.track_count} tracks, ${result.summary.album_count} albums${status}`;
-  } catch (error) {
-    els.trackList.innerHTML = `<p class="error">Rescan failed: ${escapeHtml(error.message)}</p>`;
-  } finally {
-    els.refresh.disabled = false;
-    els.refresh.textContent = label;
+    const summary = await api("/api/library/summary");
+    const signature = `${summary.track_count}:${summary.album_count}`;
+    if (signature !== state.librarySignature) {
+      await loadLibrary();
+    }
+  } catch {
+    /* transient; the next tick retries */
   }
 }
 
@@ -295,26 +297,34 @@ function markNavActive(view) {
   }
 }
 
+const HISTORY_VIEWS = {
+  most: { url: "/api/history/most-played", title: "Most played", empty: "Nothing played yet." },
+  recent: { url: "/api/history/recent", title: "Recently played", empty: "Nothing played yet." },
+};
+
 async function setView(view) {
   markNavActive(view);
-
   if (view === "library") {
     await applyBrowseFilter({ clearSearch: false });
-    return;
+  } else {
+    await loadHistoryView(view);
   }
+}
 
-  const config =
-    view === "most"
-      ? { url: "/api/history/most-played", title: "Most played", empty: "Nothing played yet." }
-      : { url: "/api/history/recent", title: "Recently played", empty: "Nothing played yet." };
-
+// Fetch and render a history view. Safe to call repeatedly (e.g. when a track
+// changes), so the list stays live without any manual refresh.
+async function loadHistoryView(view) {
+  const config = HISTORY_VIEWS[view];
+  if (!config) return;
   els.viewTitle.textContent = config.title;
   try {
     const tracks = await api(config.url);
+    if (state.view !== view) return; // The user switched away while we were loading.
     state.visibleTracks = tracks;
-    renderTracks(tracks);
     if (tracks.length === 0) {
       els.trackList.innerHTML = `<p class="empty">${config.empty}</p>`;
+    } else {
+      renderTracks(tracks);
     }
   } catch (error) {
     els.trackList.innerHTML = `<p class="error">Failed to load history: ${escapeHtml(error.message)}</p>`;
@@ -1217,10 +1227,17 @@ els.browseClear.addEventListener("click", () => {
   clearBrowseFilter();
   applyBrowseFilter();
 });
-els.refresh.addEventListener("click", rescanLibrary);
 for (const link of els.navLinks) {
   link.addEventListener("click", () => setView(link.dataset.view));
 }
+// Auto-refresh the library: poll for filesystem changes and re-check on focus, so
+// there is no manual refresh button.
+const LIBRARY_SYNC_INTERVAL = 20000;
+setInterval(syncLibrary, LIBRARY_SYNC_INTERVAL);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") syncLibrary();
+});
+window.addEventListener("focus", syncLibrary);
 els.metadataClose.addEventListener("click", closeMetadata);
 // Footer transport targets the active player.
 els.prev.addEventListener("click", () => {
@@ -1496,6 +1513,15 @@ function openPlayerSocket(id) {
       const playback = JSON.parse(event.data);
       // Track every player's status so the switcher can flag which are playing.
       state.playerStatus[id] = playback.status;
+      // When any player advances to a different track, a listen for the previous one
+      // may have just been recorded — refresh an open history view so it stays live.
+      const nowTrack = playback.now_playing?.track_id ?? null;
+      if (nowTrack !== state.lastNow[id]) {
+        state.lastNow[id] = nowTrack;
+        if (state.view === "recent" || state.view === "most") {
+          loadHistoryView(state.view);
+        }
+      }
       const node = playerEls.list.querySelector(`[data-now="${cssEscape(id)}"]`);
       if (node) {
         const suffix = id === browserPlayerId && browserOutput ? " (playing here)" : "";

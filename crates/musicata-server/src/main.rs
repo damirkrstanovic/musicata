@@ -136,12 +136,74 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", config.addr))?;
 
+    // Keep the library current with the filesystem on its own, so controllers never
+    // need a manual "rescan" — they just re-read and see new/changed tracks. The
+    // shared lock serializes this with on-demand rescans.
+    let rescan_lock = Arc::new(Mutex::new(()));
+    if !config.no_incremental_rescan {
+        tokio::spawn(periodic_rescan(
+            database.clone(),
+            provider.clone(),
+            rescan_lock.clone(),
+            LIBRARY_RESCAN_INTERVAL,
+        ));
+    }
+
     tracing::info!("listening on http://{}", config.addr);
-    axum::serve(listener, app(database, provider, players))
+    axum::serve(listener, app(database, provider, players, rescan_lock))
         .await
         .context("server failed")?;
 
     Ok(())
+}
+
+/// How often the library is re-scanned against the filesystem in the background.
+const LIBRARY_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Periodically re-scans the library and persists any changes. Incremental change
+/// detection only stats files, so an unchanged library is cheap; nothing is written
+/// when nothing changed. Errors are logged and the loop continues.
+async fn periodic_rescan(
+    database: Database,
+    provider: LocalDiskProvider,
+    rescan_lock: Arc<Mutex<()>>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await; // The first tick fires immediately; skip it (startup already scanned).
+    loop {
+        ticker.tick().await;
+        let _guard = rescan_lock.lock().await;
+        let scan_provider = provider.clone();
+        let scanned = match tokio::task::spawn_blocking(move || scan_provider.scan()).await {
+            Ok(Ok(scanned)) => scanned,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "background rescan failed");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "background rescan task panicked");
+                continue;
+            }
+        };
+        match database.detect_library_changes(&scanned).await {
+            Ok(changes) if changes.has_changes() => {
+                let mut scanned = scanned;
+                if let Err(error) = database.save_library(&mut scanned).await {
+                    tracing::warn!(%error, "failed to persist background rescan");
+                } else {
+                    tracing::info!(
+                        added = changes.added,
+                        removed = changes.removed,
+                        modified = changes.modified,
+                        "background rescan updated library"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "background change detection failed"),
+        }
+    }
 }
 
 async fn load_or_scan_library(
@@ -197,7 +259,12 @@ async fn load_or_scan_library(
     Ok(scanned)
 }
 
-fn app(database: Database, provider: LocalDiskProvider, players: Arc<PlayerManager>) -> Router {
+fn app(
+    database: Database,
+    provider: LocalDiskProvider,
+    players: Arc<PlayerManager>,
+    rescan_lock: Arc<Mutex<()>>,
+) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
@@ -282,7 +349,7 @@ fn app(database: Database, provider: LocalDiskProvider, players: Arc<PlayerManag
             provider,
             players,
             musicbrainz: MusicBrainzClient::default(),
-            rescan_lock: Arc::new(Mutex::new(())),
+            rescan_lock,
             playback_sessions: Arc::new(RwLock::new(BTreeMap::new())),
             next_playback_session: Arc::new(AtomicU64::new(1)),
         })
@@ -3254,7 +3321,12 @@ mod tests {
             let players = PlayerManager::load(database.clone(), "http://127.0.0.1".to_string())
                 .await
                 .expect("player manager");
-            app(database, LocalDiskProvider::new(&self.root), players)
+            app(
+                database,
+                LocalDiskProvider::new(&self.root),
+                players,
+                std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            )
         }
 
         fn write(&self, relative_path: &str) {
