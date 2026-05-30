@@ -13,6 +13,8 @@ const state = {
   activeDuration: 0,
   seekDragging: false,
   queueOpen: false,
+  playerStatus: {},
+  playerMenuOpen: false,
   searchController: null,
   metadataTrackId: null,
   metadataReview: null,
@@ -45,7 +47,12 @@ const els = {
   prev: document.querySelector("#prev"),
   next: document.querySelector("#next"),
   playPause: document.querySelector("#play-pause"),
-  activePlayer: document.querySelector("#active-player"),
+  switchBtn: document.querySelector("#player-switch-btn"),
+  switchName: document.querySelector("#switch-name"),
+  switchSignal: document.querySelector("#switch-signal"),
+  playerMenu: document.querySelector("#player-menu"),
+  playerMenuList: document.querySelector("#player-menu-list"),
+  playerMenuConfig: document.querySelector("#player-menu-config"),
   transport: document.querySelector(".transport"),
   nowArt: document.querySelector("#now-art"),
   nowArtFallback: document.querySelector("#now-art-fallback"),
@@ -55,7 +62,6 @@ const els = {
   shuffle: document.querySelector("#shuffle"),
   repeat: document.querySelector("#repeat"),
   footerVolume: document.querySelector("#footer-volume"),
-  outputSignal: document.querySelector("#output-signal"),
   queueToggle: document.querySelector("#queue-toggle"),
   queueCount: document.querySelector("#queue-count"),
   queueDrawer: document.querySelector("#queue-drawer"),
@@ -67,7 +73,6 @@ const els = {
   metadataBody: document.querySelector("#metadata-body"),
   metadataClose: document.querySelector("#metadata-close"),
   settings: document.querySelector("#settings"),
-  settingsOpen: document.querySelector("#settings-open"),
   settingsClose: document.querySelector("#settings-close"),
 };
 
@@ -77,7 +82,6 @@ function openSettings() {
 function closeSettings() {
   els.settings.hidden = true;
 }
-els.settingsOpen.addEventListener("click", openSettings);
 els.settingsClose.addEventListener("click", closeSettings);
 els.settings.addEventListener("click", (event) => {
   if (event.target === els.settings) closeSettings();
@@ -1194,7 +1198,6 @@ els.playPause.addEventListener("click", () => {
     playTrack(0);
   }
 });
-els.activePlayer.addEventListener("change", () => setActivePlayer(els.activePlayer.value));
 
 // Seek: preview while dragging, commit on release.
 els.seek.addEventListener("input", () => {
@@ -1357,7 +1360,7 @@ async function loadPlayers() {
     playerData = { players, zones };
     browserPlayerId = players.find((player) => player.kind === "browser")?.id ?? null;
     renderPlayers();
-    populateActivePlayerSelect(players);
+    renderPlayerSwitcher(players);
   } catch (error) {
     playerEls.list.innerHTML = `<p class="error">Players unavailable: ${escapeHtml(error.message)}</p>`;
   }
@@ -1448,6 +1451,8 @@ function openPlayerSocket(id) {
   socket.onmessage = (event) => {
     try {
       const playback = JSON.parse(event.data);
+      // Track every player's status so the switcher can flag which are playing.
+      state.playerStatus[id] = playback.status;
       const node = playerEls.list.querySelector(`[data-now="${cssEscape(id)}"]`);
       if (node) {
         const suffix = id === browserPlayerId && browserOutput ? " (playing here)" : "";
@@ -1466,7 +1471,10 @@ function openPlayerSocket(id) {
       }
       if (id === state.activePlayerId) {
         updateFooterFromState(playback);
+      } else {
+        updateSwitchIndicator();
       }
+      if (state.playerMenuOpen) renderPlayerSwitcher(playerData.players);
     } catch {
       /* ignore malformed frames */
     }
@@ -1586,31 +1594,44 @@ function savedActivePlayer() {
   }
 }
 
-function populateActivePlayerSelect(players) {
-  if (!els.activePlayer) return;
-  els.activePlayer.innerHTML = players
+// Dot class for a player's live status: playing > online > offline.
+function dotClass(player) {
+  const status = state.playerStatus[player.id];
+  if (status === "playing") return "pm-dot playing";
+  if (player.online) return "pm-dot online";
+  return "pm-dot";
+}
+
+function renderPlayerSwitcher(players) {
+  if (!els.playerMenuList) return;
+  els.playerMenuList.innerHTML = players
     .map(
-      (player) =>
-        `<option value="${escapeHtml(player.id)}">${escapeHtml(player.name)}${player.online ? "" : " (offline)"}</option>`,
+      (player) => `
+        <button class="player-menu-item ${player.id === state.activePlayerId ? "active" : ""}"
+                data-player="${escapeHtml(player.id)}" type="button" role="menuitem">
+          <span class="${dotClass(player)}"></span>
+          <span class="pm-name">${escapeHtml(player.name)}</span>
+          <span class="pm-check">${player.id === state.activePlayerId ? "✓" : ""}</span>
+        </button>`,
     )
     .join("");
-  const saved = savedActivePlayer();
-  const active =
-    players.find((player) => player.id === saved)?.id ||
-    browserPlayerId ||
-    players[0]?.id ||
-    null;
-  if (active) {
-    setActivePlayer(active);
+
+  if (!players.some((player) => player.id === state.activePlayerId)) {
+    const saved = savedActivePlayer();
+    const active =
+      players.find((player) => player.id === saved)?.id ||
+      browserPlayerId ||
+      players[0]?.id ||
+      null;
+    if (active) setActivePlayer(active);
+  } else {
+    updateSwitchIndicator();
   }
 }
 
 function setActivePlayer(id) {
   if (!id) return;
   state.activePlayerId = id;
-  if (els.activePlayer && els.activePlayer.value !== id) {
-    els.activePlayer.value = id;
-  }
   try {
     localStorage.setItem("musicata-active-player", id);
   } catch {
@@ -1620,8 +1641,47 @@ function setActivePlayer(id) {
     // A remote player renders its own audio; this tab must stay silent.
     els.audio.pause();
   }
+  renderPlayerSwitcher(playerData.players);
   refreshActivePlayerFooter();
 }
+
+// Reflect the active player's name + live status on the switcher button.
+function updateSwitchIndicator() {
+  const player = playerData.players.find((entry) => entry.id === state.activePlayerId);
+  els.switchName.textContent = player ? player.name : "No player";
+  const here = state.activePlayerId === browserPlayerId && browserOutput;
+  const playing = state.playerStatus[state.activePlayerId] === "playing";
+  els.switchSignal.className = "signal";
+  if (playing || here) els.switchSignal.classList.add("playing");
+  else if (player?.online) els.switchSignal.classList.add("online");
+}
+
+function setPlayerMenu(open) {
+  state.playerMenuOpen = open;
+  els.playerMenu.hidden = !open;
+  els.switchBtn.setAttribute("aria-expanded", String(open));
+  if (open) renderPlayerSwitcher(playerData.players);
+}
+
+els.switchBtn.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setPlayerMenu(!state.playerMenuOpen);
+});
+els.playerMenuList.addEventListener("click", (event) => {
+  const item = event.target.closest("[data-player]");
+  if (!item) return;
+  setActivePlayer(item.dataset.player);
+  setPlayerMenu(false);
+});
+els.playerMenuConfig.addEventListener("click", () => {
+  setPlayerMenu(false);
+  openSettings();
+});
+document.addEventListener("click", (event) => {
+  if (state.playerMenuOpen && !event.target.closest(".player-switch")) {
+    setPlayerMenu(false);
+  }
+});
 
 async function refreshActivePlayerFooter() {
   if (!state.activePlayerId) return;
@@ -1699,7 +1759,7 @@ function updateFooterFromState(playback) {
     els.duration.textContent = formatTime(state.activeDuration);
   }
 
-  updateOutputSignal();
+  updateSwitchIndicator();
   els.queueCount.textContent = String(playback.queue?.length ?? 0);
   if (state.queueOpen) renderQueue();
 
@@ -1731,13 +1791,6 @@ function renderNowArt(now) {
     els.nowArtFallback.hidden = false;
     els.nowArtFallback.textContent = now?.title ? now.title.trim().charAt(0).toUpperCase() : "♪";
   }
-}
-
-function updateOutputSignal() {
-  const here = state.activePlayerId === browserPlayerId && browserOutput;
-  const player = playerData.players.find((entry) => entry.id === state.activePlayerId);
-  els.outputSignal.classList.toggle("here", here);
-  els.outputSignal.classList.toggle("online", !here && Boolean(player?.online));
 }
 
 // Smoothly advance the elapsed readout between server updates while playing.

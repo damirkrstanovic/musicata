@@ -17,7 +17,6 @@
             <h1>Musicata</h1>
             <p id="summary">Scanning library...</p>
           </div>
-          <button id="settings-open" class="settings-gear" type="button" title="Players &amp; settings" aria-label="Players and settings">⚙</button>
         </div>
 
         <label class="search">
@@ -63,6 +62,20 @@
       </section>
 
       <aside class="right-rail">
+        <div class="rail-header">
+          <div class="player-switch">
+            <button id="player-switch-btn" class="player-switch-btn" type="button" aria-haspopup="true" aria-expanded="false">
+              <span id="switch-signal" class="signal" aria-hidden="true"></span>
+              <span id="switch-name" class="switch-name">This Browser</span>
+              <span class="chev" aria-hidden="true">▾</span>
+            </button>
+            <div id="player-menu" class="player-menu" hidden role="menu">
+              <div id="player-menu-list" class="player-menu-list"></div>
+              <button id="player-menu-config" class="player-menu-config" type="button">⚙&nbsp; Configure players…</button>
+            </div>
+          </div>
+        </div>
+
         <div class="rail-top">
           <div id="metadata-panel" class="metadata-panel">
             <header class="metadata-header">
@@ -118,10 +131,6 @@
             <label class="volume" title="Volume">
               <span class="vol-icon" aria-hidden="true">▮</span>
               <input id="footer-volume" type="range" min="0" max="100" value="100" aria-label="Volume">
-            </label>
-            <label class="output">
-              <span id="output-signal" class="signal" aria-hidden="true"></span>
-              <select id="active-player" aria-label="Output player"></select>
             </label>
             <button id="queue-toggle" class="queue-btn" type="button" title="Queue" aria-pressed="false">
               <span class="queue-glyph">≣</span><span id="queue-count" class="queue-count">0</span>
