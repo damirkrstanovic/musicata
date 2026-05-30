@@ -237,6 +237,8 @@ fn app(database: Database, provider: LocalDiskProvider, players: Arc<PlayerManag
         .route("/api/albums/{id}", get(album_detail))
         .route("/api/browse", get(browse))
         .route("/api/browse/recently-added", get(recently_added))
+        .route("/api/history/recent", get(recently_played))
+        .route("/api/history/most-played", get(most_played))
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
             get(album_musicbrainz_candidates),
@@ -898,6 +900,52 @@ async fn recently_added(
         .await
         .map_err(db_error)?;
     Ok(Json(page_envelope(items, total, &query)))
+}
+
+/// Query parameters for the history endpoints: a single optional row cap.
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    limit: Option<usize>,
+}
+
+/// History row cap: default 100, clamped to a sane ceiling.
+fn history_limit(query: &HistoryQuery) -> usize {
+    query.limit.unwrap_or(100).clamp(1, 500)
+}
+
+async fn recently_played(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<Vec<Track>>, AppError> {
+    let items = state
+        .database
+        .recently_played(history_limit(&query))
+        .await
+        .map_err(db_error)?;
+    Ok(Json(items))
+}
+
+/// A track paired with how many times it has been listened to.
+#[derive(Debug, Serialize)]
+struct PlayCount {
+    #[serde(flatten)]
+    track: Track,
+    play_count: i64,
+}
+
+async fn most_played(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<Vec<PlayCount>>, AppError> {
+    let items = state
+        .database
+        .most_played(history_limit(&query))
+        .await
+        .map_err(db_error)?
+        .into_iter()
+        .map(|(track, play_count)| PlayCount { track, play_count })
+        .collect();
+    Ok(Json(items))
 }
 
 /// Query parameters for `/api/tracks`: browse filters plus pagination/sorting.

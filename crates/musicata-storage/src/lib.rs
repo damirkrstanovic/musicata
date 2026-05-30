@@ -148,6 +148,13 @@ impl Database {
             set_user_version(&self.pool, 10).await?;
         }
 
+        if version < 11 {
+            for statement in MIGRATION_011_LISTENS {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 11).await?;
+        }
+
         Ok(())
     }
 
@@ -1224,6 +1231,62 @@ impl Database {
             .await?;
         Ok(())
     }
+
+    /// Records one confirmed listen. `listened_at` is when the track started playing.
+    pub async fn record_listen(
+        &self,
+        track_id: &str,
+        player_id: &str,
+        listened_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO listens (track_id, player_id, listened_at_unix_seconds)
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(track_id)
+        .bind(player_id)
+        .bind(listened_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Distinct tracks ordered by their most recent listen, newest first. Listens for
+    /// tracks no longer in the library are skipped by the join.
+    pub async fn recently_played(&self, limit: usize) -> Result<Vec<Track>> {
+        let columns = track_columns("t");
+        let sql = format!(
+            "SELECT {columns}, MAX(l.listened_at_unix_seconds) AS last_listen
+             FROM listens l JOIN tracks t ON t.id = l.track_id
+             GROUP BY l.track_id
+             ORDER BY last_listen DESC
+             LIMIT ?1"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(track_from_row).collect()
+    }
+
+    /// Tracks paired with their listen count, most played first. Ties break on recency.
+    pub async fn most_played(&self, limit: usize) -> Result<Vec<(Track, i64)>> {
+        let columns = track_columns("t");
+        let sql = format!(
+            "SELECT {columns}, COUNT(*) AS plays
+             FROM listens l JOIN tracks t ON t.id = l.track_id
+             GROUP BY l.track_id
+             ORDER BY plays DESC, MAX(l.listened_at_unix_seconds) DESC
+             LIMIT ?1"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| Ok((track_from_row(row)?, row.try_get("plays")?)))
+            .collect()
+    }
 }
 
 /// A persisted player registration (its live state lives in the player manager).
@@ -1845,6 +1908,21 @@ const MIGRATION_010_PLAYERS_AND_ZONES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_players_zone_id ON players(zone_id)",
 ];
 
+// Listening history. One row per confirmed listen (a track that played past the
+// ListenBrainz threshold — see `players::ListenTracker`). `listened_at` is when the
+// track *started*, so ordering by it reflects when each play began. We keep the raw
+// log (repeats allowed); "recently played" and "most played" aggregate at read time.
+const MIGRATION_011_LISTENS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS listens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        track_id TEXT NOT NULL,
+        player_id TEXT NOT NULL,
+        listened_at_unix_seconds INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_listens_at ON listens(listened_at_unix_seconds)",
+    "CREATE INDEX IF NOT EXISTS idx_listens_track ON listens(track_id)",
+];
+
 // Full-text search indexes. These are external-content FTS5 tables (they store
 // only the inverted index and read the text from the base tables) kept in sync by
 // triggers, so any insert/update/delete on tracks/albums/artists — including future
@@ -2311,6 +2389,53 @@ mod tests {
                 .any(|track| track.title == "Zephyr Anthem"),
             "freshly inserted track should be searchable without a rebuild"
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn listening_history_aggregates_recent_and_most_played() {
+        let db_path = temp_db_path("listening-history");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+
+        // A second track so ordering is observable.
+        sqlx::query(
+            "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name,
+                album_id, album_title, extension, relative_path, stream_url, path)
+             VALUES ('track_2', 'local-disk', 'album/two.mp3', 'Second', 'artist_1', 'Artist',
+                'album_1', 'Album', 'mp3', 'album/two.mp3', '/api/tracks/track_2/stream',
+                '/music/album/two.mp3')",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("insert second track");
+
+        // track_1 played twice, track_2 once. Newest listen is track_1 at t=300.
+        database.record_listen("track_1", "p", 100).await.unwrap();
+        database.record_listen("track_2", "p", 200).await.unwrap();
+        database.record_listen("track_1", "p", 300).await.unwrap();
+
+        // Recently played: distinct tracks, newest-listen first.
+        let recent = database.recently_played(10).await.expect("recent");
+        let recent_ids: Vec<_> = recent.iter().map(|track| track.id.as_str()).collect();
+        assert_eq!(recent_ids, ["track_1", "track_2"]);
+
+        // Most played: by listen count, track_1 (2) before track_2 (1).
+        let most = database.most_played(10).await.expect("most");
+        assert_eq!(most[0].0.id, "track_1");
+        assert_eq!(most[0].1, 2);
+        assert_eq!(most[1].0.id, "track_2");
+        assert_eq!(most[1].1, 1);
+
+        // A listen for a track no longer in the library is dropped by the join.
+        database.record_listen("ghost", "p", 400).await.unwrap();
+        let recent = database.recently_played(10).await.expect("recent again");
+        assert!(recent.iter().all(|track| track.id != "ghost"));
 
         let _ = std::fs::remove_file(db_path);
     }

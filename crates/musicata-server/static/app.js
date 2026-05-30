@@ -5,6 +5,7 @@ const state = {
   browseFilter: { genre: "", year: "", composer: "" },
   tracks: [],
   visibleTracks: [],
+  view: "library",
   activePlayerId: null,
   activeStatus: "stopped",
   activeNowTrackId: null,
@@ -39,6 +40,7 @@ const els = {
   browseClear: document.querySelector("#browse-clear"),
   albums: document.querySelector("#albums"),
   trackList: document.querySelector("#track-list"),
+  navLinks: Array.from(document.querySelectorAll(".library-nav .nav-link")),
   viewTitle: document.querySelector("#view-title"),
   refresh: document.querySelector("#refresh"),
   audio: document.querySelector("#audio"),
@@ -253,6 +255,7 @@ function renderBrowseSelect(select, emptyLabel, facets, selectedValue) {
 }
 
 async function applyBrowseFilter(options = {}) {
+  markNavActive("library");
   const clearSearch = options.clearSearch !== false;
   state.browseFilter = currentBrowseFilter();
   renderBrowseFilters();
@@ -279,6 +282,42 @@ async function applyBrowseFilter(options = {}) {
     renderTracks(tracks);
   } catch (error) {
     els.trackList.innerHTML = `<p class="error">Browse failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+/// Switch the center panel between the library and the history views. The library
+/// view restores whatever the browse filter currently resolves to; the history
+/// views fetch their tracks fresh each time so they reflect the latest listens.
+function markNavActive(view) {
+  state.view = view;
+  for (const link of els.navLinks) {
+    link.classList.toggle("is-active", link.dataset.view === view);
+  }
+}
+
+async function setView(view) {
+  markNavActive(view);
+
+  if (view === "library") {
+    await applyBrowseFilter({ clearSearch: false });
+    return;
+  }
+
+  const config =
+    view === "most"
+      ? { url: "/api/history/most-played", title: "Most played", empty: "Nothing played yet." }
+      : { url: "/api/history/recent", title: "Recently played", empty: "Nothing played yet." };
+
+  els.viewTitle.textContent = config.title;
+  try {
+    const tracks = await api(config.url);
+    state.visibleTracks = tracks;
+    renderTracks(tracks);
+    if (tracks.length === 0) {
+      els.trackList.innerHTML = `<p class="empty">${config.empty}</p>`;
+    }
+  } catch (error) {
+    els.trackList.innerHTML = `<p class="error">Failed to load history: ${escapeHtml(error.message)}</p>`;
   }
 }
 
@@ -1103,6 +1142,7 @@ function element(tag, className, text) {
 }
 
 async function search() {
+  markNavActive("library");
   const query = els.search.value.trim();
   if (!query) {
     state.searchController?.abort();
@@ -1178,6 +1218,9 @@ els.browseClear.addEventListener("click", () => {
   applyBrowseFilter();
 });
 els.refresh.addEventListener("click", rescanLibrary);
+for (const link of els.navLinks) {
+  link.addEventListener("click", () => setView(link.dataset.view));
+}
 els.metadataClose.addEventListener("click", closeMetadata);
 // Footer transport targets the active player.
 els.prev.addEventListener("click", () => {

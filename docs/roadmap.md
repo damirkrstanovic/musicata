@@ -188,8 +188,14 @@ Tasks:
   state over a bidirectional WebSocket (reporting progress and track-ended back).
   One tab "owns" output at a time (coordinated client-side); refining handoff and
   folding it into the main footer is part of the player UX follow-up.
-- Add playback session state and now-playing history. (Live now-playing is
-  reported; durable history is still to come.)
+- [x] Add now-playing history. Each player's state broadcast is watched by a
+  per-player recorder that confirms a listen using the ListenBrainz rule (half the
+  track or four minutes, whichever is lower) and only counts time the player was
+  actually playing, so pauses and skips don't inflate it — this works for both the
+  per-second browser reports and MPD's sparse idle updates. Listens persist to a
+  `listens` table (migration v11); `GET /api/history/recent` and
+  `/api/history/most-played` aggregate them, surfaced in the web app as "Recently
+  played" / "Most played" views. This is the foundation for Milestone 7.
 - [x] Stop browser playback when the server-bound playback session heartbeat is lost.
 
 Player provider design decisions (see also Milestone 10):
