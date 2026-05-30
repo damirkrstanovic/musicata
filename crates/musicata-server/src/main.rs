@@ -3461,6 +3461,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subsonic_advertises_formpost_extension() {
+        let fixture = TestFixture::new("ss-ext");
+        let app = fixture.app().await;
+        let value =
+            subsonic_json(&app, &format!("getOpenSubsonicExtensions.view?{SS_AUTH}")).await;
+        let names: Vec<&str> = value["subsonic-response"]["openSubsonicExtensions"]
+            .as_array()
+            .expect("extensions")
+            .iter()
+            .filter_map(|extension| extension["name"].as_str())
+            .collect();
+        assert!(names.contains(&"formPost"), "got {names:?}");
+        assert!(names.contains(&"songLyrics"), "got {names:?}");
+    }
+
+    #[tokio::test]
+    async fn subsonic_get_random_songs_and_music_directory() {
+        let fixture = TestFixture::new("ss-random-dir");
+        let app = fixture.app().await;
+
+        let random = subsonic_json(&app, &format!("getRandomSongs.view?{SS_AUTH}&size=5")).await;
+        assert!(
+            !random["subsonic-response"]["randomSongs"]["song"]
+                .as_array()
+                .expect("randomSongs")
+                .is_empty()
+        );
+
+        // An artist directory lists its albums as sub-directories.
+        let artists = subsonic_json(&app, &format!("getArtists.view?{SS_AUTH}")).await;
+        let artist_id = artists["subsonic-response"]["artists"]["index"][0]["artist"][0]["id"]
+            .as_str()
+            .expect("artist id")
+            .to_string();
+        let dir =
+            subsonic_json(&app, &format!("getMusicDirectory.view?{SS_AUTH}&id={artist_id}")).await;
+        let children = dir["subsonic-response"]["directory"]["child"]
+            .as_array()
+            .expect("children");
+        assert!(!children.is_empty());
+        assert_eq!(children[0]["isDir"], true);
+    }
+
+    #[tokio::test]
+    async fn subsonic_get_lyrics_by_song_id_returns_list() {
+        let fixture = TestFixture::new("ss-lyrics");
+        let app = fixture.app().await;
+        let search = subsonic_json(&app, &format!("search3.view?{SS_AUTH}&query=vavilon")).await;
+        let song_id = search["subsonic-response"]["searchResult3"]["song"][0]["id"]
+            .as_str()
+            .expect("song id")
+            .to_string();
+        let value =
+            subsonic_json(&app, &format!("getLyricsBySongId.view?{SS_AUTH}&id={song_id}")).await;
+        // Whether or not the track has lyrics, the response is a well-formed lyricsList.
+        assert_eq!(value["subsonic-response"]["status"], "ok");
+        assert!(value["subsonic-response"]["lyricsList"].is_object());
+    }
+
+    #[tokio::test]
     async fn subsonic_reads_params_from_post_form_body() {
         // Real clients (e.g. py-sonic) POST parameters as a form body rather than in
         // the query string; the API must read both.

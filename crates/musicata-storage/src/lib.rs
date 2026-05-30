@@ -155,6 +155,19 @@ impl Database {
             set_user_version(&self.pool, 11).await?;
         }
 
+        if version < 12 {
+            for migration in MIGRATION_012_TRACK_DURATION {
+                ensure_column(
+                    &self.pool,
+                    "tracks",
+                    migration.column,
+                    migration.alter_statement,
+                )
+                .await?;
+            }
+            set_user_version(&self.pool, 12).await?;
+        }
+
         Ok(())
     }
 
@@ -245,7 +258,7 @@ impl Database {
 
             for track in &library.tracks {
                 sqlx::query(
-                    "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, disc_number, extension, file_size_bytes, modified_at_unix_seconds, content_hash, relative_path, stream_url, path, added_at_unix_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                    "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, disc_number, extension, file_size_bytes, modified_at_unix_seconds, content_hash, relative_path, stream_url, path, added_at_unix_seconds, duration_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 )
                 .bind(&track.id)
                 .bind(&track.provider.provider_id)
@@ -266,6 +279,7 @@ impl Database {
                 .bind(&track.stream_url)
                 .bind(path_to_string(&track.path))
                 .bind(track.added_at_unix_seconds)
+                .bind(track.duration_seconds)
                 .execute(&mut *conn)
                 .await?;
 
@@ -382,7 +396,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         let track_rows = sqlx::query(
-            "SELECT id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, disc_number, extension, file_size_bytes, modified_at_unix_seconds, content_hash, relative_path, stream_url, path, added_at_unix_seconds FROM tracks ORDER BY artist_name, year, album_title, disc_number, track_number, title",
+            "SELECT id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, disc_number, extension, file_size_bytes, modified_at_unix_seconds, content_hash, relative_path, stream_url, path, added_at_unix_seconds, duration_seconds FROM tracks ORDER BY artist_name, year, album_title, disc_number, track_number, title",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -527,6 +541,7 @@ impl Database {
                     row.try_get("file_size_bytes")?,
                     "file_size_bytes",
                 )?,
+                duration_seconds: row.try_get("duration_seconds")?,
                 modified_at_unix_seconds: row.try_get("modified_at_unix_seconds")?,
                 content_hash: row.try_get("content_hash")?,
                 relative_path: row.try_get("relative_path")?,
@@ -762,7 +777,7 @@ impl Database {
             "SELECT t.id, t.provider_id, t.provider_item_id, t.title, t.artist_id, t.artist_name,
                     t.album_id, t.album_title, t.year, t.track_number, t.disc_number, t.extension,
                     t.file_size_bytes, t.modified_at_unix_seconds, t.content_hash, t.relative_path,
-                    t.stream_url, t.added_at_unix_seconds, t.path
+                    t.stream_url, t.added_at_unix_seconds, t.duration_seconds, t.path
              FROM tracks_fts f JOIN tracks t ON t.rowid = f.rowid
              WHERE tracks_fts MATCH ?1 ORDER BY rank LIMIT ?2",
         )
@@ -792,6 +807,7 @@ impl Database {
                     row.try_get("file_size_bytes")?,
                     "file_size_bytes",
                 )?,
+                duration_seconds: row.try_get("duration_seconds")?,
                 modified_at_unix_seconds: row.try_get("modified_at_unix_seconds")?,
                 content_hash: row.try_get("content_hash")?,
                 relative_path: row.try_get("relative_path")?,
@@ -989,6 +1005,32 @@ impl Database {
             .await?;
         match row {
             Some(row) => Ok(row.try_get("artwork_url")?),
+            None => Ok(None),
+        }
+    }
+
+    /// A random sample of tracks, newest randomization each call. Used by the
+    /// OpenSubsonic `getRandomSongs` endpoint.
+    pub async fn random_tracks(&self, limit: i64) -> Result<Vec<Track>> {
+        let columns = track_columns("t");
+        let sql = format!("SELECT {columns} FROM tracks t ORDER BY RANDOM() LIMIT ?1");
+        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.pool).await?;
+        rows.iter().map(track_from_row).collect()
+    }
+
+    /// The most confident stored lyrics for a track, if any (from embedded tags or a
+    /// sidecar file). Used by the OpenSubsonic lyrics endpoints.
+    pub async fn track_lyrics(&self, track_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT lyrics FROM track_metadata_observations
+             WHERE track_id = ?1 AND lyrics IS NOT NULL AND lyrics != ''
+             ORDER BY confidence DESC LIMIT 1",
+        )
+        .bind(track_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => Ok(row.try_get("lyrics")?),
             None => Ok(None),
         }
     }
@@ -1346,6 +1388,7 @@ fn track_columns(alias: &str) -> String {
         "relative_path",
         "stream_url",
         "added_at_unix_seconds",
+        "duration_seconds",
         "path",
     ]
     .iter()
@@ -1398,6 +1441,7 @@ fn track_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Track> {
         disc_number: optional_i64_to_u16(row.try_get("disc_number")?, "disc_number")?,
         extension: row.try_get("extension")?,
         file_size_bytes: optional_i64_to_u64(row.try_get("file_size_bytes")?, "file_size_bytes")?,
+        duration_seconds: row.try_get("duration_seconds")?,
         modified_at_unix_seconds: row.try_get("modified_at_unix_seconds")?,
         content_hash: row.try_get("content_hash")?,
         relative_path: row.try_get("relative_path")?,
@@ -1900,6 +1944,11 @@ const MIGRATION_008_TRACK_ADDED_AT: &[ColumnMigration] = &[ColumnMigration {
     alter_statement: "ALTER TABLE tracks ADD COLUMN added_at_unix_seconds INTEGER",
 }];
 
+const MIGRATION_012_TRACK_DURATION: &[ColumnMigration] = &[ColumnMigration {
+    column: "duration_seconds",
+    alter_statement: "ALTER TABLE tracks ADD COLUMN duration_seconds REAL",
+}];
+
 // Registered players and zones. Players are reported to the server (e.g. via the
 // web UI) and persisted so they survive restarts; a player optionally belongs to
 // a zone (a named group used as a control target).
@@ -2176,6 +2225,7 @@ mod tests {
         assert_eq!(loaded.tracks.len(), 1);
         assert_eq!(loaded.tracks[0].provider.item_id, "album/song.mp3");
         assert_eq!(loaded.tracks[0].file_size_bytes, Some(1234));
+        assert_eq!(loaded.tracks[0].duration_seconds, Some(212.0));
         assert_eq!(
             loaded.tracks[0].modified_at_unix_seconds,
             Some(1_800_000_000)
@@ -2695,6 +2745,7 @@ mod tests {
             disc_number: None,
             extension: "mp3".to_string(),
             file_size_bytes: Some(10),
+            duration_seconds: None,
             modified_at_unix_seconds: Some(1_800_000_100),
             content_hash: Some("new789".to_string()),
             relative_path: "album/new-song.mp3".to_string(),
@@ -2761,6 +2812,7 @@ mod tests {
                 disc_number: None,
                 extension: "mp3".to_string(),
                 file_size_bytes: Some(1234),
+                duration_seconds: Some(212.0),
                 modified_at_unix_seconds: Some(1_800_000_000),
                 content_hash: Some("abc123".to_string()),
                 relative_path: "album/song.mp3".to_string(),

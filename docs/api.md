@@ -164,15 +164,19 @@ missing parameter, `40` wrong username/password, `70` not found.
 | ------ | ----- |
 | `ping` | Connectivity / auth check. |
 | `getLicense` | Always valid. |
-| `getOpenSubsonicExtensions` | Empty (no extensions yet). |
+| `getOpenSubsonicExtensions` | Advertises `formPost` and `songLyrics`. |
 | `getMusicFolders` | A single folder. |
-| `getGenres` | Library genres. |
+| `getGenres` | Library genres with song counts. |
 | `getArtists` / `getIndexes` | Artists grouped into alphabetical indexes. |
 | `getArtist` | Artist with its albums (`id`). |
 | `getAlbum` | Album with its songs (`id`). |
 | `getSong` | One song (`id`). |
+| `getMusicDirectory` | Folder-style browse: artist `id` → albums as dirs, album `id` → songs. |
 | `getAlbumList` / `getAlbumList2` | Album lists; `type` (`alphabeticalByName`, `alphabeticalByArtist`, `newest`, `byYear`, …), `size`, `offset`. |
+| `getRandomSongs` | `size` random songs. |
+| `getSongsByGenre` | Songs in a `genre`; `count`, `offset`. |
 | `search2` / `search3` | `query`; returns artists, albums, songs. |
+| `getLyrics` / `getLyricsBySongId` | Stored lyrics (legacy by artist/title; OpenSubsonic structured by song `id`). |
 | `getCoverArt` | Image bytes for an album or song `id`. |
 | `stream` / `download` | Audio bytes for a song `id` (supports `Range`). |
 | `scrobble` | Records a listen (`submission=true`) into Musicata's history. |
@@ -183,6 +187,10 @@ opaque. `coverArt` on albums and songs is the album id.
 
 ### Limitations
 
-- Song duration and bitrate are not yet reported (streaming/seeking still work).
+- Song `duration` is read from the audio stream at scan time and reported, along with
+  an approximate average `bitRate`. Libraries scanned before this was added populate
+  duration on their next rescan (or a forced `--rescan`).
 - No transcoding: `stream` returns the original file.
+- Playlists, favorites/ratings, and play-queue sync are not implemented yet (they need
+  data models Musicata doesn't have); those endpoints are absent or return empty.
 - Starring/ratings/playlists are not persisted yet.

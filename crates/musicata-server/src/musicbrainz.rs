@@ -1387,6 +1387,7 @@ mod tests {
             disc_number: None,
             extension: "mp3".to_string(),
             file_size_bytes: None,
+            duration_seconds: None,
             modified_at_unix_seconds: None,
             content_hash: None,
             relative_path: "album/song.mp3".to_string(),

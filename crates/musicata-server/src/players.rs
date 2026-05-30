@@ -920,6 +920,7 @@ mod tests {
                 disc_number: None,
                 extension: "mp3".to_string(),
                 file_size_bytes: Some(1),
+                duration_seconds: Some(180.0),
                 modified_at_unix_seconds: Some(1),
                 content_hash: Some(format!("h{i}")),
                 relative_path: format!("album/{i}.mp3"),

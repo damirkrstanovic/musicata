@@ -343,6 +343,14 @@ Tasks:
   code the Supersonic desktop app uses. Driving a full GUI client end-to-end (Supersonic,
   Symfonium, Amperfy, …) by hand remains a nice-to-have.
 
+- [x] Broaden OpenSubsonic coverage toward Navidrome's surface (gap analysis done
+  against Navidrome's 67 methods). Added `getMusicDirectory`, `getRandomSongs`,
+  `getSongsByGenre`, `getLyrics`/`getLyricsBySongId` (served from stored lyrics), and
+  advertised the `formPost` + `songLyrics` extensions. Tracks now carry **duration**
+  (read from the audio stream at scan time; migration v12) so songs report `duration`
+  and an approximate `bitRate`. Still missing (need new data models): playlists,
+  favorites/ratings, play-queue sync, artist/album info, internet radio, jukebox.
+
 Done when:
 
 - [x] At least one third-party client can browse and stream from Musicata.

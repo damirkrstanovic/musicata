@@ -4,7 +4,8 @@
 //! deliberately describes music independently from the source that provided it.
 
 use lofty::{
-    config::ParseOptions, file::TaggedFileExt, prelude::Accessor, probe::Probe, tag::ItemKey,
+    config::ParseOptions, file::AudioFile, file::TaggedFileExt, prelude::Accessor, probe::Probe,
+    tag::ItemKey,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -190,6 +191,9 @@ pub struct Track {
     pub disc_number: Option<u16>,
     pub extension: String,
     pub file_size_bytes: Option<u64>,
+    /// Track length in seconds, read from the audio stream at scan time. `None` when
+    /// the file's properties couldn't be decoded.
+    pub duration_seconds: Option<f64>,
     pub modified_at_unix_seconds: Option<i64>,
     pub content_hash: Option<String>,
     pub relative_path: String,
@@ -470,7 +474,7 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
     for file in files {
         let path = file.path;
         let folder_metadata = infer_track_metadata(&root, &path);
-        let embedded_metadata =
+        let (embedded_metadata, duration_seconds) =
             read_embedded_metadata(&path, &mut scan_errors, observed_at_unix_seconds);
         let sidecar_lyrics = read_sidecar_lyrics(&path, &mut scan_errors, observed_at_unix_seconds);
         let metadata = canonical_metadata(embedded_metadata.as_ref(), &folder_metadata);
@@ -564,6 +568,7 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
             disc_number: metadata.disc_number,
             extension,
             file_size_bytes: file.file_size_bytes,
+            duration_seconds,
             modified_at_unix_seconds: file.modified_at_unix_seconds,
             content_hash: file.content_hash,
             relative_path,
@@ -1080,29 +1085,46 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
+/// Read the embedded tag observation and the track duration in one probe. Properties
+/// are parsed so we get the stream length; a zero/unknown duration becomes `None`.
 fn read_embedded_metadata(
     path: &Path,
     scan_errors: &mut Vec<ScanIssue>,
     observed_at_unix_seconds: i64,
-) -> Option<TrackMetadataObservation> {
-    let tagged_file = match Probe::open(path)
-        .map(|probe| probe.options(ParseOptions::new().read_properties(false)))
-        .and_then(Probe::read)
-    {
-        Ok(tagged_file) => tagged_file,
-        Err(error) => {
-            scan_errors.push(ScanIssue {
-                path: path.display().to_string(),
-                message: format!("metadata read failed: {error}"),
-            });
-            return None;
+) -> (Option<TrackMetadataObservation>, Option<f64>) {
+    // Prefer reading stream properties (so we get a duration), but some files — and
+    // minimal/edge-case inputs — fail property parsing while their tags are still
+    // readable. Fall back to a tags-only read in that case (duration stays `None`).
+    let with_properties = Probe::open(path)
+        .map(|probe| probe.options(ParseOptions::new().read_properties(true)))
+        .and_then(Probe::read);
+    let (tagged_file, duration) = match with_properties {
+        Ok(tagged_file) => {
+            let seconds = tagged_file.properties().duration().as_secs_f64();
+            (tagged_file, (seconds > 0.0).then_some(seconds))
+        }
+        Err(_) => {
+            match Probe::open(path)
+                .map(|probe| probe.options(ParseOptions::new().read_properties(false)))
+                .and_then(Probe::read)
+            {
+                Ok(tagged_file) => (tagged_file, None),
+                Err(error) => {
+                    scan_errors.push(ScanIssue {
+                        path: path.display().to_string(),
+                        message: format!("metadata read failed: {error}"),
+                    });
+                    return (None, None);
+                }
+            }
         }
     };
 
-    tagged_file
+    let observation = tagged_file
         .primary_tag()
         .or_else(|| tagged_file.first_tag())
-        .and_then(|tag| TrackMetadataObservation::embedded_tag(tag, observed_at_unix_seconds))
+        .and_then(|tag| TrackMetadataObservation::embedded_tag(tag, observed_at_unix_seconds));
+    (observation, duration)
 }
 
 fn read_sidecar_lyrics(

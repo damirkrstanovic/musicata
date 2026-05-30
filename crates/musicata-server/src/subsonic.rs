@@ -23,7 +23,7 @@ use axum::{
     routing::get,
 };
 use md5::{Digest, Md5};
-use musicata_core::{Album, Artist, SearchResults, Track};
+use musicata_core::{Album, Artist, BrowseFilter, SearchResults, Track};
 use serde_json::{Map, Value, json};
 
 use crate::{AppState, audio_content_type, image_content_type, ranged_response};
@@ -137,9 +137,16 @@ async fn handle(
     match method {
         "ping" => ok_response(format, Map::new()),
         "getLicense" => ok_response(format, map1("license", json!({ "valid": true }))),
-        "getOpenSubsonicExtensions" => {
-            ok_response(format, map1("openSubsonicExtensions", json!([])))
-        }
+        "getOpenSubsonicExtensions" => ok_response(
+            format,
+            map1(
+                "openSubsonicExtensions",
+                json!([
+                    { "name": "formPost", "versions": [1] },
+                    { "name": "songLyrics", "versions": [1] }
+                ]),
+            ),
+        ),
         "getMusicFolders" => ok_response(
             format,
             map1(
@@ -150,6 +157,11 @@ async fn handle(
         "getGenres" => get_genres(&state, format).await,
         "getArtists" => artist_index(&state, format, "artists").await,
         "getIndexes" => artist_index(&state, format, "indexes").await,
+        "getMusicDirectory" => get_music_directory(&state, format, &params).await,
+        "getRandomSongs" => get_random_songs(&state, format, &params).await,
+        "getSongsByGenre" => get_songs_by_genre(&state, format, &params).await,
+        "getLyrics" => get_lyrics(&state, format, &params).await,
+        "getLyricsBySongId" => get_lyrics_by_song_id(&state, format, &params).await,
         "getArtist" => get_artist(&state, format, &params).await,
         "getAlbum" => get_album(&state, format, &params).await,
         "getSong" => get_song(&state, format, &params).await,
@@ -255,7 +267,7 @@ async fn get_genres(state: &AppState, format: Format) -> Response {
     let genres: Vec<Value> = index
         .genres
         .into_iter()
-        .map(|genre| json!({ "value": genre }))
+        .map(|facet| json!({ "value": facet.value, "songCount": facet.track_count }))
         .collect();
     ok_response(format, map1("genres", json!({ "genre": genres })))
 }
@@ -287,6 +299,173 @@ async fn artist_index(state: &AppState, format: Format, wrapper: &str) -> Respon
             wrapper,
             json!({ "ignoredArticles": IGNORED_ARTICLES, "index": index }),
         ),
+    )
+}
+
+fn int_param(params: &HashMap<String, String>, key: &str, default: i64) -> i64 {
+    params
+        .get(key)
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+/// Folder-style browsing: an artist id lists its albums as sub-directories; an album
+/// id lists its songs. Older clients (and some new ones) use this instead of the ID3
+/// endpoints.
+async fn get_music_directory(
+    state: &AppState,
+    format: Format,
+    params: &HashMap<String, String>,
+) -> Response {
+    let Some(id) = params.get("id") else {
+        return error_response(format, 10, "Required parameter is missing.");
+    };
+
+    if let Ok(Some(album)) = state.database.album(id).await {
+        let tracks = state.database.tracks_for_album(id).await.unwrap_or_default();
+        let children: Vec<Value> = tracks.iter().map(song_value).collect();
+        return ok_response(
+            format,
+            map1(
+                "directory",
+                json!({ "id": album.id, "name": album.title, "child": children }),
+            ),
+        );
+    }
+
+    if let Ok(Some(artist)) = state.database.artist(id).await {
+        let albums = state.database.albums_for_artist(id).await.unwrap_or_default();
+        let children: Vec<Value> = albums
+            .iter()
+            .map(|album| {
+                json!({
+                    "id": album.id,
+                    "name": album.title,
+                    "title": album.title,
+                    "isDir": true,
+                    "artist": album.artist_name,
+                    "artistId": album.artist_id,
+                    "coverArt": album.id,
+                })
+            })
+            .collect();
+        return ok_response(
+            format,
+            map1(
+                "directory",
+                json!({ "id": artist.id, "name": artist.name, "child": children }),
+            ),
+        );
+    }
+
+    error_response(format, 70, "Directory not found.")
+}
+
+async fn get_random_songs(
+    state: &AppState,
+    format: Format,
+    params: &HashMap<String, String>,
+) -> Response {
+    let size = int_param(params, "size", 10).clamp(1, 500);
+    match state.database.random_tracks(size).await {
+        Ok(tracks) => ok_response(
+            format,
+            map1(
+                "randomSongs",
+                json!({ "song": tracks.iter().map(song_value).collect::<Vec<_>>() }),
+            ),
+        ),
+        Err(error) => error_response(format, 0, &error.to_string()),
+    }
+}
+
+async fn get_songs_by_genre(
+    state: &AppState,
+    format: Format,
+    params: &HashMap<String, String>,
+) -> Response {
+    let Some(genre) = params.get("genre") else {
+        return error_response(format, 10, "Required parameter is missing.");
+    };
+    let count = int_param(params, "count", 10).clamp(1, 500);
+    let offset = int_param(params, "offset", 0).max(0);
+    let filter = BrowseFilter {
+        genre: Some(genre.clone()),
+        ..Default::default()
+    };
+    match state.database.list_tracks(&filter, None, count, offset).await {
+        Ok((tracks, _)) => ok_response(
+            format,
+            map1(
+                "songsByGenre",
+                json!({ "song": tracks.iter().map(song_value).collect::<Vec<_>>() }),
+            ),
+        ),
+        Err(error) => error_response(format, 0, &error.to_string()),
+    }
+}
+
+/// Legacy lyrics by artist/title. We match on title and return the first track's
+/// stored lyrics (empty element if none).
+async fn get_lyrics(state: &AppState, format: Format, params: &HashMap<String, String>) -> Response {
+    let title = params.get("title").map(String::as_str).unwrap_or("").trim();
+    let artist = params.get("artist").cloned().unwrap_or_default();
+    let mut text = String::new();
+    let mut matched_title = title.to_string();
+    if !title.is_empty()
+        && let Ok(results) = state.database.search(title, 5).await
+        && let Some(track) = results.tracks.first()
+    {
+        matched_title = track.title.clone();
+        text = state
+            .database
+            .track_lyrics(&track.id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+    }
+    ok_response(
+        format,
+        map1(
+            "lyrics",
+            json!({ "artist": artist, "title": matched_title, "value": text }),
+        ),
+    )
+}
+
+/// OpenSubsonic structured lyrics by song id (unsynced — we store plain text).
+async fn get_lyrics_by_song_id(
+    state: &AppState,
+    format: Format,
+    params: &HashMap<String, String>,
+) -> Response {
+    let Some(id) = params.get("id") else {
+        return error_response(format, 10, "Required parameter is missing.");
+    };
+    let track = match state.database.track(id).await {
+        Ok(Some(track)) => track,
+        Ok(None) => return error_response(format, 70, "Song not found."),
+        Err(error) => return error_response(format, 0, &error.to_string()),
+    };
+
+    let structured = match state.database.track_lyrics(id).await.ok().flatten() {
+        Some(text) => {
+            let lines: Vec<Value> = text.lines().map(|line| json!({ "value": line })).collect();
+            vec![json!({
+                "displayArtist": track.artist_name,
+                "displayTitle": track.title,
+                "lang": "xxx",
+                "offset": 0,
+                "synced": false,
+                "line": lines,
+            })]
+        }
+        None => Vec::new(),
+    };
+    ok_response(
+        format,
+        map1("lyricsList", json!({ "structuredLyrics": structured })),
     )
 }
 
@@ -548,6 +727,16 @@ fn song_value(track: &Track) -> Value {
     if let Some(size) = track.file_size_bytes {
         map.insert("size".into(), json!(size));
     }
+    if let Some(duration) = track.duration_seconds {
+        map.insert("duration".into(), json!(duration.round() as i64));
+        // Approximate average bitrate (kbps) from size and duration.
+        if let Some(size) = track.file_size_bytes
+            && duration > 0.0
+        {
+            let kbps = (size as f64 * 8.0) / duration / 1000.0;
+            map.insert("bitRate".into(), json!(kbps.round() as i64));
+        }
+    }
     Value::Object(map)
 }
 
@@ -622,6 +811,7 @@ fn write_element(out: &mut String, name: &str, value: &Value) {
         Value::Object(map) => {
             let mut attributes = String::new();
             let mut children = String::new();
+            let mut text = String::new();
             for (key, child) in map {
                 match child {
                     Value::Null => {}
@@ -631,6 +821,11 @@ fn write_element(out: &mut String, name: &str, value: &Value) {
                         }
                     }
                     Value::Object(_) => write_element(&mut children, key, child),
+                    // A "value" scalar is the element's text content (Subsonic uses
+                    // this for e.g. <genre>Rock</genre>); other scalars are attributes.
+                    scalar if key == "value" => {
+                        text.push_str(&escape_text(&scalar_to_string(scalar)));
+                    }
                     scalar => {
                         attributes.push_str(&format!(
                             " {}=\"{}\"",
@@ -640,10 +835,10 @@ fn write_element(out: &mut String, name: &str, value: &Value) {
                     }
                 }
             }
-            if children.is_empty() {
+            if children.is_empty() && text.is_empty() {
                 out.push_str(&format!("<{name}{attributes}/>"));
             } else {
-                out.push_str(&format!("<{name}{attributes}>{children}</{name}>"));
+                out.push_str(&format!("<{name}{attributes}>{text}{children}</{name}>"));
             }
         }
         Value::Null => {}
