@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use musicata_core::{
-    Album, Artist, Library, MetadataApprovalState, MetadataFieldValue, ProviderMapping, ScanIssue,
+    Album, Artist, BrowseFilter, BrowseIndex, BrowseTextFacet, BrowseYearFacet, Library,
+    LibrarySummary, MetadataApprovalState, MetadataFieldValue, ProviderMapping, ScanIssue,
     SearchResults, Track, TrackMetadataFieldObservation, TrackMetadataObservation,
 };
 use sqlx::{
@@ -793,6 +794,417 @@ impl Database {
             tracks,
         })
     }
+
+    /// Provider identity and entity counts, read directly from the database.
+    pub async fn summary(&self) -> Result<Option<LibrarySummary>> {
+        let Some(provider) =
+            sqlx::query("SELECT id, source_root FROM providers ORDER BY rowid LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await?
+        else {
+            return Ok(None);
+        };
+        let counts = sqlx::query(
+            "SELECT
+                (SELECT COUNT(*) FROM artists) AS artist_count,
+                (SELECT COUNT(*) FROM albums) AS album_count,
+                (SELECT COUNT(*) FROM tracks) AS track_count",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Some(LibrarySummary {
+            provider_id: provider.try_get("id")?,
+            source_root: provider.try_get("source_root")?,
+            artist_count: i64_to_usize(counts.try_get("artist_count")?, "artist_count")?,
+            album_count: i64_to_usize(counts.try_get("album_count")?, "album_count")?,
+            track_count: i64_to_usize(counts.try_get("track_count")?, "track_count")?,
+        }))
+    }
+
+    pub async fn list_artists(
+        &self,
+        sort: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Artist>, usize)> {
+        let total = i64_to_usize(
+            sqlx::query("SELECT COUNT(*) AS n FROM artists")
+                .fetch_one(&self.pool)
+                .await?
+                .try_get("n")?,
+            "total",
+        )?;
+        let sql = format!(
+            "SELECT id, name, album_count, track_count FROM artists ORDER BY {} LIMIT ?1 OFFSET ?2",
+            artist_order_clause(sort)
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut artists = Vec::with_capacity(rows.len());
+        for row in rows {
+            artists.push(artist_from_row(&row)?);
+        }
+        Ok((artists, total))
+    }
+
+    pub async fn list_albums(
+        &self,
+        sort: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Album>, usize)> {
+        let total = i64_to_usize(
+            sqlx::query("SELECT COUNT(*) AS n FROM albums")
+                .fetch_one(&self.pool)
+                .await?
+                .try_get("n")?,
+            "total",
+        )?;
+        let sql = format!(
+            "SELECT {ALBUM_COLUMNS} FROM albums ORDER BY {} LIMIT ?1 OFFSET ?2",
+            album_order_clause(sort)
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut albums = Vec::with_capacity(rows.len());
+        for row in rows {
+            albums.push(album_from_row(&row)?);
+        }
+        Ok((albums, total))
+    }
+
+    /// Paginated, sorted, filtered track listing. Tracks are returned without
+    /// observation provenance (`observed_metadata` is empty); the metadata-review
+    /// endpoint serves that. Genre/composer filters match any observation via the
+    /// stored JSON arrays; the folder filter matches a folder or any nested folder.
+    pub async fn list_tracks(
+        &self,
+        filter: &BrowseFilter,
+        sort: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Track>, usize)> {
+        let year = filter.year.map(i64::from);
+        let genre = filter
+            .genre
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let composer = filter
+            .composer
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let folder_prefix = filter
+            .folder
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|folder| format!("{}/", folder.trim_end_matches('/')));
+
+        const FILTER: &str = "(?1 IS NULL OR t.year = ?1)
+             AND (?2 IS NULL OR EXISTS (SELECT 1 FROM track_metadata_observations o, json_each(o.genres)
+                  WHERE o.track_id = t.id AND json_each.value = ?2 COLLATE NOCASE))
+             AND (?3 IS NULL OR EXISTS (SELECT 1 FROM track_metadata_observations o, json_each(o.composers)
+                  WHERE o.track_id = t.id AND json_each.value = ?3 COLLATE NOCASE))
+             AND (?4 IS NULL OR substr(t.relative_path, 1, length(?4)) = ?4)";
+
+        let count_sql = format!("SELECT COUNT(*) AS n FROM tracks t WHERE {FILTER}");
+        let total = i64_to_usize(
+            sqlx::query(&count_sql)
+                .bind(year)
+                .bind(genre)
+                .bind(composer)
+                .bind(&folder_prefix)
+                .fetch_one(&self.pool)
+                .await?
+                .try_get("n")?,
+            "total",
+        )?;
+
+        let sql = format!(
+            "SELECT {} FROM tracks t WHERE {FILTER} ORDER BY {} LIMIT ?5 OFFSET ?6",
+            track_columns("t"),
+            track_order_clause(sort)
+        );
+        let rows = sqlx::query(&sql)
+            .bind(year)
+            .bind(genre)
+            .bind(composer)
+            .bind(&folder_prefix)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut tracks = Vec::with_capacity(rows.len());
+        for row in rows {
+            tracks.push(track_from_row(&row)?);
+        }
+        Ok((tracks, total))
+    }
+
+    pub async fn artist(&self, id: &str) -> Result<Option<Artist>> {
+        let row =
+            sqlx::query("SELECT id, name, album_count, track_count FROM artists WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|row| artist_from_row(&row)).transpose()
+    }
+
+    pub async fn album(&self, id: &str) -> Result<Option<Album>> {
+        let sql = format!("SELECT {ALBUM_COLUMNS} FROM albums WHERE id = ?1");
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| album_from_row(&row)).transpose()
+    }
+
+    pub async fn track(&self, id: &str) -> Result<Option<Track>> {
+        let sql = format!(
+            "SELECT {} FROM tracks t WHERE t.id = ?1",
+            track_columns("t")
+        );
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| track_from_row(&row)).transpose()
+    }
+
+    pub async fn albums_for_artist(&self, artist_id: &str) -> Result<Vec<Album>> {
+        let sql =
+            format!("SELECT {ALBUM_COLUMNS} FROM albums WHERE artist_id = ?1 ORDER BY year, title");
+        let rows = sqlx::query(&sql)
+            .bind(artist_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(album_from_row).collect()
+    }
+
+    pub async fn tracks_for_artist(&self, artist_id: &str) -> Result<Vec<Track>> {
+        let sql = format!(
+            "SELECT {} FROM tracks t WHERE t.artist_id = ?1
+             ORDER BY t.year, t.album_title, t.disc_number, t.track_number, t.title",
+            track_columns("t")
+        );
+        let rows = sqlx::query(&sql)
+            .bind(artist_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(track_from_row).collect()
+    }
+
+    pub async fn tracks_for_album(&self, album_id: &str) -> Result<Vec<Track>> {
+        let sql = format!(
+            "SELECT {} FROM tracks t WHERE t.album_id = ?1
+             ORDER BY t.disc_number, t.track_number, t.title",
+            track_columns("t")
+        );
+        let rows = sqlx::query(&sql)
+            .bind(album_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(track_from_row).collect()
+    }
+
+    /// Browse facets (genre/composer/year/folder), computed in SQL where practical.
+    pub async fn browse_index(&self) -> Result<BrowseIndex> {
+        let genres = self.text_facet("genres").await?;
+        let composers = self.text_facet("composers").await?;
+
+        let year_rows = sqlx::query(
+            "SELECT year, COUNT(*) AS n FROM tracks WHERE year IS NOT NULL GROUP BY year ORDER BY year DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut years = Vec::with_capacity(year_rows.len());
+        for row in year_rows {
+            years.push(BrowseYearFacet {
+                value: optional_i64_to_u16(row.try_get("year")?, "year")?
+                    .ok_or_else(|| anyhow::anyhow!("null year in facet"))?,
+                track_count: i64_to_usize(row.try_get("n")?, "track_count")?,
+            });
+        }
+
+        // Folders are derived from each track's relative path; computed in Rust to
+        // match the scanner's parent-directory semantics exactly.
+        let path_rows = sqlx::query("SELECT relative_path FROM tracks")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut folder_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for row in path_rows {
+            let relative_path: String = row.try_get("relative_path")?;
+            if let Some((folder, _file)) = relative_path.rsplit_once('/') {
+                *folder_counts.entry(folder.to_string()).or_insert(0) += 1;
+            }
+        }
+        let folders = folder_counts
+            .into_iter()
+            .map(|(value, track_count)| BrowseTextFacet { value, track_count })
+            .collect();
+
+        Ok(BrowseIndex {
+            genres,
+            years,
+            composers,
+            folders,
+        })
+    }
+
+    /// Distinct-track counts per value of a JSON-array observation column.
+    async fn text_facet(&self, column: &str) -> Result<Vec<BrowseTextFacet>> {
+        let sql = format!(
+            "SELECT json_each.value AS value, COUNT(DISTINCT o.track_id) AS n
+             FROM track_metadata_observations o, json_each(o.{column})
+             WHERE trim(json_each.value) <> ''
+             GROUP BY json_each.value ORDER BY json_each.value"
+        );
+        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        let mut facets = Vec::with_capacity(rows.len());
+        for row in rows {
+            facets.push(BrowseTextFacet {
+                value: row.try_get("value")?,
+                track_count: i64_to_usize(row.try_get("n")?, "track_count")?,
+            });
+        }
+        Ok(facets)
+    }
+
+    /// Update an album's selected artwork without rewriting the whole library.
+    pub async fn set_album_artwork(
+        &self,
+        album_id: &str,
+        artwork_path: Option<&Path>,
+        artwork_url: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE albums SET artwork_path = ?1, artwork_url = ?2 WHERE id = ?3")
+            .bind(artwork_path.map(|path| path.to_string_lossy().to_string()))
+            .bind(artwork_url)
+            .bind(album_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+const ALBUM_COLUMNS: &str =
+    "id, title, artist_id, artist_name, year, track_count, artwork_url, artwork_path";
+
+/// The track column list, prefixed with a table alias, matching `track_from_row`.
+fn track_columns(alias: &str) -> String {
+    [
+        "id",
+        "provider_id",
+        "provider_item_id",
+        "title",
+        "artist_id",
+        "artist_name",
+        "album_id",
+        "album_title",
+        "year",
+        "track_number",
+        "disc_number",
+        "extension",
+        "file_size_bytes",
+        "modified_at_unix_seconds",
+        "content_hash",
+        "relative_path",
+        "stream_url",
+        "added_at_unix_seconds",
+        "path",
+    ]
+    .iter()
+    .map(|column| format!("{alias}.{column}"))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+fn artist_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Artist> {
+    Ok(Artist {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        album_count: i64_to_usize(row.try_get("album_count")?, "album_count")?,
+        track_count: i64_to_usize(row.try_get("track_count")?, "track_count")?,
+    })
+}
+
+fn album_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Album> {
+    Ok(Album {
+        id: row.try_get("id")?,
+        title: row.try_get("title")?,
+        artist_id: row.try_get("artist_id")?,
+        artist_name: row.try_get("artist_name")?,
+        year: optional_i64_to_u16(row.try_get("year")?, "year")?,
+        track_count: i64_to_usize(row.try_get("track_count")?, "track_count")?,
+        artwork_url: row.try_get("artwork_url")?,
+        artwork_path: row
+            .try_get::<Option<String>, _>("artwork_path")?
+            .map(PathBuf::from),
+    })
+}
+
+/// Builds a `Track` from a row without observation provenance (`observed_metadata`
+/// is empty). Used by the list/detail/stream read paths.
+fn track_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Track> {
+    Ok(Track {
+        id: row.try_get("id")?,
+        provider: ProviderMapping {
+            provider_id: row.try_get("provider_id")?,
+            item_id: row.try_get("provider_item_id")?,
+        },
+        observed_metadata: Vec::new(),
+        title: row.try_get("title")?,
+        artist_id: row.try_get("artist_id")?,
+        artist_name: row.try_get("artist_name")?,
+        album_id: row.try_get("album_id")?,
+        album_title: row.try_get("album_title")?,
+        year: optional_i64_to_u16(row.try_get("year")?, "year")?,
+        track_number: optional_i64_to_u16(row.try_get("track_number")?, "track_number")?,
+        disc_number: optional_i64_to_u16(row.try_get("disc_number")?, "disc_number")?,
+        extension: row.try_get("extension")?,
+        file_size_bytes: optional_i64_to_u64(row.try_get("file_size_bytes")?, "file_size_bytes")?,
+        modified_at_unix_seconds: row.try_get("modified_at_unix_seconds")?,
+        content_hash: row.try_get("content_hash")?,
+        relative_path: row.try_get("relative_path")?,
+        stream_url: row.try_get("stream_url")?,
+        added_at_unix_seconds: row.try_get("added_at_unix_seconds")?,
+        path: PathBuf::from(row.try_get::<String, _>("path")?),
+    })
+}
+
+// Allowlisted ORDER BY fragments (no user input is interpolated). Kept in sync
+// with the previous in-memory sort_* helpers in the server.
+fn artist_order_clause(sort: Option<&str>) -> &'static str {
+    match sort {
+        Some("tracks") => "track_count DESC, name",
+        Some("albums") => "album_count DESC, name",
+        _ => "name",
+    }
+}
+
+fn album_order_clause(sort: Option<&str>) -> &'static str {
+    match sort {
+        Some("title") => "title",
+        Some("year") => "year DESC, artist_name, title",
+        _ => "artist_name, year, title",
+    }
+}
+
+fn track_order_clause(sort: Option<&str>) -> &'static str {
+    match sort {
+        Some("title") => "t.title",
+        Some("album") => "t.album_title, t.disc_number, t.track_number",
+        Some("recent") => "t.added_at_unix_seconds DESC, t.artist_name, t.title",
+        _ => "t.artist_name, t.year, t.album_title, t.disc_number, t.track_number, t.title",
+    }
 }
 
 /// Builds a safe FTS5 MATCH expression from free-form user input: each
@@ -1471,8 +1883,8 @@ async fn ensure_column(
 mod tests {
     use super::Database;
     use musicata_core::{
-        Album, Artist, Library, MetadataApprovalState, MetadataFieldValue, ProviderMapping,
-        ScanIssue, Track, TrackMetadataObservation,
+        Album, Artist, BrowseFilter, Library, MetadataApprovalState, MetadataFieldValue,
+        ProviderMapping, ScanIssue, Track, TrackMetadataObservation,
     };
     use std::{
         path::PathBuf,
@@ -1727,6 +2139,87 @@ mod tests {
                 .any(|track| track.title == "Zephyr Anthem"),
             "freshly inserted track should be searchable without a rebuild"
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn browse_index_reports_facets_from_sql() {
+        let db_path = temp_db_path("browse-index-sql");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+
+        let index = database.browse_index().await.expect("browse index");
+        // fixture observation: genres Dub/Electronic, composers Composer, year 2026,
+        // relative_path "album/song.mp3" -> folder "album".
+        assert!(
+            index
+                .genres
+                .iter()
+                .any(|facet| facet.value == "Dub" && facet.track_count == 1)
+        );
+        assert!(
+            index
+                .composers
+                .iter()
+                .any(|facet| facet.value == "Composer" && facet.track_count == 1)
+        );
+        assert!(
+            index
+                .years
+                .iter()
+                .any(|facet| facet.value == 2026 && facet.track_count == 1)
+        );
+        assert!(
+            index
+                .folders
+                .iter()
+                .any(|facet| facet.value == "album" && facet.track_count == 1)
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn list_tracks_filters_and_paginates_in_sql() {
+        let db_path = temp_db_path("list-tracks-sql");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+
+        // Genre filter matches the fixture track via its observation's JSON array.
+        let filter = BrowseFilter {
+            genre: Some("dub".to_string()),
+            ..BrowseFilter::default()
+        };
+        let (tracks, total) = database
+            .list_tracks(&filter, None, -1, 0)
+            .await
+            .expect("list tracks");
+        assert_eq!(total, 1);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "Song");
+        // Listed tracks omit observation provenance.
+        assert!(tracks[0].observed_metadata.is_empty());
+
+        // A non-matching genre returns nothing.
+        let filter = BrowseFilter {
+            genre: Some("jazz".to_string()),
+            ..BrowseFilter::default()
+        };
+        let (tracks, total) = database
+            .list_tracks(&filter, None, -1, 0)
+            .await
+            .expect("list tracks");
+        assert_eq!(total, 0);
+        assert!(tracks.is_empty());
 
         let _ = std::fs::remove_file(db_path);
     }

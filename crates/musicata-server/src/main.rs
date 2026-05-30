@@ -19,9 +19,10 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use musicata_core::{
-    Album, Artist, BrowseFilter, Library, LibrarySummary, LocalDiskProvider, MetadataApprovalState,
-    MetadataFieldValue, MusicProvider, SearchResults, Track, TrackMetadataFieldObservation,
-    album_artwork_url, artwork_asset_id, find_album_artwork_candidates,
+    Album, Artist, BrowseFilter, BrowseIndex, Library, LibrarySummary, LocalDiskProvider,
+    MetadataApprovalState, MetadataFieldValue, MusicProvider, SearchResults, Track,
+    TrackMetadataFieldObservation, album_artwork_url, artwork_asset_id,
+    find_album_artwork_candidates,
 };
 use musicata_storage::Database;
 use musicbrainz::{
@@ -53,7 +54,6 @@ const TAG_WRITE_BACK_DISABLED_REASON: &str =
 
 #[derive(Clone)]
 struct AppState {
-    library: Arc<RwLock<Library>>,
     database: Database,
     provider: LocalDiskProvider,
     musicbrainz: MusicBrainzClient,
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to bind {}", config.addr))?;
 
     tracing::info!("listening on http://{}", config.addr);
-    axum::serve(listener, app(library, database, provider))
+    axum::serve(listener, app(database, provider))
         .await
         .context("server failed")?;
 
@@ -172,7 +172,7 @@ async fn load_or_scan_library(
     Ok(scanned)
 }
 
-fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Router {
+fn app(database: Database, provider: LocalDiskProvider) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
@@ -240,7 +240,6 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
         .fallback(fallback)
         .layer(middleware::from_fn(log_request))
         .with_state(AppState {
-            library: Arc::new(RwLock::new(library)),
             database,
             provider,
             musicbrainz: MusicBrainzClient::default(),
@@ -305,19 +304,29 @@ async fn fallback() -> AppError {
     AppError::not_found("route not found")
 }
 
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let library = state.library.read().await;
+async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
+    let summary = state.database.summary().await.map_err(db_error)?;
+    let provider = summary
+        .as_ref()
+        .map(|summary| summary.provider_id.clone())
+        .unwrap_or_else(|| "local-disk".to_string());
+    let tracks = summary.map(|summary| summary.track_count).unwrap_or(0);
 
-    Json(json!({
+    Ok(Json(json!({
         "status": "ok",
-        "provider": library.provider_id,
-        "tracks": library.tracks.len(),
-    }))
+        "provider": provider,
+        "tracks": tracks,
+    })))
 }
 
-async fn library_summary(State(state): State<AppState>) -> impl IntoResponse {
-    let library = state.library.read().await;
-    Json(library.summary())
+async fn library_summary(State(state): State<AppState>) -> Result<Json<LibrarySummary>, AppError> {
+    let summary = state
+        .database
+        .summary()
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| AppError::internal("library not initialized"))?;
+    Ok(Json(summary))
 }
 
 #[derive(Debug, Serialize)]
@@ -411,14 +420,12 @@ async fn rescan_library(
     let changed = changes.has_changes();
     let updated = forced || changed;
 
-    let summary = if updated {
-        let summary = scanned.summary();
+    // The scan reflects the current files; when unchanged its counts equal the
+    // stored library's, so this summary is correct whether or not we save.
+    let summary = scanned.summary();
+    if updated {
         state.database.save_library(&mut scanned).await?;
-        *state.library.write().await = scanned;
-        summary
-    } else {
-        state.library.read().await.summary()
-    };
+    }
 
     Ok(Json(RescanResponse {
         changed,
@@ -449,103 +456,54 @@ struct Page<T> {
     sort: Option<String>,
 }
 
-/// Slice an already-sorted vector into the requested page.
-///
-/// `offset` defaults to 0 and `limit` defaults to "the rest of the list", so a
-/// request without pagination parameters returns every item in one page.
-fn paginate<T>(items: Vec<T>, query: &ListQuery) -> Page<T> {
-    let total = items.len();
-    let offset = query.offset.unwrap_or(0).min(total);
-    let limit = query.limit.unwrap_or(total - offset);
-    let page = items.into_iter().skip(offset).take(limit).collect();
+/// SQLite `LIMIT` argument: a missing limit becomes -1, which SQLite treats as
+/// "no limit" so the page returns every remaining row.
+fn limit_arg(query: &ListQuery) -> i64 {
+    query.limit.map(|limit| limit as i64).unwrap_or(-1)
+}
+
+fn offset_arg(query: &ListQuery) -> i64 {
+    query.offset.unwrap_or(0) as i64
+}
+
+/// Wrap SQL page results in the response envelope. A missing limit reports the
+/// total (the whole list was returned in one page), matching the prior behavior.
+fn page_envelope<T>(items: Vec<T>, total: usize, query: &ListQuery) -> Page<T> {
     Page {
-        items: page,
+        items,
         total,
-        limit,
-        offset,
+        limit: query.limit.unwrap_or(total),
+        offset: query.offset.unwrap_or(0),
         sort: query.sort.clone(),
     }
 }
 
-fn sort_artists(artists: &mut [Artist], sort: Option<&str>) {
-    match sort {
-        Some("tracks") => artists.sort_by(|left, right| {
-            right
-                .track_count
-                .cmp(&left.track_count)
-                .then_with(|| left.name.cmp(&right.name))
-        }),
-        Some("albums") => artists.sort_by(|left, right| {
-            right
-                .album_count
-                .cmp(&left.album_count)
-                .then_with(|| left.name.cmp(&right.name))
-        }),
-        // "name" and any unknown key fall back to alphabetical.
-        _ => artists.sort_by(|left, right| left.name.cmp(&right.name)),
-    }
-}
-
-fn sort_albums(albums: &mut [Album], sort: Option<&str>) {
-    match sort {
-        Some("title") => albums.sort_by(|left, right| left.title.cmp(&right.title)),
-        Some("year") => albums.sort_by(|left, right| {
-            right
-                .year
-                .cmp(&left.year)
-                .then_with(|| left.artist_name.cmp(&right.artist_name))
-                .then_with(|| left.title.cmp(&right.title))
-        }),
-        // "artist" and any unknown key keep the canonical artist/year/title order.
-        _ => albums.sort_by(|left, right| {
-            left.artist_name
-                .cmp(&right.artist_name)
-                .then_with(|| left.year.cmp(&right.year))
-                .then_with(|| left.title.cmp(&right.title))
-        }),
-    }
-}
-
-fn sort_tracks(tracks: &mut [Track], sort: Option<&str>) {
-    match sort {
-        Some("title") => tracks.sort_by(|left, right| left.title.cmp(&right.title)),
-        Some("album") => tracks.sort_by(|left, right| {
-            left.album_title
-                .cmp(&right.album_title)
-                .then_with(|| left.disc_number.cmp(&right.disc_number))
-                .then_with(|| left.track_number.cmp(&right.track_number))
-        }),
-        // "artist" and any unknown key keep the canonical scan order.
-        _ => tracks.sort_by(|left, right| {
-            left.artist_name
-                .cmp(&right.artist_name)
-                .then_with(|| left.year.cmp(&right.year))
-                .then_with(|| left.album_title.cmp(&right.album_title))
-                .then_with(|| left.disc_number.cmp(&right.disc_number))
-                .then_with(|| left.track_number.cmp(&right.track_number))
-                .then_with(|| left.title.cmp(&right.title))
-        }),
-    }
+fn db_error(error: anyhow::Error) -> AppError {
+    AppError::internal(error.to_string())
 }
 
 async fn artists(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
-) -> impl IntoResponse {
-    let library = state.library.read().await;
-    let mut items = library.artists.clone();
-    sort_artists(&mut items, query.sort.as_deref());
-    Json(paginate(items, &query))
+) -> Result<Json<Page<Artist>>, AppError> {
+    let (items, total) = state
+        .database
+        .list_artists(query.sort.as_deref(), limit_arg(&query), offset_arg(&query))
+        .await
+        .map_err(db_error)?;
+    Ok(Json(page_envelope(items, total, &query)))
 }
 
 async fn albums(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
-) -> impl IntoResponse {
-    let library = state.library.read().await;
-    let mut items = library.albums.clone();
-    sort_albums(&mut items, query.sort.as_deref());
-    Json(paginate(items, &query))
+) -> Result<Json<Page<Album>>, AppError> {
+    let (items, total) = state
+        .database
+        .list_albums(query.sort.as_deref(), limit_arg(&query), offset_arg(&query))
+        .await
+        .map_err(db_error)?;
+    Ok(Json(page_envelope(items, total, &query)))
 }
 
 #[derive(Debug, Serialize)]
@@ -559,23 +517,22 @@ async fn artist_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ArtistDetailResponse>, AppError> {
-    let library = state.library.read().await;
-    let artist = library
+    let artist = state
+        .database
         .artist(&id)
-        .cloned()
+        .await
+        .map_err(db_error)?
         .ok_or_else(|| AppError::not_found(format!("unknown artist: {id}")))?;
-    let albums = library
-        .albums
-        .iter()
-        .filter(|album| album.artist_id == id)
-        .cloned()
-        .collect();
-    let tracks = library
-        .tracks
-        .iter()
-        .filter(|track| track.artist_id == id)
-        .cloned()
-        .collect();
+    let albums = state
+        .database
+        .albums_for_artist(&id)
+        .await
+        .map_err(db_error)?;
+    let tracks = state
+        .database
+        .tracks_for_artist(&id)
+        .await
+        .map_err(db_error)?;
 
     Ok(Json(ArtistDetailResponse {
         artist,
@@ -595,28 +552,23 @@ async fn album_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<AlbumDetailResponse>, AppError> {
-    let library = state.library.read().await;
-    let album = library
+    let album = state
+        .database
         .album(&id)
-        .cloned()
+        .await
+        .map_err(db_error)?
         .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
-    let artist = library
-        .artists
-        .iter()
-        .find(|artist| artist.id == album.artist_id)
-        .cloned();
-    let mut tracks: Vec<Track> = library
-        .tracks
-        .iter()
-        .filter(|track| track.album_id == id)
-        .cloned()
-        .collect();
-    tracks.sort_by(|left, right| {
-        left.disc_number
-            .cmp(&right.disc_number)
-            .then_with(|| left.track_number.cmp(&right.track_number))
-            .then_with(|| left.title.cmp(&right.title))
-    });
+    let artist = state
+        .database
+        .artist(&album.artist_id)
+        .await
+        .map_err(db_error)?;
+    // tracks_for_album returns tracks already ordered by disc, track, then title.
+    let tracks = state
+        .database
+        .tracks_for_album(&id)
+        .await
+        .map_err(db_error)?;
 
     Ok(Json(AlbumDetailResponse {
         album,
@@ -625,9 +577,9 @@ async fn album_detail(
     }))
 }
 
-async fn browse(State(state): State<AppState>) -> impl IntoResponse {
-    let library = state.library.read().await;
-    Json(library.browse_index())
+async fn browse(State(state): State<AppState>) -> Result<Json<BrowseIndex>, AppError> {
+    let index = state.database.browse_index().await.map_err(db_error)?;
+    Ok(Json(index))
 }
 
 /// Tracks ordered newest-first by when they entered the database. Tracks without
@@ -635,17 +587,18 @@ async fn browse(State(state): State<AppState>) -> impl IntoResponse {
 async fn recently_added(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
-) -> impl IntoResponse {
-    let library = state.library.read().await;
-    let mut items = library.tracks.clone();
-    items.sort_by(|left, right| {
-        right
-            .added_at_unix_seconds
-            .cmp(&left.added_at_unix_seconds)
-            .then_with(|| left.artist_name.cmp(&right.artist_name))
-            .then_with(|| left.title.cmp(&right.title))
-    });
-    Json(paginate(items, &query))
+) -> Result<Json<Page<Track>>, AppError> {
+    let (items, total) = state
+        .database
+        .list_tracks(
+            &BrowseFilter::default(),
+            Some("recent"),
+            limit_arg(&query),
+            offset_arg(&query),
+        )
+        .await
+        .map_err(db_error)?;
+    Ok(Json(page_envelope(items, total, &query)))
 }
 
 /// Query parameters for `/api/tracks`: browse filters plus pagination/sorting.
@@ -666,7 +619,7 @@ struct TrackListQuery {
 async fn tracks(
     State(state): State<AppState>,
     Query(query): Query<TrackListQuery>,
-) -> impl IntoResponse {
+) -> Result<Json<Page<Track>>, AppError> {
     let filter = BrowseFilter {
         genre: query.genre,
         year: query.year,
@@ -678,10 +631,17 @@ async fn tracks(
         offset: query.offset,
         sort: query.sort,
     };
-    let library = state.library.read().await;
-    let mut items = library.browse_tracks(&filter);
-    sort_tracks(&mut items, page.sort.as_deref());
-    Json(paginate(items, &page))
+    let (items, total) = state
+        .database
+        .list_tracks(
+            &filter,
+            page.sort.as_deref(),
+            limit_arg(&page),
+            offset_arg(&page),
+        )
+        .await
+        .map_err(db_error)?;
+    Ok(Json(page_envelope(items, total, &page)))
 }
 
 #[derive(Debug, Serialize)]
@@ -770,7 +730,11 @@ async fn track_metadata_review(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<TrackMetadataReviewResponse>, AppError> {
-    let library = state.library.read().await;
+    let library = state
+        .database
+        .load_library()
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?;
     let track = library
         .track(&id)
         .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?;
@@ -783,22 +747,21 @@ async fn update_track_metadata_field_review(
     Path(id): Path<String>,
     Json(update): Json<MetadataFieldReviewUpdate>,
 ) -> Result<Json<TrackMetadataReviewResponse>, AppError> {
-    let (mut updated_library, response) = {
-        let library = state.library.read().await;
-        let mut updated_library = library.clone();
-        let track = updated_library
-            .tracks
-            .iter_mut()
-            .find(|track| track.id == id)
-            .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?;
+    let mut updated_library = state
+        .database
+        .load_library()
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?;
+    let track = updated_library
+        .tracks
+        .iter_mut()
+        .find(|track| track.id == id)
+        .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?;
 
-        update_metadata_field_approval(track, &update)?;
-        let response = metadata_review_response(track);
-        (updated_library, response)
-    };
+    update_metadata_field_approval(track, &update)?;
+    let response = metadata_review_response(track);
 
     state.database.save_library(&mut updated_library).await?;
-    *state.library.write().await = updated_library;
 
     Ok(Json(response))
 }
@@ -879,7 +842,11 @@ async fn track_musicbrainz_lookup(
     Path(id): Path<String>,
 ) -> Result<Json<MusicBrainzTrackLookupResponse>, AppError> {
     let track = {
-        let library = state.library.read().await;
+        let library = state
+            .database
+            .load_library()
+            .await?
+            .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?;
         library
             .track(&id)
             .cloned()
@@ -905,7 +872,11 @@ async fn track_musicbrainz_candidates(
     Query(query): Query<CandidateSearchQuery>,
 ) -> Result<Json<MusicBrainzTrackCandidateSearchResponse>, AppError> {
     let track = {
-        let library = state.library.read().await;
+        let library = state
+            .database
+            .load_library()
+            .await?
+            .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?;
         library
             .track(&id)
             .cloned()
@@ -928,7 +899,11 @@ async fn album_musicbrainz_candidates(
     Query(query): Query<CandidateSearchQuery>,
 ) -> Result<Json<MusicBrainzAlbumCandidateSearchResponse>, AppError> {
     let (album, album_tracks) = {
-        let library = state.library.read().await;
+        let library = state
+            .database
+            .load_library()
+            .await?
+            .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
         let album = library
             .album(&id)
             .cloned()
@@ -959,7 +934,11 @@ async fn album_cover_art_archive_candidates(
     Query(query): Query<CandidateSearchQuery>,
 ) -> Result<Json<CoverArtArchiveCandidateResponse>, AppError> {
     let (album, tracks) = {
-        let library = state.library.read().await;
+        let library = state
+            .database
+            .load_library()
+            .await?
+            .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
         let album = library
             .album(&id)
             .cloned()
@@ -1052,13 +1031,12 @@ async fn stream_track(
         }
     }
 
-    let track = {
-        let library = state.library.read().await;
-        library
-            .track(&id)
-            .cloned()
-            .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?
-    };
+    let track = state
+        .database
+        .track(&id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?;
     let bytes = tokio::fs::read(&track.path).await?;
     let content_type = audio_content_type(&track.extension);
 
@@ -1084,7 +1062,11 @@ async fn album_artwork_review(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<AlbumArtworkReviewResponse>, AppError> {
-    let library = state.library.read().await;
+    let library = state
+        .database
+        .load_library()
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
     Ok(Json(album_artwork_review_response(&library, &id)?))
 }
 
@@ -1093,37 +1075,44 @@ async fn update_album_artwork(
     Path(id): Path<String>,
     Json(update): Json<AlbumArtworkSelectionUpdate>,
 ) -> Result<Json<AlbumArtworkReviewResponse>, AppError> {
-    let (mut updated_library, response) = {
-        let library = state.library.read().await;
-        let mut updated_library = library.clone();
-        let candidate = album_artwork_candidates(&updated_library, &id)?
-            .into_iter()
-            .find(|candidate| candidate.id == update.artwork_id)
-            .ok_or_else(|| {
-                AppError::not_found(format!(
-                    "unknown artwork candidate for album {id}: {}",
-                    update.artwork_id
-                ))
-            })?;
-        let album = updated_library
-            .albums
-            .iter_mut()
-            .find(|album| album.id == id)
-            .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
+    let mut library = state
+        .database
+        .load_library()
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
+    let candidate = album_artwork_candidates(&library, &id)?
+        .into_iter()
+        .find(|candidate| candidate.id == update.artwork_id)
+        .ok_or_else(|| {
+            AppError::not_found(format!(
+                "unknown artwork candidate for album {id}: {}",
+                update.artwork_id
+            ))
+        })?;
+    let album = library
+        .albums
+        .iter_mut()
+        .find(|album| album.id == id)
+        .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
 
-        album.artwork_path = Some(candidate.path);
-        album.artwork_url = Some(album_artwork_url(
-            &album.id,
-            album.artwork_path.as_ref().unwrap(),
-        ));
+    album.artwork_path = Some(candidate.path);
+    album.artwork_url = Some(album_artwork_url(
+        &album.id,
+        album.artwork_path.as_ref().unwrap(),
+    ));
 
-        let response = album_artwork_review_response(&updated_library, &id)?;
-        (updated_library, response)
-    };
+    // Persist just the album's artwork columns rather than rewriting the library.
+    state
+        .database
+        .set_album_artwork(
+            &id,
+            album.artwork_path.as_deref(),
+            album.artwork_url.as_deref(),
+        )
+        .await
+        .map_err(db_error)?;
 
-    state.database.save_library(&mut updated_library).await?;
-    *state.library.write().await = updated_library;
-
+    let response = album_artwork_review_response(&library, &id)?;
     Ok(Json(response))
 }
 
@@ -1132,16 +1121,15 @@ async fn album_artwork(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let path = {
-        let library = state.library.read().await;
-        let album = library
-            .album(&id)
-            .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
-        album
-            .artwork_path
-            .clone()
-            .ok_or_else(|| AppError::not_found(format!("album has no artwork: {id}")))?
-    };
+    let album = state
+        .database
+        .album(&id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
+    let path = album
+        .artwork_path
+        .ok_or_else(|| AppError::not_found(format!("album has no artwork: {id}")))?;
 
     serve_artwork(path, headers).await
 }
@@ -1152,7 +1140,11 @@ async fn album_artwork_candidate(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let path = {
-        let library = state.library.read().await;
+        let library = state
+            .database
+            .load_library()
+            .await?
+            .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
         album_artwork_candidates(&library, &id)?
             .into_iter()
             .find(|candidate| candidate.id == artwork_id)
@@ -2687,7 +2679,7 @@ mod tests {
                 .save_library(&mut library)
                 .await
                 .expect("save fixture library");
-            app(library, database, LocalDiskProvider::new(&self.root))
+            app(database, LocalDiskProvider::new(&self.root))
         }
 
         fn write(&self, relative_path: &str) {

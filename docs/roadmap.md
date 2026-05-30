@@ -156,8 +156,11 @@ Search design decisions:
 - No application-level search cache: SQLite's own page cache already keeps hot
   index pages resident, and a separate cache would add invalidation complexity for
   little gain on a single-user local server. Revisit only if profiling shows a need.
-- Follow-up: the browse and list endpoints still read the in-memory library;
-  moving them onto SQL queries would remove the remaining in-memory footprint.
+- The list, detail, and browse endpoints now query SQLite directly rather than a
+  resident in-memory library snapshot, so steady-state memory no longer scales with
+  library size. The few low-frequency, per-entity operations (metadata review/apply,
+  MusicBrainz lookups, artwork review) still load the library transiently for one
+  request; converting those to targeted queries is a possible later refinement.
 
 ## Milestone 5: Playback, Queues, And Zones
 
@@ -305,10 +308,7 @@ Done when:
 
 ## Immediate Next Steps
 
-Milestones 3 and 4 are complete, including SQLite FTS5 full-text search. The next
-implementation slice should either:
-
-1. Begin Milestone 5 (player registry, queues, zones, and WebSocket state sync), or
-2. Move the browse/list endpoints off the in-memory library onto SQL queries, to
-   remove the remaining whole-library-in-RAM footprint (the search follow-up noted
-   in Milestone 4).
+Milestones 3 and 4 are complete, including SQLite FTS5 full-text search and the
+move of all read endpoints onto SQL queries (the in-memory library snapshot has
+been removed). The next implementation slice is Milestone 5: player registry,
+queues, zones, and WebSocket state sync.
