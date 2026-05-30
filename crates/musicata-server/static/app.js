@@ -1,7 +1,3 @@
-const SERVER_CHECK_INTERVAL_MS = 3000;
-const SERVER_CHECK_TIMEOUT_MS = 1500;
-const SERVER_EVENT_TIMEOUT_MS = 3500;
-
 const state = {
   albums: [],
   visibleAlbums: [],
@@ -9,18 +5,10 @@ const state = {
   browseFilter: { genre: "", year: "", composer: "" },
   tracks: [],
   visibleTracks: [],
-  currentIndex: -1,
   activePlayerId: null,
   activeStatus: "stopped",
   activeNowTrackId: null,
   searchController: null,
-  serverCheckTimer: 0,
-  serverCheckPending: false,
-  playbackSession: null,
-  playbackEvents: null,
-  playbackGeneration: 0,
-  playbackWatchdogTimer: 0,
-  lastServerEventAt: 0,
   metadataTrackId: null,
   metadataReview: null,
   metadataError: "",
@@ -46,9 +34,7 @@ const els = {
   trackList: document.querySelector("#track-list"),
   viewTitle: document.querySelector("#view-title"),
   refresh: document.querySelector("#refresh"),
-  player: document.querySelector(".player"),
   audio: document.querySelector("#audio"),
-  nowArt: document.querySelector("#now-art"),
   nowTitle: document.querySelector("#now-title"),
   nowSubtitle: document.querySelector("#now-subtitle"),
   prev: document.querySelector("#prev"),
@@ -335,197 +321,6 @@ async function playTrack(index) {
   await playerCommand(state.activePlayerId, { command: "play_tracks", track_ids: ids });
   if (index > 0) {
     await playerCommand(state.activePlayerId, { command: "play_queue_index", index });
-  }
-}
-
-function stopPlayback(message) {
-  closePlaybackSession();
-  stopPlaybackServerMonitor();
-  stopPlaybackEventWatchdog();
-  els.audio.pause();
-  els.audio.removeAttribute("src");
-  els.audio.load();
-  state.currentIndex = -1;
-  els.playPause.textContent = "Play";
-  els.nowTitle.textContent = message ? "Playback stopped" : "Nothing playing";
-  els.nowSubtitle.textContent = message || "Select a track to start browser playback.";
-  els.nowArt.src = "";
-  els.nowArt.hidden = true;
-  updatePlayerLayout(false, false);
-  markActiveTrack();
-
-  if ("mediaSession" in navigator) {
-    navigator.mediaSession.metadata = null;
-    navigator.mediaSession.playbackState = "none";
-  }
-}
-
-async function startPlaybackSession() {
-  closePlaybackSession();
-  const generation = ++state.playbackGeneration;
-  const session = await apiPost("/api/playback/sessions");
-
-  if (generation !== state.playbackGeneration) {
-    endPlaybackSession(session.id);
-    return null;
-  }
-
-  state.playbackSession = session;
-  state.lastServerEventAt = Date.now();
-
-  if ("EventSource" in window) {
-    const events = new EventSource(session.event_url);
-    state.playbackEvents = events;
-    events.addEventListener("open", recordServerEvent);
-    events.addEventListener("heartbeat", recordServerEvent);
-    events.addEventListener("message", recordServerEvent);
-    events.addEventListener("error", () => {
-      if (state.playbackEvents === events && els.audio.src) {
-        stopPlayback("Musicata server connection was lost. Playback was stopped.");
-      }
-    });
-    startPlaybackEventWatchdog();
-  }
-
-  return session;
-}
-
-function closePlaybackSession() {
-  const session = state.playbackSession;
-  state.playbackSession = null;
-  state.playbackGeneration += 1;
-
-  if (state.playbackEvents) {
-    state.playbackEvents.close();
-    state.playbackEvents = null;
-  }
-
-  if (session) {
-    endPlaybackSession(session.id);
-  }
-}
-
-function endPlaybackSession(id) {
-  fetch(`/api/playback/sessions/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-    keepalive: true,
-  }).catch(() => {});
-}
-
-function streamUrlForSession(streamUrl, sessionId) {
-  const separator = streamUrl.includes("?") ? "&" : "?";
-  return `${streamUrl}${separator}playback_session=${encodeURIComponent(sessionId)}`;
-}
-
-function updateNowPlaying(track) {
-  const album = state.albums.find((item) => item.id === track.album_id);
-  const artworkUrl = album?.artwork_url || "";
-  els.nowTitle.textContent = track.title;
-  els.nowSubtitle.textContent = `${track.artist_name} - ${track.album_title}`;
-  els.nowArt.src = artworkUrl;
-  els.nowArt.hidden = !artworkUrl;
-  updatePlayerLayout(Boolean(artworkUrl), true);
-
-  if ("mediaSession" in navigator) {
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: track.title,
-      artist: track.artist_name,
-      album: track.album_title,
-      artwork: artworkUrl ? [{ src: artworkUrl }] : [],
-    });
-  }
-}
-
-function updatePlayerLayout(hasArtwork, hasAudio) {
-  els.player.classList.toggle("no-art", !hasArtwork);
-  els.player.classList.toggle("no-audio", !hasAudio);
-  els.audio.hidden = !hasAudio;
-}
-
-function startPlaybackServerMonitor() {
-  if (state.playbackEvents) {
-    return;
-  }
-
-  if (state.serverCheckTimer) {
-    return;
-  }
-
-  checkPlaybackServer();
-  state.serverCheckTimer = window.setInterval(
-    checkPlaybackServer,
-    SERVER_CHECK_INTERVAL_MS,
-  );
-}
-
-function stopPlaybackServerMonitor() {
-  if (!state.serverCheckTimer) {
-    return;
-  }
-
-  window.clearInterval(state.serverCheckTimer);
-  state.serverCheckTimer = 0;
-}
-
-async function checkPlaybackServer() {
-  if (state.serverCheckPending || els.audio.paused || !els.audio.src) {
-    return;
-  }
-
-  state.serverCheckPending = true;
-  try {
-    await fetchWithTimeout("/api/health", SERVER_CHECK_TIMEOUT_MS);
-  } catch (_error) {
-    stopPlayback("Musicata server is unavailable. Playback was stopped.");
-  } finally {
-    state.serverCheckPending = false;
-  }
-}
-
-function startPlaybackEventWatchdog() {
-  if (state.playbackWatchdogTimer) {
-    return;
-  }
-
-  state.playbackWatchdogTimer = window.setInterval(() => {
-    if (!state.playbackEvents || !els.audio.src) {
-      return;
-    }
-
-    if (Date.now() - state.lastServerEventAt > SERVER_EVENT_TIMEOUT_MS) {
-      stopPlayback("Musicata server connection was lost. Playback was stopped.");
-    }
-  }, 1000);
-}
-
-function stopPlaybackEventWatchdog() {
-  if (!state.playbackWatchdogTimer) {
-    return;
-  }
-
-  window.clearInterval(state.playbackWatchdogTimer);
-  state.playbackWatchdogTimer = 0;
-}
-
-function recordServerEvent() {
-  state.lastServerEventAt = Date.now();
-}
-
-async function fetchWithTimeout(path, timeoutMs) {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(path, {
-      cache: "no-store",
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      throw new Error(`${response.status} ${response.statusText}`);
-    }
-    return response;
-  } finally {
-    window.clearTimeout(timeout);
   }
 }
 
@@ -913,11 +708,6 @@ function updateAlbumArtwork(albumId, artworkUrl) {
     }
   }
   renderAlbums(state.visibleAlbums);
-
-  const currentTrack = state.visibleTracks[state.currentIndex];
-  if (currentTrack?.album_id === albumId) {
-    updateNowPlaying(currentTrack);
-  }
 }
 
 function renderObservedMetadata(observations) {
@@ -1321,17 +1111,6 @@ function searchAlbums(results) {
 function albumsForTracks(tracks) {
   const albumIds = new Set(tracks.map((track) => track.album_id));
   return state.albums.filter((album) => albumIds.has(album.id));
-}
-
-function playNext(offset) {
-  if (state.visibleTracks.length === 0) {
-    return;
-  }
-
-  const nextIndex = state.currentIndex < 0
-    ? 0
-    : (state.currentIndex + offset + state.visibleTracks.length) % state.visibleTracks.length;
-  playTrack(nextIndex);
 }
 
 function escapeHtml(value) {
