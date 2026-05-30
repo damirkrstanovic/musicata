@@ -1883,15 +1883,92 @@ function updateFooterFromState(playback) {
   els.queueCount.textContent = String(playback.queue?.length ?? 0);
   if (state.queueOpen) renderQueue();
 
-  if ("mediaSession" in navigator) {
-    navigator.mediaSession.playbackState =
-      playback.status === "playing"
-        ? "playing"
-        : playback.status === "paused"
-          ? "paused"
-          : "none";
-  }
+  updateMediaSession(playback);
   markActiveTrack();
+}
+
+// Reflect the active player into the OS media surfaces (lock screen, media keys,
+// notification, Bluetooth/car displays). The OS UI only appears once this tab is
+// actually producing audio (i.e. it's the browser player's output), but setting the
+// metadata for any active player is harmless.
+function updateMediaSession(playback) {
+  if (!("mediaSession" in navigator)) return;
+  const ms = navigator.mediaSession;
+
+  ms.playbackState =
+    playback.status === "playing"
+      ? "playing"
+      : playback.status === "paused"
+        ? "paused"
+        : "none";
+
+  const now = playback.now_playing;
+  if (now) {
+    ms.metadata = new MediaMetadata({
+      title: now.title || "Unknown",
+      artist: now.artist || "",
+      album: now.album || "",
+      artwork: now.artwork_url ? [{ src: now.artwork_url, sizes: "512x512" }] : [],
+    });
+  } else {
+    ms.metadata = null;
+  }
+
+  // Position state drives OS scrubbers. setPositionState throws on inconsistent
+  // values (e.g. position past duration), so guard and clear when unknown.
+  try {
+    const duration = playback.duration_seconds ?? 0;
+    const position = playback.elapsed_seconds ?? 0;
+    if (duration > 0 && position >= 0 && position <= duration) {
+      ms.setPositionState({ duration, position, playbackRate: 1 });
+    } else {
+      ms.setPositionState();
+    }
+  } catch {
+    /* ignore invalid position state */
+  }
+}
+
+// Wire OS media controls (play/pause/prev/next/stop/seek) to the active player.
+// Registered once; each handler targets whichever player is currently active.
+function setupMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+  const ms = navigator.mediaSession;
+  const send = (body) => {
+    if (state.activePlayerId) playerCommand(state.activePlayerId, body);
+  };
+  const handlers = {
+    play: () => {
+      if (!state.activePlayerId) return;
+      if (state.activePlayerId === browserPlayerId) claimBrowserOutput();
+      if (state.activeNowTrackId) send({ command: "play" });
+      else playTrack(0);
+    },
+    pause: () => send({ command: "pause" }),
+    previoustrack: () => send({ command: "previous" }),
+    nexttrack: () => send({ command: "next" }),
+    stop: () => send({ command: "stop" }),
+    seekto: (details) => {
+      if (details.seekTime != null) {
+        send({ command: "seek", position_seconds: details.seekTime });
+      }
+    },
+    seekbackward: (details) => {
+      const offset = details.seekOffset || 10;
+      send({ command: "seek", position_seconds: Math.max(0, state.activeElapsed - offset) });
+    },
+    seekforward: (details) => {
+      const offset = details.seekOffset || 10;
+      send({ command: "seek", position_seconds: state.activeElapsed + offset });
+    },
+  };
+  for (const [action, handler] of Object.entries(handlers)) {
+    try {
+      ms.setActionHandler(action, handler);
+    } catch {
+      /* browser doesn't support this action */
+    }
+  }
 }
 
 function renderNowArt(now) {
@@ -2045,3 +2122,4 @@ if (playerEls.addZoneForm) {
 }
 
 loadPlayers();
+setupMediaSession();

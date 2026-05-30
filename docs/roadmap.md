@@ -251,7 +251,10 @@ Tasks:
 
 - Decide whether to migrate the UI to Leptos now or keep static JS until server APIs stabilize.
 - Build responsive views for library, album, artist, search, queue, player selection, and settings.
-- Add Media Session API integration.
+- [x] Add Media Session API integration. The web app publishes the active player's
+  track metadata (title/artist/album/artwork) and playback/position state to the OS
+  media surfaces (lock screen, media keys, notification, Bluetooth/car displays), and
+  routes the OS play/pause/prev/next/stop/seek controls back to the active player.
 - Improve PWA installability, caching, loading states, and mobile ergonomics.
 - Add virtualized lists for large libraries if needed.
 - Visual polish pass on the existing controls — e.g. the library search field still
@@ -331,6 +334,12 @@ Tasks:
 
 - Define `PlayerProvider` and endpoint capabilities.
 - Add a lightweight native endpoint prototype.
+- Introduce authentication between the server and players/endpoints. Today any device
+  on the network can register itself as a player and any client can control one; the
+  player-provider plugin interface should define how an endpoint proves its identity
+  to the server (and the server to the endpoint) — e.g. a per-player token or shared
+  key issued at registration and presented on the command/state channels — so players
+  can't be spoofed or hijacked. (Distinct from user↔server auth in Milestone 12.)
 - Research and prototype Squeezelite/LMS bridge behavior.
 - Research Snapcast for synchronized transport.
 - Later evaluate AirPlay, Chromecast, UPnP/DLNA, and MPD integrations.
