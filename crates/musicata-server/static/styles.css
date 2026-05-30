@@ -354,12 +354,23 @@ h1 {
 
 .track {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   gap: 8px;
   align-items: center;
   min-width: 0;
   min-height: 58px;
   border-bottom: 1px solid var(--line);
+}
+
+.track-stat {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: var(--accent-strong);
+  white-space: nowrap;
+  text-align: right;
+  padding: 0 4px;
+  font-variant-numeric: tabular-nums;
 }
 
 .track.active {

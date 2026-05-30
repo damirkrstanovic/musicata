@@ -298,21 +298,43 @@ function markNavActive(view) {
 }
 
 const HISTORY_VIEWS = {
-  most: { url: "/api/history/most-played", title: "Most played", empty: "Nothing played yet." },
-  recent: { url: "/api/history/recent", title: "Recently played", empty: "Nothing played yet." },
+  most: {
+    url: "/api/history/most-played",
+    title: "Most played",
+    empty: "Nothing played yet.",
+    annotate: (track) => `${track.play_count} ${track.play_count === 1 ? "play" : "plays"}`,
+  },
+  recent: {
+    url: "/api/history/recent",
+    title: "Recently played",
+    empty: "Nothing played yet.",
+    annotate: (track) => relativeTime(track.last_listened_at),
+  },
 };
+
+// Recently played is a cheap query, so we keep it live while it's open; most played
+// is a full aggregation, so we only load it on demand (and the server caches it).
+const RECENT_REFRESH_INTERVAL = 5000;
+let recentRefreshTimer = 0;
 
 async function setView(view) {
   markNavActive(view);
+  clearInterval(recentRefreshTimer);
+  recentRefreshTimer = 0;
+
   if (view === "library") {
     await applyBrowseFilter({ clearSearch: false });
-  } else {
-    await loadHistoryView(view);
+    return;
+  }
+
+  await loadHistoryView(view);
+  if (view === "recent") {
+    recentRefreshTimer = setInterval(() => loadHistoryView("recent"), RECENT_REFRESH_INTERVAL);
   }
 }
 
-// Fetch and render a history view. Safe to call repeatedly (e.g. when a track
-// changes), so the list stays live without any manual refresh.
+// Fetch and render a history view. Safe to call repeatedly so the list stays live
+// without any manual refresh.
 async function loadHistoryView(view) {
   const config = HISTORY_VIEWS[view];
   if (!config) return;
@@ -324,7 +346,7 @@ async function loadHistoryView(view) {
     if (tracks.length === 0) {
       els.trackList.innerHTML = `<p class="empty">${config.empty}</p>`;
     } else {
-      renderTracks(tracks);
+      renderTracks(tracks, { annotate: config.annotate });
     }
   } catch (error) {
     els.trackList.innerHTML = `<p class="error">Failed to load history: ${escapeHtml(error.message)}</p>`;
@@ -353,7 +375,9 @@ function browseTitle(filter, trackCount) {
   return `Browse: ${parts.join(" / ")} (${trackCount} tracks)`;
 }
 
-function renderTracks(tracks) {
+// Render the center track list. `options.annotate(track)` may return a short string
+// (a play count, a relative time) shown as a stat at the end of each row.
+function renderTracks(tracks, options = {}) {
   els.trackList.innerHTML = "";
 
   if (tracks.length === 0) {
@@ -379,18 +403,43 @@ function renderTracks(tracks) {
     `;
     playButton.addEventListener("click", () => playTrack(index));
 
+    const stat = options.annotate ? options.annotate(track) : null;
+    let statEl = null;
+    if (stat) {
+      statEl = document.createElement("small");
+      statEl.className = "track-stat";
+      statEl.textContent = stat;
+    }
+
     const metadataButton = document.createElement("button");
     metadataButton.className = "track-action";
     metadataButton.type = "button";
     metadataButton.textContent = "Metadata";
     metadataButton.addEventListener("click", () => openMetadata(track.id));
 
-    row.append(playButton, metadataButton);
+    if (statEl) {
+      row.append(playButton, statEl, metadataButton);
+    } else {
+      row.append(playButton, metadataButton);
+    }
     els.trackList.append(row);
   }
 
   markActiveTrack();
   markMetadataTrack();
+}
+
+// Compact relative time like "just now", "5m", "3h", "2d" from a Unix timestamp.
+function relativeTime(unixSeconds) {
+  if (!unixSeconds) return "";
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - unixSeconds));
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }
 
 // Play the current track list on the active player, starting at `index`.
@@ -1518,8 +1567,10 @@ function openPlayerSocket(id) {
       const nowTrack = playback.now_playing?.track_id ?? null;
       if (nowTrack !== state.lastNow[id]) {
         state.lastNow[id] = nowTrack;
-        if (state.view === "recent" || state.view === "most") {
-          loadHistoryView(state.view);
+        // Recently played is cheap and should feel live; most played is a heavier
+        // aggregation we only refresh on demand.
+        if (state.view === "recent") {
+          loadHistoryView("recent");
         }
       }
       const node = playerEls.list.querySelector(`[data-now="${cssEscape(id)}"]`);

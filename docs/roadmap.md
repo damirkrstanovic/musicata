@@ -193,10 +193,14 @@ Tasks:
   track or four minutes, whichever is lower) and only counts time the player was
   actually playing, so pauses and skips don't inflate it — this works for both the
   per-second browser reports and MPD's sparse idle updates. Listens persist to a
-  `listens` table (migration v11); `GET /api/history/recent` and
-  `/api/history/most-played` aggregate them, surfaced in the web app as "Recently
-  played" / "Most played" views, which refresh live as tracks change. This is the
-  foundation for Milestone 7.
+  `listens` table (migration v11) and are kept for a rolling 30-day window (pruned
+  hourly). `GET /api/history/recent` returns distinct tracks with their last-listen
+  time; `/api/history/most-played` returns tracks with play counts. In the web app,
+  "Recently played" shows relative times and is refreshed eagerly (it's a cheap
+  indexed read — a 5s poll while open plus track-change events), while "Most played"
+  shows play counts and, being a full aggregation, is loaded on demand and cached
+  server-side for 60s so it isn't recomputed on every request. This is the foundation
+  for Milestone 7.
 - [x] Stop browser playback when the server-bound playback session heartbeat is lost.
 - [x] No manual refresh anywhere. The server re-scans the filesystem on a 30s timer
   (incremental, so an unchanged library is cheap), and the web app polls the library

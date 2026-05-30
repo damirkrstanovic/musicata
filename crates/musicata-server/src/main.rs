@@ -63,6 +63,7 @@ struct AppState {
     players: Arc<PlayerManager>,
     musicbrainz: MusicBrainzClient,
     rescan_lock: Arc<Mutex<()>>,
+    most_played_cache: Arc<Mutex<Option<MostPlayedCache>>>,
     playback_sessions: Arc<RwLock<BTreeMap<String, PlaybackSession>>>,
     next_playback_session: Arc<AtomicU64>,
 }
@@ -149,6 +150,13 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // Keep only a rolling window of listening history.
+    tokio::spawn(prune_old_listens(
+        database.clone(),
+        LISTEN_RETENTION,
+        LISTEN_PRUNE_INTERVAL,
+    ));
+
     tracing::info!("listening on http://{}", config.addr);
     axum::serve(listener, app(database, provider, players, rescan_lock))
         .await
@@ -159,6 +167,27 @@ async fn main() -> Result<()> {
 
 /// How often the library is re-scanned against the filesystem in the background.
 const LIBRARY_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Listening history is kept for this long; older listens are pruned.
+const LISTEN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How often the history retention prune runs.
+const LISTEN_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Periodically drops listens older than the retention window. The first tick fires
+/// immediately, so stale history is trimmed at startup too.
+async fn prune_old_listens(database: Database, retention: Duration, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        ticker.tick().await;
+        let cutoff = now_unix_seconds() - retention.as_secs() as i64;
+        match database.prune_listens_before(cutoff).await {
+            Ok(removed) if removed > 0 => tracing::info!(removed, "pruned old listens"),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "failed to prune old listens"),
+        }
+    }
+}
 
 /// Periodically re-scans the library and persists any changes. Incremental change
 /// detection only stats files, so an unchanged library is cheap; nothing is written
@@ -350,6 +379,7 @@ fn app(
             players,
             musicbrainz: MusicBrainzClient::default(),
             rescan_lock,
+            most_played_cache: Arc::new(Mutex::new(None)),
             playback_sessions: Arc::new(RwLock::new(BTreeMap::new())),
             next_playback_session: Arc::new(AtomicU64::new(1)),
         })
@@ -980,38 +1010,86 @@ fn history_limit(query: &HistoryQuery) -> usize {
     query.limit.unwrap_or(100).clamp(1, 500)
 }
 
+/// A track paired with when it was last listened to (Unix seconds). Recently-played
+/// is a cheap indexed read, so this is served fresh on every request.
+#[derive(Clone, Debug, Serialize)]
+struct RecentListen {
+    #[serde(flatten)]
+    track: Track,
+    last_listened_at: i64,
+}
+
 async fn recently_played(
     State(state): State<AppState>,
     Query(query): Query<HistoryQuery>,
-) -> Result<Json<Vec<Track>>, AppError> {
+) -> Result<Json<Vec<RecentListen>>, AppError> {
     let items = state
         .database
         .recently_played(history_limit(&query))
         .await
-        .map_err(db_error)?;
+        .map_err(db_error)?
+        .into_iter()
+        .map(|(track, last_listened_at)| RecentListen {
+            track,
+            last_listened_at,
+        })
+        .collect();
     Ok(Json(items))
 }
 
 /// A track paired with how many times it has been listened to.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct PlayCount {
     #[serde(flatten)]
     track: Track,
     play_count: i64,
 }
 
+/// How long a computed most-played ranking is reused before recomputing. The ranking
+/// is a full aggregation over the history, so — unlike recently-played — we don't want
+/// to recompute it on every request; a short cache bounds that cost.
+const MOST_PLAYED_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Clone)]
+struct MostPlayedCache {
+    computed_at: Instant,
+    limit: usize,
+    items: Vec<PlayCount>,
+}
+
 async fn most_played(
     State(state): State<AppState>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Vec<PlayCount>>, AppError> {
-    let items = state
+    let limit = history_limit(&query);
+
+    // Serve a recent ranking from cache when it matches the requested size and is
+    // still fresh, so frequent opens don't re-aggregate the whole history.
+    {
+        let cache = state.most_played_cache.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.limit == limit
+            && cached.computed_at.elapsed() < MOST_PLAYED_TTL
+        {
+            return Ok(Json(cached.items.clone()));
+        }
+    }
+
+    let items: Vec<PlayCount> = state
         .database
-        .most_played(history_limit(&query))
+        .most_played(limit)
         .await
         .map_err(db_error)?
         .into_iter()
         .map(|(track, play_count)| PlayCount { track, play_count })
         .collect();
+
+    *state.most_played_cache.lock().await = Some(MostPlayedCache {
+        computed_at: Instant::now(),
+        limit,
+        items: items.clone(),
+    });
+
     Ok(Json(items))
 }
 

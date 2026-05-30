@@ -1251,9 +1251,10 @@ impl Database {
         Ok(())
     }
 
-    /// Distinct tracks ordered by their most recent listen, newest first. Listens for
-    /// tracks no longer in the library are skipped by the join.
-    pub async fn recently_played(&self, limit: usize) -> Result<Vec<Track>> {
+    /// Distinct tracks paired with their most recent listen time (Unix seconds),
+    /// newest first. Listens for tracks no longer in the library are skipped by the
+    /// join. This is a cheap indexed query, safe to call often.
+    pub async fn recently_played(&self, limit: usize) -> Result<Vec<(Track, i64)>> {
         let columns = track_columns("t");
         let sql = format!(
             "SELECT {columns}, MAX(l.listened_at_unix_seconds) AS last_listen
@@ -1266,7 +1267,19 @@ impl Database {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await?;
-        rows.iter().map(track_from_row).collect()
+        rows.iter()
+            .map(|row| Ok((track_from_row(row)?, row.try_get("last_listen")?)))
+            .collect()
+    }
+
+    /// Deletes listens older than `cutoff_unix` (Unix seconds), returning the number
+    /// removed. Used to keep only a rolling retention window of history.
+    pub async fn prune_listens_before(&self, cutoff_unix: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM listens WHERE listened_at_unix_seconds < ?1")
+            .bind(cutoff_unix)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     /// Tracks paired with their listen count, most played first. Ties break on recency.
@@ -2420,10 +2433,13 @@ mod tests {
         database.record_listen("track_2", "p", 200).await.unwrap();
         database.record_listen("track_1", "p", 300).await.unwrap();
 
-        // Recently played: distinct tracks, newest-listen first.
+        // Recently played: distinct tracks, newest-listen first, each with its most
+        // recent listen time (track_1's is 300, not 100).
         let recent = database.recently_played(10).await.expect("recent");
-        let recent_ids: Vec<_> = recent.iter().map(|track| track.id.as_str()).collect();
+        let recent_ids: Vec<_> = recent.iter().map(|(track, _)| track.id.as_str()).collect();
         assert_eq!(recent_ids, ["track_1", "track_2"]);
+        assert_eq!(recent[0].1, 300);
+        assert_eq!(recent[1].1, 200);
 
         // Most played: by listen count, track_1 (2) before track_2 (1).
         let most = database.most_played(10).await.expect("most");
@@ -2435,7 +2451,16 @@ mod tests {
         // A listen for a track no longer in the library is dropped by the join.
         database.record_listen("ghost", "p", 400).await.unwrap();
         let recent = database.recently_played(10).await.expect("recent again");
-        assert!(recent.iter().all(|track| track.id != "ghost"));
+        assert!(recent.iter().all(|(track, _)| track.id != "ghost"));
+
+        // Retention: pruning drops listens before the cutoff. Removing everything
+        // before t=300 leaves only track_1's t=300 listen (and the ghost at t=400).
+        let removed = database.prune_listens_before(300).await.expect("prune");
+        assert_eq!(removed, 2); // track_1@100 and track_2@200
+        let most = database.most_played(10).await.expect("most after prune");
+        assert_eq!(most.len(), 1);
+        assert_eq!(most[0].0.id, "track_1");
+        assert_eq!(most[0].1, 1);
 
         let _ = std::fs::remove_file(db_path);
     }
