@@ -16,8 +16,9 @@ use std::collections::HashMap;
 
 use axum::{
     Router,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
+    body::to_bytes,
+    extract::{Path, Request, State},
+    http::{HeaderMap, Method, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -56,18 +57,82 @@ fn format_of(params: &HashMap<String, String>) -> Format {
     }
 }
 
+fn is_form_body(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/x-www-form-urlencoded"))
+}
+
+/// Parse `a=1&b=2` (query string or form body) into a map, percent-decoding both
+/// keys and values. Repeated keys keep the first value.
+fn parse_params(raw: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        map.entry(percent_decode(key))
+            .or_insert_with(|| percent_decode(value));
+    }
+    map
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&input[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 async fn handle(
     State(state): State<AppState>,
     Path(method): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
+    request: Request,
 ) -> Response {
-    let format = format_of(&params);
+    let (parts, body) = request.into_parts();
 
+    // Subsonic clients pass parameters in the query string (GET) or a form-urlencoded
+    // body (POST); accept both. Query wins on the rare duplicate.
+    let mut params = parse_params(parts.uri.query().unwrap_or(""));
+    if parts.method == Method::POST && is_form_body(&parts.headers) {
+        if let Ok(bytes) = to_bytes(body, 64 * 1024).await {
+            let text = String::from_utf8_lossy(&bytes);
+            for (key, value) in parse_params(&text) {
+                params.entry(key).or_insert(value);
+            }
+        }
+    }
+
+    let format = format_of(&params);
     if let Err((code, message)) = authenticate(&state.subsonic, &params) {
         return error_response(format, code, message);
     }
 
+    let headers = parts.headers;
     let method = method.strip_suffix(".view").unwrap_or(&method);
     match method {
         "ping" => ok_response(format, Map::new()),
@@ -83,7 +148,8 @@ async fn handle(
             ),
         ),
         "getGenres" => get_genres(&state, format).await,
-        "getArtists" | "getIndexes" => get_artists(&state, format).await,
+        "getArtists" => artist_index(&state, format, "artists").await,
+        "getIndexes" => artist_index(&state, format, "indexes").await,
         "getArtist" => get_artist(&state, format, &params).await,
         "getAlbum" => get_album(&state, format, &params).await,
         "getSong" => get_song(&state, format, &params).await,
@@ -194,13 +260,14 @@ async fn get_genres(state: &AppState, format: Format) -> Response {
     ok_response(format, map1("genres", json!({ "genre": genres })))
 }
 
-async fn get_artists(state: &AppState, format: Format) -> Response {
+/// Shared by getArtists (`<artists>`, ID3) and getIndexes (`<indexes>`, legacy): both
+/// return artists grouped into alphabetical `<index name="A">` buckets.
+async fn artist_index(state: &AppState, format: Format, wrapper: &str) -> Response {
     let artists = match state.database.list_artists(None, -1, 0).await {
         Ok((artists, _)) => artists,
         Err(error) => return error_response(format, 0, &error.to_string()),
     };
 
-    // Group into alphabetical indexes (Subsonic's `<index name="A">` buckets).
     let mut buckets: Vec<(String, Vec<Value>)> = Vec::new();
     for artist in &artists {
         let letter = index_letter(&artist.name);
@@ -217,7 +284,7 @@ async fn get_artists(state: &AppState, format: Format) -> Response {
     ok_response(
         format,
         map1(
-            "artists",
+            wrapper,
             json!({ "ignoredArticles": IGNORED_ARTICLES, "index": index }),
         ),
     )

@@ -3461,6 +3461,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subsonic_reads_params_from_post_form_body() {
+        // Real clients (e.g. py-sonic) POST parameters as a form body rather than in
+        // the query string; the API must read both.
+        let fixture = TestFixture::new("ss-post");
+        let app = fixture.app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rest/ping.view")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("u=u&p=p&f=json&v=1.16.1&c=test"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).expect("json");
+        assert_eq!(value["subsonic-response"]["status"], "ok");
+    }
+
+    #[tokio::test]
     async fn subsonic_ping_renders_xml_by_default() {
         let fixture = TestFixture::new("ss-xml");
         let app = fixture.app().await;

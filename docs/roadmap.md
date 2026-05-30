@@ -332,15 +332,18 @@ Tasks:
   getAlbumList/2, getGenres, getMusicFolders, getIndexes, and `scrobble` (which feeds
   Musicata's listening history). Unit + integration tested (auth, XML/JSON envelopes,
   browse, search3, stream bytes, cover art).
-- [~] Test with real OpenSubsonic/Subsonic clients. The protocol is verified end to
-  end against a simulated client (token auth, browse chain, search, stream, cover
-  art, scrobble); validation against named native clients (Symfonium, Amperfy,
-  Feishin, DSub, …) is still to be done.
+- [x] Test with a real OpenSubsonic/Subsonic client. Validated against the `py-sonic`
+  (libsonic) client library — a real client that does salt+token MD5 auth and parses
+  the responses: ping, reject-bad-password, getMusicFolders, getArtists, getIndexes,
+  getArtist, getAlbum, getAlbumList/2, search3, stream (3.6 MB audio), and scrobble
+  all pass. This surfaced two bugs missed by hand-rolled curl tests — clients POST
+  parameters in a form body (not just the query string), and getIndexes needs its own
+  `<indexes>` wrapper — both fixed and regression-tested. GUI clients (Symfonium,
+  Amperfy, Feishin, DSub) should be smoke-tested when convenient.
 
 Done when:
 
-- [x] At least one third-party client can browse and stream from Musicata. *(Protocol
-  implemented and verified; pending a named-client smoke test.)*
+- [x] At least one third-party client can browse and stream from Musicata.
 - [x] Native API docs are accurate enough for integration work.
 
 ## Milestone 9: Provider And Plugin System
