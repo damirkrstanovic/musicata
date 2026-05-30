@@ -2557,6 +2557,7 @@ mod tests {
 
         // Pause is reflected in state.
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2570,6 +2571,22 @@ mod tests {
         let playback: serde_json::Value =
             serde_json::from_str(&body_text(response.into_body()).await).unwrap();
         assert_eq!(playback["status"], "paused");
+
+        // Volume is settable per player and reflected in state.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/players/{browser_id}/commands"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"command":"set_volume","volume":37}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let playback: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(playback["volume"], 37);
     }
 
     #[tokio::test]

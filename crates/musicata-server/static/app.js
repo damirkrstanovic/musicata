@@ -1252,6 +1252,10 @@ function renderPlayers() {
             <button data-action="next" title="Next">&#9197;</button>
             <button data-action="play-here" class="ghost-button">Play view here</button>
           </div>
+          <label class="player-volume" title="Volume">
+            <span>&#128266;</span>
+            <input type="range" min="0" max="100" value="100" data-action="volume" data-volume="${escapeHtml(player.id)}">
+          </label>
           <label class="player-zone">
             <span>Zone</span>
             <select data-action="zone">${zoneOptions(player.zone_id)}</select>
@@ -1295,6 +1299,10 @@ function openPlayerSocket(id) {
       if (node) {
         const suffix = id === browserPlayerId && browserOutput ? " (playing here)" : "";
         node.textContent = nowPlayingText(playback) + suffix;
+      }
+      const volume = playerEls.list.querySelector(`input[data-volume="${cssEscape(id)}"]`);
+      if (volume && playback.volume != null && document.activeElement !== volume) {
+        volume.value = String(playback.volume);
       }
       if (
         id === browserPlayerId &&
@@ -1343,6 +1351,9 @@ window.addEventListener("storage", (event) => {
 
 function driveBrowserAudio(playback) {
   if (!browserAudio) return;
+  if (playback.volume != null) {
+    browserAudio.volume = Math.min(1, Math.max(0, playback.volume / 100));
+  }
   const now = playback.now_playing;
   if (playback.status === "playing" && now && now.stream_url) {
     if (!browserAudio.src.endsWith(now.stream_url)) {
@@ -1535,6 +1546,25 @@ if (playerEls.list) {
       zone_id: select.value || null,
     });
     await loadPlayers();
+  });
+
+  // Volume slider: instant local feedback for the browser output, debounced
+  // command to the player so dragging doesn't flood it.
+  const volumeTimers = new Map();
+  playerEls.list.addEventListener("input", (event) => {
+    const slider = event.target.closest("input[data-action='volume']");
+    if (!slider) return;
+    const id = slider.closest("[data-player]")?.dataset.player;
+    if (!id) return;
+    const volume = Number.parseInt(slider.value, 10);
+    if (id === browserPlayerId && browserOutput) {
+      els.audio.volume = Math.min(1, Math.max(0, volume / 100));
+    }
+    clearTimeout(volumeTimers.get(id));
+    volumeTimers.set(
+      id,
+      setTimeout(() => playerCommand(id, { command: "set_volume", volume }), 150),
+    );
   });
 }
 

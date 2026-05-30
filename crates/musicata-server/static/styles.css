@@ -831,3 +831,16 @@ audio {
   padding: 4px 6px;
   max-width: 160px;
 }
+
+.player-volume {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.player-volume input[type="range"] {
+  flex: 1;
+  accent-color: var(--accent);
+}

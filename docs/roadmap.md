@@ -329,6 +329,9 @@ Tasks:
 
 - Define a per-zone audio pipeline model.
 - Add configuration placeholders for headroom, volume leveling, EQ, convolution, and sample-rate conversion.
+- Add a parametric EQ stage (per-band frequency/gain/Q biquad filters) to the
+  per-zone pipeline, with a UI for editing bands. (CamillaDSP already implements
+  parametric EQ, so this likely rides on the CamillaDSP integration below.)
 - Research CamillaDSP integration.
 
 Done when:
