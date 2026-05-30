@@ -259,26 +259,49 @@ function renderAlbums(albums) {
   els.albums.innerHTML = "";
 
   for (const album of albums) {
-    const button = document.createElement("button");
-    button.className = "album";
-    button.type = "button";
-    button.dataset.albumId = album.id;
-    button.innerHTML = `
+    const row = document.createElement("div");
+    row.className = "album";
+    row.dataset.albumId = album.id;
+    row.setAttribute("role", "button");
+    row.tabIndex = 0;
+    row.innerHTML = `
       ${album.artwork_url ? `<img src="${album.artwork_url}" alt="">` : `<span class="album-placeholder"></span>`}
-      <span>
+      <span class="album-text">
         <strong>${escapeHtml(album.title)}</strong>
         <span>${escapeHtml(album.artist_name)}${album.year ? ` · ${album.year}` : ""}</span>
       </span>
     `;
-    button.addEventListener("click", () => {
+    const open = () => {
       const tracks = state.tracks.filter((track) => track.album_id === album.id);
       state.visibleTracks = tracks;
       els.viewTitle.textContent = album.title;
       markNavActive("library");
       renderTracks(tracks);
       closeDrawerOnMobile();
+    };
+    row.addEventListener("click", open);
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        open();
+      }
     });
-    els.albums.append(button);
+
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "album-add";
+    add.title = "Add album to playlist";
+    add.textContent = "＋";
+    add.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const ids = state.tracks
+        .filter((track) => track.album_id === album.id)
+        .map((track) => track.id);
+      openAddToPlaylist(ids, add, `Add album “${album.title}” to…`);
+    });
+    row.append(add);
+
+    els.albums.append(row);
   }
 }
 
@@ -505,7 +528,7 @@ function renderTracks(tracks, options = {}) {
       context.title = "Add to playlist";
       context.addEventListener("click", (event) => {
         event.stopPropagation();
-        openAddToPlaylist(track.id, context);
+        openAddToPlaylist([track.id], context, `Add “${track.title}” to…`);
       });
     }
 
@@ -659,11 +682,13 @@ async function createPlaylist(name, trackIds) {
   return detail;
 }
 
-async function addTrackToPlaylist(playlistId, trackId) {
+async function addTracksToPlaylist(playlistId, trackIds) {
   await apiJson(`/api/playlists/${encodeURIComponent(playlistId)}`, "PATCH", {
-    add_track_ids: [trackId],
+    add_track_ids: trackIds,
   });
   await loadPlaylists();
+  // If the playlist being added to is the one on screen, reflect it.
+  if (state.currentPlaylistId === playlistId) openPlaylistView(playlistId);
 }
 
 async function removeFromPlaylist(playlistId, index) {
@@ -691,11 +716,20 @@ async function deletePlaylist(id, name) {
   await loadPlaylists();
 }
 
-// Small popover to add a track to an existing or new playlist.
-function openAddToPlaylist(trackId, anchor) {
+// Popover to add one or more tracks (a song, or a whole album) to a playlist. The
+// optional `heading` labels what's being added.
+function openAddToPlaylist(trackIds, anchor, heading) {
   closeAddMenu();
+  if (!trackIds.length) return;
   const menu = document.createElement("div");
   menu.className = "add-menu";
+
+  const label = document.createElement("div");
+  label.className = "add-menu-head";
+  label.textContent =
+    heading || (trackIds.length === 1 ? "Add to playlist" : `Add ${trackIds.length} tracks to…`);
+  menu.append(label);
+
   for (const playlist of state.playlists) {
     const item = document.createElement("button");
     item.type = "button";
@@ -703,7 +737,7 @@ function openAddToPlaylist(trackId, anchor) {
     item.textContent = playlist.name;
     item.addEventListener("click", async () => {
       closeAddMenu();
-      await addTrackToPlaylist(playlist.id, trackId);
+      await addTracksToPlaylist(playlist.id, trackIds);
     });
     menu.append(item);
   }
@@ -714,7 +748,7 @@ function openAddToPlaylist(trackId, anchor) {
   create.addEventListener("click", async () => {
     closeAddMenu();
     const name = window.prompt("Playlist name");
-    if (name && name.trim()) await createPlaylist(name.trim(), [trackId]);
+    if (name && name.trim()) await createPlaylist(name.trim(), trackIds);
   });
   menu.append(create);
 
