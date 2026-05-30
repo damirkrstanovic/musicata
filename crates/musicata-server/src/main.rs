@@ -295,6 +295,18 @@ async fn load_or_scan_library(
             return Ok(scanned);
         }
 
+        // Backfill: databases written before the scanner read a field (e.g. track
+        // duration, added in migration v12) have unchanged files but stale rows.
+        // When the fresh scan now has durations the stored rows lack, persist it —
+        // a one-time cost after upgrading.
+        let stored_missing_duration = stored.tracks.iter().any(|t| t.duration_seconds.is_none());
+        let scan_has_duration = scanned.tracks.iter().any(|t| t.duration_seconds.is_some());
+        if stored_missing_duration && scan_has_duration {
+            tracing::info!("backfilling track durations from rescan");
+            database.save_library(&mut scanned).await?;
+            return Ok(scanned);
+        }
+
         tracing::info!(
             artists = stored.artists.len(),
             albums = stored.albums.len(),
