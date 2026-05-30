@@ -332,14 +332,16 @@ Tasks:
   getAlbumList/2, getGenres, getMusicFolders, getIndexes, and `scrobble` (which feeds
   Musicata's listening history). Unit + integration tested (auth, XML/JSON envelopes,
   browse, search3, stream bytes, cover art).
-- [x] Test with a real OpenSubsonic/Subsonic client. Validated against the `py-sonic`
-  (libsonic) client library — a real client that does salt+token MD5 auth and parses
-  the responses: ping, reject-bad-password, getMusicFolders, getArtists, getIndexes,
-  getArtist, getAlbum, getAlbumList/2, search3, stream (3.6 MB audio), and scrobble
-  all pass. This surfaced two bugs missed by hand-rolled curl tests — clients POST
-  parameters in a form body (not just the query string), and getIndexes needs its own
-  `<indexes>` wrapper — both fixed and regression-tested. GUI clients (Symfonium,
-  Amperfy, Feishin, DSub) should be smoke-tested when convenient.
+- [x] Test with real OpenSubsonic/Subsonic clients. Validated against two real client
+  libraries: `py-sonic` (over JSON) and **Supersonic's own `go-subsonic` client** (over
+  XML, Supersonic's default). Both run the full session — salt+token auth,
+  reject-bad-password, getMusicFolders, getArtists, getIndexes, getArtist, getAlbum,
+  getAlbumList/2, search3, stream (3.6 MB audio), scrobble — and pass. This surfaced
+  two bugs hand-rolled curl tests missed: clients POST parameters in a form body (not
+  just the query string), and getIndexes needs its own `<indexes>` wrapper; both fixed
+  and regression-tested. Testing through `go-subsonic` exercises the exact networking
+  code the Supersonic desktop app uses. Driving a full GUI client end-to-end (Supersonic,
+  Symfonium, Amperfy, …) by hand remains a nice-to-have.
 
 Done when:
 
