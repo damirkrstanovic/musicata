@@ -6,9 +6,18 @@
     <meta name="theme-color" content="#16181d">
     <title>Musicata</title>
     <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/icon.svg">
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
+    <header id="mobile-bar" class="mobile-bar">
+      <button id="menu-toggle" class="bar-icon" type="button" aria-label="Open menu" aria-expanded="false">☰</button>
+      <span class="mobile-brand">Musicata</span>
+      <button id="mobile-settings" class="bar-icon" type="button" aria-label="Players &amp; settings">⚙</button>
+    </header>
+    <div id="scrim" class="scrim" hidden></div>
+
     <main class="shell">
       <aside class="library-panel">
         <div class="brand">
@@ -73,6 +82,7 @@
 
       <aside class="right-rail">
         <div class="rail-header">
+          <button id="np-collapse" class="np-chevron" type="button" aria-label="Collapse player">⌄</button>
           <div class="player-switch">
             <button id="player-switch-btn" class="player-switch-btn" type="button" aria-haspopup="true" aria-expanded="false">
               <span id="switch-signal" class="signal" aria-hidden="true"></span>
@@ -118,6 +128,10 @@
             <div class="now-text">
               <strong id="now-title">Nothing playing</strong>
               <span id="now-subtitle">Select a track to begin.</span>
+            </div>
+            <div class="mini-controls">
+              <button id="mini-play" class="control play" type="button" aria-label="Play">▶</button>
+              <button id="np-expand" class="np-chevron up" type="button" aria-label="Expand player">⌃</button>
             </div>
           </div>
 

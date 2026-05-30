@@ -61,6 +61,15 @@ select {
   overflow: hidden;
 }
 
+/* Mobile-only chrome (top bar, drawer scrim, mini-player controls). Hidden on
+   desktop; the mobile media query below turns these on. */
+.mobile-bar,
+.scrim,
+.mini-controls,
+.np-chevron {
+  display: none;
+}
+
 .library-panel {
   display: flex;
   flex-direction: column;
@@ -142,23 +151,53 @@ h1 {
 .search,
 .browse-filters label {
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
+/* Console-style field labels: small, tracked, uppercase. */
+.browse-filters span {
+  font-size: 0.68rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* One shared control treatment: light translucent fill, no hard border until
+   focus, where it picks up a soft gold ring. */
 .search input,
 .browse-filters select {
   width: 100%;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #101318;
+  height: 34px;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.045);
   color: var(--text);
-  padding: 11px 12px;
+  font-size: 0.84rem;
+  padding: 0 12px;
   outline: none;
+  transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.search input:hover,
+.browse-filters select:hover {
+  background: rgba(255, 255, 255, 0.07);
 }
 
 .search input:focus,
 .browse-filters select:focus {
+  background: #101318;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* Custom dropdown chevron (appearance is reset above). */
+.browse-filters select {
+  padding-right: 30px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23a5a8ad' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 11px center;
 }
 
 /* Compact, icon-led search (no separate label, normalized search appearance). */
@@ -178,23 +217,13 @@ h1 {
 }
 
 .search input {
-  appearance: none;
-  -webkit-appearance: none;
-  border-radius: 8px;
-  border-color: transparent;
-  background: rgba(255, 255, 255, 0.04);
-  padding: 6px 12px 6px 31px;
-  font-size: 0.82rem;
-  height: 32px;
+  /* Leave room for the leading magnifier icon (other sizing is shared above). */
+  padding-left: 32px;
 }
 
 .search input::placeholder {
   color: var(--muted);
   letter-spacing: 0.2px;
-}
-
-.search input:focus {
-  background: #101318;
 }
 
 .search:focus-within .search-icon {
@@ -360,6 +389,11 @@ h1 {
   min-width: 0;
   min-height: 58px;
   border-bottom: 1px solid var(--line);
+  /* Cheap virtualization: the browser skips layout/paint for off-screen rows and
+     uses the intrinsic size as a placeholder, so large libraries stay smooth
+     without a JS windowing library. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 59px;
 }
 
 .track-stat {
@@ -1096,6 +1130,51 @@ h1 {
   color: var(--accent-strong);
 }
 
+/* Loading skeleton for the track list. */
+.skeleton {
+  display: grid;
+  border-top: 1px solid var(--line);
+}
+
+.skeleton-row {
+  display: flex;
+  align-items: center;
+  height: 58px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.skeleton-bar {
+  height: 12px;
+  width: var(--w, 40%);
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.04),
+    rgba(255, 255, 255, 0.1),
+    rgba(255, 255, 255, 0.04)
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.3s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-bar,
+  .pm-dot.playing,
+  .signal.playing {
+    animation: none;
+  }
+}
+
 .empty,
 .error {
   padding: 28px 8px;
@@ -1146,21 +1225,93 @@ h1 {
 }
 
 @media (max-width: 820px) {
-  /* Stacked single column; scrolls as one document. */
-  .shell {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto auto auto;
-    height: auto;
-    min-height: 100vh;
-    overflow: visible;
-  }
-
-  .library-panel {
-    overflow-y: visible;
-    border-right: 0;
+  /* ---- Mobile top bar (hamburger · brand · settings) ---- */
+  .mobile-bar {
+    position: fixed;
+    inset: 0 0 auto 0;
+    z-index: 50;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 12px;
+    background: rgba(20, 23, 27, 0.92);
+    backdrop-filter: blur(8px);
     border-bottom: 1px solid var(--line);
   }
 
+  .bar-icon {
+    width: 38px;
+    height: 38px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: transparent;
+    color: var(--text);
+    font-size: 1.1rem;
+    cursor: pointer;
+  }
+
+  .bar-icon:hover {
+    border-color: var(--accent);
+  }
+
+  .mobile-brand {
+    flex: 1;
+    font-family: var(--font-display);
+    font-size: 1.15rem;
+    letter-spacing: 0.3px;
+  }
+
+  /* ---- Shell: single scrolling column beneath the fixed bar ---- */
+  .shell {
+    display: block;
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+    padding-top: 52px;
+  }
+
+  .content {
+    padding: 16px 16px 92px; /* leave room for the bottom mini-player */
+    overflow: visible;
+  }
+
+  .content-header h2 {
+    font-size: 1.3rem;
+  }
+
+  /* ---- Sidebar as an off-canvas drawer ---- */
+  .library-panel {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 60;
+    width: min(86vw, 320px);
+    overflow-y: auto;
+    border-right: 1px solid var(--line);
+    transform: translateX(-100%);
+    transition: transform 0.24s ease;
+    will-change: transform;
+  }
+
+  body.nav-open .library-panel {
+    transform: none;
+  }
+
+  .scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+    display: block;
+    background: rgba(6, 7, 9, 0.55);
+  }
+
+  .scrim[hidden] {
+    display: none;
+  }
+
+  /* Tracks stack into a single column. */
   .album-list {
     display: flex;
     overflow-x: auto;
@@ -1180,20 +1331,166 @@ h1 {
     text-align: left;
   }
 
-  /* The right rail (metadata + player) flows at the bottom of the page. */
+  /* ---- Right rail: bottom now-playing sheet (compact bar that expands) ---- */
   .right-rail {
+    position: fixed;
+    inset: auto 0 0 0;
+    z-index: 45;
     display: block;
+    height: 64px;
     border-left: 0;
     border-top: 1px solid var(--line);
+    background: #14171b;
+    overflow: hidden;
+    transition: height 0.26s ease;
+    box-shadow: 0 -10px 30px -18px rgba(0, 0, 0, 0.9);
   }
 
+  /* rail-top (metadata / queue overlays) take no space in the bar; their panels
+     become fixed full-screen overlays when opened (below). */
   .rail-top {
     position: static;
+    height: 0;
   }
 
-  .metadata-panel {
-    position: static;
+  .rail-header {
     display: none;
+  }
+
+  /* Compact bar layout. */
+  .transport {
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+    height: 64px;
+    padding: 0 12px;
+    border-top: 0;
+    background: none;
+  }
+
+  .transport-now {
+    flex: 1;
+    min-width: 0;
+    cursor: pointer;
+  }
+
+  .transport-now .now-text {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .now-art {
+    width: 44px;
+    height: 44px;
+  }
+
+  .mini-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: none;
+  }
+
+  .np-chevron {
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 1.2rem;
+    cursor: pointer;
+  }
+
+  .np-chevron:hover {
+    color: var(--accent-strong);
+  }
+
+  /* In the bar, only now + mini-controls show. */
+  .seek-row,
+  .transport-main,
+  .transport-aux {
+    display: none;
+  }
+
+  /* ---- Expanded full-screen now-playing sheet ---- */
+  body.np-open .right-rail {
+    inset: 0;
+    height: 100dvh;
+    z-index: 65;
+    display: flex;
+    flex-direction: column;
+    overflow: auto;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  body.np-open .rail-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  body.np-open .transport {
+    flex: 1;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: center;
+    height: auto;
+    gap: 22px;
+    padding: 12px 22px 28px;
+  }
+
+  body.np-open .transport-now {
+    flex: none;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 16px;
+    cursor: default;
+  }
+
+  body.np-open .now-art {
+    width: min(64vw, 280px);
+    height: min(64vw, 280px);
+  }
+
+  body.np-open .now-text {
+    justify-items: center;
+    text-align: center;
+  }
+
+  body.np-open .now-text strong {
+    font-size: 1.3rem;
+    white-space: normal;
+  }
+
+  body.np-open .mini-controls {
+    display: none;
+  }
+
+  body.np-open .seek-row {
+    display: flex;
+    max-width: none;
+  }
+
+  body.np-open .transport-main {
+    display: grid;
+  }
+
+  body.np-open .transport-aux {
+    display: flex;
+  }
+
+  /* Metadata / queue overlays cover the screen on mobile. */
+  .metadata-panel {
+    position: fixed;
+    inset: 52px 0 0;
+    z-index: 70;
+    display: none;
+    background: #14171b;
   }
 
   .metadata-panel.open {
@@ -1201,7 +1498,9 @@ h1 {
   }
 
   .queue-drawer {
-    position: static;
+    position: fixed;
+    inset: 0;
+    z-index: 70;
   }
 }
 

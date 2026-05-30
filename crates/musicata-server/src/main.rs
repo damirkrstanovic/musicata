@@ -299,6 +299,7 @@ fn app(
         .route("/app.js", get(app_js))
         .route("/styles.css", get(styles_css))
         .route("/manifest.webmanifest", get(manifest))
+        .route("/icon.svg", get(app_icon))
         .route("/sw.js", get(service_worker))
         .route("/api/health", get(health))
         .route("/api/library/summary", get(library_summary))
@@ -426,6 +427,16 @@ async fn manifest() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "application/manifest+json; charset=utf-8")],
         include_str!("../static/manifest.webmanifest"),
+    )
+}
+
+async fn app_icon() -> impl IntoResponse {
+    (
+        [
+            (CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
+            (CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        include_str!("../static/icon.svg"),
     )
 }
 

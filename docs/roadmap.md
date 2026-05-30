@@ -249,24 +249,45 @@ Goal: make the web app good enough to defer native mobile apps.
 
 Tasks:
 
-- Decide whether to migrate the UI to Leptos now or keep static JS until server APIs stabilize.
-- Build responsive views for library, album, artist, search, queue, player selection, and settings.
+- [x] Decide whether to migrate the UI to Leptos now or keep static JS until server
+  APIs stabilize. **Decision: keep the static vanilla HTML/CSS/JS app (no build step)
+  for now.** The server APIs are still evolving (history, players/zones, metadata
+  review are all recent), the current app already delivers the full controller
+  experience offline-first, and a no-build static bundle keeps iteration fast and the
+  PWA trivially cacheable. Revisit Leptos once the APIs stabilize and the JS starts
+  straining (e.g. when complex client-side state or routing makes hand-written DOM
+  updates costly).
+- [x] Build responsive views for library, album, artist, search, queue, player
+  selection, and settings. On narrow screens the shell collapses to a single column
+  under a fixed top bar: the sidebar (search/browse/albums) becomes an off-canvas
+  drawer (hamburger + scrim), the content goes full width, and the player moves to a
+  bottom now-playing bar. Desktop keeps the three-column layout. (Settings and the
+  metadata/queue overlays go full-screen on mobile.)
 - [x] Add Media Session API integration. The web app publishes the active player's
   track metadata (title/artist/album/artwork) and playback/position state to the OS
   media surfaces (lock screen, media keys, notification, Bluetooth/car displays), and
   routes the OS play/pause/prev/next/stop/seek controls back to the active player.
-- Improve PWA installability, caching, loading states, and mobile ergonomics.
-- Add virtualized lists for large libraries if needed.
-- Visual polish pass on the existing controls — e.g. the library search field still
-  reads too heavy/inelegant; refine inputs, spacing, and type throughout.
-- Mobile now-playing experience: the player rail currently flows at the bottom of
-  the stacked layout on small screens; design a proper compact/expandable
-  now-playing sheet.
+- [x] Improve PWA installability, caching, loading states, and mobile ergonomics. The
+  manifest now ships an icon (gold-monogram SVG, `any maskable`) plus id/scope/
+  description/categories/display_override, so the app is installable; the icon is
+  served and precached by the service worker. Initial and history loads show a
+  shimmer skeleton (respecting `prefers-reduced-motion`).
+- [x] Add virtualized lists for large libraries. Rather than a JS windowing library,
+  track rows use `content-visibility: auto` with `contain-intrinsic-size`, so the
+  browser skips layout/paint for off-screen rows. Revisit a true virtualizer only if
+  this proves insufficient at very large library sizes.
+- [x] Visual polish pass on the existing controls. The library search and the browse
+  selects now share one lighter, translucent control treatment (no hard border until
+  a soft gold focus ring), with small uppercase tracked field labels and custom
+  dropdown chevrons.
+- [x] Mobile now-playing experience: the bottom bar is a compact now-playing strip
+  (art · title · play/pause) that expands to a full-screen sheet — big artwork, seek,
+  full transport, player switch, volume, and queue — and collapses again.
 
 Done when:
 
-- The app is comfortable on phone and desktop browsers.
-- Core playback and queue control do not require a native app.
+- [x] The app is comfortable on phone and desktop browsers.
+- [x] Core playback and queue control do not require a native app.
 
 ## Milestone 7: Listening History And Recommendations
 

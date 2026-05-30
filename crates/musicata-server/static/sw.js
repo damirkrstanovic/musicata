@@ -1,5 +1,5 @@
-const CACHE = "musicata-static-v13";
-const ASSETS = ["/", "/styles.css", "/app.js", "/manifest.webmanifest"];
+const CACHE = "musicata-static-v14";
+const ASSETS = ["/", "/styles.css", "/app.js", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(

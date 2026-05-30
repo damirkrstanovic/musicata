@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Musicata">
+  <!-- Full-bleed dark background keeps the icon maskable-safe (content stays within
+       the central safe zone, the dark fills any cropped edges). -->
+  <rect width="512" height="512" fill="#101114"/>
+  <rect x="86" y="86" width="340" height="340" rx="72" fill="#d7b46a"/>
+  <text x="256" y="276" font-family="Georgia, 'Times New Roman', serif" font-size="248"
+        font-weight="700" fill="#17140e" text-anchor="middle" dominant-baseline="central">M</text>
+</svg>

@@ -77,6 +77,13 @@ const els = {
   metadataClose: document.querySelector("#metadata-close"),
   settings: document.querySelector("#settings"),
   settingsClose: document.querySelector("#settings-close"),
+  menuToggle: document.querySelector("#menu-toggle"),
+  mobileSettings: document.querySelector("#mobile-settings"),
+  scrim: document.querySelector("#scrim"),
+  transportNow: document.querySelector(".transport-now"),
+  miniPlay: document.querySelector("#mini-play"),
+  npExpand: document.querySelector("#np-expand"),
+  npCollapse: document.querySelector("#np-collapse"),
 };
 
 function openSettings() {
@@ -89,8 +96,43 @@ els.settingsClose.addEventListener("click", closeSettings);
 els.settings.addEventListener("click", (event) => {
   if (event.target === els.settings) closeSettings();
 });
+
+// ---- Mobile chrome: sidebar drawer + now-playing sheet ----
+function setDrawer(open) {
+  document.body.classList.toggle("nav-open", open);
+  els.scrim.hidden = !open;
+  els.menuToggle.setAttribute("aria-expanded", String(open));
+}
+function setNowPlayingSheet(open) {
+  document.body.classList.toggle("np-open", open);
+}
+function closeDrawerOnMobile() {
+  if (document.body.classList.contains("nav-open")) setDrawer(false);
+}
+els.menuToggle.addEventListener("click", () =>
+  setDrawer(!document.body.classList.contains("nav-open")),
+);
+els.scrim.addEventListener("click", () => setDrawer(false));
+els.mobileSettings.addEventListener("click", () => {
+  setDrawer(false);
+  openSettings();
+});
+els.npExpand.addEventListener("click", () => setNowPlayingSheet(true));
+els.npCollapse.addEventListener("click", () => setNowPlayingSheet(false));
+// Tapping the now-playing strip (but not its buttons) expands the sheet on mobile.
+els.transportNow.addEventListener("click", (event) => {
+  if (event.target.closest(".mini-controls")) return;
+  if (window.matchMedia("(max-width: 820px)").matches && !document.body.classList.contains("np-open")) {
+    setNowPlayingSheet(true);
+  }
+});
+els.miniPlay.addEventListener("click", () => els.playPause.click());
+
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !els.settings.hidden) closeSettings();
+  if (event.key !== "Escape") return;
+  if (!els.settings.hidden) closeSettings();
+  else if (document.body.classList.contains("np-open")) setNowPlayingSheet(false);
+  else if (document.body.classList.contains("nav-open")) setDrawer(false);
 });
 
 async function api(path) {
@@ -226,7 +268,9 @@ function renderAlbums(albums) {
       const tracks = state.tracks.filter((track) => track.album_id === album.id);
       state.visibleTracks = tracks;
       els.viewTitle.textContent = album.title;
+      markNavActive("library");
       renderTracks(tracks);
+      closeDrawerOnMobile();
     });
     els.albums.append(button);
   }
@@ -327,7 +371,7 @@ async function setView(view) {
     return;
   }
 
-  await loadHistoryView(view);
+  await loadHistoryView(view, { showLoading: true });
   if (view === "recent") {
     recentRefreshTimer = setInterval(() => loadHistoryView("recent"), RECENT_REFRESH_INTERVAL);
   }
@@ -335,10 +379,11 @@ async function setView(view) {
 
 // Fetch and render a history view. Safe to call repeatedly so the list stays live
 // without any manual refresh.
-async function loadHistoryView(view) {
+async function loadHistoryView(view, { showLoading = false } = {}) {
   const config = HISTORY_VIEWS[view];
   if (!config) return;
   els.viewTitle.textContent = config.title;
+  if (showLoading) renderLoading(6);
   try {
     const tracks = await api(config.url);
     if (state.view !== view) return; // The user switched away while we were loading.
@@ -373,6 +418,16 @@ function hasBrowseFilter(filter = state.browseFilter) {
 function browseTitle(filter, trackCount) {
   const parts = cleanParts([filter.genre, filter.year, filter.composer]);
   return `Browse: ${parts.join(" / ")} (${trackCount} tracks)`;
+}
+
+// A shimmering placeholder list shown while a fetch is in flight.
+function renderLoading(count = 8) {
+  let rows = "";
+  for (let i = 0; i < count; i += 1) {
+    const width = 30 + ((i * 37) % 50);
+    rows += `<div class="skeleton-row"><span class="skeleton-bar" style="--w:${width}%"></span></div>`;
+  }
+  els.trackList.innerHTML = `<div class="skeleton" aria-hidden="true">${rows}</div>`;
 }
 
 // Render the center track list. `options.annotate(track)` may return a short string
@@ -1277,7 +1332,10 @@ els.browseClear.addEventListener("click", () => {
   applyBrowseFilter();
 });
 for (const link of els.navLinks) {
-  link.addEventListener("click", () => setView(link.dataset.view));
+  link.addEventListener("click", () => {
+    setView(link.dataset.view);
+    closeDrawerOnMobile();
+  });
 }
 // Auto-refresh the library: poll for filesystem changes and re-check on focus, so
 // there is no manual refresh button.
@@ -1423,6 +1481,7 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
 }
 
+renderLoading();
 loadLibrary();
 
 function debounce(fn, delay) {
@@ -1859,6 +1918,7 @@ function updateFooterFromState(playback) {
 
   els.playPause.textContent = playback.status === "playing" ? "❚❚" : "▶";
   els.playPause.title = playback.status === "playing" ? "Pause" : "Play";
+  els.miniPlay.textContent = playback.status === "playing" ? "❚❚" : "▶";
 
   // Shuffle + repeat toggles.
   els.shuffle.classList.toggle("active", Boolean(playback.shuffle));
