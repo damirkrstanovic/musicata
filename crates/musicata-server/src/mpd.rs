@@ -401,4 +401,179 @@ mod tests {
         );
         assert_eq!(state.queue.len(), 1);
     }
+
+    // ---- Live test against a real `mpd` process -------------------------------
+    //
+    // Ignored by default because it needs the `mpd` binary installed. Run with:
+    //   cargo test -p musicata-server -- --ignored live_mpd
+    // Override the binary path with MUSICATA_MPD_BIN if mpd is not on PATH.
+
+    use std::io::Write as _;
+    use std::path::PathBuf;
+    use std::process::{Child, Command};
+    use std::time::Duration;
+
+    /// A spawned MPD process that is killed and cleaned up on drop.
+    struct LiveMpd {
+        child: Child,
+        dir: PathBuf,
+        port: u16,
+    }
+
+    impl Drop for LiveMpd {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A minimal 0.3s silent PCM WAV that MPD can decode natively.
+    fn silent_wav() -> Vec<u8> {
+        let sample_rate: u32 = 8000;
+        let data_len: u32 = sample_rate * 2 / 3; // ~0.3s of 16-bit mono
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.extend(vec![0_u8; data_len as usize]);
+        wav
+    }
+
+    /// Serve `body` over HTTP for any request at a Musicata-shaped stream path,
+    /// returning the URL MPD should fetch.
+    async fn serve_stream(body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut scratch = [0_u8; 1024];
+                let _ = socket.read(&mut scratch).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            }
+        });
+        format!("http://{addr}/api/tracks/live_track/stream")
+    }
+
+    /// Spawn `mpd` with a null audio output on a free port. Returns `None` if the
+    /// binary is unavailable so the test can skip rather than fail.
+    fn start_mpd() -> Option<LiveMpd> {
+        let binary = std::env::var("MUSICATA_MPD_BIN").unwrap_or_else(|_| "mpd".to_string());
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .ok()?
+            .local_addr()
+            .ok()?
+            .port();
+        let dir = std::env::temp_dir().join(format!("musicata-mpd-live-{port}"));
+        std::fs::create_dir_all(dir.join("music")).ok()?;
+        let conf_path = dir.join("mpd.conf");
+        let conf = format!(
+            "music_directory \"{music}\"\n\
+             db_file \"{base}/db\"\n\
+             state_file \"{base}/state\"\n\
+             pid_file \"{base}/pid\"\n\
+             log_file \"{base}/log\"\n\
+             bind_to_address \"127.0.0.1\"\n\
+             port \"{port}\"\n\
+             audio_output {{\n\ttype \"null\"\n\tname \"null\"\n}}\n",
+            music = dir.join("music").display(),
+            base = dir.display(),
+        );
+        std::fs::File::create(&conf_path)
+            .ok()?
+            .write_all(conf.as_bytes())
+            .ok()?;
+        let child = Command::new(binary)
+            .arg("--no-daemon")
+            .arg("--stderr")
+            .arg(&conf_path)
+            .spawn()
+            .ok()?;
+        Some(LiveMpd { child, dir, port })
+    }
+
+    async fn wait_for_mpd(port: u16) -> bool {
+        for _ in 0..50 {
+            if MpdConnection::connect(&format!("127.0.0.1:{port}"))
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local mpd binary; run with: cargo test -- --ignored"]
+    async fn live_mpd_controls_playback() {
+        let Some(mpd) = start_mpd() else {
+            eprintln!("skipping: `mpd` binary not found (set MUSICATA_MPD_BIN)");
+            return;
+        };
+        assert!(wait_for_mpd(mpd.port).await, "mpd did not start listening");
+
+        let mut connection = MpdConnection::connect(&format!("127.0.0.1:{}", mpd.port))
+            .await
+            .expect("connect to live mpd");
+
+        // Options and transport round-trip deterministically against real MPD.
+        connection.set_volume(42).await.expect("setvol");
+        connection
+            .set_repeat(RepeatMode::All)
+            .await
+            .expect("repeat");
+        connection.set_shuffle(true).await.expect("random");
+        connection.clear().await.expect("clear");
+
+        let state = connection.playback_state().await.expect("state");
+        assert_eq!(state.repeat, RepeatMode::All);
+        assert!(state.shuffle);
+        assert_eq!(state.volume, Some(42));
+        assert!(state.queue.is_empty());
+        assert_eq!(state.status, PlaybackStatus::Stopped);
+
+        // Enqueue and play a Musicata-shaped stream URL served over HTTP.
+        let url = serve_stream(silent_wav()).await;
+        connection
+            .replace_queue(std::slice::from_ref(&url))
+            .await
+            .expect("replace queue");
+
+        let state = connection.playback_state().await.expect("state after play");
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(state.queue[0].stream_url, url);
+        let now = state.now_playing.expect("now playing after play");
+        assert_eq!(now.track_id.as_deref(), Some("live_track"));
+
+        // MPD should reach the play state shortly after fetching the stream.
+        let mut playing = false;
+        for _ in 0..50 {
+            if connection.playback_state().await.expect("poll").status == PlaybackStatus::Playing {
+                playing = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(playing, "mpd did not reach the playing state");
+    }
 }

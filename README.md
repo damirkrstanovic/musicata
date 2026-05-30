@@ -82,14 +82,38 @@ On first run the server scans the configured library, reads embedded tags with L
 By default, startup performs a lightweight incremental rescan check using provider item IDs, file sizes, modified timestamps, and content hashes. Use `--no-incremental-rescan` to load only from the database.
 The running server can also rescan through `POST /api/library/rescan`; add `?force=true` to rewrite the stored library even when no changes are detected.
 
-To control a local MPD instance, point Musicata at it and tell it how MPD can reach this server for streams:
+### Controlling an MPD player
+
+Musicata can control a local [MPD](https://www.musicpd.org/) instance: it drives MPD over its native protocol, hands MPD Musicata stream URLs to play (so MPD needs no access to your files), and pushes live playback state to controllers over a WebSocket.
+
+Start MPD with the sample config (it streams from Musicata, so its `music_directory` can be empty), then point the server at it:
 
 ```sh
+mkdir -p /tmp/musicata-mpd/music
+mpd --no-daemon docs/mpd.example.conf
+
+# in another shell:
 cargo run -p musicata-server -- --mpd 127.0.0.1:6600 --public-url http://127.0.0.1:3030
 # or: MUSICATA_MPD=127.0.0.1:6600 MUSICATA_PUBLIC_URL=http://127.0.0.1:3030
 ```
 
-Musicata drives MPD over its native protocol, enqueues Musicata stream URLs, and pushes live state to controllers over a WebSocket. Multiple players: `--mpd host1:6600,host2:6600`.
+`--public-url` is the address MPD uses to fetch streams from this server. Control multiple players with `--mpd host1:6600,host2:6600`. Then:
+
+```sh
+curl localhost:3030/api/players
+curl -X POST localhost:3030/api/players/mpd/commands \
+  -H 'content-type: application/json' \
+  -d '{"command":"play_tracks","track_ids":["<track-id-from-/api/tracks>"]}'
+curl localhost:3030/api/players/mpd/state
+```
+
+A live integration test exercises the full path against a real MPD (it spawns MPD with a null output, serves a WAV at a Musicata stream URL, and drives playback). It is ignored by default since it needs the `mpd` binary; run it with:
+
+```sh
+cargo test -p musicata-server -- --ignored live_mpd
+# set MUSICATA_MPD_BIN if mpd is not on PATH
+```
+
 Use `--scan-once` for a non-server scan/update command:
 
 ```sh
