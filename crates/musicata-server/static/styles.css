@@ -161,6 +161,39 @@ h1 {
   border-color: var(--accent);
 }
 
+/* Compact, icon-led search (no separate label, normalized search appearance). */
+.search {
+  position: relative;
+  display: block;
+}
+
+.search .search-icon {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--muted);
+  font-size: 1.05rem;
+  pointer-events: none;
+}
+
+.search input {
+  appearance: none;
+  -webkit-appearance: none;
+  border-radius: 10px;
+  padding: 8px 12px 8px 33px;
+  font-size: 0.88rem;
+}
+
+.search input::placeholder {
+  color: var(--muted);
+}
+
+.search input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  display: none;
+}
+
 .browse-filters {
   display: grid;
   gap: 10px;
