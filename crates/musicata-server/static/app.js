@@ -66,7 +66,25 @@ const els = {
   metadataTitle: document.querySelector("#metadata-title"),
   metadataBody: document.querySelector("#metadata-body"),
   metadataClose: document.querySelector("#metadata-close"),
+  settings: document.querySelector("#settings"),
+  settingsOpen: document.querySelector("#settings-open"),
+  settingsClose: document.querySelector("#settings-close"),
 };
+
+function openSettings() {
+  els.settings.hidden = false;
+}
+function closeSettings() {
+  els.settings.hidden = true;
+}
+els.settingsOpen.addEventListener("click", openSettings);
+els.settingsClose.addEventListener("click", closeSettings);
+els.settings.addEventListener("click", (event) => {
+  if (event.target === els.settings) closeSettings();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !els.settings.hidden) closeSettings();
+});
 
 async function api(path) {
   const response = await fetch(path);
@@ -399,6 +417,8 @@ async function selectAlbumArtworkApi(albumId, artworkId) {
 }
 
 async function openMetadata(trackId) {
+  // Metadata and the queue share the right-rail top; only one shows at a time.
+  if (state.queueOpen) toggleQueue(false);
   state.metadataTrackId = trackId;
   state.metadataReview = null;
   state.metadataError = "";
