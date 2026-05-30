@@ -1384,12 +1384,14 @@ mod tests {
             album_title: "Paramparcad".to_string(),
             year: Some(1994),
             track_number: Some(1),
+            disc_number: None,
             extension: "mp3".to_string(),
             file_size_bytes: None,
             modified_at_unix_seconds: None,
             content_hash: None,
             relative_path: "album/song.mp3".to_string(),
             stream_url: "/api/tracks/track_1/stream".to_string(),
+            added_at_unix_seconds: None,
             path: PathBuf::from("/music/album/song.mp3"),
         }
     }

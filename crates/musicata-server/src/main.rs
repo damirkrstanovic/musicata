@@ -20,8 +20,8 @@ use axum::{
 };
 use musicata_core::{
     Album, Artist, BrowseFilter, Library, LibrarySummary, LocalDiskProvider, MetadataApprovalState,
-    MetadataFieldValue, MusicProvider, Track, TrackMetadataFieldObservation, album_artwork_url,
-    artwork_asset_id, find_album_artwork_candidates,
+    MetadataFieldValue, MusicProvider, SearchResults, Track, TrackMetadataFieldObservation,
+    album_artwork_url, artwork_asset_id, find_album_artwork_candidates,
 };
 use musicata_storage::Database;
 use musicbrainz::{
@@ -138,7 +138,7 @@ async fn load_or_scan_library(
         return Ok(library);
     }
 
-    let scanned = provider
+    let mut scanned = provider
         .scan()
         .with_context(|| format!("failed to scan {}", provider.root().display()))?;
 
@@ -154,7 +154,7 @@ async fn load_or_scan_library(
                 modified = changes.modified,
                 "library changes detected"
             );
-            database.save_library(&scanned).await?;
+            database.save_library(&mut scanned).await?;
             return Ok(scanned);
         }
 
@@ -167,7 +167,7 @@ async fn load_or_scan_library(
         return Ok(stored);
     }
 
-    database.save_library(&scanned).await?;
+    database.save_library(&mut scanned).await?;
 
     Ok(scanned)
 }
@@ -196,9 +196,11 @@ fn app(library: Library, database: Database, provider: LocalDiskProvider) -> Rou
             get(playback_session_events),
         )
         .route("/api/artists", get(artists))
+        .route("/api/artists/{id}", get(artist_detail))
         .route("/api/albums", get(albums))
         .route("/api/albums/{id}", get(album_detail))
         .route("/api/browse", get(browse))
+        .route("/api/browse/recently-added", get(recently_added))
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
             get(album_musicbrainz_candidates),
@@ -401,7 +403,7 @@ async fn rescan_library(
     let _guard = state.rescan_lock.lock().await;
     let forced = query.force.unwrap_or(false);
     let provider = state.provider.clone();
-    let scanned = tokio::task::spawn_blocking(move || provider.scan())
+    let mut scanned = tokio::task::spawn_blocking(move || provider.scan())
         .await
         .map_err(|error| AppError::internal(error.to_string()))?
         .map_err(|error| AppError::internal(error.to_string()))?;
@@ -411,7 +413,7 @@ async fn rescan_library(
 
     let summary = if updated {
         let summary = scanned.summary();
-        state.database.save_library(&scanned).await?;
+        state.database.save_library(&mut scanned).await?;
         *state.library.write().await = scanned;
         summary
     } else {
@@ -429,14 +431,157 @@ async fn rescan_library(
     }))
 }
 
-async fn artists(State(state): State<AppState>) -> impl IntoResponse {
-    let library = state.library.read().await;
-    Json(library.artists.clone())
+/// Common pagination/sorting query parameters for list endpoints.
+#[derive(Debug, Default, Deserialize)]
+struct ListQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    sort: Option<String>,
 }
 
-async fn albums(State(state): State<AppState>) -> impl IntoResponse {
+/// A single page of list results plus the totals needed to drive pagination.
+#[derive(Debug, Serialize)]
+struct Page<T> {
+    items: Vec<T>,
+    total: usize,
+    limit: usize,
+    offset: usize,
+    sort: Option<String>,
+}
+
+/// Slice an already-sorted vector into the requested page.
+///
+/// `offset` defaults to 0 and `limit` defaults to "the rest of the list", so a
+/// request without pagination parameters returns every item in one page.
+fn paginate<T>(items: Vec<T>, query: &ListQuery) -> Page<T> {
+    let total = items.len();
+    let offset = query.offset.unwrap_or(0).min(total);
+    let limit = query.limit.unwrap_or(total - offset);
+    let page = items.into_iter().skip(offset).take(limit).collect();
+    Page {
+        items: page,
+        total,
+        limit,
+        offset,
+        sort: query.sort.clone(),
+    }
+}
+
+fn sort_artists(artists: &mut [Artist], sort: Option<&str>) {
+    match sort {
+        Some("tracks") => artists.sort_by(|left, right| {
+            right
+                .track_count
+                .cmp(&left.track_count)
+                .then_with(|| left.name.cmp(&right.name))
+        }),
+        Some("albums") => artists.sort_by(|left, right| {
+            right
+                .album_count
+                .cmp(&left.album_count)
+                .then_with(|| left.name.cmp(&right.name))
+        }),
+        // "name" and any unknown key fall back to alphabetical.
+        _ => artists.sort_by(|left, right| left.name.cmp(&right.name)),
+    }
+}
+
+fn sort_albums(albums: &mut [Album], sort: Option<&str>) {
+    match sort {
+        Some("title") => albums.sort_by(|left, right| left.title.cmp(&right.title)),
+        Some("year") => albums.sort_by(|left, right| {
+            right
+                .year
+                .cmp(&left.year)
+                .then_with(|| left.artist_name.cmp(&right.artist_name))
+                .then_with(|| left.title.cmp(&right.title))
+        }),
+        // "artist" and any unknown key keep the canonical artist/year/title order.
+        _ => albums.sort_by(|left, right| {
+            left.artist_name
+                .cmp(&right.artist_name)
+                .then_with(|| left.year.cmp(&right.year))
+                .then_with(|| left.title.cmp(&right.title))
+        }),
+    }
+}
+
+fn sort_tracks(tracks: &mut [Track], sort: Option<&str>) {
+    match sort {
+        Some("title") => tracks.sort_by(|left, right| left.title.cmp(&right.title)),
+        Some("album") => tracks.sort_by(|left, right| {
+            left.album_title
+                .cmp(&right.album_title)
+                .then_with(|| left.disc_number.cmp(&right.disc_number))
+                .then_with(|| left.track_number.cmp(&right.track_number))
+        }),
+        // "artist" and any unknown key keep the canonical scan order.
+        _ => tracks.sort_by(|left, right| {
+            left.artist_name
+                .cmp(&right.artist_name)
+                .then_with(|| left.year.cmp(&right.year))
+                .then_with(|| left.album_title.cmp(&right.album_title))
+                .then_with(|| left.disc_number.cmp(&right.disc_number))
+                .then_with(|| left.track_number.cmp(&right.track_number))
+                .then_with(|| left.title.cmp(&right.title))
+        }),
+    }
+}
+
+async fn artists(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> impl IntoResponse {
     let library = state.library.read().await;
-    Json(library.albums.clone())
+    let mut items = library.artists.clone();
+    sort_artists(&mut items, query.sort.as_deref());
+    Json(paginate(items, &query))
+}
+
+async fn albums(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> impl IntoResponse {
+    let library = state.library.read().await;
+    let mut items = library.albums.clone();
+    sort_albums(&mut items, query.sort.as_deref());
+    Json(paginate(items, &query))
+}
+
+#[derive(Debug, Serialize)]
+struct ArtistDetailResponse {
+    artist: Artist,
+    albums: Vec<Album>,
+    tracks: Vec<Track>,
+}
+
+async fn artist_detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ArtistDetailResponse>, AppError> {
+    let library = state.library.read().await;
+    let artist = library
+        .artist(&id)
+        .cloned()
+        .ok_or_else(|| AppError::not_found(format!("unknown artist: {id}")))?;
+    let albums = library
+        .albums
+        .iter()
+        .filter(|album| album.artist_id == id)
+        .cloned()
+        .collect();
+    let tracks = library
+        .tracks
+        .iter()
+        .filter(|track| track.artist_id == id)
+        .cloned()
+        .collect();
+
+    Ok(Json(ArtistDetailResponse {
+        artist,
+        albums,
+        tracks,
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -460,12 +605,18 @@ async fn album_detail(
         .iter()
         .find(|artist| artist.id == album.artist_id)
         .cloned();
-    let tracks = library
+    let mut tracks: Vec<Track> = library
         .tracks
         .iter()
         .filter(|track| track.album_id == id)
         .cloned()
         .collect();
+    tracks.sort_by(|left, right| {
+        left.disc_number
+            .cmp(&right.disc_number)
+            .then_with(|| left.track_number.cmp(&right.track_number))
+            .then_with(|| left.title.cmp(&right.title))
+    });
 
     Ok(Json(AlbumDetailResponse {
         album,
@@ -479,12 +630,58 @@ async fn browse(State(state): State<AppState>) -> impl IntoResponse {
     Json(library.browse_index())
 }
 
-async fn tracks(
+/// Tracks ordered newest-first by when they entered the database. Tracks without
+/// a recorded timestamp (not yet saved) sort last.
+async fn recently_added(
     State(state): State<AppState>,
-    Query(filter): Query<BrowseFilter>,
+    Query(query): Query<ListQuery>,
 ) -> impl IntoResponse {
     let library = state.library.read().await;
-    Json(library.browse_tracks(&filter))
+    let mut items = library.tracks.clone();
+    items.sort_by(|left, right| {
+        right
+            .added_at_unix_seconds
+            .cmp(&left.added_at_unix_seconds)
+            .then_with(|| left.artist_name.cmp(&right.artist_name))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+    Json(paginate(items, &query))
+}
+
+/// Query parameters for `/api/tracks`: browse filters plus pagination/sorting.
+///
+/// Kept as one flat struct because `serde_urlencoded` (used by axum's `Query`)
+/// does not support `#[serde(flatten)]`.
+#[derive(Debug, Deserialize)]
+struct TrackListQuery {
+    genre: Option<String>,
+    year: Option<u16>,
+    composer: Option<String>,
+    folder: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    sort: Option<String>,
+}
+
+async fn tracks(
+    State(state): State<AppState>,
+    Query(query): Query<TrackListQuery>,
+) -> impl IntoResponse {
+    let filter = BrowseFilter {
+        genre: query.genre,
+        year: query.year,
+        composer: query.composer,
+        folder: query.folder,
+    };
+    let page = ListQuery {
+        limit: query.limit,
+        offset: query.offset,
+        sort: query.sort,
+    };
+    let library = state.library.read().await;
+    let mut items = library.browse_tracks(&filter);
+    sort_tracks(&mut items, page.sort.as_deref());
+    Json(paginate(items, &page))
 }
 
 #[derive(Debug, Serialize)]
@@ -586,7 +783,7 @@ async fn update_track_metadata_field_review(
     Path(id): Path<String>,
     Json(update): Json<MetadataFieldReviewUpdate>,
 ) -> Result<Json<TrackMetadataReviewResponse>, AppError> {
-    let (updated_library, response) = {
+    let (mut updated_library, response) = {
         let library = state.library.read().await;
         let mut updated_library = library.clone();
         let track = updated_library
@@ -600,7 +797,7 @@ async fn update_track_metadata_field_review(
         (updated_library, response)
     };
 
-    state.database.save_library(&updated_library).await?;
+    state.database.save_library(&mut updated_library).await?;
     *state.library.write().await = updated_library;
 
     Ok(Json(response))
@@ -796,15 +993,23 @@ struct StreamQuery {
 #[derive(Debug, Deserialize)]
 struct SearchQuery {
     q: Option<String>,
+    limit: Option<usize>,
 }
+
+const DEFAULT_SEARCH_LIMIT: usize = 50;
 
 async fn search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
-) -> impl IntoResponse {
+) -> Result<Json<SearchResults>, AppError> {
     let q = query.q.unwrap_or_default();
-    let library = state.library.read().await;
-    Json(library.search(&q))
+    let limit = query.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let results = state
+        .database
+        .search(&q, limit)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+    Ok(Json(results))
 }
 
 async fn metadata_write_back_policy() -> impl IntoResponse {
@@ -888,7 +1093,7 @@ async fn update_album_artwork(
     Path(id): Path<String>,
     Json(update): Json<AlbumArtworkSelectionUpdate>,
 ) -> Result<Json<AlbumArtworkReviewResponse>, AppError> {
-    let (updated_library, response) = {
+    let (mut updated_library, response) = {
         let library = state.library.read().await;
         let mut updated_library = library.clone();
         let candidate = album_artwork_candidates(&updated_library, &id)?
@@ -916,7 +1121,7 @@ async fn update_album_artwork(
         (updated_library, response)
     };
 
-    state.database.save_library(&updated_library).await?;
+    state.database.save_library(&mut updated_library).await?;
     *state.library.write().await = updated_library;
 
     Ok(Json(response))
@@ -1692,6 +1897,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_artist_detail_json() {
+        let fixture = TestFixture::new("artist-detail");
+        let library = fixture.library();
+        let artist = library
+            .artists
+            .iter()
+            .find(|artist| artist.name == "Darkwood Dub")
+            .expect("artist")
+            .clone();
+        let app = fixture.app_with_library(library).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/artists/{}", artist.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_text(response.into_body()).await;
+        let value: serde_json::Value = serde_json::from_str(&body).expect("artist detail json");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["artist"]["name"], "Darkwood Dub");
+        assert_eq!(value["albums"].as_array().expect("albums").len(), 2);
+        assert_eq!(value["tracks"].as_array().expect("tracks").len(), 3);
+        assert!(
+            value["tracks"]
+                .as_array()
+                .expect("tracks")
+                .iter()
+                .all(|track| track["artist_id"] == artist.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_artist_detail_returns_not_found() {
+        let fixture = TestFixture::new("missing-artist-detail");
+        let app = fixture.app().await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/artists/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_text(response.into_body()).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("unknown artist: missing"));
+    }
+
+    #[tokio::test]
+    async fn paginates_and_sorts_album_listing() {
+        let fixture = TestFixture::new("albums-page");
+        let app = fixture.app().await;
+
+        // Full listing is wrapped in a pagination envelope.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/albums")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).expect("albums json");
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["offset"], 0);
+        assert_eq!(value["items"].as_array().expect("items").len(), 2);
+
+        // A single-item page at offset 1 returns one item but the full total.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/albums?limit=1&offset=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).expect("albums page json");
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["limit"], 1);
+        assert_eq!(value["offset"], 1);
+        assert_eq!(value["items"].as_array().expect("items").len(), 1);
+
+        // Sorting by title orders Paramparcad before U Nedogled.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/albums?sort=title")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).expect("albums sort json");
+        assert_eq!(value["items"][0]["title"], "Paramparcad");
+        assert_eq!(value["items"][1]["title"], "U Nedogled");
+    }
+
+    #[tokio::test]
+    async fn serves_recently_added_tracks() {
+        let fixture = TestFixture::new("recently-added");
+        let app = fixture.app().await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/browse/recently-added")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let value: serde_json::Value = serde_json::from_str(&body_text(response.into_body()).await)
+            .expect("recently added json");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["total"], 3);
+        let items = value["items"].as_array().expect("items");
+        assert_eq!(items.len(), 3);
+        // Saving the library assigns an "added at" timestamp to every track.
+        assert!(
+            items
+                .iter()
+                .all(|track| track["added_at_unix_seconds"].is_number())
+        );
+    }
+
+    #[tokio::test]
+    async fn recently_added_orders_newest_first() {
+        let fixture = TestFixture::new("recently-added-order");
+        let mut library = fixture.library();
+        // Assign distinct timestamps; saving preserves already-set values, so the
+        // last track is the newest.
+        for (index, track) in library.tracks.iter_mut().enumerate() {
+            track.added_at_unix_seconds = Some(1_000 + index as i64);
+        }
+        let newest_title = library.tracks.last().expect("track").title.clone();
+        let app = fixture.app_with_library(library).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/browse/recently-added")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body_text(response.into_body()).await)
+            .expect("recently added json");
+
+        let items = value["items"].as_array().expect("items");
+        assert_eq!(items[0]["title"], newest_title);
+        let timestamps: Vec<i64> = items
+            .iter()
+            .map(|track| track["added_at_unix_seconds"].as_i64().expect("timestamp"))
+            .collect();
+        assert!(
+            timestamps.windows(2).all(|pair| pair[0] >= pair[1]),
+            "expected newest-first ordering, got {timestamps:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn serves_health_json() {
         let fixture = TestFixture::new("health");
         let app = fixture.app().await;
@@ -2293,12 +2679,12 @@ mod tests {
             self.app_with_library(library).await
         }
 
-        async fn app_with_library(&self, library: Library) -> axum::Router {
+        async fn app_with_library(&self, mut library: Library) -> axum::Router {
             let database = Database::connect(self.root.join("musicata.db"))
                 .await
                 .expect("connect fixture database");
             database
-                .save_library(&library)
+                .save_library(&mut library)
                 .await
                 .expect("save fixture library");
             app(library, database, LocalDiskProvider::new(&self.root))

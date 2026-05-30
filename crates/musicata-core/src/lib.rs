@@ -85,53 +85,15 @@ impl Library {
         self.albums.iter().find(|album| album.id == id)
     }
 
-    pub fn search(&self, query: &str) -> SearchResults {
-        let needle = query.trim().to_ascii_lowercase();
-
-        if needle.is_empty() {
-            return SearchResults::default();
-        }
-
-        let artists = self
-            .artists
-            .iter()
-            .filter(|artist| contains_ascii_case_insensitive(&artist.name, &needle))
-            .cloned()
-            .collect();
-
-        let albums = self
-            .albums
-            .iter()
-            .filter(|album| {
-                contains_ascii_case_insensitive(&album.title, &needle)
-                    || contains_ascii_case_insensitive(&album.artist_name, &needle)
-            })
-            .cloned()
-            .collect();
-
-        let tracks = self
-            .tracks
-            .iter()
-            .filter(|track| {
-                contains_ascii_case_insensitive(&track.title, &needle)
-                    || contains_ascii_case_insensitive(&track.artist_name, &needle)
-                    || contains_ascii_case_insensitive(&track.album_title, &needle)
-            })
-            .cloned()
-            .collect();
-
-        SearchResults {
-            query: query.to_string(),
-            artists,
-            albums,
-            tracks,
-        }
+    pub fn artist(&self, id: &str) -> Option<&Artist> {
+        self.artists.iter().find(|artist| artist.id == id)
     }
 
     pub fn browse_index(&self) -> BrowseIndex {
         let mut genres = BTreeMap::new();
         let mut years = BTreeMap::new();
         let mut composers = BTreeMap::new();
+        let mut folders = BTreeMap::new();
 
         for track in &self.tracks {
             for genre in track_genres(track) {
@@ -142,6 +104,9 @@ impl Library {
             }
             for composer in track_composers(track) {
                 *composers.entry(composer).or_insert(0) += 1;
+            }
+            if let Some(folder) = track_folder(track) {
+                *folders.entry(folder.to_string()).or_insert(0) += 1;
             }
         }
 
@@ -159,6 +124,10 @@ impl Library {
                 .into_iter()
                 .map(|(value, track_count)| BrowseTextFacet { value, track_count })
                 .collect(),
+            folders: folders
+                .into_iter()
+                .map(|(value, track_count)| BrowseTextFacet { value, track_count })
+                .collect(),
         }
     }
 
@@ -169,6 +138,7 @@ impl Library {
                 filter.year.is_none_or(|year| track.year == Some(year))
                     && text_filter_matches(filter.genre.as_deref(), track_genres(track))
                     && text_filter_matches(filter.composer.as_deref(), track_composers(track))
+                    && folder_filter_matches(filter.folder.as_deref(), track)
             })
             .cloned()
             .collect()
@@ -217,12 +187,17 @@ pub struct Track {
     pub album_title: String,
     pub year: Option<u16>,
     pub track_number: Option<u16>,
+    pub disc_number: Option<u16>,
     pub extension: String,
     pub file_size_bytes: Option<u64>,
     pub modified_at_unix_seconds: Option<i64>,
     pub content_hash: Option<String>,
     pub relative_path: String,
     pub stream_url: String,
+    /// When this track first entered the database, in Unix seconds. Assigned by
+    /// the storage layer (the scanner has no view of database history), so it is
+    /// `None` on freshly scanned tracks until they are saved.
+    pub added_at_unix_seconds: Option<i64>,
     #[serde(skip)]
     pub path: PathBuf,
 }
@@ -309,6 +284,7 @@ pub struct BrowseFilter {
     pub genre: Option<String>,
     pub year: Option<u16>,
     pub composer: Option<String>,
+    pub folder: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -316,6 +292,7 @@ pub struct BrowseIndex {
     pub genres: Vec<BrowseTextFacet>,
     pub years: Vec<BrowseYearFacet>,
     pub composers: Vec<BrowseTextFacet>,
+    pub folders: Vec<BrowseTextFacet>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -400,9 +377,17 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
             observed_at_unix_seconds,
         );
         let artist_id = stable_id("artist", &metadata.artist_name.to_ascii_lowercase());
+        let album_artist_name = metadata
+            .album_artist_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| metadata.artist_name.clone());
+        let album_artist_id = stable_id("artist", &album_artist_name.to_ascii_lowercase());
         let album_key = format!(
             "{}::{}",
-            metadata.artist_name.to_ascii_lowercase(),
+            album_artist_name.to_ascii_lowercase(),
             metadata.album_title.to_ascii_lowercase()
         );
         let album_id = stable_id("album", &album_key);
@@ -426,25 +411,36 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
             .or_insert_with(|| AlbumBuilder {
                 id: album_id.clone(),
                 title: metadata.album_title.clone(),
-                artist_id: artist_id.clone(),
-                artist_name: metadata.artist_name.clone(),
+                artist_id: album_artist_id.clone(),
+                artist_name: album_artist_name.clone(),
                 year: metadata.year,
                 track_count: 0,
                 artwork_path: find_album_artwork(path.parent().unwrap_or(&root)),
             })
             .track_count += 1;
 
-        let artist = artist_builders
+        // Count the track against its own (track) artist.
+        artist_builders
             .entry(artist_id.clone())
             .or_insert_with(|| ArtistBuilder {
                 id: artist_id.clone(),
                 name: metadata.artist_name.clone(),
                 album_ids: Vec::new(),
                 track_count: 0,
+            })
+            .track_count += 1;
+
+        // Associate the album with its album-artist (the same entry for non-compilations).
+        let owning_artist = artist_builders
+            .entry(album_artist_id.clone())
+            .or_insert_with(|| ArtistBuilder {
+                id: album_artist_id.clone(),
+                name: album_artist_name.clone(),
+                album_ids: Vec::new(),
+                track_count: 0,
             });
-        artist.track_count += 1;
-        if !artist.album_ids.contains(&album_id) {
-            artist.album_ids.push(album_id.clone());
+        if !owning_artist.album_ids.contains(&album_id) {
+            owning_artist.album_ids.push(album_id.clone());
         }
 
         tracks.push(Track {
@@ -461,12 +457,14 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
             album_title: metadata.album_title,
             year: metadata.year,
             track_number: metadata.track_number,
+            disc_number: metadata.disc_number,
             extension,
             file_size_bytes: file.file_size_bytes,
             modified_at_unix_seconds: file.modified_at_unix_seconds,
             content_hash: file.content_hash,
             relative_path,
             stream_url: format!("/api/tracks/{}/stream", track_id),
+            added_at_unix_seconds: None,
             path,
         });
     }
@@ -513,6 +511,7 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
             .cmp(&right.artist_name)
             .then_with(|| left.year.cmp(&right.year))
             .then_with(|| left.album_title.cmp(&right.album_title))
+            .then_with(|| left.disc_number.cmp(&right.disc_number))
             .then_with(|| left.track_number.cmp(&right.track_number))
             .then_with(|| left.title.cmp(&right.title))
     });
@@ -539,9 +538,11 @@ struct DiscoveredAudioFile {
 struct TrackMetadata {
     title: String,
     artist_name: String,
+    album_artist_name: Option<String>,
     album_title: String,
     year: Option<u16>,
     track_number: Option<u16>,
+    disc_number: Option<u16>,
 }
 
 impl TrackMetadataObservation {
@@ -1066,6 +1067,9 @@ fn canonical_metadata(
         artist_name: embedded_metadata
             .and_then(|metadata| metadata.artist_name.clone())
             .unwrap_or_else(|| folder_metadata.artist_name.clone()),
+        album_artist_name: embedded_metadata
+            .and_then(|metadata| metadata.album_artist_name.clone())
+            .or_else(|| folder_metadata.album_artist_name.clone()),
         album_title: embedded_metadata
             .and_then(|metadata| metadata.album_title.clone())
             .unwrap_or_else(|| folder_metadata.album_title.clone()),
@@ -1075,6 +1079,9 @@ fn canonical_metadata(
         track_number: embedded_metadata
             .and_then(|metadata| metadata.track_number)
             .or(folder_metadata.track_number),
+        disc_number: embedded_metadata
+            .and_then(|metadata| metadata.disc_number)
+            .or(folder_metadata.disc_number),
     }
 }
 
@@ -1097,9 +1104,11 @@ fn infer_track_metadata(root: &Path, path: &Path) -> TrackMetadata {
     TrackMetadata {
         title: clean_title(title),
         artist_name: clean_title(artist_name),
+        album_artist_name: None,
         album_title,
         year,
         track_number,
+        disc_number: None,
     }
 }
 
@@ -1327,8 +1336,26 @@ fn unique_track_id(identity: &str, counts: &mut BTreeMap<String, usize>) -> Stri
     id
 }
 
-fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool {
-    value.to_ascii_lowercase().contains(needle)
+/// The directory portion of a track's library-relative path, or `None` for a
+/// file that sits directly in the library root.
+fn track_folder(track: &Track) -> Option<&str> {
+    track
+        .relative_path
+        .rsplit_once('/')
+        .map(|(folder, _file)| folder)
+}
+
+/// Matches a track when the requested folder equals its folder or is an ancestor
+/// of it (so browsing a parent folder includes nested folders).
+fn folder_filter_matches(filter: Option<&str>, track: &Track) -> bool {
+    let Some(filter) = filter.map(str::trim).filter(|filter| !filter.is_empty()) else {
+        return true;
+    };
+    let filter = filter.trim_end_matches('/');
+    match track_folder(track) {
+        Some(folder) => folder == filter || folder.starts_with(&format!("{filter}/")),
+        None => false,
+    }
 }
 
 fn text_filter_matches(filter: Option<&str>, values: BTreeSet<String>) -> bool {
@@ -1488,23 +1515,6 @@ mod tests {
     }
 
     #[test]
-    fn search_matches_tracks_albums_and_artists() {
-        let fixture = TestFixture::new("search");
-        fixture.write("1994 - Paramparcad/Darkwood Dub - Brzi Vavilon.mp3");
-        fixture.write("1996 - U Nedogled/Darkwood Dub - U Nedogled.mp3");
-        let library = scan_local_library(&fixture.root).expect("scan fixture");
-        let results = library.search("vavilon");
-
-        assert!(!results.tracks.is_empty());
-        assert!(
-            results
-                .tracks
-                .iter()
-                .any(|track| track.title.contains("Vavilon"))
-        );
-    }
-
-    #[test]
     fn browse_index_and_filters_metadata_facets() {
         let fixture = TestFixture::new("browse");
         fixture.write_rich_tagged_mp3("2004 - Rich Album/Rich Artist - Rich Title.mp3");
@@ -1598,9 +1608,11 @@ mod tests {
         let folder = TrackMetadata {
             title: "Folder Title".to_string(),
             artist_name: "Folder Artist".to_string(),
+            album_artist_name: None,
             album_title: "Folder Album".to_string(),
             year: Some(1994),
             track_number: Some(7),
+            disc_number: None,
         };
         let embedded = TrackMetadataObservation {
             source: "embedded_tag".to_string(),
@@ -1807,6 +1819,145 @@ mod tests {
                 && field.confidence == 0.95
                 && field.approval_state == MetadataApprovalState::Observed
         }));
+    }
+
+    #[test]
+    fn groups_compilation_tracks_under_album_artist() {
+        let fixture = TestFixture::new("compilation");
+        fixture.write_album_grouping_mp3(
+            "Comp/01 First.mp3",
+            "First",
+            "Artist One",
+            "Best Of",
+            Some("Various Artists"),
+            None,
+            1,
+        );
+        fixture.write_album_grouping_mp3(
+            "Comp/02 Second.mp3",
+            "Second",
+            "Artist Two",
+            "Best Of",
+            Some("Various Artists"),
+            None,
+            2,
+        );
+        let library = scan_local_library(&fixture.root).expect("scan fixture");
+
+        // Both tracks collapse into a single compilation album owned by the album-artist.
+        assert_eq!(library.albums.len(), 1);
+        let album = library.albums.first().expect("album");
+        assert_eq!(album.artist_name, "Various Artists");
+        assert_eq!(album.track_count, 2);
+
+        // Each track keeps its own (track) artist.
+        let mut track_artists: Vec<_> = library
+            .tracks
+            .iter()
+            .map(|track| track.artist_name.as_str())
+            .collect();
+        track_artists.sort();
+        assert_eq!(track_artists, vec!["Artist One", "Artist Two"]);
+        assert!(
+            library
+                .tracks
+                .iter()
+                .all(|track| track.album_id == album.id)
+        );
+
+        // The album-artist is registered and owns the compilation.
+        let various = library
+            .artists
+            .iter()
+            .find(|artist| artist.name == "Various Artists")
+            .expect("album-artist registered");
+        assert_eq!(various.album_count, 1);
+    }
+
+    #[test]
+    fn orders_multi_disc_album_tracks_by_disc_then_track() {
+        let fixture = TestFixture::new("multi-disc");
+        fixture.write_album_grouping_mp3(
+            "Set/d2t1.mp3",
+            "Disc Two Opener",
+            "One Artist",
+            "Anthology",
+            None,
+            Some(2),
+            1,
+        );
+        fixture.write_album_grouping_mp3(
+            "Set/d1t1.mp3",
+            "Disc One Opener",
+            "One Artist",
+            "Anthology",
+            None,
+            Some(1),
+            1,
+        );
+        let library = scan_local_library(&fixture.root).expect("scan fixture");
+
+        // Multi-disc release stays a single album.
+        assert_eq!(library.albums.len(), 1);
+        assert_eq!(library.tracks.len(), 2);
+        assert!(
+            library
+                .tracks
+                .iter()
+                .any(|track| track.disc_number == Some(1))
+        );
+
+        // Global ordering places disc 1 before disc 2 despite identical track numbers.
+        let ordered: Vec<_> = library
+            .tracks
+            .iter()
+            .map(|track| (track.disc_number, track.title.as_str()))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![(Some(1), "Disc One Opener"), (Some(2), "Disc Two Opener")]
+        );
+    }
+
+    #[test]
+    fn browses_by_folder_facet_and_filter() {
+        let fixture = TestFixture::new("folder-browse");
+        fixture.write_album_grouping_mp3(
+            "Rock/track.mp3",
+            "Rock Song",
+            "Artist",
+            "Rock Album",
+            None,
+            None,
+            1,
+        );
+        fixture.write_album_grouping_mp3(
+            "Jazz/track.mp3",
+            "Jazz Song",
+            "Artist",
+            "Jazz Album",
+            None,
+            None,
+            1,
+        );
+        let library = scan_local_library(&fixture.root).expect("scan fixture");
+
+        let folders: Vec<_> = library
+            .browse_index()
+            .folders
+            .into_iter()
+            .map(|facet| facet.value)
+            .collect();
+        assert!(folders.contains(&"Rock".to_string()));
+        assert!(folders.contains(&"Jazz".to_string()));
+
+        let filter = BrowseFilter {
+            folder: Some("Rock".to_string()),
+            ..BrowseFilter::default()
+        };
+        let tracks = library.browse_tracks(&filter);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "Rock Song");
     }
 
     #[test]
@@ -2092,6 +2243,39 @@ mod tests {
                     .mime_type(MimeType::Jpeg)
                     .build(),
             );
+
+            let mut bytes = Vec::new();
+            tag.dump_to(&mut bytes, WriteOptions::default())
+                .expect("write id3v2 tag");
+            bytes.extend_from_slice(&minimal_mpeg_frame());
+            fs::write(path, bytes).expect("write fixture file");
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn write_album_grouping_mp3(
+            &self,
+            relative_path: &str,
+            title: &str,
+            artist: &str,
+            album: &str,
+            album_artist: Option<&str>,
+            disc_number: Option<u32>,
+            track_number: u32,
+        ) {
+            let path = self.root.join(relative_path);
+            fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture dir");
+
+            let mut tag = Tag::new(TagType::Id3v2);
+            tag.set_title(title.to_string());
+            tag.set_artist(artist.to_string());
+            tag.set_album(album.to_string());
+            if let Some(album_artist) = album_artist {
+                tag.insert_text(ItemKey::AlbumArtist, album_artist.to_string());
+            }
+            if let Some(disc_number) = disc_number {
+                tag.set_disk(disc_number);
+            }
+            tag.set_track(track_number);
 
             let mut bytes = Vec::new();
             tag.dump_to(&mut bytes, WriteOptions::default())

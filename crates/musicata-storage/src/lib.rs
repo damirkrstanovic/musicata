@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use musicata_core::{
     Album, Artist, Library, MetadataApprovalState, MetadataFieldValue, ProviderMapping, ScanIssue,
-    Track, TrackMetadataFieldObservation, TrackMetadataObservation,
+    SearchResults, Track, TrackMetadataFieldObservation, TrackMetadataObservation,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -107,14 +107,74 @@ impl Database {
             set_user_version(&self.pool, 6).await?;
         }
 
+        if version < 7 {
+            for migration in MIGRATION_007_TRACK_DISC_NUMBER {
+                ensure_column(
+                    &self.pool,
+                    "tracks",
+                    migration.column,
+                    migration.alter_statement,
+                )
+                .await?;
+            }
+            set_user_version(&self.pool, 7).await?;
+        }
+
+        if version < 8 {
+            for migration in MIGRATION_008_TRACK_ADDED_AT {
+                ensure_column(
+                    &self.pool,
+                    "tracks",
+                    migration.column,
+                    migration.alter_statement,
+                )
+                .await?;
+            }
+            set_user_version(&self.pool, 8).await?;
+        }
+
+        if version < 9 {
+            for statement in MIGRATION_009_FTS {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 9).await?;
+        }
+
         Ok(())
     }
 
-    pub async fn save_library(&self, library: &Library) -> Result<()> {
+    pub async fn save_library(&self, library: &mut Library) -> Result<()> {
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
 
         let result = async {
+            // Preserve each track's original "added at" timestamp across the full
+            // delete/re-insert by keying on the stable provider item id.
+            let mut existing_added_at: BTreeMap<String, Option<i64>> = BTreeMap::new();
+            let existing_rows =
+                sqlx::query("SELECT provider_item_id, added_at_unix_seconds FROM tracks")
+                    .fetch_all(&mut *conn)
+                    .await?;
+            for row in existing_rows {
+                existing_added_at.insert(
+                    row.try_get("provider_item_id")?,
+                    row.try_get("added_at_unix_seconds")?,
+                );
+            }
+            let now = now_unix_seconds();
+            for track in &mut library.tracks {
+                let added_at = track
+                    .added_at_unix_seconds
+                    .or_else(|| {
+                        existing_added_at
+                            .get(&track.provider.item_id)
+                            .copied()
+                            .flatten()
+                    })
+                    .unwrap_or(now);
+                track.added_at_unix_seconds = Some(added_at);
+            }
+
             sqlx::query("DELETE FROM track_metadata_field_observations")
                 .execute(&mut *conn)
                 .await?;
@@ -170,7 +230,7 @@ impl Database {
 
             for track in &library.tracks {
                 sqlx::query(
-                    "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, extension, file_size_bytes, modified_at_unix_seconds, content_hash, relative_path, stream_url, path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, disc_number, extension, file_size_bytes, modified_at_unix_seconds, content_hash, relative_path, stream_url, path, added_at_unix_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 )
                 .bind(&track.id)
                 .bind(&track.provider.provider_id)
@@ -182,6 +242,7 @@ impl Database {
                 .bind(&track.album_title)
                 .bind(track.year.map(i64::from))
                 .bind(track.track_number.map(i64::from))
+                .bind(track.disc_number.map(i64::from))
                 .bind(&track.extension)
                 .bind(track.file_size_bytes.map(u64_to_i64).transpose()?)
                 .bind(track.modified_at_unix_seconds)
@@ -189,6 +250,7 @@ impl Database {
                 .bind(&track.relative_path)
                 .bind(&track.stream_url)
                 .bind(path_to_string(&track.path))
+                .bind(track.added_at_unix_seconds)
                 .execute(&mut *conn)
                 .await?;
 
@@ -305,7 +367,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         let track_rows = sqlx::query(
-            "SELECT id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, extension, file_size_bytes, modified_at_unix_seconds, content_hash, relative_path, stream_url, path FROM tracks ORDER BY artist_name, year, album_title, track_number, title",
+            "SELECT id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, disc_number, extension, file_size_bytes, modified_at_unix_seconds, content_hash, relative_path, stream_url, path, added_at_unix_seconds FROM tracks ORDER BY artist_name, year, album_title, disc_number, track_number, title",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -444,6 +506,7 @@ impl Database {
                 album_title: row.try_get("album_title")?,
                 year: optional_i64_to_u16(row.try_get("year")?, "year")?,
                 track_number: optional_i64_to_u16(row.try_get("track_number")?, "track_number")?,
+                disc_number: optional_i64_to_u16(row.try_get("disc_number")?, "disc_number")?,
                 extension: row.try_get("extension")?,
                 file_size_bytes: optional_i64_to_u64(
                     row.try_get("file_size_bytes")?,
@@ -453,6 +516,7 @@ impl Database {
                 content_hash: row.try_get("content_hash")?,
                 relative_path: row.try_get("relative_path")?,
                 stream_url: row.try_get("stream_url")?,
+                added_at_unix_seconds: row.try_get("added_at_unix_seconds")?,
                 path: PathBuf::from(row.try_get::<String, _>("path")?),
             });
         }
@@ -624,6 +688,129 @@ impl Database {
             modified,
         })
     }
+
+    /// Full-text search across artists, albums, and tracks via the FTS5 indexes,
+    /// ranked best-match-first and capped at `limit` per entity type. Tracks are
+    /// returned without their observation provenance (`observed_metadata` is empty);
+    /// clients needing that fetch the track or album detail.
+    pub async fn search(&self, query: &str, limit: usize) -> Result<SearchResults> {
+        let Some(match_query) = fts_match_query(query) else {
+            return Ok(SearchResults::default());
+        };
+        let limit = limit as i64;
+
+        let artist_rows = sqlx::query(
+            "SELECT a.id, a.name, a.album_count, a.track_count
+             FROM artists_fts f JOIN artists a ON a.rowid = f.rowid
+             WHERE artists_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        )
+        .bind(&match_query)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut artists = Vec::with_capacity(artist_rows.len());
+        for row in artist_rows {
+            artists.push(Artist {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+                album_count: i64_to_usize(row.try_get("album_count")?, "album_count")?,
+                track_count: i64_to_usize(row.try_get("track_count")?, "track_count")?,
+            });
+        }
+
+        let album_rows = sqlx::query(
+            "SELECT a.id, a.title, a.artist_id, a.artist_name, a.year, a.track_count, a.artwork_url, a.artwork_path
+             FROM albums_fts f JOIN albums a ON a.rowid = f.rowid
+             WHERE albums_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        )
+        .bind(&match_query)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut albums = Vec::with_capacity(album_rows.len());
+        for row in album_rows {
+            albums.push(Album {
+                id: row.try_get("id")?,
+                title: row.try_get("title")?,
+                artist_id: row.try_get("artist_id")?,
+                artist_name: row.try_get("artist_name")?,
+                year: optional_i64_to_u16(row.try_get("year")?, "year")?,
+                track_count: i64_to_usize(row.try_get("track_count")?, "track_count")?,
+                artwork_url: row.try_get("artwork_url")?,
+                artwork_path: row
+                    .try_get::<Option<String>, _>("artwork_path")?
+                    .map(PathBuf::from),
+            });
+        }
+
+        let track_rows = sqlx::query(
+            "SELECT t.id, t.provider_id, t.provider_item_id, t.title, t.artist_id, t.artist_name,
+                    t.album_id, t.album_title, t.year, t.track_number, t.disc_number, t.extension,
+                    t.file_size_bytes, t.modified_at_unix_seconds, t.content_hash, t.relative_path,
+                    t.stream_url, t.added_at_unix_seconds, t.path
+             FROM tracks_fts f JOIN tracks t ON t.rowid = f.rowid
+             WHERE tracks_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        )
+        .bind(&match_query)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut tracks = Vec::with_capacity(track_rows.len());
+        for row in track_rows {
+            tracks.push(Track {
+                id: row.try_get("id")?,
+                provider: ProviderMapping {
+                    provider_id: row.try_get("provider_id")?,
+                    item_id: row.try_get("provider_item_id")?,
+                },
+                observed_metadata: Vec::new(),
+                title: row.try_get("title")?,
+                artist_id: row.try_get("artist_id")?,
+                artist_name: row.try_get("artist_name")?,
+                album_id: row.try_get("album_id")?,
+                album_title: row.try_get("album_title")?,
+                year: optional_i64_to_u16(row.try_get("year")?, "year")?,
+                track_number: optional_i64_to_u16(row.try_get("track_number")?, "track_number")?,
+                disc_number: optional_i64_to_u16(row.try_get("disc_number")?, "disc_number")?,
+                extension: row.try_get("extension")?,
+                file_size_bytes: optional_i64_to_u64(
+                    row.try_get("file_size_bytes")?,
+                    "file_size_bytes",
+                )?,
+                modified_at_unix_seconds: row.try_get("modified_at_unix_seconds")?,
+                content_hash: row.try_get("content_hash")?,
+                relative_path: row.try_get("relative_path")?,
+                stream_url: row.try_get("stream_url")?,
+                added_at_unix_seconds: row.try_get("added_at_unix_seconds")?,
+                path: PathBuf::from(row.try_get::<String, _>("path")?),
+            });
+        }
+
+        Ok(SearchResults {
+            query: query.to_string(),
+            artists,
+            albums,
+            tracks,
+        })
+    }
+}
+
+/// Builds a safe FTS5 MATCH expression from free-form user input: each
+/// alphanumeric token becomes a quoted prefix term joined by implicit AND, e.g.
+/// `daft punk` -> `"daft"* "punk"*`. Quoting neutralizes FTS operator characters,
+/// and prefix matching supports type-ahead. Returns `None` when the input has no
+/// usable tokens.
+fn fts_match_query(input: &str) -> Option<String> {
+    let terms: Vec<String> = input
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -653,10 +840,10 @@ fn metadata_observations_fingerprint(observations: &[TrackMetadataObservation]) 
     for observation in observations {
         push_fingerprint_part(&mut fingerprint, &observation.source);
         push_fingerprint_part(&mut fingerprint, &observation.confidence.to_string());
-        push_fingerprint_part(
-            &mut fingerprint,
-            &observation.observed_at_unix_seconds.to_string(),
-        );
+        // `observed_at_unix_seconds` is intentionally excluded: it is stamped fresh
+        // on every scan, so including it would mark every track "modified" whenever
+        // two scans straddle a second boundary. Change detection tracks metadata
+        // content, not when it was observed.
         push_fingerprint_part(
             &mut fingerprint,
             approval_state_to_str(&observation.approval_state),
@@ -783,10 +970,7 @@ fn metadata_observations_fingerprint(observations: &[TrackMetadataObservation]) 
                 &metadata_field_value_fingerprint(&field_observation.value),
             );
             push_fingerprint_part(&mut fingerprint, &field_observation.confidence.to_string());
-            push_fingerprint_part(
-                &mut fingerprint,
-                &field_observation.observed_at_unix_seconds.to_string(),
-            );
+            // Excluded for the same reason as the observation-level timestamp above.
             push_fingerprint_part(
                 &mut fingerprint,
                 approval_state_to_str(&field_observation.approval_state),
@@ -865,13 +1049,15 @@ const MIGRATION_001: &[&str] = &[
         album_title TEXT NOT NULL,
         year INTEGER,
         track_number INTEGER,
+        disc_number INTEGER,
         extension TEXT NOT NULL,
         file_size_bytes INTEGER,
         modified_at_unix_seconds INTEGER,
         content_hash TEXT,
         relative_path TEXT NOT NULL,
         stream_url TEXT NOT NULL,
-        path TEXT NOT NULL
+        path TEXT NOT NULL,
+        added_at_unix_seconds INTEGER
     )",
     "CREATE TABLE IF NOT EXISTS scan_errors (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1065,6 +1251,82 @@ const MIGRATION_005_METADATA_OBSERVATION_VALUE_COLUMNS: &[ColumnMigration] = &[
     },
 ];
 
+const MIGRATION_007_TRACK_DISC_NUMBER: &[ColumnMigration] = &[ColumnMigration {
+    column: "disc_number",
+    alter_statement: "ALTER TABLE tracks ADD COLUMN disc_number INTEGER",
+}];
+
+const MIGRATION_008_TRACK_ADDED_AT: &[ColumnMigration] = &[ColumnMigration {
+    column: "added_at_unix_seconds",
+    alter_statement: "ALTER TABLE tracks ADD COLUMN added_at_unix_seconds INTEGER",
+}];
+
+// Full-text search indexes. These are external-content FTS5 tables (they store
+// only the inverted index and read the text from the base tables) kept in sync by
+// triggers, so any insert/update/delete on tracks/albums/artists — including future
+// incremental writes — is immediately reflected in search with no manual upkeep.
+// `remove_diacritics 2` makes matching accent-insensitive ("bjork" finds "Björk").
+const MIGRATION_009_FTS: &[&str] = &[
+    "CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
+        title, artist_name, album_title,
+        content='tracks', content_rowid='rowid',
+        tokenize='unicode61 remove_diacritics 2'
+    )",
+    "CREATE TRIGGER IF NOT EXISTS tracks_fts_insert AFTER INSERT ON tracks BEGIN
+        INSERT INTO tracks_fts(rowid, title, artist_name, album_title)
+        VALUES (new.rowid, new.title, new.artist_name, new.album_title);
+    END",
+    "CREATE TRIGGER IF NOT EXISTS tracks_fts_delete AFTER DELETE ON tracks BEGIN
+        INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_title)
+        VALUES ('delete', old.rowid, old.title, old.artist_name, old.album_title);
+    END",
+    "CREATE TRIGGER IF NOT EXISTS tracks_fts_update AFTER UPDATE ON tracks BEGIN
+        INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_title)
+        VALUES ('delete', old.rowid, old.title, old.artist_name, old.album_title);
+        INSERT INTO tracks_fts(rowid, title, artist_name, album_title)
+        VALUES (new.rowid, new.title, new.artist_name, new.album_title);
+    END",
+    "INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild')",
+    "CREATE VIRTUAL TABLE IF NOT EXISTS albums_fts USING fts5(
+        title, artist_name,
+        content='albums', content_rowid='rowid',
+        tokenize='unicode61 remove_diacritics 2'
+    )",
+    "CREATE TRIGGER IF NOT EXISTS albums_fts_insert AFTER INSERT ON albums BEGIN
+        INSERT INTO albums_fts(rowid, title, artist_name)
+        VALUES (new.rowid, new.title, new.artist_name);
+    END",
+    "CREATE TRIGGER IF NOT EXISTS albums_fts_delete AFTER DELETE ON albums BEGIN
+        INSERT INTO albums_fts(albums_fts, rowid, title, artist_name)
+        VALUES ('delete', old.rowid, old.title, old.artist_name);
+    END",
+    "CREATE TRIGGER IF NOT EXISTS albums_fts_update AFTER UPDATE ON albums BEGIN
+        INSERT INTO albums_fts(albums_fts, rowid, title, artist_name)
+        VALUES ('delete', old.rowid, old.title, old.artist_name);
+        INSERT INTO albums_fts(rowid, title, artist_name)
+        VALUES (new.rowid, new.title, new.artist_name);
+    END",
+    "INSERT INTO albums_fts(albums_fts) VALUES('rebuild')",
+    "CREATE VIRTUAL TABLE IF NOT EXISTS artists_fts USING fts5(
+        name,
+        content='artists', content_rowid='rowid',
+        tokenize='unicode61 remove_diacritics 2'
+    )",
+    "CREATE TRIGGER IF NOT EXISTS artists_fts_insert AFTER INSERT ON artists BEGIN
+        INSERT INTO artists_fts(rowid, name) VALUES (new.rowid, new.name);
+    END",
+    "CREATE TRIGGER IF NOT EXISTS artists_fts_delete AFTER DELETE ON artists BEGIN
+        INSERT INTO artists_fts(artists_fts, rowid, name)
+        VALUES ('delete', old.rowid, old.name);
+    END",
+    "CREATE TRIGGER IF NOT EXISTS artists_fts_update AFTER UPDATE ON artists BEGIN
+        INSERT INTO artists_fts(artists_fts, rowid, name)
+        VALUES ('delete', old.rowid, old.name);
+        INSERT INTO artists_fts(rowid, name) VALUES (new.rowid, new.name);
+    END",
+    "INSERT INTO artists_fts(artists_fts) VALUES('rebuild')",
+];
+
 const MIGRATION_006_METADATA_FIELD_OBSERVATIONS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS track_metadata_field_observations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1221,9 +1483,12 @@ mod tests {
     async fn saves_and_loads_library() {
         let db_path = temp_db_path("roundtrip");
         let database = Database::connect(&db_path).await.expect("connect database");
-        let library = fixture_library();
+        let mut library = fixture_library();
 
-        database.save_library(&library).await.expect("save library");
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
         let loaded = database
             .load_library()
             .await
@@ -1318,11 +1583,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preserves_added_at_across_rescans() {
+        let db_path = temp_db_path("added-at");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        // Seed a distinctive original timestamp far from "now".
+        let mut library = fixture_library();
+        library.tracks[0].added_at_unix_seconds = Some(1_000_000);
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+
+        // A fresh rescan carries no in-memory timestamp; the stored one must win.
+        let mut rescanned = fixture_library();
+        assert!(rescanned.tracks[0].added_at_unix_seconds.is_none());
+        database
+            .save_library(&mut rescanned)
+            .await
+            .expect("resave library");
+
+        assert_eq!(rescanned.tracks[0].added_at_unix_seconds, Some(1_000_000));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn search_matches_each_entity_type() {
+        let db_path = temp_db_path("search-entities");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+
+        let by_track = database.search("song", 50).await.expect("search");
+        assert!(by_track.tracks.iter().any(|track| track.title == "Song"));
+
+        let by_album = database.search("album", 50).await.expect("search");
+        assert!(by_album.albums.iter().any(|album| album.title == "Album"));
+
+        let by_artist = database.search("artist", 50).await.expect("search");
+        assert!(
+            by_artist
+                .artists
+                .iter()
+                .any(|artist| artist.name == "Artist")
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn search_empty_query_returns_no_results() {
+        let db_path = temp_db_path("search-empty");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+
+        let results = database.search("   ", 50).await.expect("search");
+        assert!(results.artists.is_empty());
+        assert!(results.albums.is_empty());
+        assert!(results.tracks.is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn search_is_accent_and_case_insensitive() {
+        let db_path = temp_db_path("search-accent");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        library.artists[0].name = "Motörhead".to_string();
+        library.tracks[0].artist_name = "Motörhead".to_string();
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+
+        for query in ["motorhead", "MOTÖRHEAD", "Motorhead"] {
+            let results = database.search(query, 50).await.expect("search");
+            assert!(
+                results
+                    .artists
+                    .iter()
+                    .any(|artist| artist.name == "Motörhead"),
+                "query {query:?} should match the accented artist"
+            );
+        }
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn search_supports_prefix_matching() {
+        let db_path = temp_db_path("search-prefix");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+
+        // A partial token still matches via prefix, supporting type-ahead.
+        let results = database.search("alb", 50).await.expect("search");
+        assert!(results.albums.iter().any(|album| album.title == "Album"));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn newly_inserted_track_is_immediately_searchable() {
+        let db_path = temp_db_path("search-incremental");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+
+        // Insert a track directly, bypassing save_library, to prove the FTS trigger
+        // keeps the index fresh for any write path (e.g. future incremental adds).
+        sqlx::query(
+            "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name,
+                album_id, album_title, extension, relative_path, stream_url, path)
+             VALUES ('track_zephyr', 'local-disk', 'album/zephyr.mp3', 'Zephyr Anthem', 'artist_1',
+                'Artist', 'album_1', 'Album', 'mp3', 'album/zephyr.mp3',
+                '/api/tracks/track_zephyr/stream', '/music/album/zephyr.mp3')",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("insert track");
+
+        let results = database.search("zephyr", 50).await.expect("search");
+        assert!(
+            results
+                .tracks
+                .iter()
+                .any(|track| track.title == "Zephyr Anthem"),
+            "freshly inserted track should be searchable without a rebuild"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn rescan_with_only_new_observation_timestamps_reports_no_changes() {
+        let db_path = temp_db_path("idempotent-rescan");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+
+        // Simulate a later scan of unchanged files: identical content, but every
+        // observation (and its field observations) carries a fresh scan timestamp.
+        let mut rescanned = library.clone();
+        for track in &mut rescanned.tracks {
+            for observation in &mut track.observed_metadata {
+                observation.observed_at_unix_seconds += 86_400;
+                observation.field_observations = observation.effective_field_observations();
+                for field in &mut observation.field_observations {
+                    field.observed_at_unix_seconds += 86_400;
+                }
+            }
+        }
+
+        let changes = database
+            .detect_library_changes(&rescanned)
+            .await
+            .expect("detect changes");
+        assert_eq!(changes.added, 0);
+        assert_eq!(changes.removed, 0);
+        assert_eq!(changes.modified, 0);
+        assert!(!changes.has_changes());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn detects_added_removed_and_modified_tracks() {
         let db_path = temp_db_path("changes");
         let database = Database::connect(&db_path).await.expect("connect database");
-        let library = fixture_library();
-        database.save_library(&library).await.expect("save library");
+        let mut library = fixture_library();
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
 
         let mut metadata_changed = library.clone();
         metadata_changed.tracks[0].observed_metadata[0].title = Some("Retagged".to_string());
@@ -1363,12 +1815,14 @@ mod tests {
             album_title: "Album".to_string(),
             year: Some(2026),
             track_number: Some(2),
+            disc_number: None,
             extension: "mp3".to_string(),
             file_size_bytes: Some(10),
             modified_at_unix_seconds: Some(1_800_000_100),
             content_hash: Some("new789".to_string()),
             relative_path: "album/new-song.mp3".to_string(),
             stream_url: "/api/tracks/track_2/stream".to_string(),
+            added_at_unix_seconds: None,
             path: PathBuf::from("/music/album/new-song.mp3"),
         });
 
@@ -1427,12 +1881,14 @@ mod tests {
                 album_title: "Album".to_string(),
                 year: Some(2026),
                 track_number: Some(1),
+                disc_number: None,
                 extension: "mp3".to_string(),
                 file_size_bytes: Some(1234),
                 modified_at_unix_seconds: Some(1_800_000_000),
                 content_hash: Some("abc123".to_string()),
                 relative_path: "album/song.mp3".to_string(),
                 stream_url: "/api/tracks/track_1/stream".to_string(),
+                added_at_unix_seconds: None,
                 path: PathBuf::from("/music/album/song.mp3"),
             }],
             scan_errors: vec![ScanIssue {

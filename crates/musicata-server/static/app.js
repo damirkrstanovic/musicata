@@ -93,7 +93,7 @@ async function searchApi(query, signal) {
   return response.json();
 }
 
-function tracksApi(filter = {}) {
+async function tracksApi(filter = {}) {
   const params = new URLSearchParams();
   if (filter.genre) {
     params.set("genre", filter.genre);
@@ -104,7 +104,12 @@ function tracksApi(filter = {}) {
   if (filter.composer) {
     params.set("composer", filter.composer);
   }
-  return api(`/api/tracks${params.size ? `?${params}` : ""}`);
+  if (filter.folder) {
+    params.set("folder", filter.folder);
+  }
+  // /api/tracks returns a pagination envelope; the UI works with the items array.
+  const page = await api(`/api/tracks${params.size ? `?${params}` : ""}`);
+  return page.items;
 }
 
 function browseApi() {
@@ -113,13 +118,14 @@ function browseApi() {
 
 async function loadLibrary() {
   try {
-    const [summary, albums, tracks, browse] = await Promise.all([
+    const [summary, albumsPage, tracks, browse] = await Promise.all([
       api("/api/library/summary"),
       api("/api/albums"),
       tracksApi(),
       browseApi(),
     ]);
 
+    const albums = albumsPage.items;
     state.albums = albums;
     state.tracks = tracks;
     state.browse = browse;

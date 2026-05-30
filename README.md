@@ -93,11 +93,13 @@ Useful endpoints:
 - `GET /` web controller.
 - `GET /api/library/summary` library counts.
 - `POST /api/library/rescan` scan the configured provider and update the database when files changed.
-- `GET /api/tracks` provider-neutral track list.
-- `GET /api/tracks?genre=Dub&year=2004&composer=Name` filtered track list.
+- `GET /api/artists`, `GET /api/albums`, `GET /api/tracks` paginated, sortable lists (`?limit=&offset=&sort=`); each returns `{ items, total, limit, offset, sort }`.
+- `GET /api/tracks?genre=Dub&year=2004&composer=Name&folder=Path` filtered track list.
+- `GET /api/artists/{id}` artist detail with albums and tracks.
 - `GET /api/albums/{id}` album detail with artist and track list.
-- `GET /api/browse` metadata facets for genre, year, and composer.
-- `GET /api/search?q=darkwood` simple library search.
+- `GET /api/browse` metadata facets for genre, year, composer, and folder.
+- `GET /api/browse/recently-added` tracks ordered by when they entered the database.
+- `GET /api/search?q=darkwood&limit=50` ranked SQLite FTS5 search (tokenized, prefix, accent- and case-insensitive) across artists, albums, and tracks.
 - `GET /api/albums/{id}/artwork/cover-art-archive/candidates` reviewed remote artwork candidates for MusicBrainz-linked albums.
 - `GET /api/metadata/write-back` current file tag write-back policy.
 - `GET /api/tracks/{id}/stream` audio stream with basic byte-range support.

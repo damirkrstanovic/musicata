@@ -85,7 +85,7 @@ Done when:
 
 ## Milestone 3: Metadata Extraction And Updates
 
-Status: in progress.
+Status: complete.
 
 Goal: make local-library quality good enough for real collections.
 
@@ -110,6 +110,7 @@ Tasks:
 - [x] Add generated FLAC and MP4/M4A tag fixtures.
 - [x] Add generated tag-heavy embedded metadata fixture.
 - [x] Add generated poorly tagged file fixture for folder fallback coverage.
+- [x] Group compilations under album artist and order multi-disc tracks by disc then track.
 
 Done when:
 
@@ -123,22 +124,40 @@ Reference: [Metadata Update Strategy](metadata.md)
 
 ## Milestone 4: Search And Browsing
 
+Status: complete.
+
 Goal: make the library fast to explore.
 
 Tasks:
 
-- Add Tantivy for full-text search.
-- Add pagination and sorting to API endpoints.
-- Add browse endpoints for artists, albums, tracks, genres, years, folders, and recently added music.
+- [x] Add SQLite FTS5 full-text search (replaces the planned Tantivy dependency).
+- [x] Add pagination and sorting to API endpoints.
+- [x] Add browse endpoints for artists, albums, tracks, genres, years, folders, and recently added music.
 - [x] Add metadata-based browse filters for genre, year, and composer.
 - [x] Add album detail endpoints.
-- Add artist detail endpoints.
-- Support accent-insensitive and case-insensitive search where practical.
+- [x] Add artist detail endpoints.
+- [x] Support accent-insensitive and case-insensitive search where practical.
 
 Done when:
 
 - Large libraries can be searched without loading every track into API responses.
 - Web UI uses paginated/detail endpoints instead of fetching everything.
+
+Search design decisions:
+
+- Tantivy was dropped as too complex: it is a second datastore to keep in sync
+  with SQLite. SQLite FTS5 lives in the same database file and transaction.
+- Search runs as SQL against FTS5 external-content indexes for artists, albums,
+  and tracks (tokenized, ranked, prefix, accent-insensitive). It does not read
+  the in-memory library snapshot, so it scales without holding everything in RAM.
+- Indexes are kept current by triggers on the base tables, so any insert, update,
+  or delete — including future incremental adds — is immediately searchable with
+  no manual index maintenance.
+- No application-level search cache: SQLite's own page cache already keeps hot
+  index pages resident, and a separate cache would add invalidation complexity for
+  little gain on a single-user local server. Revisit only if profiling shows a need.
+- Follow-up: the browse and list endpoints still read the in-memory library;
+  moving them onto SQL queries would remove the remaining in-memory footprint.
 
 ## Milestone 5: Playback, Queues, And Zones
 
@@ -286,8 +305,10 @@ Done when:
 
 ## Immediate Next Steps
 
-The next implementation slice should continue metadata enrichment, then move into Milestone 4:
+Milestones 3 and 4 are complete, including SQLite FTS5 full-text search. The next
+implementation slice should either:
 
-1. Add artist detail endpoints.
-2. Add pagination and sorting to API endpoints.
-3. Add browse endpoints for folders and recently added music.
+1. Begin Milestone 5 (player registry, queues, zones, and WebSocket state sync), or
+2. Move the browse/list endpoints off the in-memory library onto SQL queries, to
+   remove the remaining whole-library-in-RAM footprint (the search follow-up noted
+   in Milestone 4).
