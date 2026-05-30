@@ -21,13 +21,13 @@ use axum::{
     middleware::{self, Next},
     response::sse::{Event, KeepAlive, Sse},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, Library, LibrarySummary, LocalDiskProvider,
     MetadataApprovalState, MetadataFieldValue, MusicProvider, PlaybackState, Player, PlayerCommand,
-    SearchResults, Track, TrackMetadataFieldObservation, Zone, album_artwork_url, artwork_asset_id,
-    find_album_artwork_candidates,
+    Playlist, SearchResults, Track, TrackMetadataFieldObservation, Zone, album_artwork_url,
+    artwork_asset_id, find_album_artwork_candidates,
 };
 use musicata_storage::Database;
 use musicbrainz::{
@@ -371,6 +371,18 @@ fn app(
         .route("/api/browse/recently-added", get(recently_added))
         .route("/api/history/recent", get(recently_played))
         .route("/api/history/most-played", get(most_played))
+        .route("/api/playlists", get(list_playlists_route).post(create_playlist_route))
+        .route(
+            "/api/playlists/{id}",
+            get(playlist_detail)
+                .patch(update_playlist_route)
+                .delete(delete_playlist_route),
+        )
+        .route("/api/favorites", get(list_favorites))
+        .route(
+            "/api/favorites/{kind}/{id}",
+            put(star_favorite).delete(unstar_favorite),
+        )
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
             get(album_musicbrainz_candidates),
@@ -1145,6 +1157,186 @@ async fn most_played(
     });
 
     Ok(Json(items))
+}
+
+// ---- Playlists ----
+
+/// A playlist plus its ordered tracks.
+#[derive(Debug, Serialize)]
+struct PlaylistDetail {
+    #[serde(flatten)]
+    playlist: Playlist,
+    tracks: Vec<Track>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatePlaylistRequest {
+    name: String,
+    comment: Option<String>,
+    track_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdatePlaylistRequest {
+    name: Option<String>,
+    comment: Option<String>,
+    /// Replace the whole track list, in this order (used for reorder).
+    track_ids: Option<Vec<String>>,
+    /// Append these tracks.
+    add_track_ids: Option<Vec<String>>,
+    /// Remove the tracks currently at these positions.
+    remove_indices: Option<Vec<usize>>,
+}
+
+async fn list_playlists_route(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Playlist>>, AppError> {
+    Ok(Json(state.database.list_playlists().await.map_err(db_error)?))
+}
+
+async fn playlist_detail_response(
+    state: &AppState,
+    id: &str,
+) -> Result<PlaylistDetail, AppError> {
+    let playlist = state
+        .database
+        .playlist(id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| AppError::not_found(format!("unknown playlist: {id}")))?;
+    let tracks = state.database.playlist_tracks(id).await.map_err(db_error)?;
+    Ok(PlaylistDetail { playlist, tracks })
+}
+
+async fn create_playlist_route(
+    State(state): State<AppState>,
+    Json(request): Json<CreatePlaylistRequest>,
+) -> Result<Json<PlaylistDetail>, AppError> {
+    let name = request.name.trim();
+    if name.is_empty() {
+        return Err(AppError::bad_request("playlist name is required"));
+    }
+    let id = state
+        .database
+        .create_playlist(
+            name,
+            request.comment.as_deref(),
+            &request.track_ids.unwrap_or_default(),
+            now_unix_seconds(),
+        )
+        .await
+        .map_err(db_error)?;
+    Ok(Json(playlist_detail_response(&state, &id).await?))
+}
+
+async fn playlist_detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PlaylistDetail>, AppError> {
+    Ok(Json(playlist_detail_response(&state, &id).await?))
+}
+
+async fn update_playlist_route(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdatePlaylistRequest>,
+) -> Result<Json<PlaylistDetail>, AppError> {
+    // Confirm it exists first.
+    playlist_detail_response(&state, &id).await?;
+    let now = now_unix_seconds();
+
+    if request.name.is_some() || request.comment.is_some() {
+        state
+            .database
+            .update_playlist_meta(&id, request.name.as_deref(), request.comment.as_deref(), now)
+            .await
+            .map_err(db_error)?;
+    }
+
+    if let Some(track_ids) = request.track_ids {
+        state
+            .database
+            .set_playlist_tracks(&id, &track_ids, now)
+            .await
+            .map_err(db_error)?;
+    } else if request.add_track_ids.is_some() || request.remove_indices.is_some() {
+        let mut ids = state.database.playlist_track_ids(&id).await.map_err(db_error)?;
+        if let Some(remove) = request.remove_indices {
+            let mut remove: Vec<usize> = remove;
+            remove.sort_unstable();
+            remove.dedup();
+            for index in remove.into_iter().rev() {
+                if index < ids.len() {
+                    ids.remove(index);
+                }
+            }
+        }
+        if let Some(add) = request.add_track_ids {
+            ids.extend(add);
+        }
+        state
+            .database
+            .set_playlist_tracks(&id, &ids, now)
+            .await
+            .map_err(db_error)?;
+    }
+
+    Ok(Json(playlist_detail_response(&state, &id).await?))
+}
+
+async fn delete_playlist_route(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    state.database.delete_playlist(&id).await.map_err(db_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- Favorites ----
+
+#[derive(Debug, Serialize)]
+struct FavoritesResponse {
+    tracks: Vec<Track>,
+    albums: Vec<Album>,
+    artists: Vec<Artist>,
+}
+
+async fn list_favorites(State(state): State<AppState>) -> Result<Json<FavoritesResponse>, AppError> {
+    Ok(Json(FavoritesResponse {
+        tracks: state.database.starred_tracks().await.map_err(db_error)?,
+        albums: state.database.starred_albums().await.map_err(db_error)?,
+        artists: state.database.starred_artists().await.map_err(db_error)?,
+    }))
+}
+
+/// Validate the favorite item kind from the path.
+fn favorite_kind(kind: &str) -> Result<&str, AppError> {
+    match kind {
+        "track" | "album" | "artist" => Ok(kind),
+        other => Err(AppError::bad_request(format!("unknown favorite kind: {other}"))),
+    }
+}
+
+async fn star_favorite(
+    State(state): State<AppState>,
+    Path((kind, id)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    let kind = favorite_kind(&kind)?;
+    state
+        .database
+        .set_favorite(kind, &id, now_unix_seconds())
+        .await
+        .map_err(db_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn unstar_favorite(
+    State(state): State<AppState>,
+    Path((kind, id)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    let kind = favorite_kind(&kind)?;
+    state.database.clear_favorite(kind, &id).await.map_err(db_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Query parameters for `/api/tracks`: browse filters plus pagination/sorting.
@@ -3530,6 +3722,138 @@ mod tests {
         // Whether or not the track has lyrics, the response is a well-formed lyricsList.
         assert_eq!(value["subsonic-response"]["status"], "ok");
         assert!(value["subsonic-response"]["lyricsList"].is_object());
+    }
+
+    #[tokio::test]
+    async fn native_playlists_and_favorites_round_trip() {
+        let fixture = TestFixture::new("native-pl-fav");
+        let app = fixture.app().await;
+
+        // A track id from the library.
+        let page: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/tracks?limit=1")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        let track_id = page["items"][0]["id"].as_str().expect("track id").to_string();
+
+        // Create a playlist containing that track.
+        let created: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/playlists")
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(format!(
+                                r#"{{"name":"Mix","track_ids":["{track_id}"]}}"#
+                            )))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(created["name"], "Mix");
+        assert_eq!(created["tracks"].as_array().unwrap().len(), 1);
+
+        // It shows up in the list.
+        let list: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(Request::builder().uri("/api/playlists").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+
+        // Star the track, then it appears in favorites.
+        let star = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/favorites/track/{track_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(star.status(), StatusCode::NO_CONTENT);
+
+        let favorites: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(Request::builder().uri("/api/favorites").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(favorites["tracks"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn subsonic_playlists_and_stars() {
+        let fixture = TestFixture::new("ss-pl-stars");
+        let app = fixture.app().await;
+        let search = subsonic_json(&app, &format!("search3.view?{SS_AUTH}&query=vavilon")).await;
+        let song_id = search["subsonic-response"]["searchResult3"]["song"][0]["id"]
+            .as_str()
+            .expect("song id")
+            .to_string();
+
+        // createPlaylist returns the new playlist with its entries.
+        let created = subsonic_json(
+            &app,
+            &format!("createPlaylist.view?{SS_AUTH}&name=Mix&songId={song_id}"),
+        )
+        .await;
+        assert_eq!(
+            created["subsonic-response"]["playlist"]["entry"]
+                .as_array()
+                .expect("entries")
+                .len(),
+            1
+        );
+
+        let lists = subsonic_json(&app, &format!("getPlaylists.view?{SS_AUTH}")).await;
+        assert!(
+            !lists["subsonic-response"]["playlists"]["playlist"]
+                .as_array()
+                .expect("playlists")
+                .is_empty()
+        );
+
+        // Star the song, then getStarred2 lists it.
+        let starred = subsonic_json(&app, &format!("star.view?{SS_AUTH}&id={song_id}")).await;
+        assert_eq!(starred["subsonic-response"]["status"], "ok");
+        let starred2 = subsonic_json(&app, &format!("getStarred2.view?{SS_AUTH}")).await;
+        let songs = starred2["subsonic-response"]["starred2"]["song"]
+            .as_array()
+            .expect("starred songs");
+        assert!(songs.iter().any(|song| song["id"] == song_id));
     }
 
     #[tokio::test]

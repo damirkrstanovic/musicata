@@ -176,6 +176,18 @@ pub struct Album {
     pub artwork_path: Option<PathBuf>,
 }
 
+/// A user-created playlist. Its tracks are stored separately (ordered) and returned
+/// with the detail view.
+#[derive(Clone, Debug, Serialize)]
+pub struct Playlist {
+    pub id: String,
+    pub name: String,
+    pub comment: Option<String>,
+    pub song_count: usize,
+    pub created_at_unix_seconds: i64,
+    pub updated_at_unix_seconds: i64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Track {
     pub id: String,

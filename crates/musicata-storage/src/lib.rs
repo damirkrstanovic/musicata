@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, BrowseTextFacet, BrowseYearFacet, Library,
-    LibrarySummary, MetadataApprovalState, MetadataFieldValue, ProviderMapping, ScanIssue,
-    SearchResults, Track, TrackMetadataFieldObservation, TrackMetadataObservation, Zone,
+    LibrarySummary, MetadataApprovalState, MetadataFieldValue, Playlist, ProviderMapping,
+    ScanIssue, SearchResults, Track, TrackMetadataFieldObservation, TrackMetadataObservation,
+    Zone,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -166,6 +167,13 @@ impl Database {
                 .await?;
             }
             set_user_version(&self.pool, 12).await?;
+        }
+
+        if version < 13 {
+            for statement in MIGRATION_013_PLAYLISTS_AND_FAVORITES {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 13).await?;
         }
 
         Ok(())
@@ -1342,6 +1350,210 @@ impl Database {
             .map(|row| Ok((track_from_row(row)?, row.try_get("plays")?)))
             .collect()
     }
+
+    // ---- Playlists ----
+
+    /// Create a playlist (with optional initial tracks) and return its generated id.
+    pub async fn create_playlist(
+        &self,
+        name: &str,
+        comment: Option<&str>,
+        track_ids: &[String],
+        now: i64,
+    ) -> Result<String> {
+        let row = sqlx::query(
+            "INSERT INTO playlists (id, name, comment, created_at_unix_seconds, updated_at_unix_seconds)
+             VALUES (lower(hex(randomblob(12))), ?1, ?2, ?3, ?3) RETURNING id",
+        )
+        .bind(name)
+        .bind(comment)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        let id: String = row.try_get("id")?;
+        if !track_ids.is_empty() {
+            self.set_playlist_tracks(&id, track_ids, now).await?;
+        }
+        Ok(id)
+    }
+
+    pub async fn list_playlists(&self) -> Result<Vec<Playlist>> {
+        let rows = sqlx::query(
+            "SELECT id, name, comment, created_at_unix_seconds, updated_at_unix_seconds,
+                    (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = playlists.id) AS song_count
+             FROM playlists ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(playlist_from_row).collect()
+    }
+
+    pub async fn playlist(&self, id: &str) -> Result<Option<Playlist>> {
+        let row = sqlx::query(
+            "SELECT id, name, comment, created_at_unix_seconds, updated_at_unix_seconds,
+                    (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = playlists.id) AS song_count
+             FROM playlists WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(playlist_from_row).transpose()
+    }
+
+    /// The playlist's tracks in order. Tracks no longer in the library are skipped.
+    pub async fn playlist_tracks(&self, id: &str) -> Result<Vec<Track>> {
+        let columns = track_columns("t");
+        let sql = format!(
+            "SELECT {columns} FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
+             WHERE pt.playlist_id = ?1 ORDER BY pt.position"
+        );
+        let rows = sqlx::query(&sql).bind(id).fetch_all(&self.pool).await?;
+        rows.iter().map(track_from_row).collect()
+    }
+
+    /// The raw ordered track ids (including any that no longer resolve to a track).
+    pub async fn playlist_track_ids(&self, id: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|row| Ok(row.try_get("track_id")?)).collect()
+    }
+
+    pub async fn update_playlist_meta(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        comment: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        if let Some(name) = name {
+            sqlx::query("UPDATE playlists SET name = ?2, updated_at_unix_seconds = ?3 WHERE id = ?1")
+                .bind(id)
+                .bind(name)
+                .bind(now)
+                .execute(&self.pool)
+                .await?;
+        }
+        if let Some(comment) = comment {
+            sqlx::query(
+                "UPDATE playlists SET comment = ?2, updated_at_unix_seconds = ?3 WHERE id = ?1",
+            )
+            .bind(id)
+            .bind(comment)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Replace the playlist's tracks with `track_ids`, in order.
+    pub async fn set_playlist_tracks(
+        &self,
+        id: &str,
+        track_ids: &[String],
+        now: i64,
+    ) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("DELETE FROM playlist_tracks WHERE playlist_id = ?1")
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+        for (position, track_id) in track_ids.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?1, ?2, ?3)",
+            )
+            .bind(id)
+            .bind(position as i64)
+            .bind(track_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+        sqlx::query("UPDATE playlists SET updated_at_unix_seconds = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(now)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_playlist(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM playlist_tracks WHERE playlist_id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM playlists WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ---- Favorites (starred tracks / albums / artists) ----
+
+    pub async fn set_favorite(&self, item_type: &str, item_id: &str, now: i64) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO favorites (item_type, item_id, created_at_unix_seconds) VALUES (?1, ?2, ?3)
+             ON CONFLICT(item_type, item_id) DO NOTHING",
+        )
+        .bind(item_type)
+        .bind(item_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear_favorite(&self, item_type: &str, item_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM favorites WHERE item_type = ?1 AND item_id = ?2")
+            .bind(item_type)
+            .bind(item_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// All favorited ids of a given type (for marking entities as starred).
+    pub async fn favorite_ids(&self, item_type: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT item_id FROM favorites WHERE item_type = ?1")
+            .bind(item_type)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(|row| Ok(row.try_get("item_id")?)).collect()
+    }
+
+    pub async fn starred_tracks(&self) -> Result<Vec<Track>> {
+        let columns = track_columns("t");
+        let sql = format!(
+            "SELECT {columns} FROM favorites f JOIN tracks t ON t.id = f.item_id
+             WHERE f.item_type = 'track' ORDER BY f.created_at_unix_seconds DESC"
+        );
+        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        rows.iter().map(track_from_row).collect()
+    }
+
+    pub async fn starred_albums(&self) -> Result<Vec<Album>> {
+        let sql = format!(
+            "SELECT {ALBUM_COLUMNS} FROM favorites f JOIN albums a ON a.id = f.item_id
+             WHERE f.item_type = 'album' ORDER BY f.created_at_unix_seconds DESC"
+        );
+        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        rows.iter().map(album_from_row).collect()
+    }
+
+    pub async fn starred_artists(&self) -> Result<Vec<Artist>> {
+        let rows = sqlx::query(
+            "SELECT id, name, album_count, track_count FROM favorites f
+             JOIN artists a ON a.id = f.item_id
+             WHERE f.item_type = 'artist' ORDER BY f.created_at_unix_seconds DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(artist_from_row).collect()
+    }
 }
 
 /// A persisted player registration (its live state lives in the player manager).
@@ -1403,6 +1615,17 @@ fn artist_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Artist> {
         name: row.try_get("name")?,
         album_count: i64_to_usize(row.try_get("album_count")?, "album_count")?,
         track_count: i64_to_usize(row.try_get("track_count")?, "track_count")?,
+    })
+}
+
+fn playlist_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Playlist> {
+    Ok(Playlist {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        comment: row.try_get("comment")?,
+        song_count: i64_to_usize(row.try_get("song_count")?, "song_count")?,
+        created_at_unix_seconds: row.try_get("created_at_unix_seconds")?,
+        updated_at_unix_seconds: row.try_get("updated_at_unix_seconds")?,
     })
 }
 
@@ -1949,6 +2172,33 @@ const MIGRATION_012_TRACK_DURATION: &[ColumnMigration] = &[ColumnMigration {
     alter_statement: "ALTER TABLE tracks ADD COLUMN duration_seconds REAL",
 }];
 
+// User playlists (ordered track lists) and favorites (starred tracks/albums/artists).
+// Playlist/favorite rows reference track/album/artist ids; entries for items no longer
+// in the library are skipped by the joins, mirroring listening history.
+const MIGRATION_013_PLAYLISTS_AND_FAVORITES: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS playlists (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        comment TEXT,
+        created_at_unix_seconds INTEGER NOT NULL,
+        updated_at_unix_seconds INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS playlist_tracks (
+        playlist_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        track_id TEXT NOT NULL,
+        PRIMARY KEY (playlist_id, position),
+        FOREIGN KEY(playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist ON playlist_tracks(playlist_id)",
+    "CREATE TABLE IF NOT EXISTS favorites (
+        item_type TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        created_at_unix_seconds INTEGER NOT NULL,
+        PRIMARY KEY (item_type, item_id)
+    )",
+];
+
 // Registered players and zones. Players are reported to the server (e.g. via the
 // web UI) and persisted so they survive restarts; a player optionally belongs to
 // a zone (a named group used as a control target).
@@ -2452,6 +2702,73 @@ mod tests {
                 .any(|track| track.title == "Zephyr Anthem"),
             "freshly inserted track should be searchable without a rebuild"
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn playlists_and_favorites_round_trip() {
+        let db_path = temp_db_path("playlists-favorites");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+        sqlx::query(
+            "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name,
+                album_id, album_title, extension, relative_path, stream_url, path)
+             VALUES ('track_2', 'local-disk', 'album/two.mp3', 'Second', 'artist_1', 'Artist',
+                'album_1', 'Album', 'mp3', 'album/two.mp3', '/api/tracks/track_2/stream',
+                '/music/album/two.mp3')",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("insert second track");
+
+        // Playlists: create with two tracks, in order.
+        let id = database
+            .create_playlist("Mix", Some("notes"), &["track_2".into(), "track_1".into()], 100)
+            .await
+            .expect("create playlist");
+        let playlists = database.list_playlists().await.expect("list");
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].name, "Mix");
+        assert_eq!(playlists[0].song_count, 2);
+        let tracks = database.playlist_tracks(&id).await.expect("tracks");
+        assert_eq!(
+            tracks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["track_2", "track_1"]
+        );
+
+        // Reorder/replace, then rename.
+        database
+            .set_playlist_tracks(&id, &["track_1".into()], 200)
+            .await
+            .expect("set tracks");
+        database
+            .update_playlist_meta(&id, Some("Renamed"), None, 200)
+            .await
+            .expect("rename");
+        let detail = database.playlist(&id).await.expect("get").expect("exists");
+        assert_eq!(detail.name, "Renamed");
+        assert_eq!(detail.song_count, 1);
+
+        database.delete_playlist(&id).await.expect("delete");
+        assert!(database.list_playlists().await.unwrap().is_empty());
+
+        // Favorites: star a track, album, and artist.
+        database.set_favorite("track", "track_1", 1).await.unwrap();
+        database.set_favorite("track", "track_1", 1).await.unwrap(); // idempotent
+        database.set_favorite("album", "album_1", 2).await.unwrap();
+        database.set_favorite("artist", "artist_1", 3).await.unwrap();
+        assert_eq!(database.starred_tracks().await.unwrap().len(), 1);
+        assert_eq!(database.starred_albums().await.unwrap().len(), 1);
+        assert_eq!(database.starred_artists().await.unwrap().len(), 1);
+        assert_eq!(database.favorite_ids("track").await.unwrap(), ["track_1"]);
+
+        database.clear_favorite("track", "track_1").await.unwrap();
+        assert!(database.starred_tracks().await.unwrap().is_empty());
 
         let _ = std::fs::remove_file(db_path);
     }
