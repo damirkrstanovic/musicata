@@ -974,6 +974,18 @@ impl Database {
         row.map(|row| album_from_row(&row)).transpose()
     }
 
+    /// The artwork URL for an album, if any.
+    pub async fn album_artwork_url(&self, album_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT artwork_url FROM albums WHERE id = ?1")
+            .bind(album_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => Ok(row.try_get("artwork_url")?),
+            None => Ok(None),
+        }
+    }
+
     pub async fn track(&self, id: &str) -> Result<Option<Track>> {
         let sql = format!(
             "SELECT {} FROM tracks t WHERE t.id = ?1",

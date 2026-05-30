@@ -8,6 +8,11 @@ const state = {
   activePlayerId: null,
   activeStatus: "stopped",
   activeNowTrackId: null,
+  activeState: null,
+  activeElapsed: 0,
+  activeDuration: 0,
+  seekDragging: false,
+  queueOpen: false,
   searchController: null,
   metadataTrackId: null,
   metadataReview: null,
@@ -41,6 +46,22 @@ const els = {
   next: document.querySelector("#next"),
   playPause: document.querySelector("#play-pause"),
   activePlayer: document.querySelector("#active-player"),
+  transport: document.querySelector(".transport"),
+  nowArt: document.querySelector("#now-art"),
+  nowArtFallback: document.querySelector("#now-art-fallback"),
+  seek: document.querySelector("#seek"),
+  elapsed: document.querySelector("#elapsed"),
+  duration: document.querySelector("#duration"),
+  shuffle: document.querySelector("#shuffle"),
+  repeat: document.querySelector("#repeat"),
+  footerVolume: document.querySelector("#footer-volume"),
+  outputSignal: document.querySelector("#output-signal"),
+  queueToggle: document.querySelector("#queue-toggle"),
+  queueCount: document.querySelector("#queue-count"),
+  queueDrawer: document.querySelector("#queue-drawer"),
+  queueList: document.querySelector("#queue-list"),
+  queueClear: document.querySelector("#queue-clear"),
+  queueClose: document.querySelector("#queue-close"),
   metadataPanel: document.querySelector("#metadata-panel"),
   metadataTitle: document.querySelector("#metadata-title"),
   metadataBody: document.querySelector("#metadata-body"),
@@ -1155,6 +1176,117 @@ els.playPause.addEventListener("click", () => {
 });
 els.activePlayer.addEventListener("change", () => setActivePlayer(els.activePlayer.value));
 
+// Seek: preview while dragging, commit on release.
+els.seek.addEventListener("input", () => {
+  state.seekDragging = true;
+  const value = Number(els.seek.value);
+  els.elapsed.textContent = formatTime(value);
+  els.seek.style.setProperty(
+    "--fill",
+    `${state.activeDuration > 0 ? (value / state.activeDuration) * 100 : 0}%`,
+  );
+});
+els.seek.addEventListener("change", () => {
+  const value = Number(els.seek.value);
+  state.seekDragging = false;
+  state.activeElapsed = value;
+  if (state.activePlayerId) {
+    playerCommand(state.activePlayerId, { command: "seek", position_seconds: value });
+  }
+});
+
+els.shuffle.addEventListener("click", () => {
+  if (!state.activePlayerId) return;
+  const enabled = !(state.activeState?.shuffle ?? false);
+  playerCommand(state.activePlayerId, { command: "set_shuffle", enabled });
+});
+
+els.repeat.addEventListener("click", () => {
+  if (!state.activePlayerId) return;
+  const order = ["off", "all", "one"];
+  const current = state.activeState?.repeat ?? "off";
+  const mode = order[(order.indexOf(current) + 1) % order.length];
+  playerCommand(state.activePlayerId, { command: "set_repeat", mode });
+});
+
+let footerVolumeTimer = 0;
+els.footerVolume.addEventListener("input", () => {
+  const volume = Number.parseInt(els.footerVolume.value, 10);
+  els.footerVolume.style.setProperty("--fill", `${volume}%`);
+  if (state.activePlayerId === browserPlayerId && browserOutput) {
+    els.audio.volume = Math.min(1, Math.max(0, volume / 100));
+  }
+  clearTimeout(footerVolumeTimer);
+  footerVolumeTimer = setTimeout(() => {
+    if (state.activePlayerId) {
+      playerCommand(state.activePlayerId, { command: "set_volume", volume });
+    }
+  }, 150);
+});
+
+// Queue drawer.
+function toggleQueue(open) {
+  state.queueOpen = open ?? !state.queueOpen;
+  els.queueDrawer.hidden = !state.queueOpen;
+  els.queueToggle.setAttribute("aria-pressed", String(state.queueOpen));
+  if (state.queueOpen) renderQueue();
+}
+
+els.queueToggle.addEventListener("click", () => toggleQueue());
+els.queueClose.addEventListener("click", () => toggleQueue(false));
+els.queueClear.addEventListener("click", () => {
+  if (state.activePlayerId) playerCommand(state.activePlayerId, { command: "clear" });
+});
+
+function renderQueue() {
+  const playback = state.activeState;
+  const queue = playback?.queue ?? [];
+  const position = playback?.queue_position ?? -1;
+  if (queue.length === 0) {
+    els.queueList.innerHTML = `<p class="queue-empty">The queue is empty.</p>`;
+    return;
+  }
+  els.queueList.innerHTML = queue
+    .map((item, index) => {
+      const art = item.artwork_url
+        ? `<span class="q-art"><img src="${escapeHtml(item.artwork_url)}" alt=""></span>`
+        : `<span class="q-art">${escapeHtml((item.title || "♪").trim().charAt(0).toUpperCase())}</span>`;
+      return `
+        <div class="queue-row ${index === position ? "current" : ""}" data-index="${index}">
+          <span class="q-index">${index === position ? "▶" : index + 1}</span>
+          ${art}
+          <button class="q-main" data-action="play-index" type="button">
+            <span class="q-title">${escapeHtml(item.title || "Unknown")}</span>
+            <span class="q-sub">${escapeHtml([item.artist, item.album].filter(Boolean).join(" · "))}</span>
+          </button>
+          <span class="q-actions">
+            <button class="icon-button" data-action="up" title="Move up" ${index === 0 ? "disabled" : ""}>↑</button>
+            <button class="icon-button" data-action="down" title="Move down" ${index === queue.length - 1 ? "disabled" : ""}>↓</button>
+            <button class="icon-button" data-action="remove" title="Remove">&times;</button>
+          </span>
+        </div>`;
+    })
+    .join("");
+}
+
+els.queueList.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-action]");
+  if (!button || !state.activePlayerId) return;
+  const index = Number(button.closest("[data-index]")?.dataset.index);
+  if (Number.isNaN(index)) return;
+  const action = button.dataset.action;
+  if (action === "play-index") {
+    if (state.activePlayerId === browserPlayerId) claimBrowserOutput();
+    playerCommand(state.activePlayerId, { command: "play_queue_index", index });
+  } else if (action === "remove") {
+    playerCommand(state.activePlayerId, { command: "remove_queue_item", index });
+  } else if (action === "up") {
+    playerCommand(state.activePlayerId, { command: "move_queue_item", from: index, to: index - 1 });
+  } else if (action === "down") {
+    playerCommand(state.activePlayerId, { command: "move_queue_item", from: index, to: index + 1 });
+  }
+});
+
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
 }
@@ -1179,6 +1311,7 @@ const playerEls = {
   zonesList: document.querySelector("#zones-list"),
   addZoneForm: document.querySelector("#add-zone"),
   zoneName: document.querySelector("#zone-name"),
+  addStatus: document.querySelector("#add-player-status"),
 };
 
 const playerSockets = new Map();
@@ -1475,21 +1608,71 @@ async function refreshActivePlayerFooter() {
   }
 }
 
+function formatTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const total = Math.floor(seconds);
+  const minutes = Math.floor(total / 60);
+  const secs = String(total % 60).padStart(2, "0");
+  return `${minutes}:${secs}`;
+}
+
+function setRange(input, value, max) {
+  input.max = String(max > 0 ? max : 0);
+  input.value = String(Math.min(value, max || 0));
+  const pct = max > 0 ? (Math.min(value, max) / max) * 100 : 0;
+  input.style.setProperty("--fill", `${pct}%`);
+}
+
 function updateFooterFromState(playback) {
+  state.activeState = playback;
   state.activeStatus = playback.status;
   const now = playback.now_playing;
   state.activeNowTrackId = now?.track_id ?? null;
+  state.activeElapsed = playback.elapsed_seconds ?? 0;
+  state.activeDuration = playback.duration_seconds ?? 0;
+
+  els.transport.dataset.status = playback.status;
+
+  // Now-playing art (real cover when known, monogram fallback otherwise).
+  renderNowArt(now);
+
   if (now) {
     els.nowTitle.textContent = now.title || "Unknown";
-    els.nowSubtitle.textContent = [now.artist, now.album].filter(Boolean).join(" — ");
+    els.nowSubtitle.textContent = [now.artist, now.album].filter(Boolean).join(" · ");
   } else {
     els.nowTitle.textContent = "Nothing playing";
     els.nowSubtitle.textContent =
       state.activePlayerId === browserPlayerId
-        ? "Pick a track to play in this browser."
+        ? "Pick a track to play here."
         : "Select a track to play on this player.";
   }
-  els.playPause.textContent = playback.status === "playing" ? "Pause" : "Play";
+
+  els.playPause.textContent = playback.status === "playing" ? "❚❚" : "▶";
+  els.playPause.title = playback.status === "playing" ? "Pause" : "Play";
+
+  // Shuffle + repeat toggles.
+  els.shuffle.classList.toggle("active", Boolean(playback.shuffle));
+  els.shuffle.setAttribute("aria-pressed", String(Boolean(playback.shuffle)));
+  els.repeat.dataset.mode = playback.repeat || "off";
+  els.repeat.classList.toggle("active", playback.repeat && playback.repeat !== "off");
+  els.repeat.innerHTML = playback.repeat === "one" ? "↻<span class='one'>1</span>" : "↻";
+
+  // Volume (unless the user is adjusting it).
+  if (playback.volume != null && document.activeElement !== els.footerVolume) {
+    setRange(els.footerVolume, playback.volume, 100);
+  }
+
+  // Seek (unless dragging).
+  if (!state.seekDragging) {
+    setRange(els.seek, state.activeElapsed, state.activeDuration);
+    els.elapsed.textContent = formatTime(state.activeElapsed);
+    els.duration.textContent = formatTime(state.activeDuration);
+  }
+
+  updateOutputSignal();
+  els.queueCount.textContent = String(playback.queue?.length ?? 0);
+  if (state.queueOpen) renderQueue();
+
   if ("mediaSession" in navigator) {
     navigator.mediaSession.playbackState =
       playback.status === "playing"
@@ -1500,6 +1683,41 @@ function updateFooterFromState(playback) {
   }
   markActiveTrack();
 }
+
+function renderNowArt(now) {
+  const existing = els.nowArt.querySelector("img");
+  if (now && now.artwork_url) {
+    if (existing) {
+      if (!existing.src.endsWith(now.artwork_url)) existing.src = now.artwork_url;
+    } else {
+      const img = document.createElement("img");
+      img.alt = "";
+      img.src = now.artwork_url;
+      els.nowArt.prepend(img);
+    }
+    els.nowArtFallback.hidden = true;
+  } else {
+    if (existing) existing.remove();
+    els.nowArtFallback.hidden = false;
+    els.nowArtFallback.textContent = now?.title ? now.title.trim().charAt(0).toUpperCase() : "♪";
+  }
+}
+
+function updateOutputSignal() {
+  const here = state.activePlayerId === browserPlayerId && browserOutput;
+  const player = playerData.players.find((entry) => entry.id === state.activePlayerId);
+  els.outputSignal.classList.toggle("here", here);
+  els.outputSignal.classList.toggle("online", !here && Boolean(player?.online));
+}
+
+// Smoothly advance the elapsed readout between server updates while playing.
+setInterval(() => {
+  if (state.activeStatus !== "playing" || state.seekDragging) return;
+  if (state.activeDuration > 0 && state.activeElapsed >= state.activeDuration) return;
+  state.activeElapsed += 1;
+  setRange(els.seek, state.activeElapsed, state.activeDuration);
+  els.elapsed.textContent = formatTime(state.activeElapsed);
+}, 1000);
 
 if (playerEls.list) {
   playerEls.list.addEventListener("click", async (event) => {
@@ -1574,13 +1792,24 @@ if (playerEls.addForm) {
     const address = playerEls.address.value.trim();
     if (!address) return;
     const name = playerEls.name.value.trim();
+    playerEls.addStatus.classList.remove("error");
+    playerEls.addStatus.textContent = `Registering ${address}…`;
     try {
-      await apiJson("/api/players", "POST", { address, name: name || undefined });
+      const player = await apiJson("/api/players", "POST", { address, name: name || undefined });
       playerEls.address.value = "";
       playerEls.name.value = "";
       await loadPlayers();
+      // Connection happens in the background; the dot turns green once reached.
+      playerEls.addStatus.textContent = `Added ${player.name}. Connecting…`;
+      setTimeout(() => loadPlayers(), 1500);
+      setTimeout(() => {
+        if (playerEls.addStatus.textContent.startsWith("Added")) {
+          playerEls.addStatus.textContent = "";
+        }
+      }, 4000);
     } catch (error) {
-      alert(`Add player failed: ${error.message}`);
+      playerEls.addStatus.classList.add("error");
+      playerEls.addStatus.textContent = `Could not add player: ${error.message}`;
     }
   });
 }

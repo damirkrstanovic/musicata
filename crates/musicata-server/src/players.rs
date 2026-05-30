@@ -454,6 +454,8 @@ async fn apply_command(
             }
             Ok(())
         }
+        PlayerCommand::RemoveQueueItem { index } => connection.delete_index(*index).await,
+        PlayerCommand::MoveQueueItem { from, to } => connection.move_item(*from, *to).await,
     }
 }
 
@@ -472,18 +474,34 @@ async fn resolve_urls(
     Ok(urls)
 }
 
-/// Fill in title/artist/album for queue items that link to a known library track
-/// but came back from MPD without tags (common when streaming over HTTP).
+/// Fill in title/artist/album/artwork for queue items that link to a known
+/// library track but came back from MPD without tags (common when streaming
+/// over HTTP).
 async fn enrich_state(state: &mut PlaybackState, database: &Database) {
     for item in state.queue.iter_mut().chain(state.now_playing.iter_mut()) {
-        if !item.title.is_empty() {
+        let Some(track_id) = item.track_id.clone() else {
             continue;
-        }
-        if let Some(track_id) = &item.track_id {
-            if let Ok(Some(track)) = database.track(track_id).await {
+        };
+        if item.title.is_empty() {
+            if let Ok(Some(track)) = database.track(&track_id).await {
                 item.title = track.title;
                 item.artist = track.artist_name;
                 item.album = track.album_title;
+                if item.artwork_url.is_none() {
+                    item.artwork_url = database
+                        .album_artwork_url(&track.album_id)
+                        .await
+                        .ok()
+                        .flatten();
+                }
+            }
+        } else if item.artwork_url.is_none() {
+            if let Ok(Some(track)) = database.track(&track_id).await {
+                item.artwork_url = database
+                    .album_artwork_url(&track.album_id)
+                    .await
+                    .ok()
+                    .flatten();
             }
         }
     }
@@ -602,6 +620,8 @@ impl BrowserPlayer {
                         .queue
                         .extend(resolve_queue_items(database, &track_ids).await?);
                 }
+                PlayerCommand::RemoveQueueItem { index } => remove_queue_item(&mut state, index),
+                PlayerCommand::MoveQueueItem { from, to } => move_queue_item(&mut state, from, to),
             }
         }
         self.broadcast().await;
@@ -651,14 +671,63 @@ async fn resolve_queue_items(database: &Database, track_ids: &[String]) -> Resul
     let mut items = Vec::with_capacity(track_ids.len());
     for id in track_ids {
         if let Some(track) = database.track(id).await? {
+            let artwork_url = database.album_artwork_url(&track.album_id).await?;
             items.push(QueueItem {
                 track_id: Some(track.id),
                 title: track.title,
                 artist: track.artist_name,
                 album: track.album_title,
                 stream_url: track.stream_url,
+                artwork_url,
             });
         }
     }
     Ok(items)
+}
+
+/// Remove a queue item, keeping `position` pointing at the same playing track
+/// (or stopping if the playing track itself was removed).
+fn remove_queue_item(state: &mut BrowserState, index: usize) {
+    if index >= state.queue.len() {
+        return;
+    }
+    state.queue.remove(index);
+    match state.position {
+        Some(pos) if pos == index => {
+            if state.queue.is_empty() {
+                state.position = None;
+                state.status = PlaybackStatus::Stopped;
+            } else {
+                state.position = Some(pos.min(state.queue.len() - 1));
+                state.elapsed_seconds = Some(0.0);
+            }
+        }
+        Some(pos) if pos > index => state.position = Some(pos - 1),
+        _ => {}
+    }
+}
+
+/// Move a queue item, keeping `position` pointing at the same playing track.
+fn move_queue_item(state: &mut BrowserState, from: usize, to: usize) {
+    if from >= state.queue.len() || to >= state.queue.len() || from == to {
+        return;
+    }
+    let item = state.queue.remove(from);
+    state.queue.insert(to, item);
+    if let Some(pos) = state.position {
+        state.position = Some(reindex_after_move(pos, from, to));
+    }
+}
+
+/// New index of the element previously at `pos` after moving `from` -> `to`.
+fn reindex_after_move(pos: usize, from: usize, to: usize) -> usize {
+    if pos == from {
+        to
+    } else if from < pos && pos <= to {
+        pos - 1
+    } else if to <= pos && pos < from {
+        pos + 1
+    } else {
+        pos
+    }
 }

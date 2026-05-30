@@ -158,6 +158,16 @@ impl MpdConnection {
         Ok(())
     }
 
+    pub async fn delete_index(&mut self, index: usize) -> Result<()> {
+        self.command(&format!("delete {index}")).await?;
+        Ok(())
+    }
+
+    pub async fn move_item(&mut self, from: usize, to: usize) -> Result<()> {
+        self.command(&format!("move {from} {to}")).await?;
+        Ok(())
+    }
+
     /// Replace the queue with `uris` and start playing from the first.
     pub async fn replace_queue(&mut self, uris: &[String]) -> Result<()> {
         self.clear().await?;
@@ -205,6 +215,8 @@ fn queue_item(pairs: &[(String, String)]) -> QueueItem {
         artist: find(pairs, "Artist").unwrap_or_default().to_string(),
         album: find(pairs, "Album").unwrap_or_default().to_string(),
         stream_url: uri,
+        // Filled in from the library during enrichment; MPD has no artwork URL.
+        artwork_url: None,
     }
 }
 

@@ -373,6 +373,7 @@ pub struct QueueItem {
     pub artist: String,
     pub album: String,
     pub stream_url: String,
+    pub artwork_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -406,6 +407,8 @@ pub enum PlayerCommand {
     PlayTracks { track_ids: Vec<String> },
     Enqueue { track_ids: Vec<String> },
     PlayQueueIndex { index: usize },
+    RemoveQueueItem { index: usize },
+    MoveQueueItem { from: usize, to: usize },
 }
 
 #[derive(Debug)]
