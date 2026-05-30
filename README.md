@@ -97,7 +97,7 @@ cargo run -p musicata-server -- --mpd 127.0.0.1:6600 --public-url http://127.0.0
 # or: MUSICATA_MPD=127.0.0.1:6600 MUSICATA_PUBLIC_URL=http://127.0.0.1:3030
 ```
 
-`--public-url` is the address MPD uses to fetch streams from this server. Control multiple players with `--mpd host1:6600,host2:6600`. Then:
+`--public-url` is the address MPD uses to fetch streams from this server. `--mpd` is optional convenience seeding — you can also register players from the web app's **Players** panel (or `POST /api/players`), name them, group them into zones, and control them (transport plus "play the current view on this player"); registrations persist across restarts. Then:
 
 ```sh
 curl localhost:3030/api/players
@@ -133,10 +133,12 @@ Useful endpoints:
 - `GET /api/browse` metadata facets for genre, year, composer, and folder.
 - `GET /api/browse/recently-added` tracks ordered by when they entered the database.
 - `GET /api/search?q=darkwood&limit=50` ranked SQLite FTS5 search (tokenized, prefix, accent- and case-insensitive) across artists, albums, and tracks.
-- `GET /api/players` configured players (e.g. MPD) with capabilities and online state.
+- `GET /api/players` registered players (e.g. MPD) with capabilities, zone, and online state; `POST /api/players` registers one (`{"address":"host:port","name":"..."}`).
+- `PATCH /api/players/{id}` rename or assign a zone (`{"name":"..."}` and/or `{"zone_id":"..."}`, null to clear); `DELETE /api/players/{id}` removes it.
 - `GET /api/players/{id}/state` current playback state (status, now playing, queue, volume).
 - `POST /api/players/{id}/commands` issue a command, e.g. `{"command":"play_tracks","track_ids":["..."]}`, `{"command":"pause"}`, `{"command":"seek","position_seconds":30}`.
 - `GET /api/players/{id}/ws` WebSocket stream of live playback state.
+- `GET/POST /api/zones`, `PATCH/DELETE /api/zones/{id}`, `POST /api/zones/{id}/commands` manage zones and control all players in a zone.
 - `GET /api/albums/{id}/artwork/cover-art-archive/candidates` reviewed remote artwork candidates for MusicBrainz-linked albums.
 - `GET /api/metadata/write-back` current file tag write-back policy.
 - `GET /api/tracks/{id}/stream` audio stream with basic byte-range support.

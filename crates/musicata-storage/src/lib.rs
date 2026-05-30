@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, BrowseTextFacet, BrowseYearFacet, Library,
     LibrarySummary, MetadataApprovalState, MetadataFieldValue, ProviderMapping, ScanIssue,
-    SearchResults, Track, TrackMetadataFieldObservation, TrackMetadataObservation,
+    SearchResults, Track, TrackMetadataFieldObservation, TrackMetadataObservation, Zone,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -139,6 +139,13 @@ impl Database {
                 sqlx::query(statement).execute(&self.pool).await?;
             }
             set_user_version(&self.pool, 9).await?;
+        }
+
+        if version < 10 {
+            for statement in MIGRATION_010_PLAYERS_AND_ZONES {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 10).await?;
         }
 
         Ok(())
@@ -1093,6 +1100,138 @@ impl Database {
             .await?;
         Ok(())
     }
+
+    // ---- Players & zones -----------------------------------------------------
+
+    pub async fn list_players(&self) -> Result<Vec<PlayerRecord>> {
+        let rows =
+            sqlx::query("SELECT id, kind, address, name, zone_id FROM players ORDER BY name, id")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.iter().map(player_record_from_row).collect()
+    }
+
+    pub async fn player_record(&self, id: &str) -> Result<Option<PlayerRecord>> {
+        let row = sqlx::query("SELECT id, kind, address, name, zone_id FROM players WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(player_record_from_row).transpose()
+    }
+
+    pub async fn players_in_zone(&self, zone_id: &str) -> Result<Vec<PlayerRecord>> {
+        let rows =
+            sqlx::query("SELECT id, kind, address, name, zone_id FROM players WHERE zone_id = ?1")
+                .bind(zone_id)
+                .fetch_all(&self.pool)
+                .await?;
+        rows.iter().map(player_record_from_row).collect()
+    }
+
+    /// Insert or replace a registered player (keyed by id derived from kind+address).
+    pub async fn upsert_player(&self, record: &PlayerRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO players (id, kind, address, name, zone_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET kind = ?2, address = ?3, name = ?4, zone_id = ?5",
+        )
+        .bind(&record.id)
+        .bind(&record.kind)
+        .bind(&record.address)
+        .bind(&record.name)
+        .bind(&record.zone_id)
+        .bind(now_unix_seconds())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_player_name(&self, id: &str, name: &str) -> Result<()> {
+        sqlx::query("UPDATE players SET name = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_player_zone(&self, id: &str, zone_id: Option<&str>) -> Result<()> {
+        sqlx::query("UPDATE players SET zone_id = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(zone_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_player(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM players WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_zones(&self) -> Result<Vec<Zone>> {
+        let rows = sqlx::query("SELECT id, name FROM zones ORDER BY name, id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(Zone {
+                    id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn insert_zone(&self, id: &str, name: &str) -> Result<()> {
+        sqlx::query("INSERT INTO zones (id, name, created_at) VALUES (?1, ?2, ?3)")
+            .bind(id)
+            .bind(name)
+            .bind(now_unix_seconds())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_zone_name(&self, id: &str, name: &str) -> Result<()> {
+        sqlx::query("UPDATE zones SET name = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_zone(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM zones WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+/// A persisted player registration (its live state lives in the player manager).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerRecord {
+    pub id: String,
+    pub kind: String,
+    pub address: String,
+    pub name: String,
+    pub zone_id: Option<String>,
+}
+
+fn player_record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PlayerRecord> {
+    Ok(PlayerRecord {
+        id: row.try_get("id")?,
+        kind: row.try_get("kind")?,
+        address: row.try_get("address")?,
+        name: row.try_get("name")?,
+        zone_id: row.try_get("zone_id")?,
+    })
 }
 
 const ALBUM_COLUMNS: &str =
@@ -1673,6 +1812,27 @@ const MIGRATION_008_TRACK_ADDED_AT: &[ColumnMigration] = &[ColumnMigration {
     alter_statement: "ALTER TABLE tracks ADD COLUMN added_at_unix_seconds INTEGER",
 }];
 
+// Registered players and zones. Players are reported to the server (e.g. via the
+// web UI) and persisted so they survive restarts; a player optionally belongs to
+// a zone (a named group used as a control target).
+const MIGRATION_010_PLAYERS_AND_ZONES: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS zones (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS players (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        address TEXT NOT NULL,
+        name TEXT NOT NULL,
+        zone_id TEXT,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(zone_id) REFERENCES zones(id) ON DELETE SET NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_players_zone_id ON players(zone_id)",
+];
+
 // Full-text search indexes. These are external-content FTS5 tables (they store
 // only the inverted index and read the text from the base tables) kept in sync by
 // triggers, so any insert/update/delete on tracks/albums/artists — including future
@@ -2220,6 +2380,68 @@ mod tests {
             .expect("list tracks");
         assert_eq!(total, 0);
         assert!(tracks.is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn persists_players_and_zones() {
+        let db_path = temp_db_path("players-zones");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        database
+            .insert_zone("zone-a", "Zone A")
+            .await
+            .expect("zone");
+        assert_eq!(database.list_zones().await.expect("zones").len(), 1);
+
+        let record = super::PlayerRecord {
+            id: "mpd-x".to_string(),
+            kind: "mpd".to_string(),
+            address: "127.0.0.1:6600".to_string(),
+            name: "Test".to_string(),
+            zone_id: None,
+        };
+        database.upsert_player(&record).await.expect("upsert");
+        assert_eq!(
+            database
+                .player_record("mpd-x")
+                .await
+                .expect("record")
+                .expect("some")
+                .name,
+            "Test"
+        );
+
+        database
+            .update_player_name("mpd-x", "Renamed")
+            .await
+            .expect("rename");
+        database
+            .update_player_zone("mpd-x", Some("zone-a"))
+            .await
+            .expect("zone assign");
+        let in_zone = database.players_in_zone("zone-a").await.expect("in zone");
+        assert_eq!(in_zone.len(), 1);
+        assert_eq!(in_zone[0].name, "Renamed");
+
+        // Deleting the zone clears the player's zone (FK ON DELETE SET NULL).
+        database.delete_zone("zone-a").await.expect("delete zone");
+        assert_eq!(
+            database
+                .player_record("mpd-x")
+                .await
+                .expect("record")
+                .expect("some")
+                .zone_id,
+            None
+        );
+
+        database
+            .delete_player("mpd-x")
+            .await
+            .expect("delete player");
+        assert!(database.list_players().await.expect("players").is_empty());
 
         let _ = std::fs::remove_file(db_path);
     }

@@ -170,13 +170,17 @@ Goal: move from “play this URL in browser” to server-managed playback state.
 
 Tasks:
 
-- [x] Add player registry (provider-neutral player domain types + a registry).
-- Add zone model.
+- [x] Add player registry — players are registered (reported to the server, e.g.
+  from the web UI), persisted in SQLite, and survive restarts.
+- [x] Add zone model — named groups of players used as a control target (a command
+  sent to a zone applies to its players). No audio synchronization yet.
 - Add queue model per player/zone. (MPD's own queue is currently driven directly;
   a server-owned persistent queue is still to come.)
 - [x] Add commands: play, pause, stop, seek, next, previous, enqueue, clear,
   shuffle, repeat. (Reorder still to do.)
 - [x] Add WebSocket state updates for controllers.
+- [x] Add a web UI to register, name, zone, and control players (transport plus
+  "play the current view on this player"), with live state over the WebSocket.
 - Treat the browser player as the first player provider. (The first concrete
   provider is MPD; the browser provider is still to come.)
 - Add playback session state and now-playing history. (Live now-playing is

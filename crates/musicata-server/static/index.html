@@ -43,6 +43,24 @@
           </div>
         </section>
 
+        <section class="section players-section">
+          <h2>Players</h2>
+          <div id="players-list" class="players-list"></div>
+          <form id="add-player" class="inline-form">
+            <input id="player-address" type="text" inputmode="url" autocomplete="off"
+                   placeholder="MPD host:port" required>
+            <input id="player-name" type="text" autocomplete="off" placeholder="Name (optional)">
+            <button class="ghost-button" type="submit">Add player</button>
+          </form>
+          <div class="zones">
+            <div id="zones-list" class="zones-list"></div>
+            <form id="add-zone" class="inline-form">
+              <input id="zone-name" type="text" autocomplete="off" placeholder="New zone" required>
+              <button class="ghost-button" type="submit">Add zone</button>
+            </form>
+          </div>
+        </section>
+
         <section class="section">
           <h2>Albums</h2>
           <div id="albums" class="album-list"></div>

@@ -2,7 +2,7 @@ mod mpd;
 mod musicbrainz;
 mod players;
 
-use crate::players::{MpdPlayer, MpdPlayerConfig, PlayerManager};
+use crate::players::{MpdPlayer, PlayerManager};
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
@@ -25,7 +25,7 @@ use axum::{
 use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, Library, LibrarySummary, LocalDiskProvider,
     MetadataApprovalState, MetadataFieldValue, MusicProvider, PlaybackState, Player, PlayerCommand,
-    SearchResults, Track, TrackMetadataFieldObservation, album_artwork_url, artwork_asset_id,
+    SearchResults, Track, TrackMetadataFieldObservation, Zone, album_artwork_url, artwork_asset_id,
     find_album_artwork_candidates,
 };
 use musicata_storage::Database;
@@ -121,16 +121,16 @@ async fn main() -> Result<()> {
         .public_url
         .clone()
         .unwrap_or_else(|| format!("http://{}", config.addr));
-    let player_configs = mpd_player_configs(&config.mpd_addrs);
-    if !player_configs.is_empty() {
-        tracing::info!(
-            players = player_configs.len(),
-            "registered MPD players: {}",
-            config.mpd_addrs.join(", ")
-        );
+    let players = PlayerManager::load(database.clone(), public_url).await?;
+    // Seed any players given on the command line / config (idempotent).
+    for addr in &config.mpd_addrs {
+        if let Err(error) = players
+            .register("mpd", addr, &format!("MPD ({addr})"))
+            .await
+        {
+            tracing::warn!(%addr, %error, "failed to register configured MPD player");
+        }
     }
-    let players = Arc::new(PlayerManager::new(player_configs, public_url));
-    players.start(database.clone());
 
     let listener = tokio::net::TcpListener::bind(config.addr)
         .await
@@ -220,10 +220,17 @@ fn app(database: Database, provider: LocalDiskProvider, players: Arc<PlayerManag
             "/api/playback/sessions/{id}/events",
             get(playback_session_events),
         )
-        .route("/api/players", get(list_players))
+        .route("/api/players", get(list_players).post(register_player))
+        .route(
+            "/api/players/{id}",
+            patch(update_player).delete(delete_player),
+        )
         .route("/api/players/{id}/state", get(player_state))
         .route("/api/players/{id}/commands", post(player_command))
         .route("/api/players/{id}/ws", get(player_ws))
+        .route("/api/zones", get(list_zones).post(create_zone))
+        .route("/api/zones/{id}", patch(update_zone).delete(delete_zone))
+        .route("/api/zones/{id}/commands", post(zone_command))
         .route("/api/artists", get(artists))
         .route("/api/artists/{id}", get(artist_detail))
         .route("/api/albums", get(albums))
@@ -536,8 +543,70 @@ async fn albums(
     Ok(Json(page_envelope(items, total, &query)))
 }
 
-async fn list_players(State(state): State<AppState>) -> Json<Vec<Player>> {
-    Json(state.players.descriptors())
+async fn list_players(State(state): State<AppState>) -> Result<Json<Vec<Player>>, AppError> {
+    Ok(Json(state.players.descriptors().await.map_err(db_error)?))
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterPlayerRequest {
+    kind: Option<String>,
+    address: String,
+    name: Option<String>,
+}
+
+async fn register_player(
+    State(state): State<AppState>,
+    Json(request): Json<RegisterPlayerRequest>,
+) -> Result<Json<Player>, AppError> {
+    let kind = request.kind.as_deref().unwrap_or("mpd");
+    let name = request
+        .name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| format!("MPD ({})", request.address));
+    let player = state
+        .players
+        .register(kind, &request.address, &name)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    Ok(Json(player))
+}
+
+async fn update_player(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<Player>, AppError> {
+    // Apply only the fields present in the body: `name` renames; a `zone_id` key
+    // (string to assign, null to clear) changes the zone.
+    if let Some(name) = body.get("name").and_then(|value| value.as_str()) {
+        state.players.rename(&id, name).await.map_err(db_error)?;
+    }
+    if let Some(zone) = body.get("zone_id") {
+        let zone_id = zone.as_str().filter(|value| !value.is_empty());
+        state
+            .players
+            .set_zone(&id, zone_id)
+            .await
+            .map_err(db_error)?;
+    }
+    let players = state.players.descriptors().await.map_err(db_error)?;
+    players
+        .into_iter()
+        .find(|player| player.id == id)
+        .map(Json)
+        .ok_or_else(|| AppError::not_found(format!("unknown player: {id}")))
+}
+
+async fn delete_player(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    state
+        .players
+        .remove(&id)
+        .await
+        .map_err(|error| AppError::not_found(error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn player_state(
@@ -547,6 +616,7 @@ async fn player_state(
     let player = state
         .players
         .get(&id)
+        .await
         .ok_or_else(|| AppError::not_found(format!("unknown player: {id}")))?;
     let playback = player.state(&state.database).await.map_err(db_error)?;
     Ok(Json(playback))
@@ -560,6 +630,7 @@ async fn player_command(
     let player = state
         .players
         .get(&id)
+        .await
         .ok_or_else(|| AppError::not_found(format!("unknown player: {id}")))?;
     player
         .execute(command, &state.database, state.players.public_base_url())
@@ -569,12 +640,67 @@ async fn player_command(
     Ok(Json(playback))
 }
 
+#[derive(Debug, Deserialize)]
+struct ZoneRequest {
+    name: String,
+}
+
+async fn list_zones(State(state): State<AppState>) -> Result<Json<Vec<Zone>>, AppError> {
+    Ok(Json(state.players.zones().await.map_err(db_error)?))
+}
+
+async fn create_zone(
+    State(state): State<AppState>,
+    Json(request): Json<ZoneRequest>,
+) -> Result<Json<Zone>, AppError> {
+    let zone = state
+        .players
+        .create_zone(&request.name)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    Ok(Json(zone))
+}
+
+async fn update_zone(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ZoneRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .players
+        .rename_zone(&id, &request.name)
+        .await
+        .map_err(db_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_zone(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    state.players.delete_zone(&id).await.map_err(db_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn zone_command(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(command): Json<PlayerCommand>,
+) -> Result<StatusCode, AppError> {
+    state
+        .players
+        .command_zone(&id, command)
+        .await
+        .map_err(db_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn player_ws(
     State(state): State<AppState>,
     Path(id): Path<String>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    match state.players.get(&id) {
+    match state.players.get(&id).await {
         Some(player) => {
             let database = state.database.clone();
             upgrade.on_upgrade(move |socket| player_ws_loop(socket, player, database))
@@ -1837,25 +1963,6 @@ fn parse_addr_list(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Turn configured MPD addresses into player configs. A single player gets the
-/// id `mpd`; multiple get `mpd-1`, `mpd-2`, ...
-fn mpd_player_configs(addrs: &[String]) -> Vec<MpdPlayerConfig> {
-    let single = addrs.len() == 1;
-    addrs
-        .iter()
-        .enumerate()
-        .map(|(index, addr)| MpdPlayerConfig {
-            id: if single {
-                "mpd".to_string()
-            } else {
-                format!("mpd-{}", index + 1)
-            },
-            name: format!("MPD ({addr})"),
-            addr: addr.clone(),
-        })
-        .collect()
-}
-
 fn parse_addr(value: &str, source: &str) -> Result<SocketAddr> {
     value
         .parse()
@@ -1900,7 +2007,6 @@ mod tests {
     };
     use musicata_core::{Library, LocalDiskProvider, scan_local_library};
     use musicata_storage::Database;
-    use std::sync::Arc;
     use std::{collections::HashMap, fs, path::PathBuf, time::SystemTime};
     use tower::ServiceExt;
 
@@ -2234,6 +2340,92 @@ mod tests {
             timestamps.windows(2).all(|pair| pair[0] >= pair[1]),
             "expected newest-first ordering, got {timestamps:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn registers_renames_zones_and_removes_players() {
+        let fixture = TestFixture::new("players-api");
+        let app = fixture.app().await;
+
+        let json_post = |uri: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // Register a player (offline; the bogus address is never reached).
+        let response = app
+            .clone()
+            .oneshot(json_post(
+                "/api/players",
+                r#"{"address":"127.0.0.1:6699","name":"Den"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let player: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        let id = player["id"].as_str().expect("id").to_string();
+        assert_eq!(player["name"], "Den");
+        assert_eq!(player["online"], false);
+
+        // Create a zone and assign the player to it.
+        let response = app
+            .clone()
+            .oneshot(json_post("/api/zones", r#"{"name":"Main Floor"}"#))
+            .await
+            .unwrap();
+        let zone: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        let zone_id = zone["id"].as_str().expect("zone id").to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/players/{id}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"name":"Den Speaker","zone_id":"{zone_id}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The listing reflects the rename and zone assignment.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/players")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let players: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(players[0]["name"], "Den Speaker");
+        assert_eq!(players[0]["zone_id"], zone_id);
+
+        // Remove the player.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/players/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -2846,10 +3038,9 @@ mod tests {
                 .save_library(&mut library)
                 .await
                 .expect("save fixture library");
-            let players = Arc::new(PlayerManager::new(
-                Vec::new(),
-                "http://127.0.0.1".to_string(),
-            ));
+            let players = PlayerManager::load(database.clone(), "http://127.0.0.1".to_string())
+                .await
+                .expect("player manager");
             app(database, LocalDiskProvider::new(&self.root), players)
         }
 

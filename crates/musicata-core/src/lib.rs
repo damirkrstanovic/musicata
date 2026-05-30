@@ -348,8 +348,20 @@ pub struct Player {
     pub name: String,
     /// Backend kind, e.g. "mpd".
     pub kind: String,
+    /// Backend address the server connects to, e.g. `host:port` for MPD.
+    pub address: String,
+    /// Zone this player belongs to, if any.
+    pub zone_id: Option<String>,
     pub online: bool,
     pub capabilities: PlayerCapabilities,
+}
+
+/// A named group of players. Commands sent to a zone apply to its players; there
+/// is no audio synchronization between them.
+#[derive(Clone, Debug, Serialize)]
+pub struct Zone {
+    pub id: String,
+    pub name: String,
 }
 
 /// What a controller knows about a track queued on a player. `stream_url` is what

@@ -1405,3 +1405,245 @@ function debounce(fn, delay) {
     timer = setTimeout(() => fn(...args), delay);
   };
 }
+
+// ---- Players & zones ------------------------------------------------------
+
+const playerEls = {
+  list: document.querySelector("#players-list"),
+  addForm: document.querySelector("#add-player"),
+  address: document.querySelector("#player-address"),
+  name: document.querySelector("#player-name"),
+  zonesList: document.querySelector("#zones-list"),
+  addZoneForm: document.querySelector("#add-zone"),
+  zoneName: document.querySelector("#zone-name"),
+};
+
+const playerSockets = new Map();
+let playerData = { players: [], zones: [] };
+
+async function apiJson(path, method, body) {
+  const init = { method };
+  if (body !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, init);
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+  return response.status === 204 ? null : response.json();
+}
+
+async function loadPlayers() {
+  if (!playerEls.list) return;
+  try {
+    const [players, zones] = await Promise.all([api("/api/players"), api("/api/zones")]);
+    playerData = { players, zones };
+    renderPlayers();
+  } catch (error) {
+    playerEls.list.innerHTML = `<p class="error">Players unavailable: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function zoneOptions(selected) {
+  const none = `<option value=""${selected ? "" : " selected"}>No zone</option>`;
+  const options = playerData.zones
+    .map(
+      (zone) =>
+        `<option value="${escapeHtml(zone.id)}"${zone.id === selected ? " selected" : ""}>${escapeHtml(zone.name)}</option>`,
+    )
+    .join("");
+  return none + options;
+}
+
+function renderPlayers() {
+  // Drop sockets for players that no longer exist.
+  for (const [id, socket] of playerSockets) {
+    if (!playerData.players.some((player) => player.id === id)) {
+      socket.close();
+      playerSockets.delete(id);
+    }
+  }
+
+  playerEls.list.innerHTML =
+    playerData.players.length === 0
+      ? `<p class="empty">No players yet. Add an MPD host:port below.</p>`
+      : playerData.players
+          .map(
+            (player) => `
+        <div class="player-card" data-player="${escapeHtml(player.id)}">
+          <div class="player-head">
+            <span class="player-dot ${player.online ? "online" : "offline"}"></span>
+            <strong>${escapeHtml(player.name)}</strong>
+            <button class="icon-button" data-action="rename" title="Rename">&#9998;</button>
+            <button class="icon-button" data-action="remove" title="Remove">&times;</button>
+          </div>
+          <p class="player-now" data-now="${escapeHtml(player.id)}">${player.online ? "Idle" : "Offline"}</p>
+          <div class="player-controls-row">
+            <button data-action="previous" title="Previous">&#9198;</button>
+            <button data-action="play" title="Play">&#9654;</button>
+            <button data-action="pause" title="Pause">&#9208;</button>
+            <button data-action="stop" title="Stop">&#9209;</button>
+            <button data-action="next" title="Next">&#9197;</button>
+            <button data-action="play-here" class="ghost-button">Play view here</button>
+          </div>
+          <label class="player-zone">
+            <span>Zone</span>
+            <select data-action="zone">${zoneOptions(player.zone_id)}</select>
+          </label>
+        </div>`,
+          )
+          .join("");
+
+  playerEls.zonesList.innerHTML =
+    playerData.zones.length === 0
+      ? `<p class="empty">No zones.</p>`
+      : playerData.zones
+          .map(
+            (zone) => `
+        <div class="zone-row" data-zone="${escapeHtml(zone.id)}">
+          <span>${escapeHtml(zone.name)}</span>
+          <button class="icon-button" data-action="delete-zone" title="Delete zone">&times;</button>
+        </div>`,
+          )
+          .join("");
+
+  for (const player of playerData.players) {
+    if (!playerSockets.has(player.id)) {
+      openPlayerSocket(player.id);
+    }
+  }
+}
+
+function openPlayerSocket(id) {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  let socket;
+  try {
+    socket = new WebSocket(`${scheme}://${location.host}/api/players/${encodeURIComponent(id)}/ws`);
+  } catch {
+    return;
+  }
+  socket.onmessage = (event) => {
+    try {
+      const playback = JSON.parse(event.data);
+      const node = playerEls.list.querySelector(`[data-now="${cssEscape(id)}"]`);
+      if (node) {
+        node.textContent = nowPlayingText(playback);
+      }
+    } catch {
+      /* ignore malformed frames */
+    }
+  };
+  socket.onclose = () => playerSockets.delete(id);
+  playerSockets.set(id, socket);
+}
+
+function nowPlayingText(playback) {
+  const icon =
+    playback.status === "playing" ? "▶" : playback.status === "paused" ? "⏸" : "■";
+  const now = playback.now_playing;
+  if (!now) {
+    return `${icon} ${playback.status}`;
+  }
+  const artist = now.artist ? ` — ${now.artist}` : "";
+  return `${icon} ${now.title || "Unknown"}${artist}`;
+}
+
+function cssEscape(value) {
+  return value.replace(/["\\]/g, "\\$&");
+}
+
+async function playerCommand(id, command) {
+  try {
+    await apiJson(`/api/players/${encodeURIComponent(id)}/commands`, "POST", command);
+  } catch (error) {
+    console.error("player command failed", error);
+  }
+}
+
+if (playerEls.list) {
+  playerEls.list.addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-action]");
+    if (!button) return;
+    const id = button.closest("[data-player]")?.dataset.player;
+    if (!id) return;
+    const action = button.dataset.action;
+    if (["play", "pause", "stop", "next", "previous"].includes(action)) {
+      await playerCommand(id, { command: action });
+    } else if (action === "play-here") {
+      const ids = state.visibleTracks.map((track) => track.id);
+      if (ids.length) {
+        await playerCommand(id, { command: "play_tracks", track_ids: ids });
+      }
+    } else if (action === "rename") {
+      const current = playerData.players.find((player) => player.id === id);
+      const name = prompt("Player name", current?.name ?? "");
+      if (name) {
+        await apiJson(`/api/players/${encodeURIComponent(id)}`, "PATCH", { name });
+        await loadPlayers();
+      }
+    } else if (action === "remove") {
+      if (confirm("Remove this player?")) {
+        await apiJson(`/api/players/${encodeURIComponent(id)}`, "DELETE");
+        await loadPlayers();
+      }
+    }
+  });
+
+  playerEls.list.addEventListener("change", async (event) => {
+    const select = event.target.closest("select[data-action='zone']");
+    if (!select) return;
+    const id = select.closest("[data-player]")?.dataset.player;
+    if (!id) return;
+    await apiJson(`/api/players/${encodeURIComponent(id)}`, "PATCH", {
+      zone_id: select.value || null,
+    });
+    await loadPlayers();
+  });
+}
+
+if (playerEls.addForm) {
+  playerEls.addForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const address = playerEls.address.value.trim();
+    if (!address) return;
+    const name = playerEls.name.value.trim();
+    try {
+      await apiJson("/api/players", "POST", { address, name: name || undefined });
+      playerEls.address.value = "";
+      playerEls.name.value = "";
+      await loadPlayers();
+    } catch (error) {
+      alert(`Add player failed: ${error.message}`);
+    }
+  });
+}
+
+if (playerEls.zonesList) {
+  playerEls.zonesList.addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-action='delete-zone']");
+    if (!button) return;
+    const id = button.closest("[data-zone]")?.dataset.zone;
+    if (id && confirm("Delete this zone?")) {
+      await apiJson(`/api/zones/${encodeURIComponent(id)}`, "DELETE");
+      await loadPlayers();
+    }
+  });
+}
+
+if (playerEls.addZoneForm) {
+  playerEls.addZoneForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const name = playerEls.zoneName.value.trim();
+    if (!name) return;
+    try {
+      await apiJson("/api/zones", "POST", { name });
+      playerEls.zoneName.value = "";
+      await loadPlayers();
+    } catch (error) {
+      alert(`Add zone failed: ${error.message}`);
+    }
+  });
+}
+
+loadPlayers();
