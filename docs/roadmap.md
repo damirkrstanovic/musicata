@@ -238,6 +238,11 @@ Tasks:
 - Add Media Session API integration.
 - Improve PWA installability, caching, loading states, and mobile ergonomics.
 - Add virtualized lists for large libraries if needed.
+- Visual polish pass on the existing controls — e.g. the library search field still
+  reads too heavy/inelegant; refine inputs, spacing, and type throughout.
+- Mobile now-playing experience: the player rail currently flows at the bottom of
+  the stacked layout on small screens; design a proper compact/expandable
+  now-playing sheet.
 
 Done when:
 
