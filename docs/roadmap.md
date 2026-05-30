@@ -181,8 +181,13 @@ Tasks:
 - [x] Add WebSocket state updates for controllers.
 - [x] Add a web UI to register, name, zone, and control players (transport plus
   "play the current view on this player"), with live state over the WebSocket.
-- Treat the browser player as the first player provider. (The first concrete
-  provider is MPD; the browser provider is still to come.)
+- [x] Add the local browser as a player provider. The browser player is a
+  server-owned player: its queue, current track, and play/pause live on the
+  server (so they survive a page refresh and stay in sync across controllers),
+  and a browser tab renders the audio by driving an `<audio>` element from that
+  state over a bidirectional WebSocket (reporting progress and track-ended back).
+  One tab "owns" output at a time (coordinated client-side); refining handoff and
+  folding it into the main footer is part of the player UX follow-up.
 - Add playback session state and now-playing history. (Live now-playing is
   reported; durable history is still to come.)
 - [x] Stop browser playback when the server-bound playback session heartbeat is lost.

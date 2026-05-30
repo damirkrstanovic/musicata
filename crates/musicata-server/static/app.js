@@ -1439,6 +1439,7 @@ async function loadPlayers() {
   try {
     const [players, zones] = await Promise.all([api("/api/players"), api("/api/zones")]);
     playerData = { players, zones };
+    browserPlayerId = players.find((player) => player.kind === "browser")?.id ?? null;
     renderPlayers();
   } catch (error) {
     playerEls.list.innerHTML = `<p class="error">Players unavailable: ${escapeHtml(error.message)}</p>`;
@@ -1528,7 +1529,11 @@ function openPlayerSocket(id) {
       const playback = JSON.parse(event.data);
       const node = playerEls.list.querySelector(`[data-now="${cssEscape(id)}"]`);
       if (node) {
-        node.textContent = nowPlayingText(playback);
+        const suffix = id === browserPlayerId && browserOutput ? " (playing here)" : "";
+        node.textContent = nowPlayingText(playback) + suffix;
+      }
+      if (id === browserPlayerId && browserOutput) {
+        driveBrowserAudio(playback);
       }
     } catch {
       /* ignore malformed frames */
@@ -1536,6 +1541,70 @@ function openPlayerSocket(id) {
   };
   socket.onclose = () => playerSockets.delete(id);
   playerSockets.set(id, socket);
+}
+
+// ---- Browser-player audio output ------------------------------------------
+
+const browserAudio = document.querySelector("#browser-audio");
+const TAB_ID = Math.random().toString(36).slice(2);
+let browserPlayerId = null;
+let browserOutput = false;
+let browserProgressTimer = 0;
+
+// Make this tab the audio output for the browser player, releasing any other tab.
+function claimBrowserOutput() {
+  browserOutput = true;
+  try {
+    localStorage.setItem("musicata-output", TAB_ID);
+  } catch {
+    /* localStorage may be unavailable */
+  }
+}
+
+// Only one tab plays at a time: a newer claim elsewhere makes this tab let go.
+window.addEventListener("storage", (event) => {
+  if (event.key === "musicata-output" && event.newValue !== TAB_ID) {
+    browserOutput = false;
+    if (browserAudio) browserAudio.pause();
+  }
+});
+
+function driveBrowserAudio(playback) {
+  if (!browserAudio) return;
+  const now = playback.now_playing;
+  if (playback.status === "playing" && now && now.stream_url) {
+    if (!browserAudio.src.endsWith(now.stream_url)) {
+      browserAudio.src = now.stream_url;
+    }
+    // Apply an external seek (a large jump), ignoring our own progress echoes.
+    const elapsed = playback.elapsed_seconds ?? 0;
+    if (Math.abs(browserAudio.currentTime - elapsed) > 2) {
+      browserAudio.currentTime = elapsed;
+    }
+    browserAudio.play().catch(() => {});
+  } else if (playback.status === "paused") {
+    browserAudio.pause();
+  } else {
+    browserAudio.pause();
+  }
+}
+
+function browserSocketSend(message) {
+  const socket = browserPlayerId ? playerSockets.get(browserPlayerId) : null;
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+if (browserAudio) {
+  browserAudio.addEventListener("ended", () => {
+    if (browserOutput) browserSocketSend({ type: "ended" });
+  });
+  browserProgressTimer = setInterval(() => {
+    if (browserOutput && !browserAudio.paused) {
+      browserSocketSend({ type: "progress", elapsed_seconds: browserAudio.currentTime });
+    }
+  }, 1000);
 }
 
 function nowPlayingText(playback) {
@@ -1568,6 +1637,13 @@ if (playerEls.list) {
     const id = button.closest("[data-player]")?.dataset.player;
     if (!id) return;
     const action = button.dataset.action;
+    // Interacting with the browser player makes this tab its audio output.
+    if (
+      id === browserPlayerId &&
+      ["play", "play-here", "next", "previous"].includes(action)
+    ) {
+      claimBrowserOutput();
+    }
     if (["play", "pause", "stop", "next", "previous"].includes(action)) {
       await playerCommand(id, { command: action });
     } else if (action === "play-here") {

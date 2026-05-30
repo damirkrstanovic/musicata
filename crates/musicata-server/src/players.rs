@@ -20,23 +20,76 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use musicata_core::{PlaybackState, Player, PlayerCapabilities, PlayerCommand, Zone};
+use musicata_core::{
+    PlaybackState, PlaybackStatus, Player, PlayerCapabilities, PlayerCommand, QueueItem,
+    RepeatMode, Zone,
+};
 use musicata_storage::{Database, PlayerRecord};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
 
 use crate::mpd::MpdConnection;
 
+/// Stable id of the always-present local browser player.
+pub const BROWSER_PLAYER_ID: &str = "browser-local";
+
 /// A registered player's live runtime: the provider instance plus the background
 /// task feeding its state broadcast.
 struct PlayerEntry {
-    player: Arc<MpdPlayer>,
-    task: JoinHandle<()>,
+    handle: PlayerHandle,
+    /// Background idle/state task, for backends that have one (MPD). The browser
+    /// player is command-driven and has none.
+    task: Option<JoinHandle<()>>,
 }
 
 impl Drop for PlayerEntry {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+/// A runtime player backend. Modeled as an enum (rather than `dyn`) so the async
+/// methods stay object-safe and the set of providers is explicit.
+#[derive(Clone)]
+pub enum PlayerHandle {
+    Mpd(Arc<MpdPlayer>),
+    Browser(Arc<BrowserPlayer>),
+}
+
+impl PlayerHandle {
+    pub fn is_online(&self) -> bool {
+        match self {
+            PlayerHandle::Mpd(player) => player.is_online(),
+            PlayerHandle::Browser(player) => player.is_online(),
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<PlaybackState> {
+        match self {
+            PlayerHandle::Mpd(player) => player.subscribe(),
+            PlayerHandle::Browser(player) => player.subscribe(),
+        }
+    }
+
+    pub async fn state(&self, database: &Database) -> Result<PlaybackState> {
+        match self {
+            PlayerHandle::Mpd(player) => player.state(database).await,
+            PlayerHandle::Browser(player) => Ok(player.snapshot().await),
+        }
+    }
+
+    pub async fn execute(
+        &self,
+        command: PlayerCommand,
+        database: &Database,
+        base_url: &str,
+    ) -> Result<()> {
+        match self {
+            PlayerHandle::Mpd(player) => player.execute(command, database, base_url).await,
+            PlayerHandle::Browser(player) => player.execute(command, database).await,
+        }
     }
 }
 
@@ -55,6 +108,24 @@ impl PlayerManager {
             public_base_url,
             players: RwLock::new(BTreeMap::new()),
         });
+        // The local browser player always exists.
+        if manager
+            .database
+            .player_record(BROWSER_PLAYER_ID)
+            .await?
+            .is_none()
+        {
+            manager
+                .database
+                .upsert_player(&PlayerRecord {
+                    id: BROWSER_PLAYER_ID.to_string(),
+                    kind: "browser".to_string(),
+                    address: "local".to_string(),
+                    name: "This Browser".to_string(),
+                    zone_id: None,
+                })
+                .await?;
+        }
         for record in manager.database.list_players().await? {
             manager.bring_up(&record).await;
         }
@@ -65,14 +136,20 @@ impl PlayerManager {
         &self.public_base_url
     }
 
-    /// Spawn (or replace) the runtime entry for a persisted player record.
+    /// Bring up the runtime entry for a persisted player record.
     async fn bring_up(&self, record: &PlayerRecord) {
-        let player = Arc::new(MpdPlayer::new(record.id.clone(), record.address.clone()));
-        let task = player.clone().spawn_state_task(self.database.clone());
+        let (handle, task) = match record.kind.as_str() {
+            "browser" => (PlayerHandle::Browser(Arc::new(BrowserPlayer::new())), None),
+            _ => {
+                let player = Arc::new(MpdPlayer::new(record.id.clone(), record.address.clone()));
+                let task = player.clone().spawn_state_task(self.database.clone());
+                (PlayerHandle::Mpd(player), Some(task))
+            }
+        };
         self.players
             .write()
             .await
-            .insert(record.id.clone(), PlayerEntry { player, task });
+            .insert(record.id.clone(), PlayerEntry { handle, task });
     }
 
     /// Register a player (idempotent by kind+address); persists it and brings it
@@ -127,12 +204,12 @@ impl PlayerManager {
         Ok(players)
     }
 
-    pub async fn get(&self, id: &str) -> Option<Arc<MpdPlayer>> {
+    pub async fn get(&self, id: &str) -> Option<PlayerHandle> {
         self.players
             .read()
             .await
             .get(id)
-            .map(|entry| entry.player.clone())
+            .map(|entry| entry.handle.clone())
     }
 
     async fn require_record(&self, id: &str) -> Result<PlayerRecord> {
@@ -144,7 +221,7 @@ impl PlayerManager {
 
     async fn descriptor(&self, record: &PlayerRecord) -> Result<Player> {
         let online = match self.players.read().await.get(&record.id) {
-            Some(entry) => entry.player.is_online(),
+            Some(entry) => entry.handle.is_online(),
             None => false,
         };
         Ok(Player {
@@ -410,4 +487,178 @@ async fn enrich_state(state: &mut PlaybackState, database: &Database) {
             }
         }
     }
+}
+
+// ---- Browser player -------------------------------------------------------
+
+/// A server-owned player whose audio is rendered by a browser tab. The queue and
+/// playback intent live here (so they survive a page refresh and stay in sync
+/// across controllers); a tab acting as output drives its `<audio>` from this
+/// state over the WebSocket and reports progress / track-ended back.
+pub struct BrowserPlayer {
+    state: Mutex<BrowserState>,
+    state_tx: broadcast::Sender<PlaybackState>,
+}
+
+#[derive(Default)]
+struct BrowserState {
+    status: PlaybackStatus,
+    queue: Vec<QueueItem>,
+    position: Option<usize>,
+    elapsed_seconds: Option<f64>,
+    volume: Option<u8>,
+    repeat: RepeatMode,
+    shuffle: bool,
+}
+
+impl BrowserPlayer {
+    fn new() -> Self {
+        let (state_tx, _) = broadcast::channel(32);
+        Self {
+            state: Mutex::new(BrowserState::default()),
+            state_tx,
+        }
+    }
+
+    /// Always available — it is the local browser.
+    pub fn is_online(&self) -> bool {
+        true
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<PlaybackState> {
+        self.state_tx.subscribe()
+    }
+
+    pub async fn snapshot(&self) -> PlaybackState {
+        let state = self.state.lock().await;
+        PlaybackState {
+            status: state.status,
+            now_playing: state
+                .position
+                .and_then(|index| state.queue.get(index).cloned()),
+            elapsed_seconds: state.elapsed_seconds,
+            duration_seconds: None,
+            volume: state.volume,
+            repeat: state.repeat,
+            shuffle: state.shuffle,
+            queue: state.queue.clone(),
+            queue_position: state.position,
+        }
+    }
+
+    async fn broadcast(&self) {
+        let _ = self.state_tx.send(self.snapshot().await);
+    }
+
+    pub async fn execute(&self, command: PlayerCommand, database: &Database) -> Result<()> {
+        {
+            let mut state = self.state.lock().await;
+            match command {
+                PlayerCommand::Play => state.status = PlaybackStatus::Playing,
+                PlayerCommand::Pause => state.status = PlaybackStatus::Paused,
+                PlayerCommand::Stop => {
+                    state.status = PlaybackStatus::Stopped;
+                    state.elapsed_seconds = Some(0.0);
+                }
+                PlayerCommand::Next => advance(&mut state, false),
+                PlayerCommand::Previous => {
+                    state.position = match state.position {
+                        Some(index) if index > 0 => Some(index - 1),
+                        other => other,
+                    };
+                    state.elapsed_seconds = Some(0.0);
+                }
+                PlayerCommand::Seek { position_seconds } => {
+                    state.elapsed_seconds = Some(position_seconds);
+                }
+                PlayerCommand::SetVolume { volume } => state.volume = Some(volume.min(100)),
+                PlayerCommand::SetRepeat { mode } => state.repeat = mode,
+                PlayerCommand::SetShuffle { enabled } => state.shuffle = enabled,
+                PlayerCommand::Clear => {
+                    state.queue.clear();
+                    state.position = None;
+                    state.status = PlaybackStatus::Stopped;
+                    state.elapsed_seconds = Some(0.0);
+                }
+                PlayerCommand::PlayQueueIndex { index } => {
+                    if index < state.queue.len() {
+                        state.position = Some(index);
+                        state.status = PlaybackStatus::Playing;
+                        state.elapsed_seconds = Some(0.0);
+                    }
+                }
+                PlayerCommand::PlayTracks { track_ids } => {
+                    state.queue = resolve_queue_items(database, &track_ids).await?;
+                    state.position = (!state.queue.is_empty()).then_some(0);
+                    state.status = if state.queue.is_empty() {
+                        PlaybackStatus::Stopped
+                    } else {
+                        PlaybackStatus::Playing
+                    };
+                    state.elapsed_seconds = Some(0.0);
+                }
+                PlayerCommand::Enqueue { track_ids } => {
+                    state
+                        .queue
+                        .extend(resolve_queue_items(database, &track_ids).await?);
+                }
+            }
+        }
+        self.broadcast().await;
+        Ok(())
+    }
+
+    /// The output tab finished the current track: advance (honoring repeat).
+    pub async fn track_ended(&self) {
+        {
+            let mut state = self.state.lock().await;
+            if state.repeat == RepeatMode::One {
+                state.elapsed_seconds = Some(0.0);
+            } else {
+                advance(&mut state, true);
+            }
+        }
+        self.broadcast().await;
+    }
+
+    /// The output tab reports its real playback position (for controllers).
+    pub async fn report_progress(&self, elapsed_seconds: f64) {
+        self.state.lock().await.elapsed_seconds = Some(elapsed_seconds);
+        self.broadcast().await;
+    }
+}
+
+/// Advance to the next queue item. When `stop_at_end` is set (a track finished),
+/// stop after the last item unless repeat-all is on; otherwise (an explicit Next)
+/// clamp at the last item.
+fn advance(state: &mut BrowserState, stop_at_end: bool) {
+    let Some(index) = state.position else {
+        return;
+    };
+    state.elapsed_seconds = Some(0.0);
+    if index + 1 < state.queue.len() {
+        state.position = Some(index + 1);
+    } else if state.repeat == RepeatMode::All && !state.queue.is_empty() {
+        state.position = Some(0);
+    } else if stop_at_end {
+        state.status = PlaybackStatus::Stopped;
+    }
+}
+
+/// Resolve library track ids to queue items with relative stream URLs the browser
+/// fetches directly. Unknown ids are skipped.
+async fn resolve_queue_items(database: &Database, track_ids: &[String]) -> Result<Vec<QueueItem>> {
+    let mut items = Vec::with_capacity(track_ids.len());
+    for id in track_ids {
+        if let Some(track) = database.track(id).await? {
+            items.push(QueueItem {
+                track_id: Some(track.id),
+                title: track.title,
+                artist: track.artist_name,
+                album: track.album_title,
+                stream_url: track.stream_url,
+            });
+        }
+    }
+    Ok(items)
 }

@@ -2,7 +2,7 @@ mod mpd;
 mod musicbrainz;
 mod players;
 
-use crate::players::{MpdPlayer, PlayerManager};
+use crate::players::{BrowserPlayer, PlayerHandle, PlayerManager};
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
@@ -701,20 +701,30 @@ async fn player_ws(
     upgrade: WebSocketUpgrade,
 ) -> Response {
     match state.players.get(&id).await {
-        Some(player) => {
+        Some(handle) => {
             let database = state.database.clone();
-            upgrade.on_upgrade(move |socket| player_ws_loop(socket, player, database))
+            upgrade.on_upgrade(move |socket| player_ws_loop(socket, handle, database))
         }
         None => AppError::not_found(format!("unknown player: {id}")).into_response(),
     }
 }
 
-/// Push player state to a controller: an initial snapshot, then every broadcast
-/// update (idle-driven or command-driven) until the socket closes.
-async fn player_ws_loop(mut socket: WebSocket, player: Arc<MpdPlayer>, database: Database) {
-    let mut updates = player.subscribe();
+async fn player_ws_loop(socket: WebSocket, handle: PlayerHandle, database: Database) {
+    match handle {
+        // The browser player is bidirectional: the tab also reports progress and
+        // track-ended back to the server.
+        PlayerHandle::Browser(browser) => browser_ws_loop(socket, browser, database).await,
+        other => state_push_loop(socket, other, database).await,
+    }
+}
 
-    if let Ok(state) = player.state(&database).await
+/// Push player state to a controller: an initial snapshot, then every broadcast
+/// update (idle- or command-driven) until the socket closes. Inbound frames are
+/// ignored (read-only controller).
+async fn state_push_loop(mut socket: WebSocket, handle: PlayerHandle, database: Database) {
+    let mut updates = handle.subscribe();
+
+    if let Ok(state) = handle.state(&database).await
         && let Ok(text) = serde_json::to_string(&state)
         && socket.send(Message::Text(text.into())).await.is_err()
     {
@@ -738,6 +748,56 @@ async fn player_ws_loop(mut socket: WebSocket, player: Arc<MpdPlayer>, database:
                 _ => break,
             },
         }
+    }
+}
+
+/// Bidirectional loop for the browser player: pushes state, and applies inbound
+/// `progress`/`ended` frames from the tab that is rendering audio.
+async fn browser_ws_loop(mut socket: WebSocket, browser: Arc<BrowserPlayer>, _database: Database) {
+    let mut updates = browser.subscribe();
+
+    if let Ok(text) = serde_json::to_string(&browser.snapshot().await)
+        && socket.send(Message::Text(text.into())).await.is_err()
+    {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            update = updates.recv() => match update {
+                Ok(state) => {
+                    let text = serde_json::to_string(&state).unwrap_or_default();
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Text(text))) => handle_browser_frame(&browser, text.as_str()).await,
+                Some(Ok(_)) => {}
+                _ => break,
+            },
+        }
+    }
+}
+
+async fn handle_browser_frame(browser: &BrowserPlayer, text: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    match value.get("type").and_then(|kind| kind.as_str()) {
+        Some("ended") => browser.track_ended().await,
+        Some("progress") => {
+            if let Some(elapsed) = value
+                .get("elapsed_seconds")
+                .and_then(|value| value.as_f64())
+            {
+                browser.report_progress(elapsed).await;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2426,6 +2486,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn browser_player_is_present_and_plays_tracks() {
+        let fixture = TestFixture::new("browser-player");
+        let app = fixture.app().await;
+
+        // The local browser player always exists.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/players")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let players: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        let browser = players
+            .as_array()
+            .expect("players")
+            .iter()
+            .find(|player| player["kind"] == "browser")
+            .expect("browser player");
+        let browser_id = browser["id"].as_str().expect("id").to_string();
+        assert_eq!(browser["online"], true);
+
+        // Grab a real track id from the library.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tracks?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let tracks: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        let track_id = tracks["items"][0]["id"]
+            .as_str()
+            .expect("track id")
+            .to_string();
+
+        // Play it on the browser player; server-owned state reflects the queue.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/players/{browser_id}/commands"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"command":"play_tracks","track_ids":["{track_id}"]}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let playback: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(playback["status"], "playing");
+        assert_eq!(playback["queue"].as_array().expect("queue").len(), 1);
+        assert_eq!(playback["now_playing"]["track_id"], track_id);
+
+        // Pause is reflected in state.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/players/{browser_id}/commands"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"command":"pause"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let playback: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(playback["status"], "paused");
     }
 
     #[tokio::test]
