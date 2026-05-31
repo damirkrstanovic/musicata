@@ -5,10 +5,11 @@ Local-first music server + web controller. Rust workspace, milestone-driven (see
 
 ## Prior art — read before solving a hard problem
 
-**`docs/prior-art.md`** captures how Roon, Jellyfin, Navidrome, Music Assistant and
-Mopidy solve the problems we keep hitting (provider/plugin ecosystem, incremental
-library scanning, OpenSubsonic compatibility, SMB access, background-work UX) and what
-Musicata adopted, with code pointers. When you work in one of those areas, read the
+**`docs/prior-art.md`** captures how Roon, Jellyfin, Navidrome, beets, Picard, Music
+Assistant and Mopidy solve the problems we keep hitting (provider/plugin ecosystem,
+incremental library scanning, OpenSubsonic compatibility, SMB access, background-work
+UX, and metadata sourcing & conflict resolution) and what Musicata adopted, with code
+pointers. When you work in one of those areas, read the
 relevant section first rather than re-deriving the design — and append to it when you
 learn something new from another project. Reference checkouts live next to this repo
 (`../jellyfin`, `../navidrome`).

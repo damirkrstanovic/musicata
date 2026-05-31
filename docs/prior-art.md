@@ -1,10 +1,12 @@
 # Prior art — how other music servers solve our problems
 
 A living knowledge base: for each hard problem Musicata hits, how the reference
-projects (Roon, Jellyfin, Navidrome, Music Assistant, Mopidy) solve it, and what
-we adopted — with pointers to our code. When you tackle one of these areas, read
-the relevant section first instead of re-deriving it. When you learn something new
-from another project, add it here.
+projects (Roon, Jellyfin, Navidrome, beets, Picard, Music Assistant, Mopidy) solve
+it, and what we adopted — with pointers to our code. Covers: provider/plugin
+ecosystem, incremental scanning, OpenSubsonic, SMB access, background-work UX, and
+metadata sourcing & conflict resolution. When you tackle one of these areas, read the
+relevant section first instead of re-deriving it. When you learn something new from
+another project, add it here.
 
 Checkouts referenced during research: Jellyfin at `../jellyfin`,
 Navidrome at `../navidrome`.
@@ -133,6 +135,89 @@ updates over a **WebSocket** (`/api/activity/ws`, push on change via a watch cha
 rather than polling. Long work (scans, SMB connects) always runs in the background;
 add-source validates connectivity synchronously and returns the root cause, then
 scans in the background.
+
+---
+
+## 6. Metadata sourcing & conflict resolution
+
+**Problem:** values for the same field come from several places (embedded tags,
+folder/filename, MusicBrainz, user edits). What wins, when do we hit the network,
+and how do we not clobber the user's corrections on the next scan?
+
+**How others solve it:**
+
+- **Jellyfin** (`MediaBrowser.Providers/Manager/MetadataService.cs`,
+  `MediaInfo/AudioFileProber.cs`, `Plugins/MusicBrainz/`):
+  - Provider order: **local reader first** (embedded tags via ATL + ffprobe filename
+    fallback), then remote fetchers (MusicBrainz, then AudioDB), ordered by config
+    (`LocalMetadataReaderOrder` / `MetadataFetcherOrder`).
+  - **Merge rule = empty-field-only unless full refresh.** `MergeBaseItemData`:
+    scalar fields are overwritten only if `replaceData || target field is empty`;
+    arrays (genres/artists) append + dedupe; provider IDs use `TryAdd` (**first ID
+    wins**). So in normal refresh a populated value is *not* overwritten by a
+    lower-priority provider.
+  - **Locked fields** (`BaseItem.LockedFields`, `IsLocked`) are skipped during merge
+    and block remote fetches entirely — this is how user edits survive refreshes.
+  - **MusicBrainz matching is ID-first**: use the MBID from tags → exact lookup;
+    else search by name + artist MBID, then name + artist name; **takes the first
+    result, no scoring**. No AcoustID. No per-field provenance (only locked/not).
+- **Navidrome** (tag-first, read-only):
+  - **Never modifies your files** — metadata lives in the tags; you fix tags with an
+    external tool (Picard). A safe, opinionated default.
+  - A `mappings.yaml` normalizes tag frames (ID3 `TPE1`, Vorbis `ARTIST`, MP4 `©nam`,
+    …) to internal keys, lowercases keys, and splits multi-valued tags on delimiters.
+  - **Stable identity from MusicBrainz IDs**: track persistent id derives from
+    `musicbrainz_trackid` (else album+disc+track).
+  - **Agents** enrich *artist/album* info + images only (not core track tags), tried
+    in **priority order** (default `deezer,lastfm,listenbrainz`); first hit wins,
+    fall through on miss. ListenBrainz needs MBIDs in tags.
+- **beets** autotagger (the matching gold standard):
+  - Clusters files by **directory** into album candidates.
+  - Queries MusicBrainz by existing **MBID** / text; optional **AcoustID** fingerprint
+    via the `chroma` plugin when tags are weak.
+  - Computes a **distance** (0=perfect … 1=worst) summing weighted **per-field
+    penalties**, plus a `data_source_mismatch_penalty`. **Recommendation tiers**
+    (strong/medium/none) via thresholds (`strong_rec_thresh` default 0.04): a strong
+    match **auto-applies**, weaker ones **prompt the user**.
+  - Treats **MusicBrainz as canonical** and *rewrites* tags from it (opposite of
+    Navidrome's read-only stance).
+- **MusicBrainz Picard**: **Cluster** (group files by album/artist tags) → **Lookup**
+  (query MB by existing tags/MBIDs) → **Scan** (AcoustID acoustic fingerprint when
+  tags don't resolve). Embedded MBIDs load the exact release directly. Canonical-
+  source-wins: saving rewrites tags from MB.
+
+**Cross-project consensus worth adopting:**
+1. **ID-first** — an embedded MusicBrainz ID means an exact lookup, no fuzzy search
+   and no network guesswork (Jellyfin, Picard, beets all do this).
+2. **Score text matches and gate auto-apply** (beets) — only auto-accept a
+   high-confidence match; otherwise keep it as a review candidate.
+3. **User edits / approvals are top priority and survive rescans** (Jellyfin locked
+   fields).
+4. **Per-field, highest-confidence-wins merge; don't overwrite a populated/approved
+   field with a lower-priority source** (Jellyfin empty-field-only).
+5. **Read-only to files by default** (Navidrome) — enrich the DB, don't rewrite tags
+   unless the user opts in.
+6. **AcoustID only as a last resort** when tags are missing/ambiguous (beets/Picard
+   Scan).
+
+**What Musicata does today** (`crates/musicata-core/src/lib.rs`,
+`crates/musicata-server/src/musicbrainz.rs`): each track keeps **observations** with
+`source` + `confidence` + `approval_state` (Observed/Approved/Rejected). Confidences:
+`embedded_tag` 0.95, `sidecar_lrc` 0.90, `sidecar_txt` 0.80, `folder_path` 0.55.
+The effective value (`canonical_metadata`) is currently **embedded → folder** per
+field (lyrics: `.lrc` > `.txt`); embedded MBIDs are read and carried. MusicBrainz +
+Cover Art Archive are **review-only candidates** with an approval model, not yet
+auto-resolvers. We are already **read-only to files** (write-back disabled), matching
+Navidrome (consensus #5).
+
+**Gaps to close** (maps onto the model we already have — the observation's
+`confidence` + `approval_state` are exactly the hooks): a **confidence/approval-ranked
+per-field resolver** (so `Approved` user/MB values outrank embedded, embedded outranks
+folder — consensus #3, #4); **MBID-first auto-resolution** + a **confidence gate** for
+text matches before auto-applying MB data (consensus #1, #2); a **tag-mapping/
+multi-value normalization** layer (Navidrome `mappings.yaml`); **AcoustID** as the
+last-resort matcher (consensus #6). The designed ladder is in `docs/metadata.md`
+(§Metadata Sources); this section is the *why* behind it.
 
 ---
 
