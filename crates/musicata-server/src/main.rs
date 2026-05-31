@@ -1683,13 +1683,18 @@ async fn create_source(
         created_at_unix_seconds: now_unix_seconds(),
     };
 
-    // Build the provider from the (validated) config so an obviously-bad request
-    // fails immediately, then persist + register and kick off the scan in the
-    // background. The scan's progress — and any connection/credential error with its
-    // root cause — shows up in the activity log, so adding a source never blocks the
-    // UI or wedges other requests behind a slow share.
+    // Build the provider, then verify it's actually reachable and readable (connect
+    // + list a directory) before persisting anything. This catches a bad host, wrong
+    // share, or rejected credentials up front and returns the root cause to the
+    // caller — we don't save a dead source or start a doomed scan. The check is
+    // bounded by the connect timeout; the heavy recursive scan still runs in the
+    // background afterwards (its progress shows in the activity log).
     let handle = providers::provider_from_record(&record)
         .map_err(|error| AppError::bad_request(error.to_string()))?;
+    handle
+        .validate()
+        .await
+        .map_err(|error| AppError::bad_request(format!("could not access share: {error}")))?;
 
     state.database.add_source(&record).await.map_err(db_error)?;
     state.providers.write().await.push(handle);

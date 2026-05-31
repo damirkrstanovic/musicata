@@ -20,7 +20,8 @@ use futures::StreamExt;
 use musicata_core::{FsEntry, Library, ReadSeek, SourceFs, scan_source};
 use musicata_storage::SourceRecord;
 use smb::{
-    Client, ClientConfig, FileAccessMask, FileDirectoryInformation, UncPath,
+    Client, ClientConfig, ConnectionConfig, FileAccessMask, FileDirectoryInformation, Resource,
+    UncPath,
     resource::{Directory, File, FileCreateArgs, GetLen, ReadAt},
 };
 use tokio::runtime::Handle;
@@ -105,11 +106,33 @@ fn open_read_args() -> FileCreateArgs {
 /// unreachable host blocks the request (and the rescan lock) indefinitely.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Client config that permits guest/anonymous shares — those sessions can't sign,
+/// so signing must be allowed to skip for them or the connect is rejected.
+fn client_config() -> ClientConfig {
+    ClientConfig {
+        connection: ConnectionConfig {
+            allow_unsigned_guest_access: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn new_client() -> Arc<Client> {
+    Arc::new(Client::new(client_config()))
+}
+
 /// Connect a client to the share, failing fast on an unreachable host or bad
-/// credentials instead of hanging.
+/// credentials instead of hanging. An empty username connects as `guest` (an empty
+/// identity is rejected outright by NTLM), which is how open shares expect access.
 async fn connect_share(client: &Client, config: &SmbConfig) -> anyhow::Result<()> {
     let target = config.share_unc()?;
-    let connect = client.share_connect(&target, &config.username, config.password.clone());
+    let username = if config.username.is_empty() {
+        "guest"
+    } else {
+        &config.username
+    };
+    let connect = client.share_connect(&target, username, config.password.clone());
     match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(anyhow!("SMB connect to {}: {error}", config.host)),
@@ -203,10 +226,33 @@ impl SmbProvider {
         if let Some(client) = guard.as_ref() {
             return Ok(client.clone());
         }
-        let client = Arc::new(Client::new(ClientConfig::default()));
+        let client = new_client();
         connect_share(&client, &self.config).await?;
         *guard = Some(client.clone());
         Ok(client)
+    }
+
+    /// Verify the source is reachable: connect and enumerate the root directory.
+    /// Used to reject a misconfigured source at add time, before any scan.
+    pub async fn validate(&self) -> anyhow::Result<()> {
+        let client = self.client().await?;
+        let unc = self.config.item_unc("")?;
+        let resource = client
+            .create_file(&unc, &open_read_args())
+            .await
+            .map_err(|error| anyhow!("open share: {error}"))?;
+        let directory = match resource {
+            Resource::Directory(directory) => Arc::new(directory),
+            _ => return Err(anyhow!("path is not a directory")),
+        };
+        let mut stream = Directory::query::<FileDirectoryInformation>(&directory, "*")
+            .await
+            .map_err(|error| anyhow!("list directory: {error}"))?;
+        // Pull the first entry so an enumerate error (vs. an empty share) surfaces.
+        if let Some(entry) = stream.next().await {
+            entry.map_err(|error| anyhow!("read directory: {error}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -223,7 +269,7 @@ struct SmbFs {
 
 impl SmbFs {
     fn connect(config: SmbConfig, handle: Handle) -> anyhow::Result<Self> {
-        let client = Arc::new(Client::new(ClientConfig::default()));
+        let client = new_client();
         handle.block_on(connect_share(&client, &config))?;
         Ok(Self {
             client,

@@ -74,6 +74,16 @@ impl ProviderHandle {
         }
     }
 
+    /// Cheaply verify the source is reachable and readable (connect + list a
+    /// directory) before committing to a full scan. Local disk is always ready.
+    pub async fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            ProviderHandle::Local(_) => Ok(()),
+            #[cfg(feature = "provider-smb")]
+            ProviderHandle::Smb(provider) => provider.validate().await,
+        }
+    }
+
     /// Scan this source's catalogue into a [`Library`]. Scanning is blocking work
     /// (disk or network I/O + tag parsing), so it always runs on a blocking thread.
     pub async fn scan(&self) -> anyhow::Result<Library> {
