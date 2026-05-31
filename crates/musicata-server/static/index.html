@@ -205,50 +205,6 @@
       </div>
     </div>
 
-    <div id="settings" class="settings-overlay" hidden>
-      <div class="settings-card">
-        <header class="settings-head">
-          <h2>Players &amp; Zones</h2>
-          <button id="settings-close" class="ghost-button" type="button">Done</button>
-        </header>
-        <div class="settings-body">
-          <section class="settings-section">
-            <h3>Music sources</h3>
-            <div id="sources-list" class="sources-list"></div>
-            <form id="add-source" class="inline-form">
-              <input id="source-host" type="text" autocomplete="off" placeholder="SMB host (e.g. nas.local)" required>
-              <input id="source-share" type="text" autocomplete="off" placeholder="Share (e.g. music)" required>
-              <input id="source-path" type="text" autocomplete="off" placeholder="Subfolder (optional)">
-              <input id="source-name" type="text" autocomplete="off" placeholder="Display name (optional)">
-              <input id="source-user" type="text" autocomplete="off" placeholder="Username (optional)">
-              <input id="source-pass" type="password" autocomplete="new-password" placeholder="Password (optional)">
-              <button class="ghost-button" type="submit">Add SMB share</button>
-            </form>
-            <p id="add-source-status" class="add-player-status"></p>
-          </section>
-          <section class="settings-section">
-            <h3>Players</h3>
-            <div id="players-list" class="players-list"></div>
-            <form id="add-player" class="inline-form">
-              <input id="player-address" type="text" inputmode="url" autocomplete="off"
-                     placeholder="MPD host:port" required>
-              <input id="player-name" type="text" autocomplete="off" placeholder="Name (optional)">
-              <button class="ghost-button" type="submit">Add player</button>
-            </form>
-            <p id="add-player-status" class="add-player-status"></p>
-          </section>
-          <section class="settings-section">
-            <h3>Zones</h3>
-            <div id="zones-list" class="zones-list"></div>
-            <form id="add-zone" class="inline-form">
-              <input id="zone-name" type="text" autocomplete="off" placeholder="New zone" required>
-              <button class="ghost-button" type="submit">Add zone</button>
-            </form>
-          </section>
-        </div>
-      </div>
-    </div>
-
     <script src="/app.js" defer></script>
   </body>
 </html>

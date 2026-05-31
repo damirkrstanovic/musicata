@@ -1,3 +1,4 @@
+mod activity;
 mod mpd;
 mod musicbrainz;
 mod players;
@@ -32,7 +33,7 @@ use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, Library, LibrarySummary, LocalDiskProvider,
     MetadataApprovalState, MetadataFieldValue, PlaybackState, Player, PlayerCommand, Playlist,
     RadioStation, SearchResults, Track, TrackMetadataFieldObservation, Zone, album_artwork_url,
-    artwork_asset_id, find_album_artwork_candidates,
+    artwork_asset_id, find_album_artwork_candidates, merge_libraries,
 };
 use musicata_storage::Database;
 use musicbrainz::{
@@ -69,6 +70,7 @@ struct AppState {
     players: Arc<PlayerManager>,
     musicbrainz: MusicBrainzClient,
     radio_browser: radiobrowser::RadioBrowserClient,
+    activity: Arc<activity::ActivityLog>,
     rescan_lock: Arc<Mutex<()>>,
     most_played_cache: Arc<Mutex<Option<MostPlayedCache>>>,
     playback_sessions: Arc<RwLock<BTreeMap<String, PlaybackSession>>>,
@@ -111,6 +113,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to open database {}", config.database.display()))?;
     let registry = build_registry(&database, &config).await?;
     let providers = Arc::new(RwLock::new(registry));
+    let activity = Arc::new(activity::ActivityLog::new());
 
     // `--scan-once` is the batch path: scan synchronously, persist, exit.
     if config.scan_once {
@@ -169,6 +172,7 @@ async fn main() -> Result<()> {
         database.clone(),
         providers.clone(),
         rescan_lock.clone(),
+        activity.clone(),
         LIBRARY_RESCAN_INTERVAL,
         !config.no_incremental_rescan,
     ));
@@ -194,7 +198,14 @@ async fn main() -> Result<()> {
     tracing::info!("listening on http://{}", config.addr);
     axum::serve(
         listener,
-        app(database, providers, players, rescan_lock, subsonic_auth),
+        app(
+            database,
+            providers,
+            players,
+            activity,
+            rescan_lock,
+            subsonic_auth,
+        ),
     )
     .await
     .context("server failed")?;
@@ -265,25 +276,47 @@ async fn register_persisted_sources(
 
 /// Scan every source once and persist any changes. Runs in the background so a
 /// slow or unreachable source (an SMB share on a flaky network) never blocks the
-/// web server. Errors are logged, not propagated.
+/// web server. Each source's progress and any failure (with its root cause) are
+/// recorded in the activity log for the admin page.
+///
+/// `transient` drops the activity entry when nothing changed and nothing failed —
+/// used for the routine periodic rescans so they don't bury real events in noise.
 async fn scan_and_persist(
     database: &Database,
     providers: &Arc<RwLock<ProviderRegistry>>,
     rescan_lock: &Arc<Mutex<()>>,
+    activity: &Arc<activity::ActivityLog>,
+    label: &str,
+    transient: bool,
 ) {
     let _guard = rescan_lock.lock().await;
-    let registry = providers.read().await.clone();
-    let scanned = match registry.scan_all().await {
-        Ok(scanned) => scanned,
-        Err(error) => {
-            tracing::warn!(%error, "library scan failed");
-            return;
+    let task = activity.start("scan", label.to_string());
+
+    // Scan each source in turn, recording which one is in progress and collecting
+    // per-source failures so the admin page shows exactly what broke and why.
+    let mut libraries = Vec::new();
+    let mut errors = Vec::new();
+    for handle in providers.read().await.handles() {
+        if !handle.capabilities().can_scan {
+            continue;
         }
-    };
+        let id = handle.provider_id();
+        activity.update(task, format!("Scanning {id}…"));
+        match handle.scan().await {
+            Ok(library) => libraries.push(library),
+            Err(error) => errors.push(format!("{id}: {error}")),
+        }
+    }
+    let scanned = merge_libraries(libraries);
+
     let changes = match database.detect_library_changes(&scanned).await {
         Ok(changes) => changes,
         Err(error) => {
-            tracing::warn!(%error, "library change detection failed");
+            activity.finish(
+                task,
+                false,
+                Some(format!("change detection failed: {error}")),
+            );
             return;
         }
     };
@@ -303,22 +336,51 @@ async fn scan_and_persist(
                     && scanned.tracks.iter().any(|t| t.duration_seconds.is_some())
             });
 
-    if !changes.has_changes() && !needs_backfill {
-        return;
+    if changes.has_changes() || needs_backfill {
+        let mut scanned = scanned;
+        if let Err(error) = database.save_library(&mut scanned).await {
+            errors.push(format!("failed to save library: {error}"));
+        }
     }
 
-    let mut scanned = scanned;
-    if let Err(error) = database.save_library(&mut scanned).await {
-        tracing::warn!(%error, "failed to persist library scan");
-    } else {
-        tracing::info!(
-            added = changes.added,
-            removed = changes.removed,
-            modified = changes.modified,
-            backfill = needs_backfill,
-            "library scan updated"
+    if !errors.is_empty() {
+        activity.finish(task, false, Some(errors.join("\n")));
+    } else if changes.has_changes() {
+        activity.finish(
+            task,
+            true,
+            Some(format!(
+                "{} added, {} removed, {} updated",
+                changes.added, changes.removed, changes.modified
+            )),
         );
+    } else if transient {
+        // Routine rescan with nothing to do — don't keep a log entry.
+        activity.remove(task);
+    } else {
+        activity.finish(task, true, Some("no changes".to_string()));
     }
+}
+
+/// Spawn a one-off background library scan (e.g. after a source is added/removed,
+/// or an explicit rescan request) without blocking the caller.
+fn spawn_library_scan(state: &AppState, label: &str) {
+    let database = state.database.clone();
+    let providers = state.providers.clone();
+    let rescan_lock = state.rescan_lock.clone();
+    let activity = state.activity.clone();
+    let label = label.to_string();
+    tokio::spawn(async move {
+        scan_and_persist(
+            &database,
+            &providers,
+            &rescan_lock,
+            &activity,
+            &label,
+            false,
+        )
+        .await;
+    });
 }
 
 /// Background library task: scan once right away (so a fresh database is populated
@@ -328,10 +390,19 @@ async fn library_scan_loop(
     database: Database,
     providers: Arc<RwLock<ProviderRegistry>>,
     rescan_lock: Arc<Mutex<()>>,
+    activity: Arc<activity::ActivityLog>,
     interval: Duration,
     incremental: bool,
 ) {
-    scan_and_persist(&database, &providers, &rescan_lock).await;
+    scan_and_persist(
+        &database,
+        &providers,
+        &rescan_lock,
+        &activity,
+        "Initial library scan",
+        true,
+    )
+    .await;
     if !incremental {
         return;
     }
@@ -339,7 +410,15 @@ async fn library_scan_loop(
     ticker.tick().await; // Consume the immediate tick; we just scanned.
     loop {
         ticker.tick().await;
-        scan_and_persist(&database, &providers, &rescan_lock).await;
+        scan_and_persist(
+            &database,
+            &providers,
+            &rescan_lock,
+            &activity,
+            "Library rescan",
+            true,
+        )
+        .await;
     }
 }
 
@@ -347,12 +426,15 @@ fn app(
     database: Database,
     providers: Arc<RwLock<ProviderRegistry>>,
     players: Arc<PlayerManager>,
+    activity: Arc<activity::ActivityLog>,
     rescan_lock: Arc<Mutex<()>>,
     subsonic_auth: subsonic::SubsonicAuth,
 ) -> Router {
     Router::new()
         .merge(subsonic::routes())
         .route("/", get(index))
+        .route("/admin", get(admin_page))
+        .route("/admin.js", get(admin_js))
         .route("/app.js", get(app_js))
         .route("/styles.css", get(styles_css))
         .route("/manifest.webmanifest", get(manifest))
@@ -414,6 +496,7 @@ fn app(
         .route("/api/sources", get(list_sources).post(create_source))
         .route("/api/sources/{id}", delete(delete_source))
         .route("/api/sources/{id}/rescan", post(rescan_source))
+        .route("/api/activity", get(list_activity))
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
             get(album_musicbrainz_candidates),
@@ -458,6 +541,7 @@ fn app(
             players,
             musicbrainz: MusicBrainzClient::default(),
             radio_browser: radiobrowser::RadioBrowserClient::default(),
+            activity,
             rescan_lock,
             most_played_cache: Arc::new(Mutex::new(None)),
             playback_sessions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -487,6 +571,17 @@ async fn log_request(request: Request, next: Next) -> Response {
 
 async fn index() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
+}
+
+async fn admin_page() -> Html<&'static str> {
+    Html(include_str!("../static/admin.html"))
+}
+
+async fn admin_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        include_str!("../static/admin.js"),
+    )
 }
 
 async fn app_js() -> impl IntoResponse {
@@ -1503,6 +1598,11 @@ struct CreateSourceRequest {
     domain: Option<String>,
 }
 
+/// Recent and in-progress background activities (scans, rescans), newest first.
+async fn list_activity(State(state): State<AppState>) -> Json<Vec<activity::Activity>> {
+    Json(state.activity.list())
+}
+
 /// List configured sources: the always-present local library plus any persisted
 /// network sources (SMB shares).
 async fn list_sources(State(state): State<AppState>) -> Result<Json<Vec<SourceView>>, AppError> {
@@ -1583,20 +1683,20 @@ async fn create_source(
         created_at_unix_seconds: now_unix_seconds(),
     };
 
-    // Build the provider, then actually connect + scan it so the caller gets a real
-    // error (unreachable host, bad credentials, …) instead of a silently-broken
-    // source. Only persist and register it once it's known to work — and do this
-    // before taking the rescan lock so a bad source can't wedge other requests.
+    // Build the provider from the (validated) config so an obviously-bad request
+    // fails immediately, then persist + register and kick off the scan in the
+    // background. The scan's progress — and any connection/credential error with its
+    // root cause — shows up in the activity log, so adding a source never blocks the
+    // UI or wedges other requests behind a slow share.
     let handle = providers::provider_from_record(&record)
         .map_err(|error| AppError::bad_request(error.to_string()))?;
-    handle
-        .scan()
-        .await
-        .map_err(|error| AppError::bad_request(format!("could not read source: {error}")))?;
 
     state.database.add_source(&record).await.map_err(db_error)?;
     state.providers.write().await.push(handle);
-    rescan_and_save(&state).await?;
+    spawn_library_scan(
+        &state,
+        &format!("Scanning new source {}", record.display_name),
+    );
 
     Ok(Json(source_view(&record)))
 }
@@ -1612,30 +1712,14 @@ async fn delete_source(
     }
     state.database.delete_source(&id).await.map_err(db_error)?;
     state.providers.write().await.remove(&id);
-    rescan_and_save(&state).await?;
+    // Re-merge the library without the removed source's tracks, in the background.
+    spawn_library_scan(&state, "Rescan after removing a source");
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn rescan_source(
-    State(state): State<AppState>,
-    Path(_id): Path<String>,
-) -> Result<Json<LibrarySummary>, AppError> {
-    let summary = rescan_and_save(&state).await?;
-    Ok(Json(summary))
-}
-
-/// Rescan every active source and persist the merged result. Serialized with the
-/// background rescan via `rescan_lock`.
-async fn rescan_and_save(state: &AppState) -> Result<LibrarySummary, AppError> {
-    let _guard = state.rescan_lock.lock().await;
-    let registry = state.providers.read().await.clone();
-    let mut scanned = registry
-        .scan_all()
-        .await
-        .map_err(|error| AppError::internal(error.to_string()))?;
-    let summary = scanned.summary();
-    state.database.save_library(&mut scanned).await?;
-    Ok(summary)
+async fn rescan_source(State(state): State<AppState>, Path(_id): Path<String>) -> StatusCode {
+    spawn_library_scan(&state, "Manual rescan");
+    StatusCode::ACCEPTED
 }
 
 #[derive(Debug, Deserialize)]
@@ -4209,6 +4293,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activity_endpoint_returns_array() {
+        let fixture = TestFixture::new("activity");
+        let app = fixture.app().await;
+        let body = body_text(
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/activity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(value.is_array(), "activity must be a JSON array");
+    }
+
+    #[tokio::test]
     async fn delete_source_with_slashy_id_routes() {
         let fixture = TestFixture::new("del-probe");
         let app = fixture.app().await;
@@ -4562,6 +4666,7 @@ mod tests {
                 database,
                 std::sync::Arc::new(tokio::sync::RwLock::new(registry)),
                 players,
+                std::sync::Arc::new(crate::activity::ActivityLog::new()),
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 crate::subsonic::SubsonicAuth {
                     user: "u".to_string(),

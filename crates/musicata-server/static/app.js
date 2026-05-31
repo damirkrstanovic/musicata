@@ -89,8 +89,6 @@ const els = {
   metadataTitle: document.querySelector("#metadata-title"),
   metadataBody: document.querySelector("#metadata-body"),
   metadataClose: document.querySelector("#metadata-close"),
-  settings: document.querySelector("#settings"),
-  settingsClose: document.querySelector("#settings-close"),
   menuToggle: document.querySelector("#menu-toggle"),
   mobileSettings: document.querySelector("#mobile-settings"),
   scrim: document.querySelector("#scrim"),
@@ -100,17 +98,10 @@ const els = {
   npCollapse: document.querySelector("#np-collapse"),
 };
 
-function openSettings() {
-  els.settings.hidden = false;
-  loadSources();
+// Players, music sources and background activity live on the dedicated /admin page.
+function openAdmin() {
+  window.location.href = "/admin";
 }
-function closeSettings() {
-  els.settings.hidden = true;
-}
-els.settingsClose.addEventListener("click", closeSettings);
-els.settings.addEventListener("click", (event) => {
-  if (event.target === els.settings) closeSettings();
-});
 
 // ---- Mobile chrome: sidebar drawer + now-playing sheet ----
 function setDrawer(open) {
@@ -128,10 +119,7 @@ els.menuToggle.addEventListener("click", () =>
   setDrawer(!document.body.classList.contains("nav-open")),
 );
 els.scrim.addEventListener("click", () => setDrawer(false));
-els.mobileSettings.addEventListener("click", () => {
-  setDrawer(false);
-  openSettings();
-});
+els.mobileSettings.addEventListener("click", openAdmin);
 els.npExpand.addEventListener("click", () => setNowPlayingSheet(true));
 els.npCollapse.addEventListener("click", () => setNowPlayingSheet(false));
 // Tapping the now-playing strip (but not its buttons) expands the sheet on mobile.
@@ -146,7 +134,6 @@ els.miniPlay.addEventListener("click", () => els.playPause.click());
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   if (!els.radioDirectory.hidden) closeRadioDirectory();
-  else if (!els.settings.hidden) closeSettings();
   else if (document.body.classList.contains("np-open")) setNowPlayingSheet(false);
   else if (document.body.classList.contains("nav-open")) setDrawer(false);
 });
@@ -1967,130 +1954,12 @@ function debounce(fn, delay) {
   };
 }
 
-// ---- Music sources --------------------------------------------------------
-
-const sourceEls = {
-  list: document.querySelector("#sources-list"),
-  addForm: document.querySelector("#add-source"),
-  host: document.querySelector("#source-host"),
-  share: document.querySelector("#source-share"),
-  path: document.querySelector("#source-path"),
-  name: document.querySelector("#source-name"),
-  user: document.querySelector("#source-user"),
-  pass: document.querySelector("#source-pass"),
-  addStatus: document.querySelector("#add-source-status"),
-};
-
-const CAPABILITY_LABELS = [
-  ["can_scan", "Scan"],
-  ["can_browse", "Browse"],
-  ["can_search", "Search"],
-  ["can_stream", "Stream"],
-];
-
-async function loadSources() {
-  if (!sourceEls.list) return;
-  let sources;
-  try {
-    sources = await api("/api/sources");
-  } catch (error) {
-    sourceEls.list.innerHTML = `<p class="error">Sources unavailable: ${escapeHtml(error.message)}</p>`;
-    return;
-  }
-  sourceEls.list.innerHTML = "";
-  for (const source of sources) {
-    const row = document.createElement("div");
-    row.className = "source-item";
-
-    const main = document.createElement("div");
-    main.className = "source-main";
-    const chips = (source.capabilities ? CAPABILITY_LABELS : [])
-      .filter(([key]) => source.capabilities[key])
-      .map(([, label]) => `<span class="cap-chip">${label}</span>`)
-      .join("");
-    main.innerHTML =
-      `<div class="source-head">` +
-      `<span class="source-name">${escapeHtml(source.display_name)}</span>` +
-      `<span class="source-kind">${escapeHtml(source.kind)}</span>` +
-      `</div><div class="cap-chips">${chips}</div>`;
-    row.append(main);
-
-    if (source.kind !== "local") {
-      const del = document.createElement("button");
-      del.type = "button";
-      del.className = "ghost-button source-remove";
-      del.title = "Remove source";
-      del.textContent = "Remove";
-      del.addEventListener("click", () => deleteSource(source.id, source.display_name));
-      row.append(del);
-    }
-    sourceEls.list.append(row);
-  }
-}
-
-async function deleteSource(id, name) {
-  if (!window.confirm(`Remove source "${name}"? Its tracks leave the library.`)) return;
-  try {
-    await apiJson(`/api/sources/${encodeURIComponent(id)}`, "DELETE");
-  } catch (error) {
-    sourceEls.addStatus.classList.add("error");
-    sourceEls.addStatus.textContent = `Could not remove: ${error.message}`;
-    return;
-  }
-  sourceEls.addStatus.classList.remove("error");
-  sourceEls.addStatus.textContent = "";
-  await loadSources();
-  await loadLibrary();
-}
-
-if (sourceEls.addForm) {
-  sourceEls.addForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const body = {
-      kind: "smb",
-      host: sourceEls.host.value.trim(),
-      share: sourceEls.share.value.trim(),
-      base_path: sourceEls.path.value.trim() || undefined,
-      display_name: sourceEls.name.value.trim() || undefined,
-      username: sourceEls.user.value.trim() || undefined,
-      password: sourceEls.pass.value || undefined,
-    };
-    const submit = sourceEls.addForm.querySelector("button[type=submit]");
-    if (submit) submit.disabled = true;
-    sourceEls.addStatus.classList.remove("error");
-    sourceEls.addStatus.textContent = "Connecting and scanning… (this can take a moment)";
-    let added;
-    try {
-      added = await apiJson("/api/sources", "POST", body);
-    } catch (error) {
-      sourceEls.addStatus.classList.add("error");
-      sourceEls.addStatus.textContent = `Could not add share: ${error.message}`;
-      return;
-    } finally {
-      if (submit) submit.disabled = false;
-    }
-    sourceEls.addForm.reset();
-    sourceEls.addStatus.textContent = `Added “${added?.display_name ?? "source"}”.`;
-    await loadSources();
-    await loadLibrary();
-  });
-}
-
-// ---- Players & zones ------------------------------------------------------
-
-const playerEls = {
-  list: document.querySelector("#players-list"),
-  addForm: document.querySelector("#add-player"),
-  address: document.querySelector("#player-address"),
-  name: document.querySelector("#player-name"),
-  zonesList: document.querySelector("#zones-list"),
-  addZoneForm: document.querySelector("#add-zone"),
-  zoneName: document.querySelector("#zone-name"),
-  addStatus: document.querySelector("#add-player-status"),
-};
+// ---- Players (active-output switcher) -------------------------------------
+// Player/zone/source MANAGEMENT lives on the /admin page; here we only need the
+// active-output switcher and live playback state.
 
 const playerSockets = new Map();
-let playerData = { players: [], zones: [] };
+let playerData = { players: [] };
 
 async function apiJson(path, method, body) {
   const init = { method };
@@ -2115,86 +1984,25 @@ async function apiJson(path, method, body) {
 }
 
 async function loadPlayers() {
-  if (!playerEls.list) return;
+  let players;
   try {
-    const [players, zones] = await Promise.all([api("/api/players"), api("/api/zones")]);
-    playerData = { players, zones };
-    browserPlayerId = players.find((player) => player.kind === "browser")?.id ?? null;
-    renderPlayers();
-    renderPlayerSwitcher(players);
+    players = await api("/api/players");
   } catch (error) {
-    playerEls.list.innerHTML = `<p class="error">Players unavailable: ${escapeHtml(error.message)}</p>`;
+    console.warn("players unavailable", error);
+    return;
   }
-}
+  playerData = { players };
+  browserPlayerId = players.find((player) => player.kind === "browser")?.id ?? null;
+  renderPlayerSwitcher(players);
 
-function zoneOptions(selected) {
-  const none = `<option value=""${selected ? "" : " selected"}>No zone</option>`;
-  const options = playerData.zones
-    .map(
-      (zone) =>
-        `<option value="${escapeHtml(zone.id)}"${zone.id === selected ? " selected" : ""}>${escapeHtml(zone.name)}</option>`,
-    )
-    .join("");
-  return none + options;
-}
-
-function renderPlayers() {
-  // Drop sockets for players that no longer exist.
+  // Drop sockets for players that no longer exist; open one per player for live state.
   for (const [id, socket] of playerSockets) {
-    if (!playerData.players.some((player) => player.id === id)) {
+    if (!players.some((player) => player.id === id)) {
       socket.close();
       playerSockets.delete(id);
     }
   }
-
-  playerEls.list.innerHTML =
-    playerData.players.length === 0
-      ? `<p class="empty">No players yet. Add an MPD host:port below.</p>`
-      : playerData.players
-          .map(
-            (player) => `
-        <div class="player-card" data-player="${escapeHtml(player.id)}">
-          <div class="player-head">
-            <span class="player-dot ${player.online ? "online" : "offline"}"></span>
-            <strong>${escapeHtml(player.name)}</strong>
-            <button class="icon-button" data-action="rename" title="Rename">&#9998;</button>
-            <button class="icon-button" data-action="remove" title="Remove">&times;</button>
-          </div>
-          <p class="player-now" data-now="${escapeHtml(player.id)}">${player.online ? "Idle" : "Offline"}</p>
-          <div class="player-controls-row">
-            <button data-action="previous" title="Previous">&#9198;</button>
-            <button data-action="play" title="Play">&#9654;</button>
-            <button data-action="pause" title="Pause">&#9208;</button>
-            <button data-action="stop" title="Stop">&#9209;</button>
-            <button data-action="next" title="Next">&#9197;</button>
-            <button data-action="play-here" class="ghost-button">Play view here</button>
-          </div>
-          <label class="player-volume" title="Volume">
-            <span>&#128266;</span>
-            <input type="range" min="0" max="100" value="100" data-action="volume" data-volume="${escapeHtml(player.id)}">
-          </label>
-          <label class="player-zone">
-            <span>Zone</span>
-            <select data-action="zone">${zoneOptions(player.zone_id)}</select>
-          </label>
-        </div>`,
-          )
-          .join("");
-
-  playerEls.zonesList.innerHTML =
-    playerData.zones.length === 0
-      ? `<p class="empty">No zones.</p>`
-      : playerData.zones
-          .map(
-            (zone) => `
-        <div class="zone-row" data-zone="${escapeHtml(zone.id)}">
-          <span>${escapeHtml(zone.name)}</span>
-          <button class="icon-button" data-action="delete-zone" title="Delete zone">&times;</button>
-        </div>`,
-          )
-          .join("");
-
-  for (const player of playerData.players) {
+  for (const player of players) {
     if (!playerSockets.has(player.id)) {
       openPlayerSocket(player.id);
     }
@@ -2224,15 +2032,6 @@ function openPlayerSocket(id) {
         if (state.view === "recent") {
           loadHistoryView("recent");
         }
-      }
-      const node = playerEls.list.querySelector(`[data-now="${cssEscape(id)}"]`);
-      if (node) {
-        const suffix = id === browserPlayerId && browserOutput ? " (playing here)" : "";
-        node.textContent = nowPlayingText(playback) + suffix;
-      }
-      const volume = playerEls.list.querySelector(`input[data-volume="${cssEscape(id)}"]`);
-      if (volume && playback.volume != null && document.activeElement !== volume) {
-        volume.value = String(playback.volume);
       }
       if (
         id === browserPlayerId &&
@@ -2485,7 +2284,7 @@ els.playerMenuList.addEventListener("click", (event) => {
 });
 els.playerMenuConfig.addEventListener("click", () => {
   setPlayerMenu(false);
-  openSettings();
+  openAdmin();
 });
 document.addEventListener("click", (event) => {
   if (state.playerMenuOpen && !event.target.closest(".player-switch")) {
@@ -2689,128 +2488,6 @@ setInterval(() => {
   setRange(els.seek, state.activeElapsed, state.activeDuration);
   els.elapsed.textContent = formatTime(state.activeElapsed);
 }, 1000);
-
-if (playerEls.list) {
-  playerEls.list.addEventListener("click", async (event) => {
-    const button = event.target.closest("button[data-action]");
-    if (!button) return;
-    const id = button.closest("[data-player]")?.dataset.player;
-    if (!id) return;
-    const action = button.dataset.action;
-    // Interacting with the browser player makes this tab its audio output.
-    if (
-      id === browserPlayerId &&
-      ["play", "play-here", "next", "previous"].includes(action)
-    ) {
-      claimBrowserOutput();
-    }
-    if (["play", "pause", "stop", "next", "previous"].includes(action)) {
-      await playerCommand(id, { command: action });
-    } else if (action === "play-here") {
-      const ids = state.visibleTracks.map((track) => track.id);
-      if (ids.length) {
-        await playerCommand(id, { command: "play_tracks", track_ids: ids });
-      }
-    } else if (action === "rename") {
-      const current = playerData.players.find((player) => player.id === id);
-      const name = prompt("Player name", current?.name ?? "");
-      if (name) {
-        await apiJson(`/api/players/${encodeURIComponent(id)}`, "PATCH", { name });
-        await loadPlayers();
-      }
-    } else if (action === "remove") {
-      if (confirm("Remove this player?")) {
-        await apiJson(`/api/players/${encodeURIComponent(id)}`, "DELETE");
-        await loadPlayers();
-      }
-    }
-  });
-
-  playerEls.list.addEventListener("change", async (event) => {
-    const select = event.target.closest("select[data-action='zone']");
-    if (!select) return;
-    const id = select.closest("[data-player]")?.dataset.player;
-    if (!id) return;
-    await apiJson(`/api/players/${encodeURIComponent(id)}`, "PATCH", {
-      zone_id: select.value || null,
-    });
-    await loadPlayers();
-  });
-
-  // Volume slider: instant local feedback for the browser output, debounced
-  // command to the player so dragging doesn't flood it.
-  const volumeTimers = new Map();
-  playerEls.list.addEventListener("input", (event) => {
-    const slider = event.target.closest("input[data-action='volume']");
-    if (!slider) return;
-    const id = slider.closest("[data-player]")?.dataset.player;
-    if (!id) return;
-    const volume = Number.parseInt(slider.value, 10);
-    if (id === browserPlayerId && browserOutput) {
-      els.audio.volume = Math.min(1, Math.max(0, volume / 100));
-    }
-    clearTimeout(volumeTimers.get(id));
-    volumeTimers.set(
-      id,
-      setTimeout(() => playerCommand(id, { command: "set_volume", volume }), 150),
-    );
-  });
-}
-
-if (playerEls.addForm) {
-  playerEls.addForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const address = playerEls.address.value.trim();
-    if (!address) return;
-    const name = playerEls.name.value.trim();
-    playerEls.addStatus.classList.remove("error");
-    playerEls.addStatus.textContent = `Registering ${address}…`;
-    try {
-      const player = await apiJson("/api/players", "POST", { address, name: name || undefined });
-      playerEls.address.value = "";
-      playerEls.name.value = "";
-      await loadPlayers();
-      // Connection happens in the background; the dot turns green once reached.
-      playerEls.addStatus.textContent = `Added ${player.name}. Connecting…`;
-      setTimeout(() => loadPlayers(), 1500);
-      setTimeout(() => {
-        if (playerEls.addStatus.textContent.startsWith("Added")) {
-          playerEls.addStatus.textContent = "";
-        }
-      }, 4000);
-    } catch (error) {
-      playerEls.addStatus.classList.add("error");
-      playerEls.addStatus.textContent = `Could not add player: ${error.message}`;
-    }
-  });
-}
-
-if (playerEls.zonesList) {
-  playerEls.zonesList.addEventListener("click", async (event) => {
-    const button = event.target.closest("button[data-action='delete-zone']");
-    if (!button) return;
-    const id = button.closest("[data-zone]")?.dataset.zone;
-    if (id && confirm("Delete this zone?")) {
-      await apiJson(`/api/zones/${encodeURIComponent(id)}`, "DELETE");
-      await loadPlayers();
-    }
-  });
-}
-
-if (playerEls.addZoneForm) {
-  playerEls.addZoneForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const name = playerEls.zoneName.value.trim();
-    if (!name) return;
-    try {
-      await apiJson("/api/zones", "POST", { name });
-      playerEls.zoneName.value = "";
-      await loadPlayers();
-    } catch (error) {
-      alert(`Add zone failed: ${error.message}`);
-    }
-  });
-}
 
 loadPlayers();
 setupMediaSession();

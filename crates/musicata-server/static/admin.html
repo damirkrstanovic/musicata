@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#16181d">
+    <title>Musicata · Admin</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body class="admin">
+    <header class="admin-bar">
+      <div class="admin-brand">
+        <span class="brand-mark">M</span>
+        <div>
+          <h1>Musicata</h1>
+          <p>Administration</p>
+        </div>
+      </div>
+      <a class="ghost-button" href="/">← Back to player</a>
+    </header>
+
+    <main class="admin-grid">
+      <section class="admin-panel">
+        <header class="admin-panel-head">
+          <h2>Music sources</h2>
+          <button id="rescan-all" class="ghost-button" type="button">Rescan all</button>
+        </header>
+        <p class="admin-hint">Where your music comes from. The local library is set with
+          <code>--library</code>; add network shares here. Scanning runs in the background.</p>
+        <div id="sources-list" class="admin-list"></div>
+
+        <form id="add-source" class="field-form">
+          <h3>Add an SMB share</h3>
+          <div class="field-grid">
+            <label class="field field-host">
+              <span>Host</span>
+              <input id="source-host" type="text" autocomplete="off" placeholder="nas.local" required>
+            </label>
+            <label class="field field-share">
+              <span>Share</span>
+              <input id="source-share" type="text" autocomplete="off" placeholder="Music" required>
+            </label>
+            <label class="field field-path">
+              <span>Subfolder <em>(optional)</em></span>
+              <input id="source-path" type="text" autocomplete="off" placeholder="Albums/FLAC">
+            </label>
+            <label class="field field-name">
+              <span>Display name <em>(optional)</em></span>
+              <input id="source-name" type="text" autocomplete="off" placeholder="NAS">
+            </label>
+            <label class="field field-user">
+              <span>Username <em>(optional)</em></span>
+              <input id="source-user" type="text" autocomplete="off" placeholder="guest">
+            </label>
+            <label class="field field-pass">
+              <span>Password <em>(optional)</em></span>
+              <input id="source-pass" type="password" autocomplete="new-password" placeholder="••••••">
+            </label>
+          </div>
+          <div class="field-actions">
+            <button class="primary-button" type="submit">Add SMB share</button>
+            <span id="add-source-status" class="form-status"></span>
+          </div>
+        </form>
+      </section>
+
+      <section class="admin-panel">
+        <header class="admin-panel-head"><h2>Players &amp; zones</h2></header>
+        <p class="admin-hint">Output devices Musicata controls (MPD endpoints, plus this browser).
+          Group players into zones to control them together.</p>
+        <div id="players-list" class="admin-list"></div>
+
+        <form id="add-player" class="field-form">
+          <h3>Add an MPD player</h3>
+          <div class="field-grid">
+            <label class="field field-addr">
+              <span>Address <em>(host:port)</em></span>
+              <input id="player-address" type="text" inputmode="url" autocomplete="off" placeholder="192.168.1.10:6600" required>
+            </label>
+            <label class="field field-name">
+              <span>Name <em>(optional)</em></span>
+              <input id="player-name" type="text" autocomplete="off" placeholder="Living room">
+            </label>
+          </div>
+          <div class="field-actions">
+            <button class="primary-button" type="submit">Add player</button>
+            <span id="add-player-status" class="form-status"></span>
+          </div>
+        </form>
+
+        <h3 class="admin-subhead">Zones</h3>
+        <div id="zones-list" class="admin-list"></div>
+        <form id="add-zone" class="field-form">
+          <div class="field-grid">
+            <label class="field field-name">
+              <span>New zone</span>
+              <input id="zone-name" type="text" autocomplete="off" placeholder="Upstairs" required>
+            </label>
+          </div>
+          <div class="field-actions">
+            <button class="primary-button" type="submit">Add zone</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="admin-panel admin-panel-wide">
+        <header class="admin-panel-head">
+          <h2>Activity</h2>
+          <span id="activity-live" class="activity-live" hidden>● working</span>
+        </header>
+        <p class="admin-hint">Library scans, rescans and other background work. Failures show
+          the root cause here.</p>
+        <div id="activity-list" class="activity-list"></div>
+      </section>
+    </main>
+
+    <script src="/admin.js" defer></script>
+  </body>
+</html>

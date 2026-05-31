@@ -123,6 +123,11 @@ impl ProviderRegistry {
             .cloned()
     }
 
+    /// A snapshot of the active source handles, for scanning each in turn.
+    pub fn handles(&self) -> Vec<ProviderHandle> {
+        self.providers.clone()
+    }
+
     /// Scan every scannable source and merge the results into one library. A source
     /// that fails to scan (e.g. an offline share) is logged and skipped rather than
     /// failing the whole library — the others still load.
