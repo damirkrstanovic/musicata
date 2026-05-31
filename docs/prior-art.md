@@ -181,10 +181,45 @@ and how do we not clobber the user's corrections on the next scan?
     match **auto-applies**, weaker ones **prompt the user**.
   - Treats **MusicBrainz as canonical** and *rewrites* tags from it (opposite of
     Navidrome's read-only stance).
-- **MusicBrainz Picard**: **Cluster** (group files by album/artist tags) → **Lookup**
-  (query MB by existing tags/MBIDs) → **Scan** (AcoustID acoustic fingerprint when
-  tags don't resolve). Embedded MBIDs load the exact release directly. Canonical-
-  source-wins: saving rewrites tags from MB.
+- **MusicBrainz Picard** — the canonical tagger; the strongest matcher of the lot,
+  worth understanding in depth:
+  - **Three-step workflow.** **Cluster** groups loose files into album clusters by
+    their existing album/artist tags. **Lookup** searches MusicBrainz with the
+    cluster's tags and matches the whole cluster to a *release*. **Scan** computes an
+    **AcoustID acoustic fingerprint** (Chromaprint) per file and asks acoustid.org
+    which *recording(s)* that audio is — so it identifies tracks **even with no or
+    wrong tags**. Files with embedded MBIDs (`musicbrainz_albumid` /
+    `musicbrainz_recordingid`) short-circuit straight to the exact release/recording.
+  - **Weighted similarity scoring** is the core. Picard compares a file's metadata to
+    a candidate with a weighted average of per-field similarities — title, artist,
+    album, track/total numbers, **length** (numeric closeness, a few seconds'
+    tolerance), release type/country/date — text fields by an edit-distance ratio.
+    It surfaces match quality as **green > yellow > orange > red**.
+  - **Three configurable thresholds** gate that score
+    (`config/options_matching.html`): **cluster→release** (how similar a whole cluster
+    must be to accept a release), **file→recording** (below it, a recording candidate
+    is ignored entirely — used by Lookup/Scan of single files), and **file→track**
+    (which track on a chosen release a file is assigned to; below it the file goes to
+    an "unmatched files" bucket). Lower the file→track threshold when files have poor
+    tags.
+  - **AcoustID is the killer feature**: a crowd-sourced fingerprint→recording map, so
+    audio identity doesn't depend on tags at all — the thing tag-only matchers
+    (Jellyfin) can't do.
+  - **Full MB data model**: release vs recording vs **work** vs release-group,
+    multiple/featured artists, relationships, disc/medium structure — not just flat
+    tags.
+  - **Scriptable**: a Tagger Script language (`%title%` vars; `_hidden` vars not
+    written to files; multi-values joined with "; ") plus separate **naming scripts**
+    for file/folder layout, and Python **plugins**. Per-format **tag mapping** writes
+    the right frame per container.
+  - **Canonical-source-wins, opt-in write**: Save **rewrites** the file's tags from
+    MusicBrainz (it *is* a tagger), but only the fields it manages and only when the
+    user clicks Save; it preserves tags it doesn't own.
+  - **Why it's strong:** acoustic identity (AcoustID) + a tuned weighted matcher with
+    explicit thresholds + the full relational MB model + scriptable output + human-in-
+    the-loop correction. Weaknesses: it's a desktop app, matching/length/scoring
+    weights aren't exposed as docs (they live in the source), and good results lean on
+    user review.
 
 **Cross-project consensus worth adopting:**
 1. **ID-first** — an embedded MusicBrainz ID means an exact lookup, no fuzzy search
@@ -213,11 +248,15 @@ Navidrome (consensus #5).
 **Gaps to close** (maps onto the model we already have — the observation's
 `confidence` + `approval_state` are exactly the hooks): a **confidence/approval-ranked
 per-field resolver** (so `Approved` user/MB values outrank embedded, embedded outranks
-folder — consensus #3, #4); **MBID-first auto-resolution** + a **confidence gate** for
-text matches before auto-applying MB data (consensus #1, #2); a **tag-mapping/
-multi-value normalization** layer (Navidrome `mappings.yaml`); **AcoustID** as the
-last-resort matcher (consensus #6). The designed ladder is in `docs/metadata.md`
-(§Metadata Sources); this section is the *why* behind it.
+folder — consensus #3, #4); **MBID-first auto-resolution** + a **weighted-similarity
+match with score thresholds** before auto-applying MB data — Picard's
+cluster→release / file→recording / file→track threshold model is the template, and
+its scoring (title/artist/album/tracknumber + **length** tolerance) is what to copy
+(consensus #1, #2); a **tag-mapping/multi-value normalization** layer (Navidrome
+`mappings.yaml`); and **AcoustID/Chromaprint** as the last-resort matcher that
+identifies audio when tags are missing/wrong — the one capability tag-only matchers
+lack, and the main reason Picard is strong (consensus #6). The designed ladder is in
+`docs/metadata.md` (§Metadata Sources); this section is the *why* behind it.
 
 ---
 
