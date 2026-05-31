@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use tokio::sync::watch;
 
 /// How many recent activities to retain.
 const MAX_ACTIVITIES: usize = 60;
@@ -29,10 +30,22 @@ pub struct Activity {
     pub message: Option<String>,
 }
 
-#[derive(Default)]
 pub struct ActivityLog {
     items: Mutex<VecDeque<Activity>>,
     next_id: AtomicU64,
+    // A version counter bumped on every change, so WebSocket subscribers can push
+    // updates instead of clients polling.
+    version: watch::Sender<u64>,
+}
+
+impl Default for ActivityLog {
+    fn default() -> Self {
+        Self {
+            items: Mutex::new(VecDeque::new()),
+            next_id: AtomicU64::new(0),
+            version: watch::channel(0).0,
+        }
+    }
 }
 
 fn now() -> i64 {
@@ -47,6 +60,15 @@ impl ActivityLog {
         Self::default()
     }
 
+    /// Subscribe to change notifications; the value is an opaque version counter.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.version.subscribe()
+    }
+
+    fn bump(&self) {
+        self.version.send_modify(|version| *version += 1);
+    }
+
     /// Record the start of a running activity and return its id.
     pub fn start(&self, kind: impl Into<String>, label: impl Into<String>) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -59,36 +81,48 @@ impl ActivityLog {
             finished_at_unix_seconds: None,
             message: None,
         };
-        let mut items = self.items.lock().expect("activity log poisoned");
-        items.push_front(activity);
-        while items.len() > MAX_ACTIVITIES {
-            items.pop_back();
+        {
+            let mut items = self.items.lock().expect("activity log poisoned");
+            items.push_front(activity);
+            while items.len() > MAX_ACTIVITIES {
+                items.pop_back();
+            }
         }
+        self.bump();
         id
     }
 
     /// Update the label of a running activity (e.g. which source is being scanned).
     pub fn update(&self, id: u64, label: impl Into<String>) {
-        let mut items = self.items.lock().expect("activity log poisoned");
-        if let Some(activity) = items.iter_mut().find(|activity| activity.id == id) {
-            activity.label = label.into();
+        {
+            let mut items = self.items.lock().expect("activity log poisoned");
+            if let Some(activity) = items.iter_mut().find(|activity| activity.id == id) {
+                activity.label = label.into();
+            }
         }
+        self.bump();
     }
 
     /// Mark an activity finished, ok or error, with a message.
     pub fn finish(&self, id: u64, ok: bool, message: Option<String>) {
-        let mut items = self.items.lock().expect("activity log poisoned");
-        if let Some(activity) = items.iter_mut().find(|activity| activity.id == id) {
-            activity.status = if ok { "ok" } else { "error" }.to_string();
-            activity.finished_at_unix_seconds = Some(now());
-            activity.message = message;
+        {
+            let mut items = self.items.lock().expect("activity log poisoned");
+            if let Some(activity) = items.iter_mut().find(|activity| activity.id == id) {
+                activity.status = if ok { "ok" } else { "error" }.to_string();
+                activity.finished_at_unix_seconds = Some(now());
+                activity.message = message;
+            }
         }
+        self.bump();
     }
 
     /// Drop an activity entirely — used to avoid logging routine no-op rescans.
     pub fn remove(&self, id: u64) {
-        let mut items = self.items.lock().expect("activity log poisoned");
-        items.retain(|activity| activity.id != id);
+        {
+            let mut items = self.items.lock().expect("activity log poisoned");
+            items.retain(|activity| activity.id != id);
+        }
+        self.bump();
     }
 
     /// All activities, newest first.

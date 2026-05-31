@@ -290,12 +290,14 @@ function timeAgo(unix) {
 }
 
 async function loadActivity() {
-  let items;
   try {
-    items = await api("/api/activity");
+    renderActivity(await api("/api/activity"));
   } catch {
-    return;
+    /* the WebSocket will deliver updates; ignore a one-off fetch failure */
   }
+}
+
+function renderActivity(items) {
   const running = items.some((a) => a.status === "running");
   $("#activity-live").hidden = !running;
 
@@ -325,11 +327,40 @@ async function loadActivity() {
     .join("");
 }
 
+// Live activity over a WebSocket — the server pushes the list on every change
+// (scan progress, completions, errors), so no polling. Reconnects if it drops.
+function connectActivity() {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  let socket;
+  try {
+    socket = new WebSocket(`${scheme}://${location.host}/api/activity/ws`);
+  } catch {
+    setTimeout(connectActivity, 3000);
+    return;
+  }
+  socket.onmessage = (event) => {
+    try {
+      renderActivity(JSON.parse(event.data));
+    } catch {
+      /* ignore malformed frame */
+    }
+  };
+  socket.onclose = () => setTimeout(connectActivity, 3000);
+  socket.onerror = () => {
+    try {
+      socket.close();
+    } catch {
+      /* already closing */
+    }
+  };
+}
+
 // ---- Boot -----------------------------------------------------------------
 
 loadSources();
 loadPlayers();
 loadActivity();
-// Poll activity (and players, for online status) so progress shows live.
-setInterval(loadActivity, 2000);
-setInterval(loadPlayers, 5000);
+connectActivity();
+// Players still poll (for online status), but slowly — the chatty activity feed
+// is now push-based.
+setInterval(loadPlayers, 10000);

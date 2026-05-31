@@ -292,18 +292,49 @@ async fn scan_and_persist(
     let _guard = rescan_lock.lock().await;
     let task = activity.start("scan", label.to_string());
 
-    // Scan each source in turn, recording which one is in progress and collecting
-    // per-source failures so the admin page shows exactly what broke and why.
+    // Scan each source in turn. The progress callback updates the activity label
+    // live (finding files → N/M processed); per-source results and any failure with
+    // its root cause are collected for the final summary.
     let mut libraries = Vec::new();
     let mut errors = Vec::new();
+    let mut summaries = Vec::new();
     for handle in providers.read().await.handles() {
         if !handle.capabilities().can_scan {
             continue;
         }
         let id = handle.provider_id();
-        activity.update(task, format!("Scanning {id}…"));
-        match handle.scan().await {
-            Ok(library) => libraries.push(library),
+        let progress = {
+            let activity = activity.clone();
+            let id = id.clone();
+            move |update: musicata_core::ScanProgress| {
+                let label = match update {
+                    musicata_core::ScanProgress::Discovering => {
+                        format!("Scanning {id}: finding files…")
+                    }
+                    musicata_core::ScanProgress::Discovered { files } => {
+                        format!("Scanning {id}: found {files} files")
+                    }
+                    musicata_core::ScanProgress::Processing { done, total } => {
+                        format!("Scanning {id}: {done}/{total} files")
+                    }
+                };
+                activity.update(task, label);
+            }
+        };
+        match handle.scan_with_progress(progress).await {
+            Ok(library) => {
+                let skipped = library.scan_errors.len();
+                summaries.push(format!(
+                    "{id}: {} tracks{}",
+                    library.tracks.len(),
+                    if skipped > 0 {
+                        format!(", {skipped} skipped")
+                    } else {
+                        String::new()
+                    }
+                ));
+                libraries.push(library);
+            }
             Err(error) => errors.push(format!("{id}: {error}")),
         }
     }
@@ -336,6 +367,14 @@ async fn scan_and_persist(
                     && scanned.tracks.iter().any(|t| t.duration_seconds.is_some())
             });
 
+    // A few sample skipped-file reasons (unreadable tags, etc.) so failures are
+    // visible, not just counted.
+    let skipped: Vec<String> = scanned
+        .scan_errors
+        .iter()
+        .map(|issue| format!("{}: {}", issue.path, issue.message))
+        .collect();
+
     if changes.has_changes() || needs_backfill {
         let mut scanned = scanned;
         if let Err(error) = database.save_library(&mut scanned).await {
@@ -343,22 +382,44 @@ async fn scan_and_persist(
         }
     }
 
+    let mut detail = summaries.join("\n");
+    if changes.has_changes() {
+        detail.push_str(&format!(
+            "\n{} added, {} removed, {} updated",
+            changes.added, changes.removed, changes.modified
+        ));
+    }
+    if !skipped.is_empty() {
+        detail.push_str(&format!("\n\n{} files skipped:", skipped.len()));
+        for line in skipped.iter().take(8) {
+            detail.push_str(&format!("\n• {line}"));
+        }
+        if skipped.len() > 8 {
+            detail.push_str(&format!("\n… and {} more", skipped.len() - 8));
+        }
+    }
+
     if !errors.is_empty() {
-        activity.finish(task, false, Some(errors.join("\n")));
-    } else if changes.has_changes() {
+        let mut message = errors.join("\n");
+        if !detail.is_empty() {
+            message.push_str("\n\n");
+            message.push_str(&detail);
+        }
+        activity.finish(task, false, Some(message));
+    } else if changes.has_changes() || !transient {
+        // Manual/add scans always report; routine rescans only when something changed.
         activity.finish(
             task,
             true,
-            Some(format!(
-                "{} added, {} removed, {} updated",
-                changes.added, changes.removed, changes.modified
-            )),
+            Some(if detail.is_empty() {
+                "no changes".to_string()
+            } else {
+                detail
+            }),
         );
-    } else if transient {
+    } else {
         // Routine rescan with nothing to do — don't keep a log entry.
         activity.remove(task);
-    } else {
-        activity.finish(task, true, Some("no changes".to_string()));
     }
 }
 
@@ -497,6 +558,7 @@ fn app(
         .route("/api/sources/{id}", delete(delete_source))
         .route("/api/sources/{id}/rescan", post(rescan_source))
         .route("/api/activity", get(list_activity))
+        .route("/api/activity/ws", get(activity_ws))
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
             get(album_musicbrainz_candidates),
@@ -1601,6 +1663,34 @@ struct CreateSourceRequest {
 /// Recent and in-progress background activities (scans, rescans), newest first.
 async fn list_activity(State(state): State<AppState>) -> Json<Vec<activity::Activity>> {
     Json(state.activity.list())
+}
+
+/// Push the activity list to a client whenever it changes — no polling. Sends an
+/// initial snapshot, then a fresh list on every change (coalesced by the watch
+/// channel, so a burst of progress updates collapses into one push).
+async fn activity_ws(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| activity_ws_loop(socket, state.activity))
+}
+
+async fn activity_ws_loop(mut socket: WebSocket, activity: Arc<activity::ActivityLog>) {
+    let mut changes = activity.subscribe();
+    loop {
+        let text = serde_json::to_string(&activity.list()).unwrap_or_else(|_| "[]".to_string());
+        if socket.send(Message::Text(text.into())).await.is_err() {
+            return;
+        }
+        tokio::select! {
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    return; // log dropped
+                }
+            }
+            incoming = socket.recv() => match incoming {
+                Some(Ok(_)) => {} // ignore client frames (read-only)
+                _ => return,      // closed or errored
+            },
+        }
+    }
 }
 
 /// List configured sources: the always-present local library plus any persisted

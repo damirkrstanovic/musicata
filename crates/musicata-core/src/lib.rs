@@ -631,7 +631,25 @@ impl Error for ScanError {
     }
 }
 
+/// Progress emitted during a scan so callers can show how far along it is.
+#[derive(Clone, Copy, Debug)]
+pub enum ScanProgress {
+    /// Walking the source tree to find audio files (count not yet known).
+    Discovering,
+    /// Discovery finished; `files` audio files were found.
+    Discovered { files: usize },
+    /// Reading tags: `done` of `total` files processed.
+    Processing { done: usize, total: usize },
+}
+
 pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
+    scan_local_library_with_progress(root, &mut |_| {})
+}
+
+pub fn scan_local_library_with_progress(
+    root: &Path,
+    progress: &mut dyn FnMut(ScanProgress),
+) -> Result<Library, ScanError> {
     if !root.exists() {
         return Err(ScanError::NotFound(root.to_path_buf()));
     }
@@ -645,19 +663,35 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
         source,
     })?;
 
-    scan_source(&LocalFs::new(&root), "local-disk")
+    scan_source_with_progress(&LocalFs::new(&root), "local-disk", progress)
 }
 
 /// Walk any [`SourceFs`] and build a [`Library`] attributed to `provider_id`.
 /// This is the shared scanner: the local-disk and SMB providers both feed it,
 /// only differing in how the underlying filesystem is read.
 pub fn scan_source(fs: &dyn SourceFs, provider_id: &str) -> Result<Library, ScanError> {
+    scan_source_with_progress(fs, provider_id, &mut |_| {})
+}
+
+/// As [`scan_source`], reporting progress (discovery, then per-file processing) so
+/// long network scans can show how far along they are.
+pub fn scan_source_with_progress(
+    fs: &dyn SourceFs,
+    provider_id: &str,
+    progress: &mut dyn FnMut(ScanProgress),
+) -> Result<Library, ScanError> {
     let root = fs.root().to_path_buf();
 
     let mut files = Vec::new();
     let mut scan_errors = Vec::new();
+    progress(ScanProgress::Discovering);
     collect_audio_files(fs, &root, &mut files, &mut scan_errors, true)?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let total = files.len();
+    progress(ScanProgress::Discovered { files: total });
+    // Report at most ~100 times so a huge library doesn't flood the callback.
+    let step = (total / 100).max(1);
 
     let mut tracks = Vec::new();
     let mut album_builders: BTreeMap<String, AlbumBuilder> = BTreeMap::new();
@@ -665,7 +699,13 @@ pub fn scan_source(fs: &dyn SourceFs, provider_id: &str) -> Result<Library, Scan
     let mut track_id_counts = BTreeMap::new();
     let observed_at_unix_seconds = current_unix_seconds();
 
-    for file in files {
+    for (index, file) in files.into_iter().enumerate() {
+        if (index + 1) % step == 0 || index + 1 == total {
+            progress(ScanProgress::Processing {
+                done: index + 1,
+                total,
+            });
+        }
         let path = file.path;
         let folder_metadata = infer_track_metadata(&root, &path);
         let (embedded_metadata, duration_seconds) =
