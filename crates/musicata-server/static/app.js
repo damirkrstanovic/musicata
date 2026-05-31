@@ -2018,9 +2018,9 @@ async function loadSources() {
     if (source.kind !== "local") {
       const del = document.createElement("button");
       del.type = "button";
-      del.className = "pl-del";
+      del.className = "ghost-button source-remove";
       del.title = "Remove source";
-      del.textContent = "✕";
+      del.textContent = "Remove";
       del.addEventListener("click", () => deleteSource(source.id, source.display_name));
       row.append(del);
     }
