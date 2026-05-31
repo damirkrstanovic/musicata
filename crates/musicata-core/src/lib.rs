@@ -632,14 +632,19 @@ impl Error for ScanError {
 }
 
 /// Progress emitted during a scan so callers can show how far along it is.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum ScanProgress {
     /// Walking the source tree to find audio files (count not yet known).
     Discovering,
     /// Discovery finished; `files` audio files were found.
     Discovered { files: usize },
-    /// Reading tags: `done` of `total` files processed.
-    Processing { done: usize, total: usize },
+    /// Reading tags: `done` of `total` files processed. `detail` carries extra live
+    /// info for concurrent scans (throughput, ETA, parallelism).
+    Processing {
+        done: usize,
+        total: usize,
+        detail: Option<String>,
+    },
 }
 
 pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
@@ -689,167 +694,266 @@ pub fn scan_source_incremental(
     progress: &mut dyn FnMut(ScanProgress),
 ) -> Result<Library, ScanError> {
     let root = fs.root().to_path_buf();
-
-    let mut files = Vec::new();
-    let mut scan_errors = Vec::new();
-    progress(ScanProgress::Discovering);
-    collect_audio_files(fs, &root, &mut files, &mut scan_errors, true)?;
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-
-    // Index the prior scan for this source: a file is unchanged when its relative
-    // path is known and its size + mtime match. Albums carry their artist + artwork
-    // forward so unchanged albums don't re-list directories for cover art.
-    let prior_tracks: BTreeMap<&str, &Track> = prior
-        .map(|library| {
-            library
-                .tracks
-                .iter()
-                .filter(|track| track.provider.provider_id == provider_id)
-                .map(|track| (track.relative_path.as_str(), track))
-                .collect()
-        })
-        .unwrap_or_default();
-    let prior_albums: BTreeMap<&str, &Album> = prior
-        .map(|library| {
-            library
-                .albums
-                .iter()
-                .map(|album| (album.id.as_str(), album))
-                .collect()
-        })
-        .unwrap_or_default();
+    let (files, walk_errors) = discover_audio_files(fs, &root, progress)?;
+    let index = PriorIndex::from_library(prior, provider_id);
 
     let total = files.len();
     progress(ScanProgress::Discovered { files: total });
-    // Report at most ~100 times so a huge library doesn't flood the callback.
-    let step = (total / 100).max(1);
+    let step = (total / 100).max(1); // ~100 updates max for the sequential path
+    let observed_at_unix_seconds = current_unix_seconds();
 
-    let mut tracks = Vec::new();
+    // Sequential build (local disk). The SMB provider runs `build_track` across files
+    // concurrently instead; both feed `assemble_library`.
+    let mut built = Vec::with_capacity(total);
+    for (position, file) in files.into_iter().enumerate() {
+        if (position + 1) % step == 0 || position + 1 == total {
+            progress(ScanProgress::Processing {
+                done: position + 1,
+                total,
+                detail: None,
+            });
+        }
+        built.push(build_track(
+            fs,
+            &root,
+            provider_id,
+            &file,
+            &index,
+            observed_at_unix_seconds,
+        ));
+    }
+
+    Ok(assemble_library(provider_id, &root, built, walk_errors))
+}
+
+/// Walk a source and return its audio files (sorted by path) plus any walk errors.
+/// One directory listing per folder; the entries carry size + mtime for free.
+pub fn discover_audio_files(
+    fs: &dyn SourceFs,
+    root: &Path,
+    progress: &mut dyn FnMut(ScanProgress),
+) -> Result<(Vec<DiscoveredAudioFile>, Vec<ScanIssue>), ScanError> {
+    let mut files = Vec::new();
+    let mut scan_errors = Vec::new();
+    progress(ScanProgress::Discovering);
+    collect_audio_files(fs, root, &mut files, &mut scan_errors, true)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((files, scan_errors))
+}
+
+/// A prior scan indexed for incremental reuse: tracks by their source-relative path,
+/// and albums' carried-forward artist + cover art. Owned (not borrowed) so it can be
+/// shared across concurrent scan tasks.
+pub struct PriorIndex {
+    tracks: std::collections::HashMap<String, Track>,
+    /// album id → (album-artist id, album-artist name, cover-art path)
+    albums: std::collections::HashMap<String, (String, String, Option<PathBuf>)>,
+}
+
+impl PriorIndex {
+    pub fn from_library(prior: Option<&Library>, provider_id: &str) -> Self {
+        let mut tracks = std::collections::HashMap::new();
+        let mut albums = std::collections::HashMap::new();
+        if let Some(library) = prior {
+            for track in &library.tracks {
+                if track.provider.provider_id == provider_id {
+                    tracks.insert(track.relative_path.clone(), track.clone());
+                }
+            }
+            for album in &library.albums {
+                albums.insert(
+                    album.id.clone(),
+                    (
+                        album.artist_id.clone(),
+                        album.artist_name.clone(),
+                        album.artwork_path.clone(),
+                    ),
+                );
+            }
+        }
+        Self { tracks, albums }
+    }
+}
+
+/// One built track plus the data `assemble_library` needs to aggregate it. For a
+/// reused (unchanged) file `identity` is `None` and the track keeps its prior id; for
+/// a freshly-read file `identity` holds the content/metadata identity and the final
+/// id is assigned (deduped) during assembly.
+pub struct BuiltTrack {
+    pub track: Track,
+    pub identity: Option<String>,
+    pub album_artist_id: String,
+    pub album_artist_name: String,
+    pub artwork_path: Option<PathBuf>,
+    pub issues: Vec<ScanIssue>,
+    /// Whether reading this file hit a (network/IO) read error — distinct from a tag
+    /// parse failure. Used by the concurrent scanner's adaptive limiter.
+    pub io_error: bool,
+}
+
+/// Build one track from a discovered file: reuse the prior parse if size + mtime are
+/// unchanged, otherwise read its tags. Pure given `fs` + `prior`, so it can run
+/// concurrently across files (the SMB provider does exactly that).
+pub fn build_track(
+    fs: &dyn SourceFs,
+    root: &Path,
+    provider_id: &str,
+    file: &DiscoveredAudioFile,
+    prior: &PriorIndex,
+    observed_at_unix_seconds: i64,
+) -> BuiltTrack {
+    let path = file.path.clone();
+    let relative_path = relative_display_path(root, &path);
+
+    // Fast path: unchanged file → reuse its parsed track wholesale (no tag read).
+    if let Some(previous) = prior.tracks.get(&relative_path)
+        && file.file_size_bytes.is_some()
+        && file.file_size_bytes == previous.file_size_bytes
+        && file.modified_at_unix_seconds == previous.modified_at_unix_seconds
+    {
+        let mut track = previous.clone();
+        track.path = path;
+        let (album_artist_id, album_artist_name) = prior
+            .albums
+            .get(&track.album_id)
+            .map(|(id, name, _)| (id.clone(), name.clone()))
+            .unwrap_or_else(|| (track.artist_id.clone(), track.artist_name.clone()));
+        let artwork_path = prior
+            .albums
+            .get(&track.album_id)
+            .and_then(|(_, _, artwork)| artwork.clone());
+        return BuiltTrack {
+            track,
+            identity: None,
+            album_artist_id,
+            album_artist_name,
+            artwork_path,
+            issues: Vec::new(),
+            io_error: false,
+        };
+    }
+
+    // Full path: a new or modified file — read its tags.
+    let mut issues = Vec::new();
+    let folder_metadata = infer_track_metadata(root, &path);
+    let (embedded_metadata, duration_seconds) =
+        read_embedded_metadata(fs, &path, &mut issues, observed_at_unix_seconds);
+    let sidecar_lyrics = read_sidecar_lyrics(fs, &path, &mut issues, observed_at_unix_seconds);
+    // A read that produced neither metadata nor a parsed file is most likely an IO
+    // failure (the tag read errored), not just a tagless file — signal it for backoff.
+    let io_error = embedded_metadata.is_none() && !issues.is_empty();
+    let metadata = canonical_metadata(embedded_metadata.as_ref(), &folder_metadata);
+    let observed_metadata = metadata_observations(
+        embedded_metadata,
+        sidecar_lyrics,
+        &folder_metadata,
+        observed_at_unix_seconds,
+    );
+    let artist_id = stable_id("artist", &metadata.artist_name.to_ascii_lowercase());
+    let album_artist_name = metadata
+        .album_artist_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| metadata.artist_name.clone());
+    let album_artist_id = stable_id("artist", &album_artist_name.to_ascii_lowercase());
+    let album_key = format!(
+        "{}::{}",
+        album_artist_name.to_ascii_lowercase(),
+        metadata.album_title.to_ascii_lowercase()
+    );
+    let album_id = stable_id("album", &album_key);
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let identity = build_track_identity(
+        &metadata,
+        &extension,
+        file.file_size_bytes,
+        file.modified_at_unix_seconds,
+        file.content_hash.as_deref(),
+    );
+    // Reuse the prior album's cover art if known, else discover it (a dir listing).
+    let artwork_path = prior
+        .albums
+        .get(&album_id)
+        .and_then(|(_, _, artwork)| artwork.clone())
+        .or_else(|| find_album_artwork(fs, path.parent().unwrap_or(root)));
+
+    let track = Track {
+        id: String::new(), // assigned (deduped) in assemble_library
+        provider: ProviderMapping {
+            provider_id: provider_id.to_string(),
+            item_id: relative_path.clone(),
+        },
+        observed_metadata,
+        title: metadata.title,
+        artist_id,
+        artist_name: metadata.artist_name,
+        album_id,
+        album_title: metadata.album_title,
+        year: metadata.year,
+        track_number: metadata.track_number,
+        disc_number: metadata.disc_number,
+        extension,
+        file_size_bytes: file.file_size_bytes,
+        duration_seconds,
+        modified_at_unix_seconds: file.modified_at_unix_seconds,
+        content_hash: file.content_hash.clone(),
+        relative_path,
+        stream_url: String::new(), // assigned in assemble_library
+        added_at_unix_seconds: None,
+        path,
+    };
+
+    BuiltTrack {
+        track,
+        identity: Some(identity),
+        album_artist_id,
+        album_artist_name,
+        artwork_path,
+        issues,
+        io_error,
+    }
+}
+
+/// Fold built tracks into a finished [`Library`]: assign final (deduped) ids to
+/// freshly-read tracks in a deterministic path order, aggregate albums/artists, and
+/// sort. Sequential and cheap; shared by the sequential and concurrent scanners.
+pub fn assemble_library(
+    provider_id: &str,
+    root: &Path,
+    mut built: Vec<BuiltTrack>,
+    mut scan_errors: Vec<ScanIssue>,
+) -> Library {
+    // Deterministic id assignment: order by source-relative path (matches the
+    // discovery sort), so re-scans assign the same disambiguated ids.
+    built.sort_by(|left, right| left.track.relative_path.cmp(&right.track.relative_path));
+
+    let mut tracks = Vec::with_capacity(built.len());
     let mut album_builders: BTreeMap<String, AlbumBuilder> = BTreeMap::new();
     let mut artist_builders: BTreeMap<String, ArtistBuilder> = BTreeMap::new();
     let mut track_id_counts = BTreeMap::new();
-    let observed_at_unix_seconds = current_unix_seconds();
 
-    for (index, file) in files.into_iter().enumerate() {
-        if (index + 1) % step == 0 || index + 1 == total {
-            progress(ScanProgress::Processing {
-                done: index + 1,
-                total,
-            });
+    for mut item in built {
+        scan_errors.append(&mut item.issues);
+        if let Some(identity) = item.identity {
+            let id = unique_track_id(&identity, &mut track_id_counts);
+            item.track.stream_url = format!("/api/tracks/{id}/stream");
+            item.track.id = id;
         }
-        let path = file.path;
-        let relative_path = relative_display_path(&root, &path);
-
-        // Fast path: an unchanged file (same size + mtime as the prior scan) reuses
-        // its already-parsed track wholesale — no tag read. Album-artist and cover
-        // art come from the prior album so nothing on the network is touched.
-        if let Some(previous) = prior_tracks.get(relative_path.as_str())
-            && file.file_size_bytes.is_some()
-            && file.file_size_bytes == previous.file_size_bytes
-            && file.modified_at_unix_seconds == previous.modified_at_unix_seconds
-        {
-            let mut track = (*previous).clone();
-            track.path = path;
-            let (album_artist_id, album_artist_name) = prior_albums
-                .get(track.album_id.as_str())
-                .map(|album| (album.artist_id.clone(), album.artist_name.clone()))
-                .unwrap_or_else(|| (track.artist_id.clone(), track.artist_name.clone()));
-            let artwork_path = prior_albums
-                .get(track.album_id.as_str())
-                .and_then(|album| album.artwork_path.clone());
-            aggregate_track(
-                &track,
-                &album_artist_id,
-                &album_artist_name,
-                artwork_path,
-                &mut album_builders,
-                &mut artist_builders,
-            );
-            tracks.push(track);
-            continue;
-        }
-
-        // Full path: a new or modified file — read its tags.
-        let folder_metadata = infer_track_metadata(&root, &path);
-        let (embedded_metadata, duration_seconds) =
-            read_embedded_metadata(fs, &path, &mut scan_errors, observed_at_unix_seconds);
-        let sidecar_lyrics =
-            read_sidecar_lyrics(fs, &path, &mut scan_errors, observed_at_unix_seconds);
-        let metadata = canonical_metadata(embedded_metadata.as_ref(), &folder_metadata);
-        let observed_metadata = metadata_observations(
-            embedded_metadata,
-            sidecar_lyrics,
-            &folder_metadata,
-            observed_at_unix_seconds,
-        );
-        let artist_id = stable_id("artist", &metadata.artist_name.to_ascii_lowercase());
-        let album_artist_name = metadata
-            .album_artist_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| metadata.artist_name.clone());
-        let album_artist_id = stable_id("artist", &album_artist_name.to_ascii_lowercase());
-        let album_key = format!(
-            "{}::{}",
-            album_artist_name.to_ascii_lowercase(),
-            metadata.album_title.to_ascii_lowercase()
-        );
-        let album_id = stable_id("album", &album_key);
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let track_identity = build_track_identity(
-            &metadata,
-            &extension,
-            file.file_size_bytes,
-            file.modified_at_unix_seconds,
-            file.content_hash.as_deref(),
-        );
-        let track_id = unique_track_id(&track_identity, &mut track_id_counts);
-        // Reuse the prior album's cover art if known, else discover it (a dir listing).
-        let artwork_path = prior_albums
-            .get(album_id.as_str())
-            .and_then(|album| album.artwork_path.clone())
-            .or_else(|| find_album_artwork(fs, path.parent().unwrap_or(&root)));
-
-        let track = Track {
-            id: track_id.clone(),
-            provider: ProviderMapping {
-                provider_id: provider_id.to_string(),
-                item_id: relative_path.clone(),
-            },
-            observed_metadata,
-            title: metadata.title,
-            artist_id,
-            artist_name: metadata.artist_name,
-            album_id,
-            album_title: metadata.album_title,
-            year: metadata.year,
-            track_number: metadata.track_number,
-            disc_number: metadata.disc_number,
-            extension,
-            file_size_bytes: file.file_size_bytes,
-            duration_seconds,
-            modified_at_unix_seconds: file.modified_at_unix_seconds,
-            content_hash: file.content_hash,
-            relative_path,
-            stream_url: format!("/api/tracks/{}/stream", track_id),
-            added_at_unix_seconds: None,
-            path,
-        };
         aggregate_track(
-            &track,
-            &album_artist_id,
-            &album_artist_name,
-            artwork_path,
+            &item.track,
+            &item.album_artist_id,
+            &item.album_artist_name,
+            item.artwork_path,
             &mut album_builders,
             &mut artist_builders,
         );
-        tracks.push(track);
+        tracks.push(item.track);
     }
 
     let mut artists: Vec<_> = artist_builders
@@ -899,14 +1003,14 @@ pub fn scan_source_incremental(
             .then_with(|| left.title.cmp(&right.title))
     });
 
-    Ok(Library {
+    Library {
         provider_id: provider_id.to_string(),
         source_root: root.display().to_string(),
         artists,
         albums,
         tracks,
         scan_errors,
-    })
+    }
 }
 
 /// Fold one track into the album/artist aggregates: count it against its own
@@ -1027,12 +1131,14 @@ pub fn merge_libraries(libraries: Vec<Library>) -> Library {
     }
 }
 
+/// One audio file found during discovery, with the cheap stat data (size + mtime)
+/// the incremental scanner uses to decide reuse vs re-read.
 #[derive(Clone, Debug)]
-struct DiscoveredAudioFile {
-    path: PathBuf,
-    file_size_bytes: Option<u64>,
-    modified_at_unix_seconds: Option<i64>,
-    content_hash: Option<String>,
+pub struct DiscoveredAudioFile {
+    pub path: PathBuf,
+    pub file_size_bytes: Option<u64>,
+    pub modified_at_unix_seconds: Option<i64>,
+    pub content_hash: Option<String>,
 }
 
 #[derive(Clone, Debug)]

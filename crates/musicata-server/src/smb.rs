@@ -13,12 +13,18 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
 use futures::StreamExt;
-use musicata_core::{FsEntry, Library, ReadSeek, ScanProgress, SourceFs, scan_source_incremental};
+use musicata_core::{
+    BuiltTrack, FsEntry, Library, PriorIndex, ReadSeek, ScanProgress, SourceFs, assemble_library,
+    build_track, discover_audio_files,
+};
 use musicata_storage::SourceRecord;
+
+use crate::scan_concurrency::AdaptiveLimiter;
 use smb::{
     Client, ClientConfig, ConnectionConfig, FileAccessMask, FileDirectoryInformation, Resource,
     UncPath,
@@ -31,6 +37,39 @@ use tokio::sync::Mutex;
 /// many small seeks/reads; serving them from a cached block turns a burst of tiny
 /// SMB round-trips into one.
 const READ_BLOCK_BYTES: usize = 256 * 1024;
+
+/// Adaptive scan concurrency bounds: start moderate, back off to a safe floor on
+/// stress, probe up to a generous ceiling on a healthy NAS.
+const INITIAL_CONCURRENCY: usize = 10;
+const MIN_CONCURRENCY: usize = 4;
+const MAX_CONCURRENCY: usize = 50;
+
+/// Current unix time in seconds (mirrors core's private helper; used as the scan's
+/// observation timestamp).
+fn current_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// Build the live progress detail string: throughput, ETA, and parallelism.
+fn scan_detail(done: usize, total: usize, start: Instant, concurrency: usize) -> String {
+    let elapsed = start.elapsed().as_secs_f64().max(0.001);
+    let rate = done as f64 / elapsed;
+    let remaining = total.saturating_sub(done);
+    let eta_secs = if rate > 0.0 {
+        (remaining as f64 / rate) as u64
+    } else {
+        0
+    };
+    let eta = if eta_secs >= 60 {
+        format!("{}m{:02}s", eta_secs / 60, eta_secs % 60)
+    } else {
+        format!("{eta_secs}s")
+    };
+    format!("{rate:.0}/s · ETA {eta} · {concurrency} parallel")
+}
 
 /// Connection parameters for an SMB share.
 #[derive(Clone, Debug)]
@@ -176,9 +215,12 @@ impl SmbProvider {
         &self.provider_id
     }
 
-    /// Scan the share into a [`Library`], reporting progress. Connection + tag
-    /// parsing are blocking, so this runs on a blocking thread where `block_on` is
-    /// legal.
+    /// Scan the share into a [`Library`] with **adaptive concurrency**: many files'
+    /// tags are read in parallel over one connection (SMB2 multiplexes via credits),
+    /// the parallelism climbing while healthy and backing off on I/O errors / latency.
+    /// Connecting + the directory walk + tag parsing are blocking (`block_on`), so the
+    /// per-file work runs on blocking threads; only new/changed files are read
+    /// (incremental). Reports live throughput / ETA / parallelism.
     pub async fn scan_with_progress<F>(
         &self,
         prior: Option<Arc<Library>>,
@@ -190,12 +232,89 @@ impl SmbProvider {
         let config = self.config.clone();
         let provider_id = self.provider_id.clone();
         let handle = Handle::current();
-        tokio::task::spawn_blocking(move || {
-            let fs = SmbFs::connect(config, handle)?;
-            scan_source_incremental(&fs, &provider_id, prior.as_deref(), &mut progress)
-                .map_err(|error| anyhow!(error.to_string()))
+
+        // Connect + walk the tree on a blocking thread; hand back the connected fs.
+        progress(ScanProgress::Discovering);
+        let (fs, files, walk_errors) = tokio::task::spawn_blocking({
+            let config = config.clone();
+            let handle = handle.clone();
+            move || -> anyhow::Result<(SmbFs, Vec<musicata_core::DiscoveredAudioFile>, _)> {
+                let fs = SmbFs::connect(config, handle)?;
+                let root = fs.root().to_path_buf();
+                let (files, errors) = discover_audio_files(&fs, &root, &mut |_| {})
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                Ok((fs, files, errors))
+            }
         })
-        .await?
+        .await??;
+
+        let total = files.len();
+        progress(ScanProgress::Discovered { files: total });
+
+        let root = fs.root().to_path_buf();
+        let observed_at = current_unix_seconds();
+        let index = Arc::new(PriorIndex::from_library(prior.as_deref(), &provider_id));
+        let limiter = AdaptiveLimiter::new(
+            INITIAL_CONCURRENCY,
+            MIN_CONCURRENCY,
+            MAX_CONCURRENCY,
+            fs.io_errors(),
+        );
+        let fs = Arc::new(fs);
+
+        let scan_start = Instant::now();
+        let mut last_report = Instant::now();
+        let mut built: Vec<BuiltTrack> = Vec::with_capacity(total);
+
+        let task_root = root.clone();
+        let task_limiter = limiter.clone();
+        let mut stream = futures::stream::iter(files.into_iter())
+            .map(move |file| {
+                let fs = fs.clone();
+                let index = index.clone();
+                let limiter = task_limiter.clone();
+                let provider_id = provider_id.clone();
+                let root = task_root.clone();
+                async move {
+                    let permit = limiter.acquire().await;
+                    let started = Instant::now();
+                    let result = tokio::task::spawn_blocking(move || {
+                        build_track(&*fs, &root, &provider_id, &file, &index, observed_at)
+                    })
+                    .await;
+                    limiter.record(started.elapsed());
+                    drop(permit);
+                    result
+                }
+            })
+            .buffer_unordered(MAX_CONCURRENCY);
+
+        while let Some(joined) = stream.next().await {
+            match joined {
+                Ok(item) => built.push(item),
+                Err(error) => tracing::warn!(%error, "scan task panicked"),
+            }
+            if last_report.elapsed() >= Duration::from_millis(300) || built.len() == total {
+                progress(ScanProgress::Processing {
+                    done: built.len(),
+                    total,
+                    detail: Some(scan_detail(
+                        built.len(),
+                        total,
+                        scan_start,
+                        limiter.current(),
+                    )),
+                });
+                last_report = Instant::now();
+            }
+        }
+
+        let provider_id = self.provider_id.clone();
+        let library = tokio::task::spawn_blocking(move || {
+            assemble_library(&provider_id, &root, built, walk_errors)
+        })
+        .await?;
+        Ok(library)
     }
 
     /// Read `[start, end]` (inclusive) of an item for streaming. Only the requested
@@ -274,6 +393,9 @@ struct SmbFs {
     handle: Handle,
     /// Logical root for the scanner; SMB items hang off "/".
     root: PathBuf,
+    /// Cumulative count of SMB I/O errors (not parse failures) — the adaptive
+    /// concurrency limiter watches this to back off when the share is struggling.
+    io_errors: Arc<AtomicU64>,
 }
 
 impl SmbFs {
@@ -285,6 +407,7 @@ impl SmbFs {
             config,
             handle,
             root: PathBuf::from("/"),
+            io_errors: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -298,12 +421,24 @@ impl SmbFs {
         self.config.item_unc(&relative)
     }
 
+    /// Shared cumulative I/O-error counter (for the adaptive concurrency limiter).
+    fn io_errors(&self) -> Arc<AtomicU64> {
+        self.io_errors.clone()
+    }
+
+    /// Map an SMB error to an `io::Error` and count it as an I/O error (for the
+    /// adaptive limiter). Tag-parse failures go through lofty, not here.
+    fn io_err(&self, error: smb::Error) -> io::Error {
+        self.io_errors.fetch_add(1, Ordering::Relaxed);
+        smb_io_error(error)
+    }
+
     fn open_file(&self, logical: &Path) -> io::Result<File> {
         let unc = self.unc(logical).map_err(io::Error::other)?;
         let resource = self
             .handle
             .block_on(self.client.create_file(&unc, &open_read_args()))
-            .map_err(smb_io_error)?;
+            .map_err(|error| self.io_err(error))?;
         Ok(resource.unwrap_file())
     }
 }
@@ -316,14 +451,14 @@ impl SourceFs for SmbFs {
                 .client
                 .create_file(&unc, &open_read_args())
                 .await
-                .map_err(smb_io_error)?;
+                .map_err(|error| self.io_err(error))?;
             let directory: Arc<Directory> = Arc::new(resource.unwrap_dir());
             let mut stream = Directory::query::<FileDirectoryInformation>(&directory, "*")
                 .await
-                .map_err(smb_io_error)?;
+                .map_err(|error| self.io_err(error))?;
             let mut entries = Vec::new();
             while let Some(item) = stream.next().await {
-                let info = item.map_err(smb_io_error)?;
+                let info = item.map_err(|error| self.io_err(error))?;
                 let name = info.file_name.to_string();
                 if name == "." || name == ".." {
                     continue;
@@ -343,10 +478,14 @@ impl SourceFs for SmbFs {
 
     fn open(&self, path: &Path) -> io::Result<Box<dyn ReadSeek + '_>> {
         let file = self.open_file(path)?;
-        let len = self.handle.block_on(file.get_len()).map_err(smb_io_error)?;
+        let len = self
+            .handle
+            .block_on(file.get_len())
+            .map_err(|error| self.io_err(error))?;
         let reader = SmbFileReader {
             file,
             handle: self.handle.clone(),
+            io_errors: self.io_errors.clone(),
         };
         Ok(Box::new(CachingReader::new(reader, len)))
     }
@@ -365,9 +504,9 @@ impl SourceFs for SmbFs {
                 .client
                 .create_file(&unc, &open_read_args())
                 .await
-                .map_err(smb_io_error)?;
+                .map_err(|error| self.io_err(error))?;
             let (is_dir, size) = match resource.as_file() {
-                Some(file) => (false, file.get_len().await.map_err(smb_io_error).ok()),
+                Some(file) => (false, file.get_len().await.ok()),
                 None => (true, None),
             };
             Ok(FsEntry {
@@ -400,13 +539,17 @@ trait BlockingReadAt {
 struct SmbFileReader {
     file: File,
     handle: Handle,
+    io_errors: Arc<AtomicU64>,
 }
 
 impl BlockingReadAt for SmbFileReader {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         self.handle
             .block_on(self.file.read_at(buf, offset))
-            .map_err(smb_io_error)
+            .map_err(|error| {
+                self.io_errors.fetch_add(1, Ordering::Relaxed);
+                smb_io_error(error)
+            })
     }
 }
 

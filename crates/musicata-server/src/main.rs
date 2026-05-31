@@ -5,6 +5,8 @@ mod players;
 mod providers;
 mod radiobrowser;
 #[cfg(feature = "provider-smb")]
+mod scan_concurrency;
+#[cfg(feature = "provider-smb")]
 mod smb;
 mod subsonic;
 
@@ -340,9 +342,14 @@ async fn scan_and_persist(
                     musicata_core::ScanProgress::Discovered { files } => {
                         format!("Scanning {id}: found {files} files")
                     }
-                    musicata_core::ScanProgress::Processing { done, total } => {
-                        format!("Scanning {id}: {done}/{total} files")
-                    }
+                    musicata_core::ScanProgress::Processing {
+                        done,
+                        total,
+                        detail,
+                    } => match detail {
+                        Some(detail) => format!("Scanning {id}: {done}/{total} files · {detail}"),
+                        None => format!("Scanning {id}: {done}/{total} files"),
+                    },
                 };
                 activity.update(task, label);
             }
