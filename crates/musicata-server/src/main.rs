@@ -111,25 +111,33 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to open database {}", config.database.display()))?;
     let registry = build_registry(&database, &config).await?;
     let providers = Arc::new(RwLock::new(registry));
-    let library = load_or_scan_library(
-        &database,
-        &providers,
-        config.rescan,
-        !config.no_incremental_rescan,
-    )
-    .await?;
 
-    tracing::info!(
-        artists = library.artists.len(),
-        albums = library.albums.len(),
-        tracks = library.tracks.len(),
-        root = %library.source_root,
-        "library ready"
-    );
-
+    // `--scan-once` is the batch path: scan synchronously, persist, exit.
     if config.scan_once {
-        tracing::info!("scan complete; exiting because --scan-once was set");
+        let registry = providers.read().await.clone();
+        let mut scanned = registry.scan_all().await.context("library scan failed")?;
+        database.save_library(&mut scanned).await?;
+        tracing::info!(
+            artists = scanned.artists.len(),
+            albums = scanned.albums.len(),
+            tracks = scanned.tracks.len(),
+            "scan complete; exiting because --scan-once was set"
+        );
         return Ok(());
+    }
+
+    // Serve immediately from whatever's already cached; the actual scan runs in the
+    // background (below) so a slow or unreachable source — an SMB share on a flaky
+    // network — never delays the web server from coming up.
+    match database.load_library().await? {
+        Some(library) => tracing::info!(
+            artists = library.artists.len(),
+            albums = library.albums.len(),
+            tracks = library.tracks.len(),
+            force_rescan = config.rescan,
+            "serving cached library; scanning sources in the background"
+        ),
+        None => tracing::info!("no cached library yet; scanning sources in the background"),
     }
 
     let public_url = config
@@ -151,18 +159,19 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", config.addr))?;
 
-    // Keep the library current with the filesystem on its own, so controllers never
-    // need a manual "rescan" — they just re-read and see new/changed tracks. The
-    // shared lock serializes this with on-demand rescans.
+    // Scan in the background: once right away to populate/refresh, then on a timer
+    // so controllers never need a manual "rescan" — they re-read and see changes.
+    // The shared lock serializes this with on-demand rescans. Scanning here (rather
+    // than before binding) is what keeps the web port available even while a large
+    // or offline source is being scanned.
     let rescan_lock = Arc::new(Mutex::new(()));
-    if !config.no_incremental_rescan {
-        tokio::spawn(periodic_rescan(
-            database.clone(),
-            providers.clone(),
-            rescan_lock.clone(),
-            LIBRARY_RESCAN_INTERVAL,
-        ));
-    }
+    tokio::spawn(library_scan_loop(
+        database.clone(),
+        providers.clone(),
+        rescan_lock.clone(),
+        LIBRARY_RESCAN_INTERVAL,
+        !config.no_incremental_rescan,
+    ));
 
     // Keep only a rolling window of listening history.
     tokio::spawn(prune_old_listens(
@@ -254,110 +263,84 @@ async fn register_persisted_sources(
     Ok(())
 }
 
-async fn periodic_rescan(
+/// Scan every source once and persist any changes. Runs in the background so a
+/// slow or unreachable source (an SMB share on a flaky network) never blocks the
+/// web server. Errors are logged, not propagated.
+async fn scan_and_persist(
+    database: &Database,
+    providers: &Arc<RwLock<ProviderRegistry>>,
+    rescan_lock: &Arc<Mutex<()>>,
+) {
+    let _guard = rescan_lock.lock().await;
+    let registry = providers.read().await.clone();
+    let scanned = match registry.scan_all().await {
+        Ok(scanned) => scanned,
+        Err(error) => {
+            tracing::warn!(%error, "library scan failed");
+            return;
+        }
+    };
+    let changes = match database.detect_library_changes(&scanned).await {
+        Ok(changes) => changes,
+        Err(error) => {
+            tracing::warn!(%error, "library change detection failed");
+            return;
+        }
+    };
+
+    // Backfill: a database written before the scanner read a field (e.g. track
+    // duration, added in migration v12) has unchanged files but stale rows. When the
+    // fresh scan now carries durations the stored rows lack, persist it even though
+    // no file changed — a one-time cost after upgrading.
+    let needs_backfill = !changes.has_changes()
+        && database
+            .load_library()
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|stored| {
+                stored.tracks.iter().any(|t| t.duration_seconds.is_none())
+                    && scanned.tracks.iter().any(|t| t.duration_seconds.is_some())
+            });
+
+    if !changes.has_changes() && !needs_backfill {
+        return;
+    }
+
+    let mut scanned = scanned;
+    if let Err(error) = database.save_library(&mut scanned).await {
+        tracing::warn!(%error, "failed to persist library scan");
+    } else {
+        tracing::info!(
+            added = changes.added,
+            removed = changes.removed,
+            modified = changes.modified,
+            backfill = needs_backfill,
+            "library scan updated"
+        );
+    }
+}
+
+/// Background library task: scan once right away (so a fresh database is populated
+/// and an existing one refreshed), then re-scan on the interval unless incremental
+/// rescanning is disabled. Never blocks serving.
+async fn library_scan_loop(
     database: Database,
     providers: Arc<RwLock<ProviderRegistry>>,
     rescan_lock: Arc<Mutex<()>>,
     interval: Duration,
+    incremental: bool,
 ) {
+    scan_and_persist(&database, &providers, &rescan_lock).await;
+    if !incremental {
+        return;
+    }
     let mut ticker = tokio::time::interval(interval);
-    ticker.tick().await; // The first tick fires immediately; skip it (startup already scanned).
+    ticker.tick().await; // Consume the immediate tick; we just scanned.
     loop {
         ticker.tick().await;
-        let _guard = rescan_lock.lock().await;
-        let registry = providers.read().await.clone();
-        let scanned = match registry.scan_all().await {
-            Ok(scanned) => scanned,
-            Err(error) => {
-                tracing::warn!(%error, "background rescan failed");
-                continue;
-            }
-        };
-        match database.detect_library_changes(&scanned).await {
-            Ok(changes) if changes.has_changes() => {
-                let mut scanned = scanned;
-                if let Err(error) = database.save_library(&mut scanned).await {
-                    tracing::warn!(%error, "failed to persist background rescan");
-                } else {
-                    tracing::info!(
-                        added = changes.added,
-                        removed = changes.removed,
-                        modified = changes.modified,
-                        "background rescan updated library"
-                    );
-                }
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "background change detection failed"),
-        }
+        scan_and_persist(&database, &providers, &rescan_lock).await;
     }
-}
-
-async fn load_or_scan_library(
-    database: &Database,
-    providers: &Arc<RwLock<ProviderRegistry>>,
-    rescan: bool,
-    incremental_rescan: bool,
-) -> Result<Library> {
-    if !rescan
-        && !incremental_rescan
-        && let Some(library) = database.load_library().await?
-    {
-        tracing::info!(
-            artists = library.artists.len(),
-            albums = library.albums.len(),
-            tracks = library.tracks.len(),
-            "loaded library from database"
-        );
-        return Ok(library);
-    }
-
-    let registry = providers.read().await.clone();
-    let mut scanned = registry
-        .scan_all()
-        .await
-        .context("failed to scan music sources")?;
-
-    if !rescan
-        && incremental_rescan
-        && let Some(stored) = database.load_library().await?
-    {
-        let changes = database.detect_library_changes(&scanned).await?;
-        if changes.has_changes() {
-            tracing::info!(
-                added = changes.added,
-                removed = changes.removed,
-                modified = changes.modified,
-                "library changes detected"
-            );
-            database.save_library(&mut scanned).await?;
-            return Ok(scanned);
-        }
-
-        // Backfill: databases written before the scanner read a field (e.g. track
-        // duration, added in migration v12) have unchanged files but stale rows.
-        // When the fresh scan now has durations the stored rows lack, persist it —
-        // a one-time cost after upgrading.
-        let stored_missing_duration = stored.tracks.iter().any(|t| t.duration_seconds.is_none());
-        let scan_has_duration = scanned.tracks.iter().any(|t| t.duration_seconds.is_some());
-        if stored_missing_duration && scan_has_duration {
-            tracing::info!("backfilling track durations from rescan");
-            database.save_library(&mut scanned).await?;
-            return Ok(scanned);
-        }
-
-        tracing::info!(
-            artists = stored.artists.len(),
-            albums = stored.albums.len(),
-            tracks = stored.tracks.len(),
-            "loaded unchanged library from database"
-        );
-        return Ok(stored);
-    }
-
-    database.save_library(&mut scanned).await?;
-
-    Ok(scanned)
 }
 
 fn app(
