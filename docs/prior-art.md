@@ -3,8 +3,9 @@
 A living knowledge base: for each hard problem Musicata hits, how the reference
 projects (Roon, Jellyfin, Navidrome, beets, Picard, Music Assistant, Mopidy) solve
 it, and what we adopted — with pointers to our code. Covers: provider/plugin
-ecosystem, incremental scanning, OpenSubsonic, SMB access, background-work UX, and
-metadata sourcing & conflict resolution. When you tackle one of these areas, read the
+ecosystem, incremental scanning, OpenSubsonic, SMB access, background-work UX,
+metadata sourcing & conflict resolution, and discography completeness ("what am I
+missing"). When you tackle one of these areas, read the
 relevant section first instead of re-deriving it. When you learn something new from
 another project, add it here.
 
@@ -257,6 +258,72 @@ its scoring (title/artist/album/tracknumber + **length** tolerance) is what to c
 identifies audio when tags are missing/wrong — the one capability tag-only matchers
 lack, and the main reason Picard is strong (consensus #6). The designed ladder is in
 `docs/metadata.md` (§Metadata Sources); this section is the *why* behind it.
+
+---
+
+## 7. Discography completeness — "what am I missing?"
+
+**Problem:** the user owns 5 Pink Floyd albums; show them the artist's *full*
+discography so they can see what they don't have and decide what to get next — i.e.
+merge the **local library** with a **remote catalogue** of everything the artist
+released, and diff.
+
+**How others solve it:**
+
+- **Lidarr** (and its predecessor **Headphones**) — the canonical product for exactly
+  this. You **add/monitor an artist**; Lidarr pulls the artist's **full discography
+  from MusicBrainz** and shows owned vs **Wanted → Missing**. The unit of "an album"
+  is the **MusicBrainz release group**. A **Metadata Profile** filters which
+  release-group types count (Album/Single/EP/Live/Compilation/Remix/Soundtrack/…) —
+  the default is *studio albums only*, which is the key trick to avoid drowning the
+  view in singles/live/comps. New releases appear on a periodic metadata refresh.
+  (Lidarr then *acquires* them; that's its job, not necessarily ours.)
+- **beets `missing` plugin** — the CLI version of the computation. `beet missing`
+  lists, per album, the **missing tracks** (vs the MB tracklist); `-a` lists **missing
+  albums per artist** (MusicBrainz only); `-c` counts, `-t` totals; exposes a
+  `$missing` template field. Counting is free; naming the missing items costs one MB
+  call. Good model for "completeness as a computed, cached field."
+- **Roon** — the **local + streaming merge** done well. With TIDAL/Qobuz connected, an
+  artist page shows the **whole discography in one place**: albums **"in my library"**
+  (added with **+**, editable, play-counted) vs **"outside my library"** (available to
+  stream, unedited), and you add an outside album to your library with **+**. It also
+  unifies **versions/editions** of the same album (local + streaming) and lets you pick
+  a preferred one. The model to copy: *one artist page that unifies owned + available +
+  merely-known, visually distinguished, with an "add" affordance.*
+- **Discogs** — the **collection + wantlist** model, and the richest release data. An
+  artist page lists the discography grouped by **master release** (a master groups all
+  **versions/pressings**). The user's **Collection** = what they own; the **Wantlist**
+  = what they want to acquire (literally "missing pieces"); release **stats** show
+  community haves/wants. The API exposes artist releases, master versions, collection
+  and wantlist. Discogs is **physical/edition-oriented** (every pressing), so it's the
+  better source for "which specific pressing," where MusicBrainz release groups are
+  better for "which album."
+
+**The shared data model:** an artist's discography is a list of **release groups**
+(MusicBrainz) / **masters** (Discogs); "do I own this album?" is a match at
+release-group granularity; completeness = owned ÷ (discography filtered by type).
+Both MB and Discogs key off an **artist ID** we can get from embedded tags
+(`musicbrainz_artistid`) or a name lookup.
+
+**What Musicata could do** (no acquisition — we're the Roon/Discogs "see & decide"
+side, not the Lidarr "go get it" side): we already read MusicBrainz artist/release
+IDs from tags (`musicbrainz.rs`) and have an artist detail endpoint
+(`/api/artists/{id}`). Add a **discography view**: resolve the artist's MBID → fetch
+their **release groups** → match each to a local album (by MBID, else name+year) →
+render the full list with **owned highlighted and missing greyed**, filtered by
+release-group type (Lidarr's Metadata-Profile idea) so studio albums lead and
+singles/live/comps are opt-in. Surface a **completeness %** per artist and an optional
+**wantlist** (Discogs's model) of what to get next. It's **read-only enrichment**,
+cached (one MB/Discogs call per artist, refreshed periodically — beets's "counting is
+free, naming costs a call" applies). Caveats: needs the artist MBID (tag or lookup);
+release-group **type filtering is essential** or the view is noise; album matching is
+the same fuzzy problem as §6 (prefer MBID, else name+year). MusicBrainz is the default
+catalogue; Discogs is the upgrade for edition/pressing detail and the haves/wants
+signal. This is a natural fit for **M7** (stats/recommendations) and reuses the
+provider-capabilities idea — a "discography/catalogue" capability a source can offer.
+
+References: Lidarr (servarr wiki), beets `missing` plugin docs, Roon KB "albums in my
+library vs outside", Discogs API (artist releases / masters / collection / wantlist).
 
 ---
 
