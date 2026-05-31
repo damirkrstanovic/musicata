@@ -26,7 +26,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::sse::{Event, KeepAlive, Sse},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
 use musicata_core::{
@@ -631,31 +631,57 @@ async fn log_request(request: Request, next: Next) -> Response {
     response
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../static/index.html"))
+// The app shell (HTML/JS/CSS) is served with `no-cache` so a browser always
+// revalidates and picks up a rebuilt binary's assets on reload, instead of running
+// a stale copy. Content is embedded, so revalidation is a tiny full refetch.
+const APP_SHELL_CACHE: &str = "no-cache";
+
+async fn index() -> impl IntoResponse {
+    (
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8"),
+            (CACHE_CONTROL, APP_SHELL_CACHE),
+        ],
+        include_str!("../static/index.html"),
+    )
 }
 
-async fn admin_page() -> Html<&'static str> {
-    Html(include_str!("../static/admin.html"))
+async fn admin_page() -> impl IntoResponse {
+    (
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8"),
+            (CACHE_CONTROL, APP_SHELL_CACHE),
+        ],
+        include_str!("../static/admin.html"),
+    )
 }
 
 async fn admin_js() -> impl IntoResponse {
     (
-        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [
+            (CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (CACHE_CONTROL, APP_SHELL_CACHE),
+        ],
         include_str!("../static/admin.js"),
     )
 }
 
 async fn app_js() -> impl IntoResponse {
     (
-        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [
+            (CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (CACHE_CONTROL, APP_SHELL_CACHE),
+        ],
         include_str!("../static/app.js"),
     )
 }
 
 async fn styles_css() -> impl IntoResponse {
     (
-        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+        [
+            (CONTENT_TYPE, "text/css; charset=utf-8"),
+            (CACHE_CONTROL, APP_SHELL_CACHE),
+        ],
         include_str!("../static/styles.css"),
     )
 }
@@ -679,7 +705,10 @@ async fn app_icon() -> impl IntoResponse {
 
 async fn service_worker() -> impl IntoResponse {
     (
-        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [
+            (CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (CACHE_CONTROL, APP_SHELL_CACHE),
+        ],
         include_str!("../static/sw.js"),
     )
 }
