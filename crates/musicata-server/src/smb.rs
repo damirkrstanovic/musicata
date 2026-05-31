@@ -101,6 +101,26 @@ fn open_read_args() -> FileCreateArgs {
     FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true))
 }
 
+/// How long to wait for an SMB connection before giving up. Without this an
+/// unreachable host blocks the request (and the rescan lock) indefinitely.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Connect a client to the share, failing fast on an unreachable host or bad
+/// credentials instead of hanging.
+async fn connect_share(client: &Client, config: &SmbConfig) -> anyhow::Result<()> {
+    let target = config.share_unc()?;
+    let connect = client.share_connect(&target, &config.username, config.password.clone());
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(anyhow!("SMB connect to {}: {error}", config.host)),
+        Err(_) => Err(anyhow!(
+            "SMB connect to {} timed out after {}s",
+            config.host,
+            CONNECT_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 fn smb_io_error(error: smb::Error) -> io::Error {
     io::Error::other(error.to_string())
 }
@@ -184,11 +204,7 @@ impl SmbProvider {
             return Ok(client.clone());
         }
         let client = Arc::new(Client::new(ClientConfig::default()));
-        let target = self.config.share_unc()?;
-        client
-            .share_connect(&target, &self.config.username, self.config.password.clone())
-            .await
-            .map_err(|error| anyhow!("SMB connect to {}: {error}", self.config.host))?;
+        connect_share(&client, &self.config).await?;
         *guard = Some(client.clone());
         Ok(client)
     }
@@ -208,10 +224,7 @@ struct SmbFs {
 impl SmbFs {
     fn connect(config: SmbConfig, handle: Handle) -> anyhow::Result<Self> {
         let client = Arc::new(Client::new(ClientConfig::default()));
-        let target = config.share_unc()?;
-        handle
-            .block_on(client.share_connect(&target, &config.username, config.password.clone()))
-            .map_err(|error| anyhow!("SMB connect to {}: {error}", config.host))?;
+        handle.block_on(connect_share(&client, &config))?;
         Ok(Self {
             client,
             config,

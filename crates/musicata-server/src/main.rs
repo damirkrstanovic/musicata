@@ -1600,10 +1600,16 @@ async fn create_source(
         created_at_unix_seconds: now_unix_seconds(),
     };
 
-    // Build the provider first so a bad config (or a build without `provider-smb`)
-    // fails before we persist anything.
+    // Build the provider, then actually connect + scan it so the caller gets a real
+    // error (unreachable host, bad credentials, …) instead of a silently-broken
+    // source. Only persist and register it once it's known to work — and do this
+    // before taking the rescan lock so a bad source can't wedge other requests.
     let handle = providers::provider_from_record(&record)
         .map_err(|error| AppError::bad_request(error.to_string()))?;
+    handle
+        .scan()
+        .await
+        .map_err(|error| AppError::bad_request(format!("could not read source: {error}")))?;
 
     state.database.add_source(&record).await.map_err(db_error)?;
     state.providers.write().await.push(handle);
@@ -4217,6 +4223,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(favorites["tracks"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_source_with_slashy_id_routes() {
+        let fixture = TestFixture::new("del-probe");
+        let app = fixture.app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/sources/smb%3Anas.local%2Fmusic")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Provider ids contain ':' and '/' (e.g. smb:host/share); the route must
+        // still match the percent-encoded id and reach the handler.
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND, "route did not match");
+        assert_ne!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]

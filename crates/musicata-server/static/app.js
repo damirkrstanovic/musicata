@@ -2033,9 +2033,12 @@ async function deleteSource(id, name) {
   try {
     await apiJson(`/api/sources/${encodeURIComponent(id)}`, "DELETE");
   } catch (error) {
+    sourceEls.addStatus.classList.add("error");
     sourceEls.addStatus.textContent = `Could not remove: ${error.message}`;
     return;
   }
+  sourceEls.addStatus.classList.remove("error");
+  sourceEls.addStatus.textContent = "";
   await loadSources();
   await loadLibrary();
 }
@@ -2052,15 +2055,22 @@ if (sourceEls.addForm) {
       username: sourceEls.user.value.trim() || undefined,
       password: sourceEls.pass.value || undefined,
     };
-    sourceEls.addStatus.textContent = "Connecting and scanning…";
+    const submit = sourceEls.addForm.querySelector("button[type=submit]");
+    if (submit) submit.disabled = true;
+    sourceEls.addStatus.classList.remove("error");
+    sourceEls.addStatus.textContent = "Connecting and scanning… (this can take a moment)";
+    let added;
     try {
-      await apiJson("/api/sources", "POST", body);
+      added = await apiJson("/api/sources", "POST", body);
     } catch (error) {
+      sourceEls.addStatus.classList.add("error");
       sourceEls.addStatus.textContent = `Could not add share: ${error.message}`;
       return;
+    } finally {
+      if (submit) submit.disabled = false;
     }
     sourceEls.addForm.reset();
-    sourceEls.addStatus.textContent = "";
+    sourceEls.addStatus.textContent = `Added “${added?.display_name ?? "source"}”.`;
     await loadSources();
     await loadLibrary();
   });
@@ -2090,7 +2100,16 @@ async function apiJson(path, method, body) {
   }
   const response = await fetch(path, init);
   if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
+    // Surface the server's error message (`{ error: { message } }`) rather than a
+    // bare status code, so failures like a bad SMB host are actually readable.
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const payload = await response.json();
+      if (payload?.error?.message) detail = payload.error.message;
+    } catch {
+      /* non-JSON body; keep the status line */
+    }
+    throw new Error(detail);
   }
   return response.status === 204 ? null : response.json();
 }
