@@ -46,6 +46,24 @@ fields/endpoints are additive within a version.
 | GET | `/api/tracks/{id}/stream` | Stream a track (supports HTTP `Range`). |
 | GET | `/api/albums/{id}/artwork` | Album cover image (ETag-cached). |
 
+### Music sources
+
+Every origin of music — the local library, an SMB share, internet radio — is a
+*provider*. Each advertises `capabilities` (`can_scan`/`can_browse`/`can_search`/
+`can_stream`); scannable sources merge into the one library and tracks keep their
+`provider_id`. The local library is always present and comes from `--library`;
+network sources are added at runtime and persisted.
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET | `/api/sources` | List sources: `{ id, kind, display_name, enabled, capabilities }`. |
+| POST | `/api/sources` | Add a network source. SMB: `{ "kind":"smb", "host", "share", "base_path"?, "display_name"?, "username"?, "password"? }`. Builds + scans it. Requires the `provider-smb` build feature. |
+| DELETE | `/api/sources/{id}` | Remove a source and re-merge the library (not the local source). |
+| POST | `/api/sources/{id}/rescan` | Rescan all sources and persist the merged library. |
+
+SMB shares are read directly over the wire in pure Rust (no kernel mount);
+streaming fetches only the requested byte range.
+
 ### Listening history
 
 | Method | Path | Purpose |

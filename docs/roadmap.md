@@ -369,18 +369,29 @@ Goal: make the architecture ready for sources beyond local disk.
 
 Tasks:
 
-- Formalize `MusicProvider` capabilities.
-- Add provider configuration and provider lifecycle.
-- Keep local disk as the reference provider.
+- [x] Formalize `MusicProvider` capabilities. `ProviderCapabilities`
+  (`can_scan`/`can_browse`/`can_search`/`can_stream`) is advertised per source;
+  callers skip work a source can't do (radio streams but never scans).
+- [x] Add provider configuration and provider lifecycle. A `ProviderHandle` enum
+  (enum-dispatch, like `PlayerHandle`) + `ProviderRegistry` hold the active sources;
+  scannable sources merge into one library (`merge_libraries`, per-track
+  `provider_id` preserved). Sources persist in a `sources` table (migration v15) and
+  are managed at runtime via `/api/sources` (+ a Settings "Music sources" panel with
+  capability chips). A `SourceFs` VFS lets the one scanner walk any backend.
+- [x] Keep local disk as the reference provider (unchanged behaviour; now one
+  provider among several).
 - [x] Add internet radio as the first non-library provider. Stations (name + stream
   URL + optional homepage) persist (migration v14) and are exposed via the native API
   (`/api/radio`), the web app (a Radio sidebar section: add / play / remove, plus a
   "Browse radio" directory backed by the open Radio Browser API, proxied server-side),
   and the OpenSubsonic internet-radio endpoints (get/create/update/delete).
   A new `PlayerCommand::PlayStream{url,title}` plays an external stream directly on the
-  browser and MPD players (no library resolution). This is the first source that isn't
-  a scanned library; the formal `MusicProvider` trait/registry generalization (see
-  docs/plugins.md) follows.
+  browser and MPD players (no library resolution).
+- [x] Add an SMB/CIFS network share as the first remote-disk source. Read directly
+  over the wire in pure Rust (the `smb` crate, no kernel mount, no libsmbclient),
+  feature-gated as `provider-smb`. Scanning runs the shared scanner over an SMB
+  `SourceFs` (a `Read+Seek`-over-`read_at` adapter with a read-ahead cache feeds
+  lofty); streaming fetches only the requested byte range.
 - Evaluate plugin isolation: in-process Rust modules, subprocesses, WebAssembly, or external services.
 - Document legal/API constraints for Spotify, Tidal, Qobuz, and similar services before implementation.
 

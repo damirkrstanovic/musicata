@@ -30,9 +30,9 @@ use axum::{
 };
 use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, Library, LibrarySummary, LocalDiskProvider,
-    MetadataApprovalState, MetadataFieldValue, PlaybackState, Player, PlayerCommand,
-    Playlist, RadioStation, SearchResults, Track, TrackMetadataFieldObservation, Zone,
-    album_artwork_url, artwork_asset_id, find_album_artwork_candidates,
+    MetadataApprovalState, MetadataFieldValue, PlaybackState, Player, PlayerCommand, Playlist,
+    RadioStation, SearchResults, Track, TrackMetadataFieldObservation, Zone, album_artwork_url,
+    artwork_asset_id, find_album_artwork_candidates,
 };
 use musicata_storage::Database;
 use musicbrainz::{
@@ -224,7 +224,9 @@ async fn prune_old_listens(database: Database, retention: Duration, interval: Du
 /// any persisted sources (e.g. SMB shares) recorded in the database.
 async fn build_registry(database: &Database, config: &Config) -> Result<ProviderRegistry> {
     let mut registry = ProviderRegistry::new();
-    registry.push(ProviderHandle::local(LocalDiskProvider::new(&config.library)));
+    registry.push(ProviderHandle::local(LocalDiskProvider::new(
+        &config.library,
+    )));
     register_persisted_sources(database, &mut registry).await?;
     Ok(registry)
 }
@@ -1600,8 +1602,8 @@ async fn create_source(
 
     // Build the provider first so a bad config (or a build without `provider-smb`)
     // fails before we persist anything.
-    let handle =
-        providers::provider_from_record(&record).map_err(|error| AppError::bad_request(error.to_string()))?;
+    let handle = providers::provider_from_record(&record)
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
 
     state.database.add_source(&record).await.map_err(db_error)?;
     state.providers.write().await.push(handle);
@@ -2105,14 +2107,66 @@ async fn stream_track(
         .await
         .map_err(db_error)?
         .ok_or_else(|| AppError::not_found(format!("unknown track: {id}")))?;
-    let bytes = tokio::fs::read(&track.path).await?;
     let content_type = audio_content_type(&track.extension);
+    let range_header = headers.get(RANGE).and_then(|value| value.to_str().ok());
 
-    ranged_response(
-        bytes,
-        headers.get(RANGE).and_then(|value| value.to_str().ok()),
-        content_type,
-    )
+    // Route by the track's source. SMB reads only the requested byte window over
+    // the wire; the local provider serves the file from disk.
+    #[cfg(feature = "provider-smb")]
+    if let Some(providers::ProviderHandle::Smb(smb)) = state
+        .providers
+        .read()
+        .await
+        .get(&track.provider.provider_id)
+    {
+        return smb_stream_response(&smb, &track, range_header, content_type).await;
+    }
+
+    let bytes = tokio::fs::read(&track.path).await?;
+    ranged_response(bytes, range_header, content_type)
+}
+
+/// Serve an SMB-backed track, fetching only the requested byte range so large
+/// files never buffer whole.
+#[cfg(feature = "provider-smb")]
+async fn smb_stream_response(
+    smb: &smb::SmbProvider,
+    track: &musicata_core::Track,
+    range: Option<&str>,
+    content_type: &str,
+) -> Result<Response, AppError> {
+    let total = track.file_size_bytes.unwrap_or(0) as usize;
+    let item_id = &track.provider.item_id;
+
+    if let Some((start, end)) = range.and_then(|range| parse_range(range, total)) {
+        let body = smb
+            .read_range(item_id, start as u64, end as u64)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?;
+        return Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_TYPE, content_type)
+            .header(ACCEPT_RANGES, "bytes")
+            .header(CONTENT_LENGTH, body.len().to_string())
+            .header(CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
+            .body(Body::from(body))
+            .map_err(AppError::from);
+    }
+
+    let body = if total == 0 {
+        Vec::new()
+    } else {
+        smb.read_range(item_id, 0, total as u64 - 1)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
+        .map_err(AppError::from)
 }
 
 fn new_playback_session_id(sequence: u64) -> String {

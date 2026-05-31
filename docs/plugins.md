@@ -82,9 +82,16 @@ task); endpoint tiering native vs bridged.
 - **M9 (sources):** ① **Internet radio** — the first non-library provider (no scan;
   user-managed stations; `resolve()` returns the stream URL). Realized first as a
   working feature (storage + native API + Subsonic internet-radio endpoints + web UI +
-  a `PlayStream` player command), then folded behind the formal `MusicProvider` trait.
-  ② Formalize `MusicProvider` (capabilities/lifecycle/`resolve`) + the registry, with
-  local disk as the reference impl.
+  a `PlayStream` player command). ✅
+  ② Formalize the provider abstraction. ✅ Landed as `ProviderCapabilities` + a
+  `SourceFs` VFS (one scanner over any backend) + a `ProviderHandle` enum/
+  `ProviderRegistry` (enum-dispatch, like `PlayerHandle`) + `merge_libraries` (N sources
+  → one library, per-track `provider_id` kept). Sources persist (`sources` table, v15)
+  and are managed via `/api/sources`. Local disk is the reference impl.
+  ③ **SMB share** — the first remote-disk source. ✅ Pure-Rust `smb` crate (no mount/FFI),
+  feature `provider-smb`: scanning drives the shared scanner over an SMB `SourceFs`
+  (`Read+Seek`-over-`read_at` with a read-ahead cache for lofty); streaming reads only
+  the requested byte range. Credentials stored plaintext for now (HARDEN IN M12).
 - **M10 (players):** ③ re-express Browser + MPD behind `PlayerProvider`; ④ one bridged
   endpoint (Snapcast or AirPlay/Chromecast) as the "Roon Tested" tier.
 

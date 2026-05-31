@@ -80,8 +80,7 @@ impl ProviderHandle {
         match self {
             ProviderHandle::Local(provider) => {
                 let provider = provider.clone();
-                let scanned =
-                    tokio::task::spawn_blocking(move || provider.scan()).await??;
+                let scanned = tokio::task::spawn_blocking(move || provider.scan()).await??;
                 Ok(scanned)
             }
             #[cfg(feature = "provider-smb")]
@@ -104,7 +103,8 @@ impl ProviderRegistry {
 
     pub fn push(&mut self, provider: ProviderHandle) {
         let id = provider.provider_id();
-        self.providers.retain(|existing| existing.provider_id() != id);
+        self.providers
+            .retain(|existing| existing.provider_id() != id);
         self.providers.push(provider);
     }
 
@@ -113,19 +113,14 @@ impl ProviderRegistry {
             .retain(|existing| existing.provider_id() != provider_id);
     }
 
+    /// Look up an active source by id. Only the SMB streaming path needs this, so
+    /// it's dead code in a build without `provider-smb`.
+    #[cfg_attr(not(feature = "provider-smb"), allow(dead_code))]
     pub fn get(&self, provider_id: &str) -> Option<ProviderHandle> {
         self.providers
             .iter()
             .find(|provider| provider.provider_id() == provider_id)
             .cloned()
-    }
-
-    pub fn handles(&self) -> Vec<ProviderHandle> {
-        self.providers.clone()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.providers.is_empty()
     }
 
     /// Scan every scannable source and merge the results into one library. A source

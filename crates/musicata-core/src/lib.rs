@@ -867,7 +867,6 @@ pub fn merge_libraries(libraries: Vec<Library>) -> Library {
         tracks.extend(library.tracks);
     }
 
-    let mut tracks = tracks;
     tracks.sort_by(|left, right| {
         left.artist_name
             .cmp(&right.artist_name)
@@ -1802,7 +1801,173 @@ mod tests {
         prelude::TagExt,
         tag::{ItemKey, ItemValue, Tag, TagItem, TagType},
     };
-    use std::{fs, time::SystemTime};
+    use std::{collections::BTreeSet, fs, io::Cursor, time::SystemTime};
+
+    /// An in-memory [`SourceFs`] for exercising the scanner without a disk or a
+    /// network share. Folder structure drives metadata (the fake byte content is
+    /// not valid audio, so tag parsing fails and the scanner falls back to the
+    /// path-derived metadata — exactly the path SMB scanning relies on too).
+    struct FakeFs {
+        root: PathBuf,
+        files: Vec<(PathBuf, Vec<u8>)>,
+    }
+
+    impl SourceFs for FakeFs {
+        fn read_dir(&self, dir: &Path) -> std::io::Result<Vec<FsEntry>> {
+            let mut seen_dirs = BTreeSet::new();
+            let mut entries = Vec::new();
+            for (path, bytes) in &self.files {
+                let Ok(rest) = path.strip_prefix(dir) else {
+                    continue;
+                };
+                let mut components = rest.components();
+                let Some(first) = components.next() else {
+                    continue;
+                };
+                let child = dir.join(first.as_os_str());
+                if components.next().is_some() {
+                    if seen_dirs.insert(child.clone()) {
+                        entries.push(FsEntry {
+                            path: child,
+                            is_dir: true,
+                            is_file: false,
+                            size: None,
+                            modified_at_unix_seconds: None,
+                        });
+                    }
+                } else {
+                    entries.push(FsEntry {
+                        path: child,
+                        is_dir: false,
+                        is_file: true,
+                        size: Some(bytes.len() as u64),
+                        modified_at_unix_seconds: Some(0),
+                    });
+                }
+            }
+            Ok(entries)
+        }
+
+        fn open(&self, path: &Path) -> std::io::Result<Box<dyn ReadSeek + '_>> {
+            let bytes = self
+                .files
+                .iter()
+                .find(|(candidate, _)| candidate == path)
+                .map(|(_, bytes)| bytes.clone())
+                .ok_or(std::io::ErrorKind::NotFound)?;
+            Ok(Box::new(Cursor::new(bytes)))
+        }
+
+        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            let bytes = self
+                .files
+                .iter()
+                .find(|(candidate, _)| candidate == path)
+                .map(|(_, bytes)| bytes.clone())
+                .ok_or(std::io::ErrorKind::NotFound)?;
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        fn stat(&self, path: &Path) -> std::io::Result<FsEntry> {
+            if let Some((_, bytes)) = self.files.iter().find(|(c, _)| c == path) {
+                return Ok(FsEntry {
+                    path: path.to_path_buf(),
+                    is_dir: false,
+                    is_file: true,
+                    size: Some(bytes.len() as u64),
+                    modified_at_unix_seconds: Some(0),
+                });
+            }
+            if self.files.iter().any(|(c, _)| c.starts_with(path)) {
+                return Ok(FsEntry {
+                    path: path.to_path_buf(),
+                    is_dir: true,
+                    is_file: false,
+                    size: None,
+                    modified_at_unix_seconds: None,
+                });
+            }
+            Err(std::io::ErrorKind::NotFound.into())
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    #[test]
+    fn scans_any_source_fs_and_merges_multiple_sources() {
+        // The scanner derives the artist from the "Artist - Title" filename and the
+        // album from the parent directory, so name the fakes accordingly.
+        let source_a = FakeFs {
+            root: PathBuf::from("/"),
+            files: vec![
+                (
+                    PathBuf::from("/Album1/01 - ArtistA - One.mp3"),
+                    b"x".to_vec(),
+                ),
+                (
+                    PathBuf::from("/Album1/02 - ArtistA - Two.mp3"),
+                    b"y".to_vec(),
+                ),
+            ],
+        };
+        let source_b = FakeFs {
+            root: PathBuf::from("/"),
+            files: vec![
+                (
+                    PathBuf::from("/Album3/01 - ArtistA - Three.mp3"),
+                    b"z".to_vec(),
+                ),
+                (
+                    PathBuf::from("/Album2/01 - ArtistB - Four.mp3"),
+                    b"w".to_vec(),
+                ),
+            ],
+        };
+
+        let lib_a = scan_source(&source_a, "src-a").expect("scan a");
+        let lib_b = scan_source(&source_b, "src-b").expect("scan b");
+        assert_eq!(lib_a.tracks.len(), 2);
+        assert!(
+            lib_a
+                .tracks
+                .iter()
+                .all(|t| t.provider.provider_id == "src-a")
+        );
+
+        let merged = merge_libraries(vec![lib_a, lib_b]);
+        assert_eq!(merged.provider_id, "musicata-merged");
+        assert_eq!(merged.tracks.len(), 4);
+
+        // Per-track source attribution survives the merge.
+        assert_eq!(
+            merged
+                .tracks
+                .iter()
+                .filter(|t| t.provider.provider_id == "src-a")
+                .count(),
+            2
+        );
+        assert_eq!(
+            merged
+                .tracks
+                .iter()
+                .filter(|t| t.provider.provider_id == "src-b")
+                .count(),
+            2
+        );
+
+        // ArtistA appears in both sources: counts sum, albums union (Album1 + Album3).
+        let artist_a = merged
+            .artists
+            .iter()
+            .find(|a| a.name == "ArtistA")
+            .expect("ArtistA present");
+        assert_eq!(artist_a.track_count, 3);
+        assert_eq!(artist_a.album_count, 2);
+        assert_eq!(merged.albums.len(), 3);
+    }
 
     #[test]
     fn scans_local_library_fixture() {
