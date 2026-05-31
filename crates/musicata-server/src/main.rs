@@ -113,7 +113,9 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to open database {}", config.database.display()))?;
     let registry = build_registry(&database, &config).await?;
     let providers = Arc::new(RwLock::new(registry));
-    let activity = Arc::new(activity::ActivityLog::new());
+    // Restore the activity log from the database; mark any job left "running" as
+    // interrupted (the server stopped mid-scan).
+    let activity = Arc::new(load_activity_log(&database).await);
 
     // `--scan-once` is the batch path: scan synchronously, persist, exit.
     if config.scan_once {
@@ -176,6 +178,22 @@ async fn main() -> Result<()> {
         LIBRARY_RESCAN_INTERVAL,
         !config.no_incremental_rescan,
     ));
+
+    // Persist the activity log (debounced) so its history survives a restart.
+    tokio::spawn(persist_activity_log(database.clone(), activity.clone()));
+
+    // Watch the local library for changes so additions/edits show up immediately,
+    // rather than waiting for the next periodic pass. Network shares have no such
+    // notifications and rely on the periodic rescan.
+    if !config.no_incremental_rescan {
+        spawn_library_watcher(
+            config.library.clone(),
+            database.clone(),
+            providers.clone(),
+            rescan_lock.clone(),
+            activity.clone(),
+        );
+    }
 
     // Keep only a rolling window of listening history.
     tokio::spawn(prune_old_listens(
@@ -429,6 +447,133 @@ async fn scan_and_persist(
         // Routine rescan with nothing to do — don't keep a log entry.
         activity.remove(task);
     }
+}
+
+/// How long to coalesce a burst of filesystem-change events before rescanning.
+const WATCH_DEBOUNCE: Duration = Duration::from_secs(2);
+
+fn activity_to_record(activity: &activity::Activity) -> musicata_storage::ActivityRecord {
+    musicata_storage::ActivityRecord {
+        id: activity.id as i64,
+        kind: activity.kind.clone(),
+        label: activity.label.clone(),
+        status: activity.status.clone(),
+        started_at_unix_seconds: activity.started_at_unix_seconds,
+        finished_at_unix_seconds: activity.finished_at_unix_seconds,
+        message: activity.message.clone(),
+    }
+}
+
+/// Load the persisted activity log, marking any job still "running" as interrupted
+/// (the server stopped before it finished), and persisting that correction.
+async fn load_activity_log(database: &Database) -> activity::ActivityLog {
+    let records = database.load_activities().await.unwrap_or_default();
+    let now = now_unix_seconds();
+    let initial = records
+        .into_iter()
+        .map(|record| {
+            let mut entry = activity::Activity {
+                id: record.id as u64,
+                kind: record.kind,
+                label: record.label,
+                status: record.status,
+                started_at_unix_seconds: record.started_at_unix_seconds,
+                finished_at_unix_seconds: record.finished_at_unix_seconds,
+                message: record.message,
+            };
+            if entry.status == "running" {
+                entry.status = "interrupted".to_string();
+                entry.finished_at_unix_seconds = Some(now);
+                entry.message = Some("Interrupted — server restarted".to_string());
+            }
+            entry
+        })
+        .collect();
+    let log = activity::ActivityLog::seeded(initial);
+    // Persist the interrupted-marking now, even if nothing else changes this run.
+    let records: Vec<_> = log.list().iter().map(activity_to_record).collect();
+    let _ = database.replace_activities(&records).await;
+    log
+}
+
+/// Persist the activity log to the database whenever it changes (debounced, so a
+/// burst of progress updates collapses into one write).
+async fn persist_activity_log(database: Database, activity: Arc<activity::ActivityLog>) {
+    let mut changes = activity.subscribe();
+    loop {
+        if changes.changed().await.is_err() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let records: Vec<_> = activity.list().iter().map(activity_to_record).collect();
+        if let Err(error) = database.replace_activities(&records).await {
+            tracing::warn!(%error, "failed to persist activity log");
+        }
+    }
+}
+
+/// Watch `root` recursively for filesystem changes and trigger an (incremental)
+/// rescan after a short debounce. Best-effort: if a watcher can't be created the
+/// periodic rescan still covers everything.
+fn spawn_library_watcher(
+    root: PathBuf,
+    database: Database,
+    providers: Arc<RwLock<ProviderRegistry>>,
+    rescan_lock: Arc<Mutex<()>>,
+    activity: Arc<activity::ActivityLog>,
+) {
+    use notify::{EventKind, RecursiveMode, Watcher};
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let mut watcher = match notify::recommended_watcher(
+        move |result: notify::Result<notify::Event>| {
+            if let Ok(event) = result
+                && matches!(
+                    event.kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                )
+            {
+                let _ = tx.send(());
+            }
+        },
+    ) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            tracing::warn!(%error, "filesystem watcher unavailable; relying on periodic rescan");
+            return;
+        }
+    };
+    if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
+        tracing::warn!(%error, root = %root.display(), "cannot watch library; relying on periodic rescan");
+        return;
+    }
+    tracing::info!(root = %root.display(), "watching library for changes");
+
+    tokio::spawn(async move {
+        let _watcher = watcher; // keep the watcher alive for the task's lifetime
+        while rx.recv().await.is_some() {
+            // Coalesce a burst of events into one rescan.
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(WATCH_DEBOUNCE) => break,
+                    message = rx.recv() => {
+                        if message.is_none() {
+                            return;
+                        }
+                    }
+                }
+            }
+            scan_and_persist(
+                &database,
+                &providers,
+                &rescan_lock,
+                &activity,
+                "Library change detected",
+                true,
+            )
+            .await;
+        }
+    });
 }
 
 /// Spawn a one-off background library scan (e.g. after a source is added/removed,
@@ -4798,7 +4943,7 @@ mod tests {
                 database,
                 std::sync::Arc::new(tokio::sync::RwLock::new(registry)),
                 players,
-                std::sync::Arc::new(crate::activity::ActivityLog::new()),
+                std::sync::Arc::new(crate::activity::ActivityLog::default()),
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 crate::subsonic::SubsonicAuth {
                     user: "u".to_string(),

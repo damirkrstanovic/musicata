@@ -190,6 +190,13 @@ impl Database {
             set_user_version(&self.pool, 15).await?;
         }
 
+        if version < 16 {
+            for statement in MIGRATION_016_ACTIVITIES {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 16).await?;
+        }
+
         Ok(())
     }
 
@@ -1716,6 +1723,69 @@ impl Database {
             .await?;
         Ok(())
     }
+
+    /// Load the persisted activity log (newest first), so history survives restart.
+    pub async fn load_activities(&self) -> Result<Vec<ActivityRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, kind, label, status, started_at_unix_seconds, finished_at_unix_seconds, message
+             FROM activities ORDER BY id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(activity_from_row).collect()
+    }
+
+    /// Replace the persisted activity log with the current set (≤ a few dozen rows).
+    pub async fn replace_activities(&self, activities: &[ActivityRecord]) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let result = async {
+            sqlx::query("DELETE FROM activities")
+                .execute(&mut *conn)
+                .await?;
+            for activity in activities {
+                sqlx::query(
+                    "INSERT INTO activities
+                        (id, kind, label, status, started_at_unix_seconds, finished_at_unix_seconds, message)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .bind(activity.id)
+                .bind(&activity.kind)
+                .bind(&activity.label)
+                .bind(&activity.status)
+                .bind(activity.started_at_unix_seconds)
+                .bind(activity.finished_at_unix_seconds)
+                .bind(&activity.message)
+                .execute(&mut *conn)
+                .await?;
+            }
+            Ok::<(), sqlx::Error>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error.into())
+            }
+        }
+    }
+}
+
+/// A persisted background activity (a library scan/rescan and its outcome). Mirrors
+/// the server's in-memory activity entry so the log survives restarts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivityRecord {
+    pub id: i64,
+    pub kind: String,
+    pub label: String,
+    pub status: String,
+    pub started_at_unix_seconds: i64,
+    pub finished_at_unix_seconds: Option<i64>,
+    pub message: Option<String>,
 }
 
 /// A persisted music source beyond the local-disk root. Today this is an SMB
@@ -1805,6 +1875,18 @@ fn radio_station_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RadioStation>
         stream_url: row.try_get("stream_url")?,
         homepage_url: row.try_get("homepage_url")?,
         created_at_unix_seconds: row.try_get("created_at_unix_seconds")?,
+    })
+}
+
+fn activity_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ActivityRecord> {
+    Ok(ActivityRecord {
+        id: row.try_get("id")?,
+        kind: row.try_get("kind")?,
+        label: row.try_get("label")?,
+        status: row.try_get("status")?,
+        started_at_unix_seconds: row.try_get("started_at_unix_seconds")?,
+        finished_at_unix_seconds: row.try_get("finished_at_unix_seconds")?,
+        message: row.try_get("message")?,
     })
 }
 
@@ -2418,6 +2500,18 @@ const MIGRATION_014_RADIO_STATIONS: &[&str] = &["CREATE TABLE IF NOT EXISTS radi
 // `--library`): network shares such as SMB. `id` is the provider id used to
 // attribute tracks. Credentials are stored in the clear for now — HARDEN IN M12,
 // mirroring the OpenSubsonic password handling.
+// Background-activity log (library scans, rescans) persisted so the admin page's
+// history — and any interrupted jobs — survive a restart.
+const MIGRATION_016_ACTIVITIES: &[&str] = &["CREATE TABLE IF NOT EXISTS activities (
+        id INTEGER PRIMARY KEY,
+        kind TEXT NOT NULL,
+        label TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at_unix_seconds INTEGER NOT NULL,
+        finished_at_unix_seconds INTEGER,
+        message TEXT
+    )"];
+
 const MIGRATION_015_SOURCES: &[&str] = &["CREATE TABLE IF NOT EXISTS sources (
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -2676,7 +2770,7 @@ async fn ensure_column(
 
 #[cfg(test)]
 mod tests {
-    use super::{Database, SourceRecord};
+    use super::{ActivityRecord, Database, SourceRecord};
     use musicata_core::{
         Album, Artist, BrowseFilter, Library, MetadataApprovalState, MetadataFieldValue,
         ProviderMapping, ScanIssue, Track, TrackMetadataObservation,
@@ -2971,6 +3065,49 @@ mod tests {
 
         database.delete_radio_station(&id).await.expect("delete");
         assert!(database.list_radio_stations().await.unwrap().is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn activities_round_trip() {
+        let db_path = temp_db_path("activities");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        let records = vec![
+            ActivityRecord {
+                id: 2,
+                kind: "scan".to_string(),
+                label: "Library rescan".to_string(),
+                status: "running".to_string(),
+                started_at_unix_seconds: 200,
+                finished_at_unix_seconds: None,
+                message: None,
+            },
+            ActivityRecord {
+                id: 1,
+                kind: "scan".to_string(),
+                label: "Initial scan".to_string(),
+                status: "ok".to_string(),
+                started_at_unix_seconds: 100,
+                finished_at_unix_seconds: Some(150),
+                message: Some("123 added".to_string()),
+            },
+        ];
+        database.replace_activities(&records).await.expect("save");
+
+        let loaded = database.load_activities().await.expect("load");
+        // Newest first (id DESC).
+        assert_eq!(loaded, records);
+
+        // Replace wholesale.
+        database
+            .replace_activities(&records[1..])
+            .await
+            .expect("replace");
+        let loaded = database.load_activities().await.expect("reload");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, 1);
 
         let _ = std::fs::remove_file(db_path);
     }

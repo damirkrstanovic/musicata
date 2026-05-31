@@ -56,8 +56,18 @@ fn now() -> i64 {
 }
 
 impl ActivityLog {
-    pub fn new() -> Self {
-        Self::default()
+    /// Build a log seeded with persisted activities (newest first), continuing ids
+    /// past the highest loaded one so new entries don't collide.
+    pub fn seeded(initial: Vec<Activity>) -> Self {
+        let next_id = initial
+            .iter()
+            .map(|activity| activity.id)
+            .max()
+            .unwrap_or(0);
+        let log = Self::default();
+        log.next_id.store(next_id, Ordering::Relaxed);
+        *log.items.lock().expect("activity log poisoned") = initial.into_iter().collect();
+        log
     }
 
     /// Subscribe to change notifications; the value is an opaque version counter.

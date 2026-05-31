@@ -315,10 +315,12 @@ function renderActivity(items) {
       const message = a.message
         ? `<pre class="activity-message">${escapeHtml(a.message)}</pre>`
         : "";
+      const icon =
+        { running: "⟳", ok: "✓", interrupted: "⚠" }[a.status] ?? "✕";
       return (
         `<div class="activity-item status-${a.status}">` +
         `<div class="activity-head">` +
-        `<span class="activity-status">${a.status === "running" ? "⟳" : a.status === "ok" ? "✓" : "✕"}</span>` +
+        `<span class="activity-status">${icon}</span>` +
         `<span class="activity-label">${escapeHtml(a.label)}</span>` +
         `<span class="activity-when">${when}</span>` +
         `</div>${message}</div>`

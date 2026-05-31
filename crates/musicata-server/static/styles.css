@@ -2526,6 +2526,7 @@ body.admin {
 .activity-item.status-running { border-left-color: var(--accent); }
 .activity-item.status-ok { border-left-color: var(--ok); }
 .activity-item.status-error { border-left-color: var(--danger); }
+.activity-item.status-interrupted { border-left-color: var(--warn); }
 
 .activity-head {
   display: flex;
@@ -2542,6 +2543,7 @@ body.admin {
 .status-running .activity-status { color: var(--accent); }
 .status-ok .activity-status { color: var(--ok); }
 .status-error .activity-status { color: var(--danger); }
+.status-interrupted .activity-status { color: var(--warn); }
 
 .activity-label {
   flex: 1 1 auto;
