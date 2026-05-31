@@ -336,8 +336,12 @@ async fn scan_and_persist(
             let id = id.clone();
             move |update: musicata_core::ScanProgress| {
                 let label = match update {
-                    musicata_core::ScanProgress::Discovering => {
-                        format!("Scanning {id}: finding files…")
+                    musicata_core::ScanProgress::Discovering { found } => {
+                        if found == 0 {
+                            format!("Scanning {id}: finding files…")
+                        } else {
+                            format!("Scanning {id}: finding files… ({found} found)")
+                        }
                     }
                     musicata_core::ScanProgress::Discovered { files } => {
                         format!("Scanning {id}: found {files} files")

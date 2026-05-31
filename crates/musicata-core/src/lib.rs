@@ -634,8 +634,8 @@ impl Error for ScanError {
 /// Progress emitted during a scan so callers can show how far along it is.
 #[derive(Clone, Debug)]
 pub enum ScanProgress {
-    /// Walking the source tree to find audio files (count not yet known).
-    Discovering,
+    /// Walking the source tree; `found` audio files discovered so far.
+    Discovering { found: usize },
     /// Discovery finished; `files` audio files were found.
     Discovered { files: usize },
     /// Reading tags: `done` of `total` files processed. `detail` carries extra live
@@ -735,8 +735,8 @@ pub fn discover_audio_files(
 ) -> Result<(Vec<DiscoveredAudioFile>, Vec<ScanIssue>), ScanError> {
     let mut files = Vec::new();
     let mut scan_errors = Vec::new();
-    progress(ScanProgress::Discovering);
-    collect_audio_files(fs, root, &mut files, &mut scan_errors, true)?;
+    progress(ScanProgress::Discovering { found: 0 });
+    collect_audio_files(fs, root, &mut files, &mut scan_errors, true, progress)?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok((files, scan_errors))
 }
@@ -1078,6 +1078,10 @@ pub fn merge_libraries(libraries: Vec<Library>) -> Library {
     let mut albums: BTreeMap<String, Album> = BTreeMap::new();
     let mut scan_errors = Vec::new();
     let mut roots = Vec::new();
+    // Track ids are unique within a source, but the same file present in two sources
+    // (e.g. a local copy and a NAS copy) yields the same id — keep both as distinct
+    // library entries by disambiguating the collision.
+    let mut seen_track_ids: BTreeSet<String> = BTreeSet::new();
 
     for library in libraries {
         roots.push(library.source_root);
@@ -1097,7 +1101,20 @@ pub fn merge_libraries(libraries: Vec<Library>) -> Library {
                 .and_modify(|existing| existing.track_count += album.track_count)
                 .or_insert(album);
         }
-        tracks.extend(library.tracks);
+        for mut track in library.tracks {
+            if !seen_track_ids.insert(track.id.clone()) {
+                let base = track.id.clone();
+                let mut suffix = 2;
+                let mut candidate = format!("{base}-{suffix}");
+                while !seen_track_ids.insert(candidate.clone()) {
+                    suffix += 1;
+                    candidate = format!("{base}-{suffix}");
+                }
+                track.stream_url = format!("/api/tracks/{candidate}/stream");
+                track.id = candidate;
+            }
+            tracks.push(track);
+        }
     }
 
     tracks.sort_by(|left, right| {
@@ -1451,6 +1468,7 @@ fn collect_audio_files(
     files: &mut Vec<DiscoveredAudioFile>,
     scan_errors: &mut Vec<ScanIssue>,
     required: bool,
+    progress: &mut dyn FnMut(ScanProgress),
 ) -> Result<(), ScanError> {
     let entries = match fs.read_dir(dir) {
         Ok(entries) => entries,
@@ -1473,7 +1491,7 @@ fn collect_audio_files(
         let path = entry.path;
 
         if entry.is_dir {
-            collect_audio_files(fs, &path, files, scan_errors, false)?;
+            collect_audio_files(fs, &path, files, scan_errors, false, progress)?;
         } else if entry.is_file && has_extension(&path, AUDIO_EXTENSIONS) {
             let content_hash = match hash_file_contents_if_small(fs, &path, entry.size) {
                 Ok(hash) => hash,
@@ -1491,6 +1509,10 @@ fn collect_audio_files(
                 modified_at_unix_seconds: entry.modified_at_unix_seconds,
                 content_hash,
             });
+            // Periodic discovery progress so a slow network walk shows life.
+            if files.len() % 200 == 0 {
+                progress(ScanProgress::Discovering { found: files.len() });
+            }
         }
     }
 

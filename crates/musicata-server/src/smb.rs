@@ -187,6 +187,17 @@ fn smb_io_error(error: smb::Error) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+/// Whether an SMB error reflects transport/connection stress (worth backing off the
+/// scan concurrency) rather than a normal protocol response. A `ReceivedErrorMessage`
+/// means the server answered (e.g. "file not found" when probing for a `.lrc`
+/// sidecar) — the connection is healthy, so it must NOT drive backoff.
+fn is_transport_stress(error: &smb::Error) -> bool {
+    matches!(
+        error,
+        smb::Error::TransportError(_) | smb::Error::OperationTimeout(..) | smb::Error::IoError(_)
+    )
+}
+
 fn filetime_to_unix(time: smb::binrw_util::file_time::FileTime) -> Option<i64> {
     SystemTime::from(time)
         .duration_since(UNIX_EPOCH)
@@ -233,20 +244,39 @@ impl SmbProvider {
         let provider_id = self.provider_id.clone();
         let handle = Handle::current();
 
-        // Connect + walk the tree on a blocking thread; hand back the connected fs.
-        progress(ScanProgress::Discovering);
-        let (fs, files, walk_errors) = tokio::task::spawn_blocking({
+        // Connect + walk the tree on a blocking thread (the walk is serial — one
+        // listing per folder over the wire). A shared counter lets us tick live
+        // "finding N files…" progress while it runs, so a big tree isn't a silent
+        // stall.
+        progress(ScanProgress::Discovering { found: 0 });
+        let discovered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let walk = tokio::task::spawn_blocking({
             let config = config.clone();
             let handle = handle.clone();
+            let discovered = discovered.clone();
             move || -> anyhow::Result<(SmbFs, Vec<musicata_core::DiscoveredAudioFile>, _)> {
                 let fs = SmbFs::connect(config, handle)?;
                 let root = fs.root().to_path_buf();
-                let (files, errors) = discover_audio_files(&fs, &root, &mut |_| {})
-                    .map_err(|error| anyhow!(error.to_string()))?;
+                let (files, errors) = discover_audio_files(&fs, &root, &mut |update| {
+                    if let ScanProgress::Discovering { found } = update {
+                        discovered.store(found, Ordering::Relaxed);
+                    }
+                })
+                .map_err(|error| anyhow!(error.to_string()))?;
                 Ok((fs, files, errors))
             }
-        })
-        .await??;
+        });
+        tokio::pin!(walk);
+        let (fs, files, walk_errors) = loop {
+            tokio::select! {
+                result = &mut walk => break result??,
+                _ = tokio::time::sleep(Duration::from_millis(400)) => {
+                    progress(ScanProgress::Discovering {
+                        found: discovered.load(Ordering::Relaxed),
+                    });
+                }
+            }
+        };
 
         let total = files.len();
         progress(ScanProgress::Discovered { files: total });
@@ -426,10 +456,13 @@ impl SmbFs {
         self.io_errors.clone()
     }
 
-    /// Map an SMB error to an `io::Error` and count it as an I/O error (for the
-    /// adaptive limiter). Tag-parse failures go through lofty, not here.
+    /// Map an SMB error to an `io::Error`, counting it toward the adaptive limiter's
+    /// backoff signal only when it's transport stress (not a benign protocol response
+    /// like a missing sidecar probe, and not a tag-parse failure).
     fn io_err(&self, error: smb::Error) -> io::Error {
-        self.io_errors.fetch_add(1, Ordering::Relaxed);
+        if is_transport_stress(&error) {
+            self.io_errors.fetch_add(1, Ordering::Relaxed);
+        }
         smb_io_error(error)
     }
 
@@ -547,7 +580,9 @@ impl BlockingReadAt for SmbFileReader {
         self.handle
             .block_on(self.file.read_at(buf, offset))
             .map_err(|error| {
-                self.io_errors.fetch_add(1, Ordering::Relaxed);
+                if is_transport_stress(&error) {
+                    self.io_errors.fetch_add(1, Ordering::Relaxed);
+                }
                 smb_io_error(error)
             })
     }
