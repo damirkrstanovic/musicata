@@ -213,6 +213,20 @@
         </header>
         <div class="settings-body">
           <section class="settings-section">
+            <h3>Music sources</h3>
+            <div id="sources-list" class="sources-list"></div>
+            <form id="add-source" class="inline-form">
+              <input id="source-host" type="text" autocomplete="off" placeholder="SMB host (e.g. nas.local)" required>
+              <input id="source-share" type="text" autocomplete="off" placeholder="Share (e.g. music)" required>
+              <input id="source-path" type="text" autocomplete="off" placeholder="Subfolder (optional)">
+              <input id="source-name" type="text" autocomplete="off" placeholder="Display name (optional)">
+              <input id="source-user" type="text" autocomplete="off" placeholder="Username (optional)">
+              <input id="source-pass" type="password" autocomplete="new-password" placeholder="Password (optional)">
+              <button class="ghost-button" type="submit">Add SMB share</button>
+            </form>
+            <p id="add-source-status" class="add-player-status"></p>
+          </section>
+          <section class="settings-section">
             <h3>Players</h3>
             <div id="players-list" class="players-list"></div>
             <form id="add-player" class="inline-form">

@@ -102,6 +102,7 @@ const els = {
 
 function openSettings() {
   els.settings.hidden = false;
+  loadSources();
 }
 function closeSettings() {
   els.settings.hidden = true;
@@ -1964,6 +1965,105 @@ function debounce(fn, delay) {
     clearTimeout(timer);
     timer = setTimeout(() => fn(...args), delay);
   };
+}
+
+// ---- Music sources --------------------------------------------------------
+
+const sourceEls = {
+  list: document.querySelector("#sources-list"),
+  addForm: document.querySelector("#add-source"),
+  host: document.querySelector("#source-host"),
+  share: document.querySelector("#source-share"),
+  path: document.querySelector("#source-path"),
+  name: document.querySelector("#source-name"),
+  user: document.querySelector("#source-user"),
+  pass: document.querySelector("#source-pass"),
+  addStatus: document.querySelector("#add-source-status"),
+};
+
+const CAPABILITY_LABELS = [
+  ["can_scan", "Scan"],
+  ["can_browse", "Browse"],
+  ["can_search", "Search"],
+  ["can_stream", "Stream"],
+];
+
+async function loadSources() {
+  if (!sourceEls.list) return;
+  let sources;
+  try {
+    sources = await api("/api/sources");
+  } catch (error) {
+    sourceEls.list.innerHTML = `<p class="error">Sources unavailable: ${escapeHtml(error.message)}</p>`;
+    return;
+  }
+  sourceEls.list.innerHTML = "";
+  for (const source of sources) {
+    const row = document.createElement("div");
+    row.className = "source-item";
+
+    const main = document.createElement("div");
+    main.className = "source-main";
+    const chips = (source.capabilities ? CAPABILITY_LABELS : [])
+      .filter(([key]) => source.capabilities[key])
+      .map(([, label]) => `<span class="cap-chip">${label}</span>`)
+      .join("");
+    main.innerHTML =
+      `<div class="source-head">` +
+      `<span class="source-name">${escapeHtml(source.display_name)}</span>` +
+      `<span class="source-kind">${escapeHtml(source.kind)}</span>` +
+      `</div><div class="cap-chips">${chips}</div>`;
+    row.append(main);
+
+    if (source.kind !== "local") {
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "pl-del";
+      del.title = "Remove source";
+      del.textContent = "✕";
+      del.addEventListener("click", () => deleteSource(source.id, source.display_name));
+      row.append(del);
+    }
+    sourceEls.list.append(row);
+  }
+}
+
+async function deleteSource(id, name) {
+  if (!window.confirm(`Remove source "${name}"? Its tracks leave the library.`)) return;
+  try {
+    await apiJson(`/api/sources/${encodeURIComponent(id)}`, "DELETE");
+  } catch (error) {
+    sourceEls.addStatus.textContent = `Could not remove: ${error.message}`;
+    return;
+  }
+  await loadSources();
+  await loadLibrary();
+}
+
+if (sourceEls.addForm) {
+  sourceEls.addForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const body = {
+      kind: "smb",
+      host: sourceEls.host.value.trim(),
+      share: sourceEls.share.value.trim(),
+      base_path: sourceEls.path.value.trim() || undefined,
+      display_name: sourceEls.name.value.trim() || undefined,
+      username: sourceEls.user.value.trim() || undefined,
+      password: sourceEls.pass.value || undefined,
+    };
+    sourceEls.addStatus.textContent = "Connecting and scanning…";
+    try {
+      await apiJson("/api/sources", "POST", body);
+    } catch (error) {
+      sourceEls.addStatus.textContent = `Could not add share: ${error.message}`;
+      return;
+    }
+    sourceEls.addForm.reset();
+    sourceEls.addStatus.textContent = "";
+    await loadSources();
+    await loadLibrary();
+  });
 }
 
 // ---- Players & zones ------------------------------------------------------

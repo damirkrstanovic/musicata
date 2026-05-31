@@ -4,8 +4,8 @@
 //! deliberately describes music independently from the source that provided it.
 
 use lofty::{
-    config::ParseOptions, file::AudioFile, file::TaggedFileExt, prelude::Accessor, probe::Probe,
-    tag::ItemKey,
+    config::ParseOptions, file::AudioFile, file::FileType, file::TaggedFileExt, prelude::Accessor,
+    probe::Probe, tag::ItemKey,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,7 +15,7 @@ use std::{
     fmt::{self, Display},
     fs,
     hash::{Hash, Hasher},
-    io::Read,
+    io::{Read, Seek},
     path::{Path, PathBuf},
 };
 
@@ -27,9 +27,142 @@ const LYRIC_SIDECARS: &[(&str, &str, f32)] =
 // Keep synchronous hashes for tiny files and move deep fingerprinting to a later worker.
 const INLINE_CONTENT_HASH_LIMIT_BYTES: u64 = 1024 * 1024;
 
+/// What a music source is able to do. Sources are deliberately uneven: a local
+/// folder or an SMB share can be scanned and searched, while an internet-radio
+/// source can only stream. Each provider advertises its capabilities so the API
+/// and UI can hide affordances a source does not support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ProviderCapabilities {
+    /// Can enumerate its whole catalogue into the merged library (`scan`).
+    pub can_scan: bool,
+    /// Can be navigated hierarchically without a full scan.
+    pub can_browse: bool,
+    /// Can answer text searches against its own catalogue.
+    pub can_search: bool,
+    /// Can produce a playable audio stream for its items.
+    pub can_stream: bool,
+}
+
+impl ProviderCapabilities {
+    /// On-disk sources (local folder, SMB share): full library semantics.
+    pub const DISK: Self = Self {
+        can_scan: true,
+        can_browse: true,
+        can_search: true,
+        can_stream: true,
+    };
+    /// Streaming sources with no scannable catalogue (internet radio).
+    pub const STREAM_ONLY: Self = Self {
+        can_scan: false,
+        can_browse: false,
+        can_search: false,
+        can_stream: true,
+    };
+}
+
 pub trait MusicProvider {
     fn provider_id(&self) -> &str;
+    fn capabilities(&self) -> ProviderCapabilities;
     fn scan(&self) -> Result<Library, ScanError>;
+}
+
+/// A `Read + Seek` source — what lofty needs to parse tags. Local files and the
+/// SMB read adapter both satisfy it.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+/// One entry returned by [`SourceFs::read_dir`].
+#[derive(Clone, Debug)]
+pub struct FsEntry {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub is_file: bool,
+    pub size: Option<u64>,
+    pub modified_at_unix_seconds: Option<i64>,
+}
+
+/// Filesystem abstraction the scanner walks. A `LocalFs` reads the local disk; an
+/// SMB-backed implementation in the server reads a network share over the wire.
+/// Paths are logical paths under [`SourceFs::root`] (so the existing path-based
+/// metadata inference keeps working unchanged for every backend).
+pub trait SourceFs {
+    /// List the immediate children of `dir`.
+    fn read_dir(&self, dir: &Path) -> std::io::Result<Vec<FsEntry>>;
+    /// Open `path` for tag parsing / hashing.
+    fn open(&self, path: &Path) -> std::io::Result<Box<dyn ReadSeek + '_>>;
+    /// Read a small text file whole (lyric sidecars).
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
+    /// Stat a single path.
+    fn stat(&self, path: &Path) -> std::io::Result<FsEntry>;
+    /// The logical root of this source, used for relative display paths.
+    fn root(&self) -> &Path;
+    /// Whether `path` exists. Defaults to a `stat` probe.
+    fn exists(&self, path: &Path) -> bool {
+        self.stat(path).is_ok()
+    }
+}
+
+/// The local-disk [`SourceFs`]: a thin wrapper over `std::fs` rooted at a folder.
+#[derive(Clone, Debug)]
+pub struct LocalFs {
+    root: PathBuf,
+}
+
+impl LocalFs {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
+
+impl SourceFs for LocalFs {
+    fn read_dir(&self, dir: &Path) -> std::io::Result<Vec<FsEntry>> {
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            // Resolve size/mtime best-effort; a metadata failure leaves them unset
+            // rather than dropping the entry.
+            let metadata = entry.metadata().ok();
+            entries.push(FsEntry {
+                path,
+                is_dir: file_type.is_dir(),
+                is_file: file_type.is_file(),
+                size: metadata.as_ref().map(|m| m.len()),
+                modified_at_unix_seconds: metadata
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(system_time_to_unix_seconds),
+            });
+        }
+        Ok(entries)
+    }
+
+    fn open(&self, path: &Path) -> std::io::Result<Box<dyn ReadSeek + '_>> {
+        Ok(Box::new(fs::File::open(path)?))
+    }
+
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        fs::read_to_string(path)
+    }
+
+    fn stat(&self, path: &Path) -> std::io::Result<FsEntry> {
+        let metadata = fs::metadata(path)?;
+        Ok(FsEntry {
+            path: path.to_path_buf(),
+            is_dir: metadata.is_dir(),
+            is_file: metadata.is_file(),
+            size: Some(metadata.len()),
+            modified_at_unix_seconds: metadata
+                .modified()
+                .ok()
+                .and_then(system_time_to_unix_seconds),
+        })
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +183,10 @@ impl LocalDiskProvider {
 impl MusicProvider for LocalDiskProvider {
     fn provider_id(&self) -> &str {
         "local-disk"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::DISK
     }
 
     fn scan(&self) -> Result<Library, ScanError> {
@@ -508,9 +645,18 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
         source,
     })?;
 
+    scan_source(&LocalFs::new(&root), "local-disk")
+}
+
+/// Walk any [`SourceFs`] and build a [`Library`] attributed to `provider_id`.
+/// This is the shared scanner: the local-disk and SMB providers both feed it,
+/// only differing in how the underlying filesystem is read.
+pub fn scan_source(fs: &dyn SourceFs, provider_id: &str) -> Result<Library, ScanError> {
+    let root = fs.root().to_path_buf();
+
     let mut files = Vec::new();
     let mut scan_errors = Vec::new();
-    collect_audio_files(&root, &mut files, &mut scan_errors, true)?;
+    collect_audio_files(fs, &root, &mut files, &mut scan_errors, true)?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
 
     let mut tracks = Vec::new();
@@ -523,8 +669,9 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
         let path = file.path;
         let folder_metadata = infer_track_metadata(&root, &path);
         let (embedded_metadata, duration_seconds) =
-            read_embedded_metadata(&path, &mut scan_errors, observed_at_unix_seconds);
-        let sidecar_lyrics = read_sidecar_lyrics(&path, &mut scan_errors, observed_at_unix_seconds);
+            read_embedded_metadata(fs, &path, &mut scan_errors, observed_at_unix_seconds);
+        let sidecar_lyrics =
+            read_sidecar_lyrics(fs, &path, &mut scan_errors, observed_at_unix_seconds);
         let metadata = canonical_metadata(embedded_metadata.as_ref(), &folder_metadata);
         let observed_metadata = metadata_observations(
             embedded_metadata,
@@ -571,7 +718,7 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
                 artist_name: album_artist_name.clone(),
                 year: metadata.year,
                 track_count: 0,
-                artwork_path: find_album_artwork(path.parent().unwrap_or(&root)),
+                artwork_path: find_album_artwork(fs, path.parent().unwrap_or(&root)),
             })
             .track_count += 1;
 
@@ -602,7 +749,7 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
         tracks.push(Track {
             id: track_id.clone(),
             provider: ProviderMapping {
-                provider_id: "local-disk".to_string(),
+                provider_id: provider_id.to_string(),
                 item_id: relative_path.clone(),
             },
             observed_metadata,
@@ -674,13 +821,82 @@ pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
     });
 
     Ok(Library {
-        provider_id: "local-disk".to_string(),
+        provider_id: provider_id.to_string(),
         source_root: root.display().to_string(),
         artists,
         albums,
         tracks,
         scan_errors,
     })
+}
+
+/// Combine the libraries of several sources into one merged library. Tracks are
+/// concatenated (their ids are globally unique and each keeps its own
+/// `provider_id`, so per-source attribution survives). Album and artist rows are
+/// unioned by id — disjoint sources keep their aggregates exactly, and the rare
+/// same-id collision (a duplicate album across two sources) sums its counts.
+pub fn merge_libraries(libraries: Vec<Library>) -> Library {
+    if libraries.len() == 1 {
+        return libraries.into_iter().next().expect("len checked");
+    }
+
+    let mut tracks = Vec::new();
+    let mut artists: BTreeMap<String, Artist> = BTreeMap::new();
+    let mut albums: BTreeMap<String, Album> = BTreeMap::new();
+    let mut scan_errors = Vec::new();
+    let mut roots = Vec::new();
+
+    for library in libraries {
+        roots.push(library.source_root);
+        scan_errors.extend(library.scan_errors);
+        for artist in library.artists {
+            artists
+                .entry(artist.id.clone())
+                .and_modify(|existing| {
+                    existing.album_count += artist.album_count;
+                    existing.track_count += artist.track_count;
+                })
+                .or_insert(artist);
+        }
+        for album in library.albums {
+            albums
+                .entry(album.id.clone())
+                .and_modify(|existing| existing.track_count += album.track_count)
+                .or_insert(album);
+        }
+        tracks.extend(library.tracks);
+    }
+
+    let mut tracks = tracks;
+    tracks.sort_by(|left, right| {
+        left.artist_name
+            .cmp(&right.artist_name)
+            .then_with(|| left.year.cmp(&right.year))
+            .then_with(|| left.album_title.cmp(&right.album_title))
+            .then_with(|| left.disc_number.cmp(&right.disc_number))
+            .then_with(|| left.track_number.cmp(&right.track_number))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+
+    let mut artists: Vec<_> = artists.into_values().collect();
+    artists.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut albums: Vec<_> = albums.into_values().collect();
+    albums.sort_by(|left, right| {
+        left.artist_name
+            .cmp(&right.artist_name)
+            .then_with(|| left.year.cmp(&right.year))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+
+    Library {
+        provider_id: "musicata-merged".to_string(),
+        source_root: roots.join(", "),
+        artists,
+        albums,
+        tracks,
+        scan_errors,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -996,22 +1212,23 @@ struct ArtistBuilder {
 }
 
 fn collect_audio_files(
-    root: &Path,
+    fs: &dyn SourceFs,
+    dir: &Path,
     files: &mut Vec<DiscoveredAudioFile>,
     scan_errors: &mut Vec<ScanIssue>,
     required: bool,
 ) -> Result<(), ScanError> {
-    let entries = match fs::read_dir(root) {
+    let entries = match fs.read_dir(dir) {
         Ok(entries) => entries,
         Err(source) if required => {
             return Err(ScanError::Io {
-                path: root.to_path_buf(),
+                path: dir.to_path_buf(),
                 source,
             });
         }
         Err(source) => {
             scan_errors.push(ScanIssue {
-                path: root.display().to_string(),
+                path: dir.display().to_string(),
                 message: source.to_string(),
             });
             return Ok(());
@@ -1019,48 +1236,12 @@ fn collect_audio_files(
     };
 
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(source) => {
-                scan_errors.push(ScanIssue {
-                    path: root.display().to_string(),
-                    message: source.to_string(),
-                });
-                continue;
-            }
-        };
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(source) => {
-                scan_errors.push(ScanIssue {
-                    path: path.display().to_string(),
-                    message: source.to_string(),
-                });
-                continue;
-            }
-        };
+        let path = entry.path;
 
-        if file_type.is_dir() {
-            collect_audio_files(&path, files, scan_errors, false)?;
-        } else if file_type.is_file() && has_extension(&path, AUDIO_EXTENSIONS) {
-            let file_metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(source) => {
-                    scan_errors.push(ScanIssue {
-                        path: path.display().to_string(),
-                        message: source.to_string(),
-                    });
-                    files.push(DiscoveredAudioFile {
-                        path,
-                        file_size_bytes: None,
-                        modified_at_unix_seconds: None,
-                        content_hash: None,
-                    });
-                    continue;
-                }
-            };
-            let content_hash = match hash_file_contents_if_small(&path, file_metadata.len()) {
+        if entry.is_dir {
+            collect_audio_files(fs, &path, files, scan_errors, false)?;
+        } else if entry.is_file && has_extension(&path, AUDIO_EXTENSIONS) {
+            let content_hash = match hash_file_contents_if_small(fs, &path, entry.size) {
                 Ok(hash) => hash,
                 Err(source) => {
                     scan_errors.push(ScanIssue {
@@ -1072,11 +1253,8 @@ fn collect_audio_files(
             };
             files.push(DiscoveredAudioFile {
                 path,
-                file_size_bytes: Some(file_metadata.len()),
-                modified_at_unix_seconds: file_metadata
-                    .modified()
-                    .ok()
-                    .and_then(system_time_to_unix_seconds),
+                file_size_bytes: entry.size,
+                modified_at_unix_seconds: entry.modified_at_unix_seconds,
                 content_hash,
             });
         }
@@ -1099,14 +1277,18 @@ fn current_unix_seconds() -> i64 {
 }
 
 fn hash_file_contents_if_small(
+    fs: &dyn SourceFs,
     path: &Path,
-    file_size_bytes: u64,
+    file_size_bytes: Option<u64>,
 ) -> Result<Option<String>, std::io::Error> {
-    if file_size_bytes > INLINE_CONTENT_HASH_LIMIT_BYTES {
-        return Ok(None);
+    // Only fingerprint files whose size is known and small; unknown or large
+    // files fall back to size/mtime identity (see `build_track_identity`).
+    match file_size_bytes {
+        Some(size) if size <= INLINE_CONTENT_HASH_LIMIT_BYTES => {}
+        _ => return Ok(None),
     }
 
-    let mut file = fs::File::open(path)?;
+    let mut file = fs.open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
 
@@ -1133,9 +1315,27 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
+/// Parse a tagged file from a [`SourceFs`] reader. Mirrors `Probe::open`'s
+/// extension-driven file-type detection (falling back to content sniffing when the
+/// extension is unknown), but works over any `Read + Seek` source — local or SMB.
+fn probe_tagged_file(
+    fs: &dyn SourceFs,
+    path: &Path,
+    read_properties: bool,
+) -> Result<lofty::file::TaggedFile, Box<dyn Error>> {
+    let reader = fs.open(path)?;
+    let probe = Probe::new(reader).options(ParseOptions::new().read_properties(read_properties));
+    let probe = match FileType::from_path(path) {
+        Some(file_type) => probe.set_file_type(file_type),
+        None => probe.guess_file_type()?,
+    };
+    Ok(probe.read()?)
+}
+
 /// Read the embedded tag observation and the track duration in one probe. Properties
 /// are parsed so we get the stream length; a zero/unknown duration becomes `None`.
 fn read_embedded_metadata(
+    fs: &dyn SourceFs,
     path: &Path,
     scan_errors: &mut Vec<ScanIssue>,
     observed_at_unix_seconds: i64,
@@ -1143,29 +1343,22 @@ fn read_embedded_metadata(
     // Prefer reading stream properties (so we get a duration), but some files — and
     // minimal/edge-case inputs — fail property parsing while their tags are still
     // readable. Fall back to a tags-only read in that case (duration stays `None`).
-    let with_properties = Probe::open(path)
-        .map(|probe| probe.options(ParseOptions::new().read_properties(true)))
-        .and_then(Probe::read);
+    let with_properties = probe_tagged_file(fs, path, true);
     let (tagged_file, duration) = match with_properties {
         Ok(tagged_file) => {
             let seconds = tagged_file.properties().duration().as_secs_f64();
             (tagged_file, (seconds > 0.0).then_some(seconds))
         }
-        Err(_) => {
-            match Probe::open(path)
-                .map(|probe| probe.options(ParseOptions::new().read_properties(false)))
-                .and_then(Probe::read)
-            {
-                Ok(tagged_file) => (tagged_file, None),
-                Err(error) => {
-                    scan_errors.push(ScanIssue {
-                        path: path.display().to_string(),
-                        message: format!("metadata read failed: {error}"),
-                    });
-                    return (None, None);
-                }
+        Err(_) => match probe_tagged_file(fs, path, false) {
+            Ok(tagged_file) => (tagged_file, None),
+            Err(error) => {
+                scan_errors.push(ScanIssue {
+                    path: path.display().to_string(),
+                    message: format!("metadata read failed: {error}"),
+                });
+                return (None, None);
             }
-        }
+        },
     };
 
     let observation = tagged_file
@@ -1176,17 +1369,18 @@ fn read_embedded_metadata(
 }
 
 fn read_sidecar_lyrics(
+    fs: &dyn SourceFs,
     path: &Path,
     scan_errors: &mut Vec<ScanIssue>,
     observed_at_unix_seconds: i64,
 ) -> Option<TrackMetadataObservation> {
     for (extension, source, confidence) in LYRIC_SIDECARS {
         let sidecar_path = path.with_extension(extension);
-        if !sidecar_path.exists() {
+        if !fs.exists(&sidecar_path) {
             continue;
         }
 
-        match fs::read_to_string(&sidecar_path) {
+        match fs.read_to_string(&sidecar_path) {
             Ok(contents) => {
                 if let Some(lyrics) = clean_optional_lyrics_value(Some(&contents)) {
                     return Some(TrackMetadataObservation::sidecar_lyrics(
@@ -1403,15 +1597,20 @@ pub fn artwork_asset_id(path: &Path) -> String {
 }
 
 pub fn find_album_artwork_candidates(album_dir: &Path) -> Vec<PathBuf> {
-    let Some(entries) = fs::read_dir(album_dir).ok() else {
+    find_album_artwork_candidates_in(&LocalFs::new(album_dir), album_dir)
+}
+
+/// Artwork candidates within `album_dir`, read through a [`SourceFs`] so the same
+/// discovery serves local folders and SMB shares.
+fn find_album_artwork_candidates_in(fs: &dyn SourceFs, album_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs.read_dir(album_dir) else {
         return Vec::new();
     };
     let mut images = Vec::new();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && has_extension(&path, IMAGE_EXTENSIONS) {
-            images.push(path);
+    for entry in entries {
+        if entry.is_file && has_extension(&entry.path, IMAGE_EXTENSIONS) {
+            images.push(entry.path);
         }
     }
 
@@ -1424,8 +1623,10 @@ pub fn find_album_artwork_candidates(album_dir: &Path) -> Vec<PathBuf> {
     images
 }
 
-fn find_album_artwork(album_dir: &Path) -> Option<PathBuf> {
-    find_album_artwork_candidates(album_dir).into_iter().next()
+fn find_album_artwork(fs: &dyn SourceFs, album_dir: &Path) -> Option<PathBuf> {
+    find_album_artwork_candidates_in(fs, album_dir)
+        .into_iter()
+        .next()
 }
 
 fn artwork_priority(path: &Path) -> u8 {

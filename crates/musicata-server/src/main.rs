@@ -1,10 +1,14 @@
 mod mpd;
 mod musicbrainz;
 mod players;
+mod providers;
 mod radiobrowser;
+#[cfg(feature = "provider-smb")]
+mod smb;
 mod subsonic;
 
 use crate::players::{BrowserPlayer, PlayerHandle, PlayerManager};
+use crate::providers::{ProviderHandle, ProviderRegistry};
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
@@ -26,7 +30,7 @@ use axum::{
 };
 use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, Library, LibrarySummary, LocalDiskProvider,
-    MetadataApprovalState, MetadataFieldValue, MusicProvider, PlaybackState, Player, PlayerCommand,
+    MetadataApprovalState, MetadataFieldValue, PlaybackState, Player, PlayerCommand,
     Playlist, RadioStation, SearchResults, Track, TrackMetadataFieldObservation, Zone,
     album_artwork_url, artwork_asset_id, find_album_artwork_candidates,
 };
@@ -61,7 +65,7 @@ const TAG_WRITE_BACK_DISABLED_REASON: &str =
 #[derive(Clone)]
 struct AppState {
     database: Database,
-    provider: LocalDiskProvider,
+    providers: Arc<RwLock<ProviderRegistry>>,
     players: Arc<PlayerManager>,
     musicbrainz: MusicBrainzClient,
     radio_browser: radiobrowser::RadioBrowserClient,
@@ -102,13 +106,14 @@ async fn main() -> Result<()> {
     init_logging();
 
     let config = Config::from_args()?;
-    let provider = LocalDiskProvider::new(&config.library);
     let database = Database::connect(&config.database)
         .await
         .with_context(|| format!("failed to open database {}", config.database.display()))?;
+    let registry = build_registry(&database, &config).await?;
+    let providers = Arc::new(RwLock::new(registry));
     let library = load_or_scan_library(
         &database,
-        &provider,
+        &providers,
         config.rescan,
         !config.no_incremental_rescan,
     )
@@ -153,7 +158,7 @@ async fn main() -> Result<()> {
     if !config.no_incremental_rescan {
         tokio::spawn(periodic_rescan(
             database.clone(),
-            provider.clone(),
+            providers.clone(),
             rescan_lock.clone(),
             LIBRARY_RESCAN_INTERVAL,
         ));
@@ -180,7 +185,7 @@ async fn main() -> Result<()> {
     tracing::info!("listening on http://{}", config.addr);
     axum::serve(
         listener,
-        app(database, provider, players, rescan_lock, subsonic_auth),
+        app(database, providers, players, rescan_lock, subsonic_auth),
     )
     .await
     .context("server failed")?;
@@ -215,9 +220,41 @@ async fn prune_old_listens(database: Database, retention: Duration, interval: Du
 /// Periodically re-scans the library and persists any changes. Incremental change
 /// detection only stats files, so an unchanged library is cheap; nothing is written
 /// when nothing changed. Errors are logged and the loop continues.
+/// Build the active source registry: the local-disk source from `--library`, plus
+/// any persisted sources (e.g. SMB shares) recorded in the database.
+async fn build_registry(database: &Database, config: &Config) -> Result<ProviderRegistry> {
+    let mut registry = ProviderRegistry::new();
+    registry.push(ProviderHandle::local(LocalDiskProvider::new(&config.library)));
+    register_persisted_sources(database, &mut registry).await?;
+    Ok(registry)
+}
+
+/// Add every enabled persisted source (e.g. SMB shares) to `registry`. A source
+/// that can't be constructed (bad config, or built without its cargo feature) is
+/// logged and skipped so one broken source never blocks startup.
+async fn register_persisted_sources(
+    database: &Database,
+    registry: &mut ProviderRegistry,
+) -> Result<()> {
+    for record in database.list_sources().await? {
+        if !record.enabled {
+            continue;
+        }
+        match providers::provider_from_record(&record) {
+            Ok(handle) => registry.push(handle),
+            Err(error) => tracing::warn!(
+                source = %record.id,
+                %error,
+                "skipping configured source"
+            ),
+        }
+    }
+    Ok(())
+}
+
 async fn periodic_rescan(
     database: Database,
-    provider: LocalDiskProvider,
+    providers: Arc<RwLock<ProviderRegistry>>,
     rescan_lock: Arc<Mutex<()>>,
     interval: Duration,
 ) {
@@ -226,15 +263,11 @@ async fn periodic_rescan(
     loop {
         ticker.tick().await;
         let _guard = rescan_lock.lock().await;
-        let scan_provider = provider.clone();
-        let scanned = match tokio::task::spawn_blocking(move || scan_provider.scan()).await {
-            Ok(Ok(scanned)) => scanned,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "background rescan failed");
-                continue;
-            }
+        let registry = providers.read().await.clone();
+        let scanned = match registry.scan_all().await {
+            Ok(scanned) => scanned,
             Err(error) => {
-                tracing::warn!(%error, "background rescan task panicked");
+                tracing::warn!(%error, "background rescan failed");
                 continue;
             }
         };
@@ -260,7 +293,7 @@ async fn periodic_rescan(
 
 async fn load_or_scan_library(
     database: &Database,
-    provider: &LocalDiskProvider,
+    providers: &Arc<RwLock<ProviderRegistry>>,
     rescan: bool,
     incremental_rescan: bool,
 ) -> Result<Library> {
@@ -277,9 +310,11 @@ async fn load_or_scan_library(
         return Ok(library);
     }
 
-    let mut scanned = provider
-        .scan()
-        .with_context(|| format!("failed to scan {}", provider.root().display()))?;
+    let registry = providers.read().await.clone();
+    let mut scanned = registry
+        .scan_all()
+        .await
+        .context("failed to scan music sources")?;
 
     if !rescan
         && incremental_rescan
@@ -325,7 +360,7 @@ async fn load_or_scan_library(
 
 fn app(
     database: Database,
-    provider: LocalDiskProvider,
+    providers: Arc<RwLock<ProviderRegistry>>,
     players: Arc<PlayerManager>,
     rescan_lock: Arc<Mutex<()>>,
     subsonic_auth: subsonic::SubsonicAuth,
@@ -391,6 +426,9 @@ fn app(
         .route("/api/radio", get(list_radio).post(create_radio))
         .route("/api/radio/directory", get(radio_directory))
         .route("/api/radio/{id}", patch(update_radio).delete(delete_radio))
+        .route("/api/sources", get(list_sources).post(create_source))
+        .route("/api/sources/{id}", delete(delete_source))
+        .route("/api/sources/{id}/rescan", post(rescan_source))
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
             get(album_musicbrainz_candidates),
@@ -431,7 +469,7 @@ fn app(
         .layer(middleware::from_fn(log_request))
         .with_state(AppState {
             database,
-            provider,
+            providers,
             players,
             musicbrainz: MusicBrainzClient::default(),
             radio_browser: radiobrowser::RadioBrowserClient::default(),
@@ -622,10 +660,10 @@ async fn rescan_library(
 ) -> Result<Json<RescanResponse>, AppError> {
     let _guard = state.rescan_lock.lock().await;
     let forced = query.force.unwrap_or(false);
-    let provider = state.provider.clone();
-    let mut scanned = tokio::task::spawn_blocking(move || provider.scan())
+    let registry = state.providers.read().await.clone();
+    let mut scanned = registry
+        .scan_all()
         .await
-        .map_err(|error| AppError::internal(error.to_string()))?
         .map_err(|error| AppError::internal(error.to_string()))?;
     let changes = state.database.detect_library_changes(&scanned).await?;
     let changed = changes.has_changes();
@@ -1456,6 +1494,157 @@ async fn delete_radio(
         .await
         .map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Serialize)]
+struct SourceView {
+    id: String,
+    kind: String,
+    display_name: String,
+    enabled: bool,
+    capabilities: musicata_core::ProviderCapabilities,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSourceRequest {
+    /// Source kind; currently only `"smb"` (the local-disk source comes from `--library`).
+    kind: String,
+    display_name: Option<String>,
+    host: Option<String>,
+    share: Option<String>,
+    base_path: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    domain: Option<String>,
+}
+
+/// List configured sources: the always-present local library plus any persisted
+/// network sources (SMB shares).
+async fn list_sources(State(state): State<AppState>) -> Result<Json<Vec<SourceView>>, AppError> {
+    let mut views = vec![SourceView {
+        id: "local-disk".to_string(),
+        kind: "local".to_string(),
+        display_name: "Local library".to_string(),
+        enabled: true,
+        capabilities: musicata_core::ProviderCapabilities::DISK,
+    }];
+    for record in state.database.list_sources().await.map_err(db_error)? {
+        views.push(source_view(&record));
+    }
+    Ok(Json(views))
+}
+
+fn source_view(record: &musicata_storage::SourceRecord) -> SourceView {
+    SourceView {
+        id: record.id.clone(),
+        kind: record.kind.clone(),
+        display_name: record.display_name.clone(),
+        enabled: record.enabled,
+        // Every source kind we persist today is a scannable disk-like source.
+        capabilities: musicata_core::ProviderCapabilities::DISK,
+    }
+}
+
+/// Add a network source, register it, and rescan so its tracks merge into the
+/// library immediately.
+async fn create_source(
+    State(state): State<AppState>,
+    Json(request): Json<CreateSourceRequest>,
+) -> Result<Json<SourceView>, AppError> {
+    if request.kind != "smb" {
+        return Err(AppError::bad_request(format!(
+            "unsupported source kind: {}",
+            request.kind
+        )));
+    }
+    let host = request
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("host is required for an SMB source"))?;
+    let share = request
+        .share
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("share is required for an SMB source"))?;
+    let base_path = request
+        .base_path
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+
+    let id = providers::smb_provider_id(host, share, &base_path);
+    let display_name = request
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{host}/{share}"));
+    let record = musicata_storage::SourceRecord {
+        id: id.clone(),
+        kind: "smb".to_string(),
+        display_name,
+        enabled: true,
+        host: Some(host.to_string()),
+        share: Some(share.to_string()),
+        base_path: (!base_path.is_empty()).then(|| base_path.clone()),
+        username: request.username.clone(),
+        password: request.password.clone(),
+        domain: request.domain.clone(),
+        created_at_unix_seconds: now_unix_seconds(),
+    };
+
+    // Build the provider first so a bad config (or a build without `provider-smb`)
+    // fails before we persist anything.
+    let handle =
+        providers::provider_from_record(&record).map_err(|error| AppError::bad_request(error.to_string()))?;
+
+    state.database.add_source(&record).await.map_err(db_error)?;
+    state.providers.write().await.push(handle);
+    rescan_and_save(&state).await?;
+
+    Ok(Json(source_view(&record)))
+}
+
+async fn delete_source(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    if id == "local-disk" {
+        return Err(AppError::bad_request(
+            "the local library source can't be removed (set it with --library)",
+        ));
+    }
+    state.database.delete_source(&id).await.map_err(db_error)?;
+    state.providers.write().await.remove(&id);
+    rescan_and_save(&state).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn rescan_source(
+    State(state): State<AppState>,
+    Path(_id): Path<String>,
+) -> Result<Json<LibrarySummary>, AppError> {
+    let summary = rescan_and_save(&state).await?;
+    Ok(Json(summary))
+}
+
+/// Rescan every active source and persist the merged result. Serialized with the
+/// background rescan via `rescan_lock`.
+async fn rescan_and_save(state: &AppState) -> Result<LibrarySummary, AppError> {
+    let _guard = state.rescan_lock.lock().await;
+    let registry = state.providers.read().await.clone();
+    let mut scanned = registry
+        .scan_all()
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+    let summary = scanned.summary();
+    state.database.save_library(&mut scanned).await?;
+    Ok(summary)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2669,7 +2858,10 @@ fn init_logging() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ARTWORK_CACHE_CONTROL, Config, PlayerManager, app, parse_range};
+    use super::{
+        ARTWORK_CACHE_CONTROL, Config, PlayerManager, ProviderHandle, ProviderRegistry, app,
+        parse_range,
+    };
     use axum::{
         body::{Body, to_bytes},
         http::{
@@ -3974,6 +4166,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lists_sources_and_rejects_unknown_kind() {
+        let fixture = TestFixture::new("sources");
+        let app = fixture.app().await;
+
+        // The local library is always listed, with full disk capabilities.
+        let sources: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/sources")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        let list = sources.as_array().expect("sources array");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["id"], "local-disk");
+        assert_eq!(list[0]["kind"], "local");
+        assert_eq!(list[0]["capabilities"]["can_scan"], true);
+        assert_eq!(list[0]["capabilities"]["can_stream"], true);
+
+        // An unknown source kind is rejected.
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sources")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"kind":"ftp","host":"h","share":"s"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        // An SMB source requires host/share; missing host is a 400. (Whether the
+        // SMB provider can actually be built depends on the `provider-smb` feature;
+        // either way an empty/invalid request must not 500.)
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sources")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"kind":"smb"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn radio_native_and_subsonic() {
         let fixture = TestFixture::new("radio");
         let app = fixture.app().await;
@@ -4240,9 +4493,11 @@ mod tests {
             let players = PlayerManager::load(database.clone(), "http://127.0.0.1".to_string())
                 .await
                 .expect("player manager");
+            let mut registry = ProviderRegistry::new();
+            registry.push(ProviderHandle::local(LocalDiskProvider::new(&self.root)));
             app(
                 database,
-                LocalDiskProvider::new(&self.root),
+                std::sync::Arc::new(tokio::sync::RwLock::new(registry)),
                 players,
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 crate::subsonic::SubsonicAuth {

@@ -183,6 +183,13 @@ impl Database {
             set_user_version(&self.pool, 14).await?;
         }
 
+        if version < 15 {
+            for statement in MIGRATION_015_SOURCES {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 15).await?;
+        }
+
         Ok(())
     }
 
@@ -192,28 +199,28 @@ impl Database {
 
         let result = async {
             // Preserve each track's original "added at" timestamp across the full
-            // delete/re-insert by keying on the stable provider item id.
-            let mut existing_added_at: BTreeMap<String, Option<i64>> = BTreeMap::new();
+            // delete/re-insert by keying on (provider id, provider item id) — the
+            // item id alone can collide once more than one source is merged in.
+            let mut existing_added_at: BTreeMap<(String, String), Option<i64>> = BTreeMap::new();
             let existing_rows =
-                sqlx::query("SELECT provider_item_id, added_at_unix_seconds FROM tracks")
+                sqlx::query("SELECT provider_id, provider_item_id, added_at_unix_seconds FROM tracks")
                     .fetch_all(&mut *conn)
                     .await?;
             for row in existing_rows {
                 existing_added_at.insert(
-                    row.try_get("provider_item_id")?,
+                    (row.try_get("provider_id")?, row.try_get("provider_item_id")?),
                     row.try_get("added_at_unix_seconds")?,
                 );
             }
             let now = now_unix_seconds();
             for track in &mut library.tracks {
+                let key = (
+                    track.provider.provider_id.clone(),
+                    track.provider.item_id.clone(),
+                );
                 let added_at = track
                     .added_at_unix_seconds
-                    .or_else(|| {
-                        existing_added_at
-                            .get(&track.provider.item_id)
-                            .copied()
-                            .flatten()
-                    })
+                    .or_else(|| existing_added_at.get(&key).copied().flatten())
                     .unwrap_or(now);
                 track.added_at_unix_seconds = Some(added_at);
             }
@@ -1647,6 +1654,86 @@ impl Database {
             .await?;
         Ok(())
     }
+
+    /// Persist a configured source (e.g. an SMB share). The `id` is the provider id
+    /// used to attribute that source's tracks; inserting an existing id replaces it.
+    pub async fn add_source(&self, source: &SourceRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO sources
+                (id, kind, display_name, enabled, host, share, base_path, username, password, domain, created_at_unix_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )
+        .bind(&source.id)
+        .bind(&source.kind)
+        .bind(&source.display_name)
+        .bind(source.enabled as i64)
+        .bind(&source.host)
+        .bind(&source.share)
+        .bind(&source.base_path)
+        .bind(&source.username)
+        .bind(&source.password)
+        .bind(&source.domain)
+        .bind(source.created_at_unix_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_sources(&self) -> Result<Vec<SourceRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, kind, display_name, enabled, host, share, base_path, username, password, domain, created_at_unix_seconds
+             FROM sources ORDER BY display_name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(source_from_row).collect()
+    }
+
+    pub async fn source(&self, id: &str) -> Result<Option<SourceRecord>> {
+        let row = sqlx::query(
+            "SELECT id, kind, display_name, enabled, host, share, base_path, username, password, domain, created_at_unix_seconds
+             FROM sources WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(source_from_row).transpose()
+    }
+
+    pub async fn set_source_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        sqlx::query("UPDATE sources SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_source(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM sources WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+/// A persisted music source beyond the local-disk root. Today this is an SMB
+/// share; the columns are a superset so other networked sources can reuse it.
+/// `id` is the provider id used to attribute the source's tracks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceRecord {
+    pub id: String,
+    pub kind: String,
+    pub display_name: String,
+    pub enabled: bool,
+    pub host: Option<String>,
+    pub share: Option<String>,
+    pub base_path: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub domain: Option<String>,
+    pub created_at_unix_seconds: i64,
 }
 
 /// A persisted player registration (its live state lives in the player manager).
@@ -1717,6 +1804,22 @@ fn radio_station_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RadioStation>
         name: row.try_get("name")?,
         stream_url: row.try_get("stream_url")?,
         homepage_url: row.try_get("homepage_url")?,
+        created_at_unix_seconds: row.try_get("created_at_unix_seconds")?,
+    })
+}
+
+fn source_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SourceRecord> {
+    Ok(SourceRecord {
+        id: row.try_get("id")?,
+        kind: row.try_get("kind")?,
+        display_name: row.try_get("display_name")?,
+        enabled: row.try_get::<i64, _>("enabled")? != 0,
+        host: row.try_get("host")?,
+        share: row.try_get("share")?,
+        base_path: row.try_get("base_path")?,
+        username: row.try_get("username")?,
+        password: row.try_get("password")?,
+        domain: row.try_get("domain")?,
         created_at_unix_seconds: row.try_get("created_at_unix_seconds")?,
     })
 }
@@ -2311,6 +2414,24 @@ const MIGRATION_014_RADIO_STATIONS: &[&str] = &["CREATE TABLE IF NOT EXISTS radi
         created_at_unix_seconds INTEGER NOT NULL
     )"];
 
+// Configured music sources beyond the local-disk root (which still comes from
+// `--library`): network shares such as SMB. `id` is the provider id used to
+// attribute tracks. Credentials are stored in the clear for now — HARDEN IN M12,
+// mirroring the OpenSubsonic password handling.
+const MIGRATION_015_SOURCES: &[&str] = &["CREATE TABLE IF NOT EXISTS sources (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        host TEXT,
+        share TEXT,
+        base_path TEXT,
+        username TEXT,
+        password TEXT,
+        domain TEXT,
+        created_at_unix_seconds INTEGER NOT NULL
+    )"];
+
 // Registered players and zones. Players are reported to the server (e.g. via the
 // web UI) and persisted so they survive restarts; a player optionally belongs to
 // a zone (a named group used as a control target).
@@ -2555,7 +2676,7 @@ async fn ensure_column(
 
 #[cfg(test)]
 mod tests {
-    use super::Database;
+    use super::{Database, SourceRecord};
     use musicata_core::{
         Album, Artist, BrowseFilter, Library, MetadataApprovalState, MetadataFieldValue,
         ProviderMapping, ScanIssue, Track, TrackMetadataObservation,
@@ -2850,6 +2971,88 @@ mod tests {
 
         database.delete_radio_station(&id).await.expect("delete");
         assert!(database.list_radio_stations().await.unwrap().is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn sources_round_trip() {
+        let db_path = temp_db_path("sources");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        let record = SourceRecord {
+            id: "smb:nas/music".to_string(),
+            kind: "smb".to_string(),
+            display_name: "NAS".to_string(),
+            enabled: true,
+            host: Some("nas.local".to_string()),
+            share: Some("music".to_string()),
+            base_path: Some("Albums".to_string()),
+            username: Some("guest".to_string()),
+            password: Some("secret".to_string()),
+            domain: None,
+            created_at_unix_seconds: 100,
+        };
+        database.add_source(&record).await.expect("add");
+
+        let sources = database.list_sources().await.expect("list");
+        assert_eq!(sources, vec![record.clone()]);
+
+        database
+            .set_source_enabled(&record.id, false)
+            .await
+            .expect("disable");
+        let fetched = database
+            .source(&record.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(!fetched.enabled);
+        assert_eq!(fetched.password.as_deref(), Some("secret"));
+
+        database.delete_source(&record.id).await.expect("delete");
+        assert!(database.list_sources().await.unwrap().is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn added_at_preserved_across_resave_per_provider() {
+        // Two sources can share the same provider_item_id (a relative path). The
+        // added-at preservation must key on (provider_id, item_id), not item id alone.
+        let db_path = temp_db_path("added-at-per-provider");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        // Give the fixture track an explicit added-at and a second source's twin.
+        library.tracks[0].provider.provider_id = "local-disk".to_string();
+        library.tracks[0].provider.item_id = "album/one.mp3".to_string();
+        library.tracks[0].added_at_unix_seconds = Some(42);
+        let mut twin = library.tracks[0].clone();
+        twin.id = "track_twin".to_string();
+        twin.provider.provider_id = "smb:nas/music".to_string();
+        twin.provider.item_id = "album/one.mp3".to_string();
+        twin.added_at_unix_seconds = Some(99);
+        library.tracks.push(twin);
+        database.save_library(&mut library).await.expect("save");
+
+        // Re-save without explicit timestamps; both must keep their own added-at.
+        for track in &mut library.tracks {
+            track.added_at_unix_seconds = None;
+        }
+        database.save_library(&mut library).await.expect("resave");
+
+        let local = database
+            .track(&library.tracks[0].id)
+            .await
+            .expect("get local")
+            .expect("exists");
+        let smb = database
+            .track("track_twin")
+            .await
+            .expect("get smb")
+            .expect("exists");
+        assert_eq!(local.added_at_unix_seconds, Some(42));
+        assert_eq!(smb.added_at_unix_seconds, Some(99));
 
         let _ = std::fs::remove_file(db_path);
     }
