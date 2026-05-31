@@ -1,6 +1,7 @@
 mod mpd;
 mod musicbrainz;
 mod players;
+mod radiobrowser;
 mod subsonic;
 
 use crate::players::{BrowserPlayer, PlayerHandle, PlayerManager};
@@ -63,6 +64,7 @@ struct AppState {
     provider: LocalDiskProvider,
     players: Arc<PlayerManager>,
     musicbrainz: MusicBrainzClient,
+    radio_browser: radiobrowser::RadioBrowserClient,
     rescan_lock: Arc<Mutex<()>>,
     most_played_cache: Arc<Mutex<Option<MostPlayedCache>>>,
     playback_sessions: Arc<RwLock<BTreeMap<String, PlaybackSession>>>,
@@ -387,6 +389,7 @@ fn app(
             put(star_favorite).delete(unstar_favorite),
         )
         .route("/api/radio", get(list_radio).post(create_radio))
+        .route("/api/radio/directory", get(radio_directory))
         .route("/api/radio/{id}", patch(update_radio).delete(delete_radio))
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
@@ -431,6 +434,7 @@ fn app(
             provider,
             players,
             musicbrainz: MusicBrainzClient::default(),
+            radio_browser: radiobrowser::RadioBrowserClient::default(),
             rescan_lock,
             most_played_cache: Arc::new(Mutex::new(None)),
             playback_sessions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -1452,6 +1456,28 @@ async fn delete_radio(
         .await
         .map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectoryQuery {
+    query: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Browse the public Radio Browser directory (proxied server-side). An empty query
+/// returns the most-voted stations.
+async fn radio_directory(
+    State(state): State<AppState>,
+    Query(query): Query<DirectoryQuery>,
+) -> Result<Json<Vec<radiobrowser::DirectoryStation>>, AppError> {
+    let client = state.radio_browser.clone();
+    let text = query.query.unwrap_or_default();
+    let limit = query.limit.unwrap_or(40).clamp(1, 100);
+    let stations = tokio::task::spawn_blocking(move || client.search(&text, limit))
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?
+        .map_err(AppError::internal)?;
+    Ok(Json(stations))
 }
 
 /// Query parameters for `/api/tracks`: browse filters plus pagination/sorting.

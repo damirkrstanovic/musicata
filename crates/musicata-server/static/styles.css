@@ -634,6 +634,43 @@ h1 {
   animation: queue-rise 0.14s ease;
 }
 
+/* Radio directory (Browse radio) results. */
+.radio-results {
+  display: grid;
+  gap: 2px;
+  max-height: 52vh;
+  overflow: auto;
+}
+
+.radio-result {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.radio-result .rr-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.radio-result .rr-text strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.radio-result .rr-text span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .add-menu-head {
   padding: 6px 10px 8px;
   font-size: 0.72rem;

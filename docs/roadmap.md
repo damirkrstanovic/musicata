@@ -374,8 +374,9 @@ Tasks:
 - Keep local disk as the reference provider.
 - [x] Add internet radio as the first non-library provider. Stations (name + stream
   URL + optional homepage) persist (migration v14) and are exposed via the native API
-  (`/api/radio`), the web app (a Radio sidebar section: add / play / remove), and the
-  OpenSubsonic internet-radio endpoints (get/create/update/deleteInternetRadioStation).
+  (`/api/radio`), the web app (a Radio sidebar section: add / play / remove, plus a
+  "Browse radio" directory backed by the open Radio Browser API, proxied server-side),
+  and the OpenSubsonic internet-radio endpoints (get/create/update/delete).
   A new `PlayerCommand::PlayStream{url,title}` plays an external stream directly on the
   browser and MPD players (no library resolution). This is the first source that isn't
   a scanned library; the formal `MusicProvider` trait/registry generalization (see

@@ -50,6 +50,11 @@ const els = {
   newPlaylist: document.querySelector("#new-playlist"),
   radio: document.querySelector("#radio"),
   newRadio: document.querySelector("#new-radio"),
+  radioDirectory: document.querySelector("#radio-directory"),
+  radioDirClose: document.querySelector("#radio-dir-close"),
+  radioSearch: document.querySelector("#radio-search"),
+  radioResults: document.querySelector("#radio-results"),
+  radioAddUrl: document.querySelector("#radio-add-url"),
   trackList: document.querySelector("#track-list"),
   navLinks: Array.from(document.querySelectorAll(".library-nav .nav-link")),
   viewTitle: document.querySelector("#view-title"),
@@ -139,7 +144,8 @@ els.miniPlay.addEventListener("click", () => els.playPause.click());
 
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
-  if (!els.settings.hidden) closeSettings();
+  if (!els.radioDirectory.hidden) closeRadioDirectory();
+  else if (!els.settings.hidden) closeSettings();
   else if (document.body.classList.contains("np-open")) setNowPlayingSheet(false);
   else if (document.body.classList.contains("nav-open")) setDrawer(false);
 });
@@ -844,6 +850,83 @@ async function deleteRadio(id, name) {
     return;
   }
   await loadRadio();
+}
+
+// ---- Radio directory (Radio Browser) ----
+
+function openRadioDirectory() {
+  els.radioDirectory.hidden = false;
+  els.radioSearch.value = "";
+  searchRadioDirectory("");
+  els.radioSearch.focus();
+}
+
+function closeRadioDirectory() {
+  els.radioDirectory.hidden = true;
+}
+
+async function searchRadioDirectory(query) {
+  els.radioResults.innerHTML = `<p class="muted-hint">Loading…</p>`;
+  try {
+    const stations = await api(`/api/radio/directory?query=${encodeURIComponent(query)}`);
+    renderRadioResults(stations);
+  } catch {
+    els.radioResults.innerHTML = `<p class="error">Couldn't reach the radio directory.</p>`;
+  }
+}
+
+function renderRadioResults(stations) {
+  els.radioResults.innerHTML = "";
+  if (!stations.length) {
+    els.radioResults.innerHTML = `<p class="muted-hint">No stations found.</p>`;
+    return;
+  }
+  for (const station of stations) {
+    const meta = [
+      station.country,
+      station.codec ? `${station.codec}${station.bitrate ? ` ${station.bitrate}k` : ""}` : null,
+      station.tags,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    const row = document.createElement("div");
+    row.className = "radio-result";
+    row.innerHTML = `
+      <span class="rr-text">
+        <strong>${escapeHtml(station.name)}</strong>
+        <span>${escapeHtml(meta)}</span>
+      </span>
+    `;
+    const play = document.createElement("button");
+    play.type = "button";
+    play.className = "ghost-button mini";
+    play.title = "Play now";
+    play.textContent = "▶";
+    play.addEventListener("click", () => playRadio(station));
+
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "ghost-button mini";
+    add.title = "Add to my stations";
+    add.textContent = "＋";
+    add.addEventListener("click", async () => {
+      add.disabled = true;
+      try {
+        await apiJson("/api/radio", "POST", {
+          name: station.name,
+          stream_url: station.stream_url,
+          homepage_url: station.homepage_url ?? null,
+        });
+        await loadRadio();
+        add.textContent = "✓";
+      } catch {
+        add.disabled = false;
+      }
+    });
+
+    row.append(play, add);
+    els.radioResults.append(row);
+  }
 }
 
 // Compact relative time like "just now", "5m", "3h", "2d" from a Unix timestamp.
@@ -1706,7 +1789,13 @@ els.newPlaylist.addEventListener("click", async () => {
     if (detail) openPlaylistView(detail.id);
   }
 });
-els.newRadio.addEventListener("click", async () => {
+els.newRadio.addEventListener("click", openRadioDirectory);
+els.radioDirClose.addEventListener("click", closeRadioDirectory);
+els.radioDirectory.addEventListener("click", (event) => {
+  if (event.target === els.radioDirectory) closeRadioDirectory();
+});
+els.radioSearch.addEventListener("input", debounce(() => searchRadioDirectory(els.radioSearch.value.trim()), 250));
+els.radioAddUrl.addEventListener("click", async () => {
   const name = window.prompt("Station name");
   if (!name || !name.trim()) return;
   const url = window.prompt("Stream URL (http…)");
@@ -1714,6 +1803,7 @@ els.newRadio.addEventListener("click", async () => {
   try {
     await apiJson("/api/radio", "POST", { name: name.trim(), stream_url: url.trim() });
     await loadRadio();
+    closeRadioDirectory();
   } catch {
     /* ignore */
   }
