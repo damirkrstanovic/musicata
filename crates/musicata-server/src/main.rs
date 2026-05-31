@@ -214,7 +214,10 @@ async fn main() -> Result<()> {
 }
 
 /// How often the library is re-scanned against the filesystem in the background.
-const LIBRARY_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
+// Background rescans are incremental (only new/changed files have their tags read),
+// so a pass is cheap; but the directory walk still costs round-trips on a network
+// share, so we don't run it as tightly as a local-only scan would allow.
+const LIBRARY_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Listening history is kept for this long; older listens are pruned.
 const LISTEN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -292,6 +295,11 @@ async fn scan_and_persist(
     let _guard = rescan_lock.lock().await;
     let task = activity.start("scan", label.to_string());
 
+    // The stored library is the "prior" for an incremental scan: unchanged files
+    // (same size + mtime) reuse their parsed metadata, so only new/changed files are
+    // re-read — cheap in steady state, especially over the network.
+    let prior = database.load_library().await.ok().flatten().map(Arc::new);
+
     // Scan each source in turn. The progress callback updates the activity label
     // live (finding files → N/M processed); per-source results and any failure with
     // its root cause are collected for the final summary.
@@ -321,7 +329,7 @@ async fn scan_and_persist(
                 activity.update(task, label);
             }
         };
-        match handle.scan_with_progress(progress).await {
+        match handle.scan_with_progress(prior.clone(), progress).await {
             Ok(library) => {
                 let skipped = library.scan_errors.len();
                 summaries.push(format!(

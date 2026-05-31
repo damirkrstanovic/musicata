@@ -17,9 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
 use futures::StreamExt;
-use musicata_core::{
-    FsEntry, Library, ReadSeek, ScanProgress, SourceFs, scan_source_with_progress,
-};
+use musicata_core::{FsEntry, Library, ReadSeek, ScanProgress, SourceFs, scan_source_incremental};
 use musicata_storage::SourceRecord;
 use smb::{
     Client, ClientConfig, ConnectionConfig, FileAccessMask, FileDirectoryInformation, Resource,
@@ -181,7 +179,11 @@ impl SmbProvider {
     /// Scan the share into a [`Library`], reporting progress. Connection + tag
     /// parsing are blocking, so this runs on a blocking thread where `block_on` is
     /// legal.
-    pub async fn scan_with_progress<F>(&self, mut progress: F) -> anyhow::Result<Library>
+    pub async fn scan_with_progress<F>(
+        &self,
+        prior: Option<Arc<Library>>,
+        mut progress: F,
+    ) -> anyhow::Result<Library>
     where
         F: FnMut(ScanProgress) + Send + 'static,
     {
@@ -190,7 +192,7 @@ impl SmbProvider {
         let handle = Handle::current();
         tokio::task::spawn_blocking(move || {
             let fs = SmbFs::connect(config, handle)?;
-            scan_source_with_progress(&fs, &provider_id, &mut progress)
+            scan_source_incremental(&fs, &provider_id, prior.as_deref(), &mut progress)
                 .map_err(|error| anyhow!(error.to_string()))
         })
         .await?

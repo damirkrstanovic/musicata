@@ -643,11 +643,14 @@ pub enum ScanProgress {
 }
 
 pub fn scan_local_library(root: &Path) -> Result<Library, ScanError> {
-    scan_local_library_with_progress(root, &mut |_| {})
+    scan_local_library_incremental(root, None, &mut |_| {})
 }
 
-pub fn scan_local_library_with_progress(
+/// Scan the local library, reusing unchanged files' metadata from `prior` (an
+/// earlier scan / the stored library) so only new or modified files are re-read.
+pub fn scan_local_library_incremental(
     root: &Path,
+    prior: Option<&Library>,
     progress: &mut dyn FnMut(ScanProgress),
 ) -> Result<Library, ScanError> {
     if !root.exists() {
@@ -663,21 +666,26 @@ pub fn scan_local_library_with_progress(
         source,
     })?;
 
-    scan_source_with_progress(&LocalFs::new(&root), "local-disk", progress)
+    scan_source_incremental(&LocalFs::new(&root), "local-disk", prior, progress)
 }
 
 /// Walk any [`SourceFs`] and build a [`Library`] attributed to `provider_id`.
 /// This is the shared scanner: the local-disk and SMB providers both feed it,
 /// only differing in how the underlying filesystem is read.
 pub fn scan_source(fs: &dyn SourceFs, provider_id: &str) -> Result<Library, ScanError> {
-    scan_source_with_progress(fs, provider_id, &mut |_| {})
+    scan_source_incremental(fs, provider_id, None, &mut |_| {})
 }
 
-/// As [`scan_source`], reporting progress (discovery, then per-file processing) so
-/// long network scans can show how far along they are.
-pub fn scan_source_with_progress(
+/// Incremental scan: the directory walk (cheap — one listing per folder, with each
+/// entry's size + mtime) finds every file, but tags are only read for files that are
+/// **new or whose size/mtime changed** since `prior`. Unchanged files reuse their
+/// already-parsed track (metadata, duration, hash) wholesale — the expensive part,
+/// especially over a network share. Mirrors how Jellyfin skips metadata re-reads via
+/// DateModified comparison. Reports [`ScanProgress`] as it goes.
+pub fn scan_source_incremental(
     fs: &dyn SourceFs,
     provider_id: &str,
+    prior: Option<&Library>,
     progress: &mut dyn FnMut(ScanProgress),
 ) -> Result<Library, ScanError> {
     let root = fs.root().to_path_buf();
@@ -687,6 +695,29 @@ pub fn scan_source_with_progress(
     progress(ScanProgress::Discovering);
     collect_audio_files(fs, &root, &mut files, &mut scan_errors, true)?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    // Index the prior scan for this source: a file is unchanged when its relative
+    // path is known and its size + mtime match. Albums carry their artist + artwork
+    // forward so unchanged albums don't re-list directories for cover art.
+    let prior_tracks: BTreeMap<&str, &Track> = prior
+        .map(|library| {
+            library
+                .tracks
+                .iter()
+                .filter(|track| track.provider.provider_id == provider_id)
+                .map(|track| (track.relative_path.as_str(), track))
+                .collect()
+        })
+        .unwrap_or_default();
+    let prior_albums: BTreeMap<&str, &Album> = prior
+        .map(|library| {
+            library
+                .albums
+                .iter()
+                .map(|album| (album.id.as_str(), album))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let total = files.len();
     progress(ScanProgress::Discovered { files: total });
@@ -707,6 +738,38 @@ pub fn scan_source_with_progress(
             });
         }
         let path = file.path;
+        let relative_path = relative_display_path(&root, &path);
+
+        // Fast path: an unchanged file (same size + mtime as the prior scan) reuses
+        // its already-parsed track wholesale — no tag read. Album-artist and cover
+        // art come from the prior album so nothing on the network is touched.
+        if let Some(previous) = prior_tracks.get(relative_path.as_str())
+            && file.file_size_bytes.is_some()
+            && file.file_size_bytes == previous.file_size_bytes
+            && file.modified_at_unix_seconds == previous.modified_at_unix_seconds
+        {
+            let mut track = (*previous).clone();
+            track.path = path;
+            let (album_artist_id, album_artist_name) = prior_albums
+                .get(track.album_id.as_str())
+                .map(|album| (album.artist_id.clone(), album.artist_name.clone()))
+                .unwrap_or_else(|| (track.artist_id.clone(), track.artist_name.clone()));
+            let artwork_path = prior_albums
+                .get(track.album_id.as_str())
+                .and_then(|album| album.artwork_path.clone());
+            aggregate_track(
+                &track,
+                &album_artist_id,
+                &album_artist_name,
+                artwork_path,
+                &mut album_builders,
+                &mut artist_builders,
+            );
+            tracks.push(track);
+            continue;
+        }
+
+        // Full path: a new or modified file — read its tags.
         let folder_metadata = infer_track_metadata(&root, &path);
         let (embedded_metadata, duration_seconds) =
             read_embedded_metadata(fs, &path, &mut scan_errors, observed_at_unix_seconds);
@@ -734,7 +797,6 @@ pub fn scan_source_with_progress(
             metadata.album_title.to_ascii_lowercase()
         );
         let album_id = stable_id("album", &album_key);
-        let relative_path = relative_display_path(&root, &path);
         let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -748,45 +810,13 @@ pub fn scan_source_with_progress(
             file.content_hash.as_deref(),
         );
         let track_id = unique_track_id(&track_identity, &mut track_id_counts);
+        // Reuse the prior album's cover art if known, else discover it (a dir listing).
+        let artwork_path = prior_albums
+            .get(album_id.as_str())
+            .and_then(|album| album.artwork_path.clone())
+            .or_else(|| find_album_artwork(fs, path.parent().unwrap_or(&root)));
 
-        album_builders
-            .entry(album_id.clone())
-            .or_insert_with(|| AlbumBuilder {
-                id: album_id.clone(),
-                title: metadata.album_title.clone(),
-                artist_id: album_artist_id.clone(),
-                artist_name: album_artist_name.clone(),
-                year: metadata.year,
-                track_count: 0,
-                artwork_path: find_album_artwork(fs, path.parent().unwrap_or(&root)),
-            })
-            .track_count += 1;
-
-        // Count the track against its own (track) artist.
-        artist_builders
-            .entry(artist_id.clone())
-            .or_insert_with(|| ArtistBuilder {
-                id: artist_id.clone(),
-                name: metadata.artist_name.clone(),
-                album_ids: Vec::new(),
-                track_count: 0,
-            })
-            .track_count += 1;
-
-        // Associate the album with its album-artist (the same entry for non-compilations).
-        let owning_artist = artist_builders
-            .entry(album_artist_id.clone())
-            .or_insert_with(|| ArtistBuilder {
-                id: album_artist_id.clone(),
-                name: album_artist_name.clone(),
-                album_ids: Vec::new(),
-                track_count: 0,
-            });
-        if !owning_artist.album_ids.contains(&album_id) {
-            owning_artist.album_ids.push(album_id.clone());
-        }
-
-        tracks.push(Track {
+        let track = Track {
             id: track_id.clone(),
             provider: ProviderMapping {
                 provider_id: provider_id.to_string(),
@@ -810,7 +840,16 @@ pub fn scan_source_with_progress(
             stream_url: format!("/api/tracks/{}/stream", track_id),
             added_at_unix_seconds: None,
             path,
-        });
+        };
+        aggregate_track(
+            &track,
+            &album_artist_id,
+            &album_artist_name,
+            artwork_path,
+            &mut album_builders,
+            &mut artist_builders,
+        );
+        tracks.push(track);
     }
 
     let mut artists: Vec<_> = artist_builders
@@ -868,6 +907,56 @@ pub fn scan_source_with_progress(
         tracks,
         scan_errors,
     })
+}
+
+/// Fold one track into the album/artist aggregates: count it against its own
+/// artist, register/seed its album under the album-artist, and link the album to
+/// that album-artist. Shared by the read and reuse paths so both aggregate
+/// identically.
+fn aggregate_track(
+    track: &Track,
+    album_artist_id: &str,
+    album_artist_name: &str,
+    artwork_path: Option<PathBuf>,
+    album_builders: &mut BTreeMap<String, AlbumBuilder>,
+    artist_builders: &mut BTreeMap<String, ArtistBuilder>,
+) {
+    album_builders
+        .entry(track.album_id.clone())
+        .or_insert_with(|| AlbumBuilder {
+            id: track.album_id.clone(),
+            title: track.album_title.clone(),
+            artist_id: album_artist_id.to_string(),
+            artist_name: album_artist_name.to_string(),
+            year: track.year,
+            track_count: 0,
+            artwork_path,
+        })
+        .track_count += 1;
+
+    // Count the track against its own (track) artist.
+    artist_builders
+        .entry(track.artist_id.clone())
+        .or_insert_with(|| ArtistBuilder {
+            id: track.artist_id.clone(),
+            name: track.artist_name.clone(),
+            album_ids: Vec::new(),
+            track_count: 0,
+        })
+        .track_count += 1;
+
+    // Associate the album with its album-artist (the same entry for non-compilations).
+    let owning_artist = artist_builders
+        .entry(album_artist_id.to_string())
+        .or_insert_with(|| ArtistBuilder {
+            id: album_artist_id.to_string(),
+            name: album_artist_name.to_string(),
+            album_ids: Vec::new(),
+            track_count: 0,
+        });
+    if !owning_artist.album_ids.contains(&track.album_id) {
+        owning_artist.album_ids.push(track.album_id.clone());
+    }
 }
 
 /// Combine the libraries of several sources into one merged library. Tracks are
@@ -1841,7 +1930,7 @@ mod tests {
         prelude::TagExt,
         tag::{ItemKey, ItemValue, Tag, TagItem, TagType},
     };
-    use std::{collections::BTreeSet, fs, io::Cursor, time::SystemTime};
+    use std::{cell::Cell, collections::BTreeSet, fs, io::Cursor, time::SystemTime};
 
     /// An in-memory [`SourceFs`] for exercising the scanner without a disk or a
     /// network share. Folder structure drives metadata (the fake byte content is
@@ -1850,6 +1939,23 @@ mod tests {
     struct FakeFs {
         root: PathBuf,
         files: Vec<(PathBuf, Vec<u8>)>,
+        mtimes: BTreeMap<PathBuf, i64>,
+        opens: Cell<usize>,
+    }
+
+    impl FakeFs {
+        fn new(files: Vec<(PathBuf, Vec<u8>)>) -> Self {
+            Self {
+                root: PathBuf::from("/"),
+                files,
+                mtimes: BTreeMap::new(),
+                opens: Cell::new(0),
+            }
+        }
+
+        fn bump_mtime(&mut self, path: &str, mtime: i64) {
+            self.mtimes.insert(PathBuf::from(path), mtime);
+        }
     }
 
     impl SourceFs for FakeFs {
@@ -1876,12 +1982,13 @@ mod tests {
                         });
                     }
                 } else {
+                    let modified = self.mtimes.get(&child).copied().unwrap_or(0);
                     entries.push(FsEntry {
                         path: child,
                         is_dir: false,
                         is_file: true,
                         size: Some(bytes.len() as u64),
-                        modified_at_unix_seconds: Some(0),
+                        modified_at_unix_seconds: Some(modified),
                     });
                 }
             }
@@ -1889,6 +1996,7 @@ mod tests {
         }
 
         fn open(&self, path: &Path) -> std::io::Result<Box<dyn ReadSeek + '_>> {
+            self.opens.set(self.opens.get() + 1);
             let bytes = self
                 .files
                 .iter()
@@ -1939,32 +2047,26 @@ mod tests {
     fn scans_any_source_fs_and_merges_multiple_sources() {
         // The scanner derives the artist from the "Artist - Title" filename and the
         // album from the parent directory, so name the fakes accordingly.
-        let source_a = FakeFs {
-            root: PathBuf::from("/"),
-            files: vec![
-                (
-                    PathBuf::from("/Album1/01 - ArtistA - One.mp3"),
-                    b"x".to_vec(),
-                ),
-                (
-                    PathBuf::from("/Album1/02 - ArtistA - Two.mp3"),
-                    b"y".to_vec(),
-                ),
-            ],
-        };
-        let source_b = FakeFs {
-            root: PathBuf::from("/"),
-            files: vec![
-                (
-                    PathBuf::from("/Album3/01 - ArtistA - Three.mp3"),
-                    b"z".to_vec(),
-                ),
-                (
-                    PathBuf::from("/Album2/01 - ArtistB - Four.mp3"),
-                    b"w".to_vec(),
-                ),
-            ],
-        };
+        let source_a = FakeFs::new(vec![
+            (
+                PathBuf::from("/Album1/01 - ArtistA - One.mp3"),
+                b"x".to_vec(),
+            ),
+            (
+                PathBuf::from("/Album1/02 - ArtistA - Two.mp3"),
+                b"y".to_vec(),
+            ),
+        ]);
+        let source_b = FakeFs::new(vec![
+            (
+                PathBuf::from("/Album3/01 - ArtistA - Three.mp3"),
+                b"z".to_vec(),
+            ),
+            (
+                PathBuf::from("/Album2/01 - ArtistB - Four.mp3"),
+                b"w".to_vec(),
+            ),
+        ]);
 
         let lib_a = scan_source(&source_a, "src-a").expect("scan a");
         let lib_b = scan_source(&source_b, "src-b").expect("scan b");
@@ -2007,6 +2109,55 @@ mod tests {
         assert_eq!(artist_a.track_count, 3);
         assert_eq!(artist_a.album_count, 2);
         assert_eq!(merged.albums.len(), 3);
+    }
+
+    #[test]
+    fn incremental_scan_reuses_unchanged_files_and_rereads_changed() {
+        // Files >1MB so the walk doesn't hash them (hashing opens small files); this
+        // isolates the tag-read, which is what incremental reuse must skip.
+        let files = vec![
+            (
+                PathBuf::from("/Album1/01 - ArtistA - One.mp3"),
+                vec![1u8; 1_200_000],
+            ),
+            (
+                PathBuf::from("/Album1/02 - ArtistA - Two.mp3"),
+                vec![2u8; 1_200_000],
+            ),
+        ];
+        let fs = FakeFs::new(files.clone());
+
+        // First scan: a full read — every file is opened (tags + sidecar probe).
+        let first = scan_source(&fs, "src").expect("first scan");
+        assert_eq!(first.tracks.len(), 2);
+        let first_opens = fs.opens.get();
+        assert!(first_opens > 0, "first scan must read files");
+
+        // Second scan with the prior library and identical files: nothing is opened —
+        // both tracks are reused, and the library is unchanged.
+        let fs2 = FakeFs::new(files.clone());
+        let second = scan_source_incremental(&fs2, "src", Some(&first), &mut |_| {})
+            .expect("incremental scan");
+        assert_eq!(fs2.opens.get(), 0, "unchanged files must not be re-read");
+        assert_eq!(second.tracks.len(), 2);
+        let mut a: Vec<_> = first.tracks.iter().map(|t| t.id.clone()).collect();
+        let mut b: Vec<_> = second.tracks.iter().map(|t| t.id.clone()).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "reused tracks keep their identity");
+
+        // Change one file's mtime: only that file is re-read, the other is reused.
+        let mut fs3 = FakeFs::new(files);
+        fs3.bump_mtime("/Album1/02 - ArtistA - Two.mp3", 999);
+        let third =
+            scan_source_incremental(&fs3, "src", Some(&first), &mut |_| {}).expect("changed scan");
+        assert_eq!(third.tracks.len(), 2);
+        // One file re-read (tags + sidecar) → opens are > 0 but far fewer than a full scan.
+        assert!(fs3.opens.get() > 0);
+        assert!(
+            fs3.opens.get() < first_opens,
+            "only the changed file is re-read"
+        );
     }
 
     #[test]

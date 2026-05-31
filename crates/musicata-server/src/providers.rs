@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use musicata_core::{
     Library, LocalDiskProvider, MusicProvider, ProviderCapabilities, ScanProgress, merge_libraries,
-    scan_local_library_with_progress,
+    scan_local_library_incremental,
 };
 use musicata_storage::SourceRecord;
 
@@ -85,15 +85,21 @@ impl ProviderHandle {
         }
     }
 
-    /// Scan this source's catalogue into a [`Library`]. Scanning is blocking work
-    /// (disk or network I/O + tag parsing), so it always runs on a blocking thread.
+    /// Scan this source's catalogue into a [`Library`] (full scan). Scanning is
+    /// blocking work (disk or network I/O + tag parsing), so it runs on a blocking
+    /// thread.
     pub async fn scan(&self) -> anyhow::Result<Library> {
-        self.scan_with_progress(|_| {}).await
+        self.scan_with_progress(None, |_| {}).await
     }
 
-    /// As [`Self::scan`], reporting [`ScanProgress`] as it goes (discovery, then
-    /// per-file processing) so callers can surface live progress.
-    pub async fn scan_with_progress<F>(&self, mut progress: F) -> anyhow::Result<Library>
+    /// As [`Self::scan`], but incremental: `prior` (the stored library) lets the
+    /// scanner reuse unchanged files' metadata and read tags only for new/changed
+    /// files. Reports [`ScanProgress`] as it goes.
+    pub async fn scan_with_progress<F>(
+        &self,
+        prior: Option<Arc<Library>>,
+        mut progress: F,
+    ) -> anyhow::Result<Library>
     where
         F: FnMut(ScanProgress) + Send + 'static,
     {
@@ -101,13 +107,13 @@ impl ProviderHandle {
             ProviderHandle::Local(provider) => {
                 let root = provider.root().to_path_buf();
                 let scanned = tokio::task::spawn_blocking(move || {
-                    scan_local_library_with_progress(&root, &mut progress)
+                    scan_local_library_incremental(&root, prior.as_deref(), &mut progress)
                 })
                 .await??;
                 Ok(scanned)
             }
             #[cfg(feature = "provider-smb")]
-            ProviderHandle::Smb(provider) => provider.scan_with_progress(progress).await,
+            ProviderHandle::Smb(provider) => provider.scan_with_progress(prior, progress).await,
         }
     }
 }
