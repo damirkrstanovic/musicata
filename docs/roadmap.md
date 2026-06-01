@@ -431,7 +431,28 @@ Tasks:
   `SourceFs` (a `Read+Seek`-over-`read_at` adapter with a read-ahead cache feeds
   lofty); streaming fetches only the requested byte range.
 - Evaluate plugin isolation: in-process Rust modules, subprocesses, WebAssembly, or external services.
-- Document legal/API constraints for Spotify, Tidal, Qobuz, and similar services before implementation.
+- [x] Document legal/API constraints for Spotify, Tidal, Qobuz, and similar services
+  before implementation. Done (see prior-art §9; two fact-checked research passes).
+  **Verdict:** every commercial service needs an unofficial, ToS-violating
+  reverse-engineered client, and any DRM circumvention (Spotify/Tidal-HiFi/Deezer/Amazon)
+  adds DMCA §1201 exposure that is sharper for an AGPL project publishing its source.
+  So **build the open/DRM-free tier first** — and these become the next provider tasks:
+  - [ ] **OpenSubsonic/Funkwhale upstream client** — consume Navidrome/Gonic AND
+    federated Funkwhale pods (all speak Subsonic) as a source; lossless FLAC, no DRM,
+    reuses our existing OpenSubsonic server knowledge. Highest leverage; do first.
+  - [ ] **Podcasts (RSS / Podcast Index) + Internet Archive** — DRM-free, public APIs.
+  - [ ] **Jamendo** (Creative Commons) — public REST API (free `client_id`),
+    FLAC/OGG/MP3; `jamendo-rs` crate.
+  - [ ] Commercial services, if ever: **opt-in, cargo-feature-gated, user-supplies-own
+    credentials** (the `provider-smb` precedent). **Qobuz is the first target** (lossless,
+    MD5 signing — no CDM needed; Rust prior art in `qobuz-api-rust`/`hifi-rs`/MoosicBox).
+    Tidal is partial (lower tiers via `tidalrs`; HiFi is Widevine-gated). Spotify is
+    deprioritized (librespot is mature Rust but lossy-only + Premium + account-ban risk +
+    active anti-OSS enforcement). **Apple Music / Amazon Music are infeasible** for
+    self-contained playback (MusicKit-locked / Widevine + a ToS that bans self-hosting).
+    DRM-circumvention code, if any, stays out of the default build.
+- [ ] Metadata-enrichment lane (distinct from sources): Last.fm/ListenBrainz scrobbling,
+  MusicBrainz/Discogs lookups — a metadata/plugin provider type, not a music source.
 
 Done when:
 

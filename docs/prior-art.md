@@ -397,6 +397,120 @@ References: Navidrome `core/artwork/` (sources/cache_warmer/reader_resized) +
 
 ---
 
+## 9. Streaming-service & external-source integration
+
+**Problem:** which non-local sources can Musicata add as providers, can we get
+*playable audio* (not just metadata), can it be done **self-contained in Rust**, and
+what's the legal/ToS bottom line for an **AGPL project that publishes its source**? (See
+the M9 roadmap task. Researched Jun 2026 via two fact-checked passes; per-service
+findings below are adversarially verified, sources inline.)
+
+**Architecture, confirmed by Music Assistant** (`developers.music-assistant.io`): the
+split we already have is the right one. MA separates **Music Providers** (sources) from
+**Player Providers** (targets), advertises per-provider `supported_features`
+(capability negotiation — our `ProviderCapabilities`), and plays via a **two-phase**
+`get_stream_details()` → `get_audio_stream()`. It uses exactly three audio-delivery
+shapes, a useful taxonomy for our `resolve()`: **(a) external executable** (Spotify via
+librespot), **(b) direct URL** (YouTube Music), **(c) expiring HTTPS URL** (Qobuz).
+Metadata/scrobbling services (Last.fm/ListenBrainz/MusicBrainz/Discogs) are a *separate
+metadata/plugin lane*, never a music source.
+
+### Tier A — open / free / self-hostable: highest value-per-risk, do these first
+
+DRM-free, full-quality audio over public/stable APIs, ~zero ToS risk, plain-HTTP Rust
+clients. The natural expansion for a local-first server:
+
+- **Upstream OpenSubsonic servers (Navidrome/Gonic) — the standout.** MA ships a
+  Subsonic source streaming **lossless FLAC up to 24/192, no DRM**
+  (`music-assistant.io/music-providers/subsonic/`). **Funkwhale also speaks Subsonic**
+  (`docs.funkwhale.audio/developer/api/subsonic.html`, ~27 endpoints), so **one
+  OpenSubsonic client ingests Navidrome + Gonic + federated Funkwhale pods**. We already
+  implement the OpenSubsonic *server* surface — this is writing the *client* of a
+  protocol we know; an `opensubsonic` Rust crate exists. Caveat: requires
+  `getOpenSubsonicExtensions` (works on Gonic/Navidrome/Funkwhale, not legacy
+  Subsonic/Airsonic).
+- **Jellyfin / Plex / Emby as upstream** (MA ships all three; their Plex is unmaintained,
+  Jellyfin best-effort).
+- **Podcasts** (Podcast Index / RSS), **Internet Archive** audio, **Jamendo** (CC; public
+  REST API with a free `client_id`, FLAC/OGG/MP3; `jamendo-rs` crate) — all DRM-free and
+  shipped in MA/Mopidy. RadioBrowser (already integrated) is the same class.
+
+### Tier B — the commercial big three: feasibility **Qobuz > Tidal > Spotify**
+
+All three require an **unofficial, reverse-engineered client violating the service's
+ToS**; official APIs give metadata but **forbid serving raw audio to non-certified
+players** (Spotify's `streaming` scope and Web Playback SDK are Premium- and
+browser/EME-only; TIDAL's SDK Player module is the only sanctioned playback). So audio
+always means RE.
+
+- **Qobuz — most feasible, and the only big-three lossless that needs no CDM.** Auth is
+  **MD5 request-signing, not DRM** — signed **FLAC** URLs are obtainable in Rust without
+  Widevine. Mature Rust prior art: **`qobuz-api-rust`**, **`hifi-rs`**, and
+  **MoosicBox** (a Rust self-hosted server whose Qobuz package fetches app credentials
+  via *Spoofbuz* then logs in with username/password). Needs a Qobuz subscription;
+  fragility is the Spoofbuz credential scrape. *(github.com/loxoron218/qobuz-api-rust,
+  iamdb/hifi-rs, MoosicBox/MoosicBox)*
+- **Tidal — feasible for lower tiers, DRM-gated for HiFi.** **`tidalrs`** is an unofficial
+  Rust client that returns audio stream URLs over **DASH-MPEG across four quality tiers**;
+  MoosicBox's Tidal package also gets real stream URLs. But **HiFi (High/Max) is
+  DRM-protected** → lossless is Widevine-gated, lower tiers obtainable.
+  *(github.com/phayes/tidalrs, Mastermindzh/tidal-hifi)*
+- **Spotify — most mature Rust tooling, least feasible for the goal.** **librespot** is a
+  mature, in-process **Rust** Spotify client (so "self-contained Rust" is genuinely
+  possible here) — but it is **lossy Ogg Vorbis only** (lossless is *not* delivered over
+  the same transport librespot handles — a "FLAC reuses the same key path" claim was
+  **refuted 0-3**, librespot issue #1583), **requires Premium**, and the project warns
+  connecting **may risk account bans**. Spotify also has the most active anti-OSS
+  enforcement (copyright C&D against ReVanced; a FOSDEM 2026 RE talk). *(librespot-org/
+  librespot, developer.spotify.com/terms)*
+
+### Tier C — other commercial: work, but fragile / lossy / scraping
+
+- **Deezer** — the only *other* lossless (16/44.1 FLAC), but via **Blowfish-encrypted ARL
+  streams**; Rust `deezer`/`deezer-rs` are **metadata-only**, decryption is bespoke (the
+  `pleezer` crate does it). Breaks periodically. Conditional at best.
+- **YouTube Music** — huge free catalog (free accounts work), **lossy AAC 256k**;
+  **`rustypipe`** (Rust Innertube client) but since Aug 2024 needs the separate
+  **`rustypipe-botguard`** PO-token helper or streams 403 — operationally fragile.
+- **SoundCloud** (`rsoundcloud`, scraped `client_id`, lossy) and **Bandcamp** (no API,
+  HTML scraping, ~MP3 128k) — modest value, bespoke Rust.
+
+### Infeasible for self-contained playback
+
+- **Apple Music** — catalog API exists, but playback is **locked to Apple's MusicKit
+  player**; no raw audio to third parties.
+- **Amazon Music** — Widevine DRM **and** a ToS that *explicitly forbids* platforms where
+  the user can install software or access the filesystem — it bans a self-hosted server
+  by design (`developer.amazon.com/docs/music/`).
+
+### Legal bottom line
+
+Every commercial path is **unofficial and ToS-violating**, and decrypting/working around
+DRM (Spotify, Tidal HiFi, Deezer, Amazon) raises **DMCA §1201 anti-circumvention**
+exposure. Precedent cuts both ways: RIAA's youtube-dl takedown was reversed (EFF, 2020),
+but Spotify successfully C&D'd ReVanced (2025). An AGPL project that **publishes the
+source** is more exposed than a private tool. Non-DRM RE (Qobuz MD5 signing, official-API
+metadata, scraping) is "merely" ToS-breaking; DRM circumvention is the bright legal line.
+
+**What Musicata adopts:** build **Tier A first** (real APIs, DRM-free, Rust-easy,
+no legal exposure) — start with the **OpenSubsonic/Funkwhale upstream client** (huge
+leverage, reuses our Subsonic knowledge), then podcasts/Internet Archive/Jamendo. Treat
+the commercial big three as **opt-in, cargo-feature-gated, user-supplies-own-credentials
+providers** (the SMB precedent), and if/when we do one, **Qobuz is the first target**
+(lossless, no CDM, working Rust prior art). Defer/skip Spotify (lossy + ban risk +
+enforcement), Apple/Amazon (architecturally impossible). The capability model already
+fits: a streaming provider advertises `can_search`/`can_browse`/`can_stream`, no
+`can_scan`, and `resolve()` returns a `StreamSpec` (direct or expiring URL) — exactly the
+radio-provider shape generalized. Keep DRM-circumvention code out of the default build.
+
+References: Music Assistant docs + provider list; MoosicBox (Rust Tidal/Qobuz server);
+librespot (+ issue #1583); tidalrs; qobuz-api-rust / hifi-rs; deezer-rs / pleezer;
+rustypipe (+ botguard); Funkwhale Subsonic API; Jamendo API; EFF youtube-dl/RIAA;
+Spotify↔ReVanced (TorrentFreak). Companion: the standalone Spotify/Tidal/Qobuz and
+broader-landscape research reports.
+
+---
+
 ## Conventions these led to
 
 - **Enum dispatch over `dyn`** for provider/player handles (async methods, object
