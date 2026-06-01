@@ -111,6 +111,20 @@ Tasks:
 - [x] Add generated tag-heavy embedded metadata fixture.
 - [x] Add generated poorly tagged file fixture for folder fallback coverage.
 - [x] Group compilations under album artist and order multi-disc tracks by disc then track.
+- Source-aware artwork cache (see prior-art §8). Today cover bytes are served straight
+  from the source on every request — fine for local disk, but a network source (SMB)
+  is fetched over the wire per request (~0.3 s each; brutal on a large grid), and a
+  missing/unreadable cover used to 500 (now 404 → monogram fallback). Adopt the
+  Navidrome/Jellyfin model: **DB keeps artwork provenance (source kind + original ref +
+  content hash + mtime), bytes live in a local cache** (`.musicata/artwork/`, keyed by
+  content hash, sized variants generated lazily via the `image` crate), and
+  **acquisition is a provider concern** (local reads the file; SMB fetches once and the
+  cache holds it — also surviving the source going offline; embedded extracts from tags;
+  Cover Art Archive downloads). Serving reads the cache with a `?size=` thumbnail param
+  (the real win for large-library scroll). Stage it: **(1) lazy cache population** —
+  cache the original on first request, serve from cache thereafter; **(2)** sized
+  thumbnails; **(3)** optional eager prefetch at scan time (Navidrome's CacheWarmer) and
+  an LRU/size cap.
 
 Done when:
 
@@ -387,6 +401,17 @@ Tasks:
   and the OpenSubsonic internet-radio endpoints (get/create/update/delete).
   A new `PlayerCommand::PlayStream{url,title}` plays an external stream directly on the
   browser and MPD players (no library resolution).
+- [x] Promote internet radio to a real provider. Radio is now a built-in
+  `ProviderHandle::Radio` (always present, like local-disk; not in the `sources` table)
+  backed by the stations table. It advertises `STREAM_ONLY` capabilities
+  (`can_browse` + `can_stream`) and implements the two non-scannable provider methods
+  the plugin design called for — `browse() -> Vec<BrowseEntry>` and
+  `resolve(item_id) -> StreamSpec` — on the async `ProviderHandle` layer (the core
+  `MusicProvider` trait stays sync/tokio-free). Surfaced generically at
+  `GET /api/sources/{id}/browse` and `/resolve?item=…`; the web Radio sidebar and
+  Subsonic `getInternetRadioStations` read through it (station management stays on
+  `/api/radio`). First exercise of the source-vs-transport split for a non-library
+  source; template for future streaming-service providers.
 - [x] Add an SMB/CIFS network share as the first remote-disk source. Read directly
   over the wire in pure Rust (the `smb` crate, no kernel mount, no libsmbclient),
   feature-gated as `provider-smb`. Scanning runs the shared scanner over an SMB

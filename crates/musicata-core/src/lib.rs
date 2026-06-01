@@ -51,13 +51,46 @@ impl ProviderCapabilities {
         can_search: true,
         can_stream: true,
     };
-    /// Streaming sources with no scannable catalogue (internet radio).
+    /// Streaming sources with no scannable catalogue, but a flat list you can
+    /// browse (internet radio: no full-library scan, but its stations are listed
+    /// via [`browse`](MusicProvider) and played via [`resolve`](MusicProvider)).
     pub const STREAM_ONLY: Self = Self {
         can_scan: false,
-        can_browse: false,
+        can_browse: true,
         can_search: false,
         can_stream: true,
     };
+}
+
+/// One entry returned by a provider's `browse` — a station, folder, or item in a
+/// non-scannable source's hierarchy. Scannable sources merge into the library and
+/// are browsed through the library endpoints instead; this is for sources like
+/// internet radio that are navigated directly.
+#[derive(Clone, Debug, Serialize)]
+pub struct BrowseEntry {
+    /// Stable id of this entry within its provider (e.g. a radio station id).
+    pub id: String,
+    pub title: String,
+    /// Optional secondary line (e.g. a station's homepage host or a genre).
+    pub subtitle: Option<String>,
+    /// A directly-playable stream URL when known at browse time (radio stations
+    /// carry theirs); `None` when the URL must be obtained via `resolve`.
+    pub stream_url: Option<String>,
+    pub homepage_url: Option<String>,
+    /// Whether this entry is a navigable container (a folder) rather than a leaf.
+    pub is_container: bool,
+}
+
+/// How to play one resolved item — the output of a provider's `resolve`, mirroring
+/// Music Assistant's stream-details/stream split. For internet radio it is just the
+/// station's stream URL; future providers may compute a short-lived URL on demand.
+#[derive(Clone, Debug, Serialize)]
+pub struct StreamSpec {
+    pub url: String,
+    /// A display title for the stream (station name); shown while it plays.
+    pub title: Option<String>,
+    /// MIME type when the provider knows it; clients may sniff otherwise.
+    pub content_type: Option<String>,
 }
 
 pub trait MusicProvider {
@@ -578,6 +611,12 @@ pub enum PlayerCommand {
     Clear,
     PlayTracks {
         track_ids: Vec<String>,
+        /// Which queue position to start playing from (default 0). Lets a controller
+        /// set the whole queue and start at the clicked track in a single command —
+        /// avoiding a `play_tracks` + `play_queue_index` two-step that would briefly
+        /// broadcast the wrong now-playing track and restart browser audio.
+        #[serde(default)]
+        start_index: usize,
     },
     Enqueue {
         track_ids: Vec<String>,

@@ -438,6 +438,39 @@ impl SmbProvider {
         Ok(buffer)
     }
 
+    /// Read a whole (small) file by its share-relative path — used for cover art,
+    /// which is fetched in full rather than by range. Reads in chunks until EOF so a
+    /// modest buffer is held regardless of the image size.
+    pub async fn read_file(&self, item_id: &str) -> anyhow::Result<Vec<u8>> {
+        let client = self.client().await?;
+        let unc = self.config.item_unc(item_id)?;
+        let file = client
+            .create_file(&unc, &open_read_args())
+            .await
+            .map_err(|error| anyhow!("open {item_id}: {error}"))?
+            .unwrap_file();
+
+        const CHUNK: usize = 256 * 1024;
+        // Cap total read so a mis-pointed huge file can't exhaust memory.
+        const MAX: usize = 32 * 1024 * 1024;
+        let mut out: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; CHUNK];
+        loop {
+            let read = file
+                .read_at(&mut chunk, out.len() as u64)
+                .await
+                .map_err(|error| anyhow!("read {item_id}: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..read]);
+            if out.len() >= MAX {
+                anyhow::bail!("{item_id} exceeds the {MAX}-byte artwork limit");
+            }
+        }
+        Ok(out)
+    }
+
     /// Get (or establish) the shared client connected to the share.
     async fn client(&self) -> anyhow::Result<Arc<Client>> {
         let mut guard = self.client.lock().await;

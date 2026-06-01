@@ -93,6 +93,10 @@ struct Config {
     rescan: bool,
     no_incremental_rescan: bool,
     scan_once: bool,
+    /// Serve the existing database as-is: skip the initial scan and all rescans/
+    /// watching. Useful to serve a pre-populated snapshot DB without touching disk
+    /// (and what the UI smoke suite uses to run against the real library).
+    no_scan: bool,
     /// Comma-separated MPD player addresses (`host:port`) to control.
     mpd_addrs: Vec<String>,
     /// Base URL MPD uses to fetch streams from this server, e.g.
@@ -172,14 +176,18 @@ async fn main() -> Result<()> {
     // than before binding) is what keeps the web port available even while a large
     // or offline source is being scanned.
     let rescan_lock = Arc::new(Mutex::new(()));
-    tokio::spawn(library_scan_loop(
-        database.clone(),
-        providers.clone(),
-        rescan_lock.clone(),
-        activity.clone(),
-        LIBRARY_RESCAN_INTERVAL,
-        !config.no_incremental_rescan,
-    ));
+    // `--no-scan` serves the existing database untouched (no initial scan, no rescans,
+    // no watcher) — for a snapshot DB or the UI smoke suite running on the real library.
+    if !config.no_scan {
+        tokio::spawn(library_scan_loop(
+            database.clone(),
+            providers.clone(),
+            rescan_lock.clone(),
+            activity.clone(),
+            LIBRARY_RESCAN_INTERVAL,
+            !config.no_incremental_rescan,
+        ));
+    }
 
     // Persist the activity log (debounced) so its history survives a restart.
     tokio::spawn(persist_activity_log(database.clone(), activity.clone()));
@@ -187,7 +195,7 @@ async fn main() -> Result<()> {
     // Watch the local library for changes so additions/edits show up immediately,
     // rather than waiting for the next periodic pass. Network shares have no such
     // notifications and rely on the periodic rescan.
-    if !config.no_incremental_rescan {
+    if !config.no_scan && !config.no_incremental_rescan {
         spawn_library_watcher(
             config.library.clone(),
             database.clone(),
@@ -269,6 +277,11 @@ async fn build_registry(database: &Database, config: &Config) -> Result<Provider
     let mut registry = ProviderRegistry::new();
     registry.push(ProviderHandle::local(LocalDiskProvider::new(
         &config.library,
+    )));
+    // Internet radio is a built-in, always-present non-scannable source backed by the
+    // saved-stations table (like local-disk, it isn't persisted in `sources`).
+    registry.push(ProviderHandle::radio(providers::RadioProvider::new(
+        database.clone(),
     )));
     register_persisted_sources(database, &mut registry).await?;
     Ok(registry)
@@ -721,6 +734,8 @@ fn app(
         .route("/api/sources", get(list_sources).post(create_source))
         .route("/api/sources/{id}", delete(delete_source))
         .route("/api/sources/{id}/rescan", post(rescan_source))
+        .route("/api/sources/{id}/browse", get(browse_source))
+        .route("/api/sources/{id}/resolve", get(resolve_source))
         .route("/api/activity", get(list_activity))
         .route("/api/activity/ws", get(activity_ws))
         .route(
@@ -1302,6 +1317,9 @@ async fn state_push_loop(mut socket: WebSocket, handle: PlayerHandle, database: 
 /// `progress`/`ended` frames from the tab that is rendering audio.
 async fn browser_ws_loop(mut socket: WebSocket, browser: Arc<BrowserPlayer>, _database: Database) {
     let mut updates = browser.subscribe();
+    // Position ticks arrive on a separate channel as tiny `{type:"progress"}` frames,
+    // so a playing track doesn't re-send the whole queue every second.
+    let mut progress = browser.subscribe_progress();
 
     if let Ok(text) = serde_json::to_string(&browser.snapshot().await)
         && socket.send(Message::Text(text.into())).await.is_err()
@@ -1315,6 +1333,20 @@ async fn browser_ws_loop(mut socket: WebSocket, browser: Arc<BrowserPlayer>, _da
                 Ok(state) => {
                     let text = serde_json::to_string(&state).unwrap_or_default();
                     if socket.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            tick = progress.recv() => match tick {
+                Ok(tick) => {
+                    let frame = serde_json::json!({
+                        "type": "progress",
+                        "elapsed_seconds": tick.elapsed_seconds,
+                        "duration_seconds": tick.duration_seconds,
+                    });
+                    if socket.send(Message::Text(frame.to_string().into())).await.is_err() {
                         break;
                     }
                 }
@@ -1889,13 +1921,22 @@ async fn activity_ws_loop(mut socket: WebSocket, activity: Arc<activity::Activit
 /// List configured sources: the always-present local library plus any persisted
 /// network sources (SMB shares).
 async fn list_sources(State(state): State<AppState>) -> Result<Json<Vec<SourceView>>, AppError> {
-    let mut views = vec![SourceView {
-        id: "local-disk".to_string(),
-        kind: "local".to_string(),
-        display_name: "Local library".to_string(),
-        enabled: true,
-        capabilities: musicata_core::ProviderCapabilities::DISK,
-    }];
+    let mut views = vec![
+        SourceView {
+            id: "local-disk".to_string(),
+            kind: "local".to_string(),
+            display_name: "Local library".to_string(),
+            enabled: true,
+            capabilities: musicata_core::ProviderCapabilities::DISK,
+        },
+        SourceView {
+            id: providers::RADIO_PROVIDER_ID.to_string(),
+            kind: "radio".to_string(),
+            display_name: "Internet radio".to_string(),
+            enabled: true,
+            capabilities: musicata_core::ProviderCapabilities::STREAM_ONLY,
+        },
+    ];
     for record in state.database.list_sources().await.map_err(db_error)? {
         views.push(source_view(&record));
     }
@@ -1998,6 +2039,11 @@ async fn delete_source(
             "the local library source can't be removed (set it with --library)",
         ));
     }
+    if id == providers::RADIO_PROVIDER_ID {
+        return Err(AppError::bad_request(
+            "the internet-radio source is built in; remove individual stations instead",
+        ));
+    }
     state.database.delete_source(&id).await.map_err(db_error)?;
     state.providers.write().await.remove(&id);
     // Re-merge the library without the removed source's tracks, in the background.
@@ -2008,6 +2054,57 @@ async fn delete_source(
 async fn rescan_source(State(state): State<AppState>, Path(_id): Path<String>) -> StatusCode {
     spawn_library_scan(&state, "Manual rescan");
     StatusCode::ACCEPTED
+}
+
+#[derive(Debug, Serialize)]
+struct BrowseResponse {
+    entries: Vec<musicata_core::BrowseEntry>,
+}
+
+/// Browse a non-scannable source's catalogue (internet-radio stations). Scannable
+/// sources (local disk, SMB) merge into the library and are browsed through the
+/// library endpoints, so they return 400 here.
+async fn browse_source(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<BrowseResponse>, AppError> {
+    let handle = state
+        .providers
+        .read()
+        .await
+        .get(&id)
+        .ok_or_else(|| AppError::not_found(format!("unknown source: {id}")))?;
+    let entries = handle
+        .browse()
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    Ok(Json(BrowseResponse { entries }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveQuery {
+    item: String,
+}
+
+/// Resolve an item within a source to a playable stream (a radio station id → its
+/// stream URL). For sources whose items are library tracks, callers stream through
+/// `/api/tracks/{id}/stream` instead, so those return 400 here.
+async fn resolve_source(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ResolveQuery>,
+) -> Result<Json<musicata_core::StreamSpec>, AppError> {
+    let handle = state
+        .providers
+        .read()
+        .await
+        .get(&id)
+        .ok_or_else(|| AppError::not_found(format!("unknown source: {id}")))?;
+    let spec = handle
+        .resolve(&query.item)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    Ok(Json(spec))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2614,6 +2711,34 @@ async fn album_artwork(
         .artwork_path
         .ok_or_else(|| AppError::not_found(format!("album has no artwork: {id}")))?;
 
+    // Route by the album's source. An album whose tracks live on a network source
+    // (e.g. SMB) stores its cover's share-relative path, which isn't a local file, so
+    // it must be fetched through the provider rather than read off the local disk.
+    #[cfg(feature = "provider-smb")]
+    {
+        let provider_id = state
+            .database
+            .album_provider_id(&id)
+            .await
+            .map_err(db_error)?;
+        if let Some(provider_id) = provider_id
+            && let Some(providers::ProviderHandle::Smb(smb)) =
+                state.providers.read().await.get(&provider_id)
+        {
+            let item_id = path.to_string_lossy().into_owned();
+            let etag = format!("\"{}\"", artwork_asset_id(&path));
+            if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
+                return artwork_not_modified(&etag);
+            }
+            // A missing/unreadable cover on the share is "no artwork" (404 → the UI
+            // shows its monogram fallback), never a 500.
+            let bytes = smb.read_file(&item_id).await.map_err(|error| {
+                AppError::not_found(format!("album artwork unavailable: {error}"))
+            })?;
+            return artwork_response(bytes, artwork_extension(&path), etag);
+        }
+    }
+
     serve_artwork(path, headers).await
 }
 
@@ -2763,24 +2888,37 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 async fn serve_artwork(path: PathBuf, headers: HeaderMap) -> Result<Response, AppError> {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default();
-    let _metadata = tokio::fs::metadata(&path).await?;
     let etag = format!("\"{}\"", artwork_asset_id(&path));
 
     if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
-        return Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header(CACHE_CONTROL, ARTWORK_CACHE_CONTROL)
-            .header(ETAG, etag)
-            .body(Body::empty())
-            .map_err(AppError::from);
+        return artwork_not_modified(&etag);
     }
 
-    let bytes = tokio::fs::read(&path).await?;
+    // A cover that can't be read (missing file, stale path, permissions) is "no
+    // artwork" — return 404 so the client falls back to its monogram, never a 500.
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|error| AppError::not_found(format!("album artwork unavailable: {error}")))?;
 
+    artwork_response(bytes, artwork_extension(&path), etag)
+}
+
+fn artwork_extension(path: &std::path::Path) -> &str {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+}
+
+fn artwork_not_modified(etag: &str) -> Result<Response, AppError> {
+    Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(CACHE_CONTROL, ARTWORK_CACHE_CONTROL)
+        .header(ETAG, etag)
+        .body(Body::empty())
+        .map_err(AppError::from)
+}
+
+fn artwork_response(bytes: Vec<u8>, extension: &str, etag: String) -> Result<Response, AppError> {
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, image_content_type(extension))
@@ -3018,6 +3156,9 @@ impl Config {
             scan_once: env("MUSICATA_SCAN_ONCE")
                 .map(|value| parse_bool(&value, "MUSICATA_SCAN_ONCE"))
                 .transpose()?,
+            no_scan: env("MUSICATA_NO_SCAN")
+                .map(|value| parse_bool(&value, "MUSICATA_NO_SCAN"))
+                .transpose()?,
             mpd_addrs: env("MUSICATA_MPD").map(|value| parse_addr_list(&value)),
             public_url: env("MUSICATA_PUBLIC_URL"),
             subsonic_user: env("MUSICATA_SUBSONIC_USER"),
@@ -3042,6 +3183,7 @@ impl Default for Config {
             rescan: false,
             no_incremental_rescan: false,
             scan_once: false,
+            no_scan: false,
             mpd_addrs: Vec::new(),
             public_url: None,
             subsonic_user: "musicata".to_string(),
@@ -3059,6 +3201,7 @@ struct ConfigOverrides {
     rescan: Option<bool>,
     no_incremental_rescan: Option<bool>,
     scan_once: Option<bool>,
+    no_scan: Option<bool>,
     mpd_addrs: Option<Vec<String>>,
     public_url: Option<String>,
     subsonic_user: Option<String>,
@@ -3099,6 +3242,7 @@ impl ConfigOverrides {
                 "--rescan" => overrides.rescan = Some(true),
                 "--no-incremental-rescan" => overrides.no_incremental_rescan = Some(true),
                 "--scan-once" => overrides.scan_once = Some(true),
+                "--no-scan" => overrides.no_scan = Some(true),
                 "--mpd" => {
                     let value = args
                         .next()
@@ -3125,7 +3269,7 @@ impl ConfigOverrides {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan] [--no-incremental-rescan] [--scan-once] [--mpd HOST:PORT[,HOST:PORT]] [--public-url URL] [--subsonic-user USER] [--subsonic-password PASS]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN, MUSICATA_INCREMENTAL_RESCAN, MUSICATA_SCAN_ONCE, MUSICATA_MPD, MUSICATA_PUBLIC_URL, MUSICATA_SUBSONIC_USER, MUSICATA_SUBSONIC_PASSWORD\nConfig file keys: library, database, addr, rescan, incremental_rescan, scan_once, mpd, public_url, subsonic_user, subsonic_password\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
+                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan] [--no-incremental-rescan] [--scan-once] [--no-scan] [--mpd HOST:PORT[,HOST:PORT]] [--public-url URL] [--subsonic-user USER] [--subsonic-password PASS]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN, MUSICATA_INCREMENTAL_RESCAN, MUSICATA_SCAN_ONCE, MUSICATA_NO_SCAN, MUSICATA_MPD, MUSICATA_PUBLIC_URL, MUSICATA_SUBSONIC_USER, MUSICATA_SUBSONIC_PASSWORD\nConfig file keys: library, database, addr, rescan, incremental_rescan, scan_once, no_scan, mpd, public_url, subsonic_user, subsonic_password\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
                     );
                     std::process::exit(0);
                 }
@@ -3169,6 +3313,7 @@ impl ConfigOverrides {
                         Some(parse_bool(value, "config no_incremental_rescan")?)
                 }
                 "scan_once" => overrides.scan_once = Some(parse_bool(value, "config scan_once")?),
+                "no_scan" => overrides.no_scan = Some(parse_bool(value, "config no_scan")?),
                 "mpd" | "mpd_addrs" => overrides.mpd_addrs = Some(parse_addr_list(value)),
                 "public_url" => overrides.public_url = Some(value.to_string()),
                 "subsonic_user" => overrides.subsonic_user = Some(value.to_string()),
@@ -3209,6 +3354,9 @@ impl ConfigOverrides {
 
         if let Some(scan_once) = self.scan_once {
             config.scan_once = scan_once;
+        }
+        if let Some(no_scan) = self.no_scan {
+            config.no_scan = no_scan;
         }
 
         if let Some(mpd_addrs) = self.mpd_addrs {
@@ -4211,6 +4359,39 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
     }
 
+    // A stored cover path that can't be read (stale path, offline/again-unreadable
+    // source) must degrade to 404 so the UI shows its monogram fallback — never a 500
+    // (which floods the log and surfaces as a broken request to the client).
+    #[tokio::test]
+    async fn missing_album_artwork_file_returns_404_not_500() {
+        let fixture = TestFixture::new("artwork-missing");
+        let mut library = fixture.library();
+        let album_id = library
+            .albums
+            .iter()
+            .find(|album| album.artwork_url.is_some())
+            .expect("album artwork")
+            .id
+            .clone();
+        // Point the album's artwork at a file that does not exist.
+        for album in &mut library.albums {
+            if album.id == album_id {
+                album.artwork_path = Some(PathBuf::from("/no/such/cover.jpg"));
+            }
+        }
+        let app = fixture.app_with_library(library).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/albums/{album_id}/artwork"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn reviews_and_selects_album_artwork() {
         let fixture = TestFixture::new("artwork-selection");
@@ -4643,11 +4824,32 @@ mod tests {
         )
         .unwrap();
         let list = sources.as_array().expect("sources array");
-        assert_eq!(list.len(), 1);
+        // Two built-in sources: the scannable local library and internet radio.
+        assert_eq!(list.len(), 2);
         assert_eq!(list[0]["id"], "local-disk");
         assert_eq!(list[0]["kind"], "local");
         assert_eq!(list[0]["capabilities"]["can_scan"], true);
         assert_eq!(list[0]["capabilities"]["can_stream"], true);
+        // Radio is a built-in non-scannable, browsable, streamable source.
+        assert_eq!(list[1]["id"], "radio");
+        assert_eq!(list[1]["kind"], "radio");
+        assert_eq!(list[1]["capabilities"]["can_scan"], false);
+        assert_eq!(list[1]["capabilities"]["can_browse"], true);
+        assert_eq!(list[1]["capabilities"]["can_stream"], true);
+
+        // The built-in radio source can't be deleted (stations are removed individually).
+        let undeletable = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/sources/radio")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(undeletable.status(), StatusCode::BAD_REQUEST);
 
         // An unknown source kind is rejected.
         let bad = app
@@ -4720,6 +4922,79 @@ mod tests {
             list.iter()
                 .any(|station| station["streamUrl"] == "http://ice.somafm.com/groovesalad")
         );
+
+        // The station is also reachable through the generic provider browse endpoint,
+        // which carries the playable stream URL inline.
+        let station_id = created["id"].as_str().expect("station id").to_string();
+        let browsed: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/sources/radio/browse")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        let entries = browsed["entries"].as_array().expect("browse entries");
+        let entry = entries
+            .iter()
+            .find(|entry| entry["id"] == station_id)
+            .expect("browsed station");
+        assert_eq!(entry["title"], "Groove Salad");
+        assert_eq!(entry["stream_url"], "http://ice.somafm.com/groovesalad");
+        assert_eq!(entry["is_container"], false);
+
+        // resolve turns the station id into a playable StreamSpec.
+        let resolved: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(&format!("/api/sources/radio/resolve?item={station_id}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(resolved["url"], "http://ice.somafm.com/groovesalad");
+        assert_eq!(resolved["title"], "Groove Salad");
+
+        // A scannable source isn't browsable through this endpoint (it merges into
+        // the library); resolving an unknown station is a 400.
+        let local_browse = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sources/local-disk/browse")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local_browse.status(), StatusCode::BAD_REQUEST);
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sources/radio/resolve?item=does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -4950,6 +5225,9 @@ mod tests {
                 .expect("player manager");
             let mut registry = ProviderRegistry::new();
             registry.push(ProviderHandle::local(LocalDiskProvider::new(&self.root)));
+            registry.push(ProviderHandle::radio(crate::providers::RadioProvider::new(
+                database.clone(),
+            )));
             app(
                 database,
                 std::sync::Arc::new(tokio::sync::RwLock::new(registry)),

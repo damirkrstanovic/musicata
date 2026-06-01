@@ -9,10 +9,10 @@
 use std::sync::Arc;
 
 use musicata_core::{
-    Library, LocalDiskProvider, MusicProvider, ProviderCapabilities, ScanProgress, merge_libraries,
-    scan_local_library_incremental,
+    BrowseEntry, Library, LocalDiskProvider, MusicProvider, ProviderCapabilities, ScanProgress,
+    StreamSpec, merge_libraries, scan_local_library_incremental,
 };
-use musicata_storage::SourceRecord;
+use musicata_storage::{Database, SourceRecord};
 
 #[cfg(feature = "provider-smb")]
 use crate::smb::SmbProvider;
@@ -46,10 +46,69 @@ pub fn smb_provider_id(host: &str, share: &str, base_path: &str) -> String {
     format!("smb:{}/{}{}", host.to_lowercase(), share, suffix)
 }
 
+/// Stable id of the built-in internet-radio source. Like `local-disk`, it is always
+/// present (not stored in the `sources` table) and can't be removed.
+pub const RADIO_PROVIDER_ID: &str = "radio";
+
+/// The internet-radio source: a non-scannable, browsable, streamable provider whose
+/// catalogue is the user's saved stations (the `radio_stations` table). It never
+/// merges into the scanned library — `browse` lists the stations and `resolve` turns
+/// a station id into its stream URL.
+#[derive(Clone)]
+pub struct RadioProvider {
+    database: Database,
+}
+
+impl RadioProvider {
+    pub fn new(database: Database) -> Self {
+        Self { database }
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::STREAM_ONLY
+    }
+
+    /// List the saved stations as browse entries (their stream URLs are known up
+    /// front, so they're carried inline and a client can play without `resolve`).
+    async fn browse(&self) -> anyhow::Result<Vec<BrowseEntry>> {
+        let stations = self.database.list_radio_stations().await?;
+        Ok(stations
+            .into_iter()
+            .map(|station| BrowseEntry {
+                id: station.id,
+                title: station.name,
+                subtitle: station
+                    .homepage_url
+                    .as_deref()
+                    .and_then(|url| url.split("://").nth(1).or(Some(url)))
+                    .map(|host| host.trim_end_matches('/').to_string()),
+                stream_url: Some(station.stream_url),
+                homepage_url: station.homepage_url,
+                is_container: false,
+            })
+            .collect())
+    }
+
+    /// Resolve a station id to its playable stream.
+    async fn resolve(&self, item_id: &str) -> anyhow::Result<StreamSpec> {
+        let station = self
+            .database
+            .radio_station(item_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown radio station: {item_id}"))?;
+        Ok(StreamSpec {
+            url: station.stream_url,
+            title: Some(station.name),
+            content_type: None,
+        })
+    }
+}
+
 /// A single configured music source.
 #[derive(Clone)]
 pub enum ProviderHandle {
     Local(Arc<LocalDiskProvider>),
+    Radio(Arc<RadioProvider>),
     #[cfg(feature = "provider-smb")]
     Smb(Arc<SmbProvider>),
 }
@@ -59,9 +118,14 @@ impl ProviderHandle {
         ProviderHandle::Local(Arc::new(provider))
     }
 
+    pub fn radio(provider: RadioProvider) -> Self {
+        ProviderHandle::Radio(Arc::new(provider))
+    }
+
     pub fn provider_id(&self) -> String {
         match self {
             ProviderHandle::Local(provider) => provider.provider_id().to_string(),
+            ProviderHandle::Radio(_) => RADIO_PROVIDER_ID.to_string(),
             #[cfg(feature = "provider-smb")]
             ProviderHandle::Smb(provider) => provider.provider_id().clone(),
         }
@@ -70,18 +134,52 @@ impl ProviderHandle {
     pub fn capabilities(&self) -> ProviderCapabilities {
         match self {
             ProviderHandle::Local(provider) => provider.capabilities(),
+            ProviderHandle::Radio(provider) => provider.capabilities(),
             #[cfg(feature = "provider-smb")]
             ProviderHandle::Smb(_) => ProviderCapabilities::DISK,
         }
     }
 
     /// Cheaply verify the source is reachable and readable (connect + list a
-    /// directory) before committing to a full scan. Local disk is always ready.
+    /// directory) before committing to a full scan. Local disk and radio (a DB-backed
+    /// station list) are always ready.
     pub async fn validate(&self) -> anyhow::Result<()> {
         match self {
-            ProviderHandle::Local(_) => Ok(()),
+            ProviderHandle::Local(_) | ProviderHandle::Radio(_) => Ok(()),
             #[cfg(feature = "provider-smb")]
             ProviderHandle::Smb(provider) => provider.validate().await,
+        }
+    }
+
+    /// Browse a non-scannable source's catalogue (e.g. internet-radio stations).
+    /// Scannable sources merge into the library and are browsed through the library
+    /// endpoints, so they return an error here.
+    pub async fn browse(&self) -> anyhow::Result<Vec<BrowseEntry>> {
+        match self {
+            ProviderHandle::Radio(provider) => provider.browse().await,
+            ProviderHandle::Local(_) => {
+                anyhow::bail!("the local library is browsed through the library endpoints")
+            }
+            #[cfg(feature = "provider-smb")]
+            ProviderHandle::Smb(_) => {
+                anyhow::bail!("SMB shares are browsed through the library endpoints")
+            }
+        }
+    }
+
+    /// Resolve an item id within this source to a playable stream. Only meaningful
+    /// for sources whose items aren't already library tracks (internet radio); other
+    /// sources stream library tracks through `/api/tracks/{id}/stream`.
+    pub async fn resolve(&self, item_id: &str) -> anyhow::Result<StreamSpec> {
+        match self {
+            ProviderHandle::Radio(provider) => provider.resolve(item_id).await,
+            ProviderHandle::Local(_) => {
+                anyhow::bail!("local tracks are streamed through /api/tracks/{{id}}/stream")
+            }
+            #[cfg(feature = "provider-smb")]
+            ProviderHandle::Smb(_) => {
+                anyhow::bail!("SMB tracks are streamed through /api/tracks/{{id}}/stream")
+            }
         }
     }
 
@@ -111,6 +209,11 @@ impl ProviderHandle {
                 })
                 .await??;
                 Ok(scanned)
+            }
+            // Radio has no scannable catalogue; `scan_all` skips it via `can_scan`,
+            // and a direct rescan request is rejected rather than silently no-op'd.
+            ProviderHandle::Radio(_) => {
+                anyhow::bail!("the internet-radio source has no scannable catalogue")
             }
             #[cfg(feature = "provider-smb")]
             ProviderHandle::Smb(provider) => provider.scan_with_progress(prior, progress).await,
@@ -142,9 +245,8 @@ impl ProviderRegistry {
             .retain(|existing| existing.provider_id() != provider_id);
     }
 
-    /// Look up an active source by id. Only the SMB streaming path needs this, so
-    /// it's dead code in a build without `provider-smb`.
-    #[cfg_attr(not(feature = "provider-smb"), allow(dead_code))]
+    /// Look up an active source by id (used by the SMB streaming path and the
+    /// generic browse/resolve endpoints).
     pub fn get(&self, provider_id: &str) -> Option<ProviderHandle> {
         self.providers
             .iter()

@@ -772,8 +772,18 @@ function onAddMenuOutside(event) {
 // ---- Internet radio ----
 
 async function loadRadio() {
+  // Read stations through the radio source's generic browse endpoint (the same
+  // provider abstraction local disk and SMB use). Browse entries carry the
+  // station's stream URL, so they're directly playable. Adding/removing stations
+  // still goes through /api/radio.
   try {
-    state.radio = await api("/api/radio");
+    const { entries } = await api(`/api/sources/radio/browse`);
+    state.radio = (entries || []).map((entry) => ({
+      id: entry.id,
+      name: entry.title,
+      stream_url: entry.stream_url,
+      homepage_url: entry.homepage_url,
+    }));
   } catch {
     state.radio = [];
   }
@@ -947,10 +957,14 @@ async function playTrack(index) {
     }
   }
   const ids = tracks.map((track) => track.id);
-  await playerCommand(state.activePlayerId, { command: "play_tracks", track_ids: ids });
-  if (index > 0) {
-    await playerCommand(state.activePlayerId, { command: "play_queue_index", index });
-  }
+  // One command sets the whole queue AND the starting position. Sending play_tracks
+  // (which starts at 0) followed by play_queue_index would broadcast the wrong
+  // now-playing track first, flickering the footer and restarting browser audio.
+  await playerCommand(state.activePlayerId, {
+    command: "play_tracks",
+    track_ids: ids,
+    start_index: index,
+  });
 }
 
 function markActiveTrack() {
@@ -1878,7 +1892,10 @@ function toggleQueue(open) {
   state.queueOpen = open ?? !state.queueOpen;
   els.queueDrawer.hidden = !state.queueOpen;
   els.queueToggle.setAttribute("aria-pressed", String(state.queueOpen));
-  if (state.queueOpen) renderQueue();
+  if (state.queueOpen) {
+    renderQueue();
+    if (state.activeState) state.lastQueueSig = queueSignature(state.activeState);
+  }
 }
 
 els.queueToggle.addEventListener("click", () => toggleQueue());
@@ -2020,6 +2037,13 @@ function openPlayerSocket(id) {
   socket.onmessage = (event) => {
     try {
       const playback = JSON.parse(event.data);
+      // Lightweight position tick (browser player, ~1×/second): only the elapsed
+      // position changed, so update the seek readout without touching the queue,
+      // cover art, OS metadata, or the track-list highlight.
+      if (playback.type === "progress") {
+        if (id === state.activePlayerId) applyProgressTick(playback);
+        return;
+      }
       // Track every player's status so the switcher can flag which are playing.
       state.playerStatus[id] = playback.status;
       // When any player advances to a different track, a listen for the previous one
@@ -2241,6 +2265,13 @@ function renderPlayerSwitcher(players) {
 function setActivePlayer(id) {
   if (!id) return;
   state.activePlayerId = id;
+  // Force the next state update to repaint everything for the new player (its track,
+  // toggles, and queue differ), bypassing the change-gating in updateFooterFromState.
+  state.lastTrackKey = undefined;
+  state.lastStatus = undefined;
+  state.lastShuffle = undefined;
+  state.lastRepeat = undefined;
+  state.lastQueueSig = undefined;
   try {
     localStorage.setItem("musicata-active-player", id);
   } catch {
@@ -2322,6 +2353,36 @@ function setRange(input, value, max) {
   input.style.setProperty("--fill", `${pct}%`);
 }
 
+// A cheap fingerprint of the queue, so we can skip rebuilding the drawer when the
+// queue is unchanged (the common case on a per-second progress tick).
+function queueSignature(playback) {
+  const queue = playback.queue || [];
+  let sig = `${queue.length}:${playback.queue_position ?? ""}`;
+  for (const item of queue) sig += `|${item.track_id ?? item.stream_url ?? item.title}`;
+  return sig;
+}
+
+// Apply a lightweight position tick from the active player: refresh the seek bar,
+// the elapsed/duration text, and the OS scrubber — nothing else. Keeps the cached
+// activeState's position in sync so local smoothing continues from the right place.
+function applyProgressTick(tick) {
+  state.activeElapsed = tick.elapsed_seconds ?? 0;
+  if (tick.duration_seconds != null) state.activeDuration = tick.duration_seconds;
+  if (state.activeState) {
+    state.activeState.elapsed_seconds = state.activeElapsed;
+    if (tick.duration_seconds != null) state.activeState.duration_seconds = state.activeDuration;
+  }
+  if (!state.seekDragging) {
+    setRange(els.seek, state.activeElapsed, state.activeDuration);
+    els.elapsed.textContent = formatTime(state.activeElapsed);
+    els.duration.textContent = formatTime(state.activeDuration);
+  }
+  updateMediaSessionPosition({
+    elapsed_seconds: state.activeElapsed,
+    duration_seconds: state.activeDuration,
+  });
+}
+
 function updateFooterFromState(playback) {
   state.activeState = playback;
   state.activeStatus = playback.status;
@@ -2330,58 +2391,87 @@ function updateFooterFromState(playback) {
   state.activeElapsed = playback.elapsed_seconds ?? 0;
   state.activeDuration = playback.duration_seconds ?? 0;
 
+  // While a track plays the server broadcasts the full state every second, but only
+  // the elapsed position changes. Recompute the expensive parts — cover art, OS media
+  // metadata, the active-row highlight (a sweep over the whole track list), and the
+  // queue drawer — only when their inputs actually change; otherwise these per-second
+  // DOM passes peg the main thread and the controls feel sluggish.
+  const trackKey = now ? (now.track_id ?? now.stream_url ?? now.title ?? "") : null;
+  const trackChanged = trackKey !== state.lastTrackKey;
+  const statusChanged = playback.status !== state.lastStatus;
+  const shuffle = Boolean(playback.shuffle);
+  const repeat = playback.repeat || "off";
+
+  // Cheap, every tick: transport status, play/pause glyphs, volume, seek position.
   els.transport.dataset.status = playback.status;
-
-  // Now-playing art (real cover when known, monogram fallback otherwise).
-  renderNowArt(now);
-
-  if (now) {
-    els.nowTitle.textContent = now.title || "Unknown";
-    els.nowSubtitle.textContent = [now.artist, now.album].filter(Boolean).join(" · ");
-  } else {
-    els.nowTitle.textContent = "Nothing playing";
-    els.nowSubtitle.textContent =
-      state.activePlayerId === browserPlayerId
-        ? "Pick a track to play here."
-        : "Select a track to play on this player.";
-  }
-
   els.playPause.textContent = playback.status === "playing" ? "❚❚" : "▶";
   els.playPause.title = playback.status === "playing" ? "Pause" : "Play";
   els.miniPlay.textContent = playback.status === "playing" ? "❚❚" : "▶";
 
-  // Shuffle + repeat toggles.
-  els.shuffle.classList.toggle("active", Boolean(playback.shuffle));
-  els.shuffle.setAttribute("aria-pressed", String(Boolean(playback.shuffle)));
-  els.repeat.dataset.mode = playback.repeat || "off";
-  els.repeat.classList.toggle("active", playback.repeat && playback.repeat !== "off");
-  els.repeat.innerHTML = playback.repeat === "one" ? "↻<span class='one'>1</span>" : "↻";
-
-  // Volume (unless the user is adjusting it).
   if (playback.volume != null && document.activeElement !== els.footerVolume) {
     setRange(els.footerVolume, playback.volume, 100);
   }
-
-  // Seek (unless dragging).
   if (!state.seekDragging) {
     setRange(els.seek, state.activeElapsed, state.activeDuration);
     els.elapsed.textContent = formatTime(state.activeElapsed);
     els.duration.textContent = formatTime(state.activeDuration);
   }
+  updateMediaSessionPosition(playback);
+
+  // Shuffle + repeat toggles: only when they flip.
+  if (shuffle !== state.lastShuffle) {
+    els.shuffle.classList.toggle("active", shuffle);
+    els.shuffle.setAttribute("aria-pressed", String(shuffle));
+    state.lastShuffle = shuffle;
+  }
+  if (repeat !== state.lastRepeat) {
+    els.repeat.dataset.mode = repeat;
+    els.repeat.classList.toggle("active", repeat !== "off");
+    els.repeat.innerHTML = repeat === "one" ? "↻<span class='one'>1</span>" : "↻";
+    state.lastRepeat = repeat;
+  }
+
+  // Track-dependent work: only when the now-playing track changes.
+  if (trackChanged) {
+    renderNowArt(now);
+    if (now) {
+      els.nowTitle.textContent = now.title || "Unknown";
+      els.nowSubtitle.textContent = [now.artist, now.album].filter(Boolean).join(" · ");
+    } else {
+      els.nowTitle.textContent = "Nothing playing";
+      els.nowSubtitle.textContent =
+        state.activePlayerId === browserPlayerId
+          ? "Pick a track to play here."
+          : "Select a track to play on this player.";
+    }
+    markActiveTrack();
+    state.lastTrackKey = trackKey;
+  }
+  if (trackChanged || statusChanged) {
+    updateMediaSessionMetadata(playback);
+    state.lastStatus = playback.status;
+  }
 
   updateSwitchIndicator();
-  els.queueCount.textContent = String(playback.queue?.length ?? 0);
-  if (state.queueOpen) renderQueue();
 
-  updateMediaSession(playback);
-  markActiveTrack();
+  // Queue drawer: rebuild only when open and the queue actually changed — a string
+  // signature compare is far cheaper than rebuilding the DOM every second.
+  els.queueCount.textContent = String(playback.queue?.length ?? 0);
+  if (state.queueOpen) {
+    const sig = queueSignature(playback);
+    if (sig !== state.lastQueueSig) {
+      renderQueue();
+      state.lastQueueSig = sig;
+    }
+  }
 }
 
-// Reflect the active player into the OS media surfaces (lock screen, media keys,
-// notification, Bluetooth/car displays). The OS UI only appears once this tab is
-// actually producing audio (i.e. it's the browser player's output), but setting the
-// metadata for any active player is harmless.
-function updateMediaSession(playback) {
+// Reflect the active player's track into the OS media surfaces (lock screen, media
+// keys, notification, Bluetooth/car displays). Constructing a MediaMetadata makes the
+// browser (re)fetch the artwork, so this runs only when the track or status changes —
+// not on every progress tick. The OS UI only appears once this tab is actually
+// producing audio, but setting metadata for any active player is harmless.
+function updateMediaSessionMetadata(playback) {
   if (!("mediaSession" in navigator)) return;
   const ms = navigator.mediaSession;
 
@@ -2403,9 +2493,14 @@ function updateMediaSession(playback) {
   } else {
     ms.metadata = null;
   }
+}
 
-  // Position state drives OS scrubbers. setPositionState throws on inconsistent
-  // values (e.g. position past duration), so guard and clear when unknown.
+// Keep the OS scrubber position current. Cheap (no allocation), so it runs every
+// progress tick. setPositionState throws on inconsistent values (e.g. position past
+// duration), so guard and clear when unknown.
+function updateMediaSessionPosition(playback) {
+  if (!("mediaSession" in navigator)) return;
+  const ms = navigator.mediaSession;
   try {
     const duration = playback.duration_seconds ?? 0;
     const position = playback.elapsed_seconds ?? 0;

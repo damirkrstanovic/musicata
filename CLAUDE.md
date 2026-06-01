@@ -62,8 +62,13 @@ cargo run -p musicata-server -- --library <dir> --addr 127.0.0.1:3030
   changed.
 - The repo has a real fixture library at `testdata/`.
 - Verify UI changes with the headless browser at
-  `~/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome` via `playwright-core`
-  (launch with `--headless=new --no-sandbox`).
+  `~/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome` (launch with
+  `--headless=new --no-sandbox`). The **`scripts/ui-smoke.sh`** suite (see
+  `tests/ui/README.md`) automates this: it drives the real web app over CDP and
+  asserts on user flows *and* lag (footer latency, no audio restarts, no full-state
+  broadcast or DOM sweep on position ticks). `cargo test` covers the server only — it
+  does **not** touch `static/`, so run the smoke suite after changing the web app.
+  Rust-level guards for the playback hot path live in `players.rs` tests.
 
 ## Git
 

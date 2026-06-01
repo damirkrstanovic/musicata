@@ -56,7 +56,12 @@ plugins matter). This matches the existing `PlayerHandle` enum pattern (an enum,
 - `MusicProvider` (a *source*): `id` · `capabilities()` · `configure/start/stop` ·
   `health()` (Roon's Status analog) · `scan() -> Library` (library sources) ·
   `browse(path)` (non-scannable sources) · `resolve(id) -> StreamSpec` (MA's
-  stream-details/stream split).
+  stream-details/stream split). **In practice the split lands across two layers:** the
+  core `MusicProvider` trait stays sync and tokio-free (`id`/`capabilities`/`scan`),
+  while the async, possibly DB- or network-backed methods (`validate`, `scan_with_progress`,
+  `browse`, `resolve`) live on the server-side `ProviderHandle` enum where async
+  dispatch already is. Radio (whose catalogue is a SQLite table) is the first source
+  to implement `browse`/`resolve` there.
 - `PlayerProvider` (an *endpoint*): `id` · `capabilities()` · `discover()` ·
   `execute(PlayerCommand)` · `subscribe() -> PlaybackState`.
 
@@ -82,7 +87,18 @@ task); endpoint tiering native vs bridged.
 - **M9 (sources):** ① **Internet radio** — the first non-library provider (no scan;
   user-managed stations; `resolve()` returns the stream URL). Realized first as a
   working feature (storage + native API + Subsonic internet-radio endpoints + web UI +
-  a `PlayStream` player command). ✅
+  a `PlayStream` player command), then **promoted to a real `ProviderHandle::Radio`**
+  (a built-in, always-present source like local-disk, backed by the `radio_stations`
+  table). It advertises `STREAM_ONLY` capabilities (`can_browse` + `can_stream`, no
+  scan/search) and implements the two non-scannable methods the design called for:
+  `browse() -> Vec<BrowseEntry>` (the saved stations, each carrying its stream URL) and
+  `resolve(item_id) -> StreamSpec` (a station id → its playable stream). Exposed
+  generically at `GET /api/sources/{id}/browse` and `/resolve?item=…`; the web Radio
+  sidebar and Subsonic `getInternetRadioStations` both read through this path (station
+  *management* — create/update/delete — stays on `/api/radio`). This is the first
+  exercise of the source-vs-transport split for a non-library source and the template
+  for future streaming providers (Spotify/Tidal/Qobuz), whose `resolve()` will mint a
+  short-lived URL on demand rather than carrying it inline. ✅
   ② Formalize the provider abstraction. ✅ Landed as `ProviderCapabilities` + a
   `SourceFs` VFS (one scanner over any backend) + a `ProviderHandle` enum/
   `ProviderRegistry` (enum-dispatch, like `PlayerHandle`) + `merge_libraries` (N sources

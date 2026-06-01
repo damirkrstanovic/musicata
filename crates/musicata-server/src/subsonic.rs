@@ -869,19 +869,28 @@ async fn delete_playlist_ss(
 // ---- Internet radio -------------------------------------------------------
 
 async fn get_internet_radio(state: &AppState, format: Format) -> Response {
-    let stations = state
-        .database
-        .list_radio_stations()
+    // Read through the radio provider so every surface (web, native, Subsonic) goes
+    // via the same source abstraction. Browse entries carry the station id, name, and
+    // stream URL — exactly the Subsonic internet-radio shape.
+    let entries = match state
+        .providers
+        .read()
         .await
-        .unwrap_or_default();
-    let list: Vec<Value> = stations
+        .get(crate::providers::RADIO_PROVIDER_ID)
+    {
+        Some(handle) => handle.browse().await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let list: Vec<Value> = entries
         .iter()
-        .map(|station| {
+        .map(|entry| {
             let mut map = Map::new();
-            map.insert("id".into(), json!(station.id));
-            map.insert("name".into(), json!(station.name));
-            map.insert("streamUrl".into(), json!(station.stream_url));
-            if let Some(home) = &station.homepage_url {
+            map.insert("id".into(), json!(entry.id));
+            map.insert("name".into(), json!(entry.title));
+            if let Some(url) = &entry.stream_url {
+                map.insert("streamUrl".into(), json!(url));
+            }
+            if let Some(home) = &entry.homepage_url {
                 map.insert("homePageUrl".into(), json!(home));
             }
             Value::Object(map)

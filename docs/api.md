@@ -111,7 +111,7 @@ The local browser player is always present as id `browser-local`.
 | `set_volume` | `volume` (0–100) |
 | `set_repeat` | `mode` (`off`/`all`/`one`) |
 | `set_shuffle` | `enabled` (bool) |
-| `play_tracks` | `track_ids` (string[]) — replace queue and play |
+| `play_tracks` | `track_ids` (string[]) — replace queue and play; `start_index` (number, optional, default 0) — queue position to start at |
 | `enqueue` | `track_ids` (string[]) |
 | `play_queue_index` | `index` (number) |
 | `remove_queue_item` | `index` (number) |
@@ -119,7 +119,8 @@ The local browser player is always present as id `browser-local`.
 
 ### WebSocket: `/api/players/{id}/ws`
 
-The server pushes a `PlaybackState` JSON message on every change:
+The server pushes a full `PlaybackState` JSON message on every real change (play/
+pause, track change, queue edit, volume/repeat/shuffle):
 
 ```json
 {
@@ -139,8 +140,21 @@ The server pushes a `PlaybackState` JSON message on every change:
 }
 ```
 
-For the browser player, the output tab also sends client→server frames so the
-server-owned state tracks real playback:
+Position is **not** sent as full state. While a track plays, the server emits a
+lightweight position-only frame (for the browser player, ~1×/second) so controllers
+can advance their seek bar without re-receiving the whole queue every tick:
+
+```json
+{ "type": "progress", "elapsed_seconds": 12.3, "duration_seconds": 215.0 }
+```
+
+A client distinguishes the two by the presence of a `type` field: a frame with
+`type: "progress"` is a position tick (apply elapsed/duration only); any other frame
+is a full `PlaybackState`.
+
+For the browser player, the output tab also sends the same-shaped frames in the
+client→server direction so the server-owned state tracks real playback (the server
+re-broadcasts position to other controllers as the `progress` frame above):
 
 ```json
 { "type": "progress", "elapsed_seconds": 12.3, "duration_seconds": 215.0 }

@@ -515,9 +515,18 @@ async fn apply_command(
         PlayerCommand::SetShuffle { enabled } => connection.set_shuffle(*enabled).await,
         PlayerCommand::Clear => connection.clear().await,
         PlayerCommand::PlayQueueIndex { index } => connection.play_index(*index).await,
-        PlayerCommand::PlayTracks { track_ids } => {
+        PlayerCommand::PlayTracks {
+            track_ids,
+            start_index,
+        } => {
             let urls = resolve_urls(database, public_base_url, track_ids).await?;
-            connection.replace_queue(&urls).await
+            connection.replace_queue(&urls).await?;
+            // Start at the requested queue position (default 0) in the same command,
+            // so the controller needn't follow up with a separate play_queue_index.
+            if *start_index > 0 && (*start_index) < urls.len() {
+                connection.play_index(*start_index).await?;
+            }
+            Ok(())
         }
         PlayerCommand::Enqueue { track_ids } => {
             let urls = resolve_urls(database, public_base_url, track_ids).await?;
@@ -590,6 +599,20 @@ async fn enrich_state(state: &mut PlaybackState, database: &Database) {
 pub struct BrowserPlayer {
     state: Mutex<BrowserState>,
     state_tx: broadcast::Sender<PlaybackState>,
+    /// Lightweight position ticks. The output tab reports progress ~1×/second; rather
+    /// than re-broadcast the whole `PlaybackState` (queue and all) on every tick, those
+    /// go out on this channel as a tiny frame. Full state is reserved for real changes
+    /// (play/pause, track change, queue edits). Kept separate from `state_tx` so the
+    /// listen recorder and MPD's `PlayerHandle::subscribe` path are unaffected.
+    progress_tx: broadcast::Sender<ProgressTick>,
+}
+
+/// A position-only update for controllers: the current elapsed time and (once known)
+/// the track duration. Serialized as `{ "type": "progress", … }` on the WebSocket.
+#[derive(Clone, Copy, Debug)]
+pub struct ProgressTick {
+    pub elapsed_seconds: f64,
+    pub duration_seconds: Option<f64>,
 }
 
 #[derive(Default)]
@@ -607,9 +630,11 @@ struct BrowserState {
 impl BrowserPlayer {
     fn new() -> Self {
         let (state_tx, _) = broadcast::channel(32);
+        let (progress_tx, _) = broadcast::channel(32);
         Self {
             state: Mutex::new(BrowserState::default()),
             state_tx,
+            progress_tx,
         }
     }
 
@@ -620,6 +645,11 @@ impl BrowserPlayer {
 
     pub fn subscribe(&self) -> broadcast::Receiver<PlaybackState> {
         self.state_tx.subscribe()
+    }
+
+    /// Subscribe to lightweight position ticks (separate from full-state updates).
+    pub fn subscribe_progress(&self) -> broadcast::Receiver<ProgressTick> {
+        self.progress_tx.subscribe()
     }
 
     pub async fn snapshot(&self) -> PlaybackState {
@@ -682,9 +712,13 @@ impl BrowserPlayer {
                         state.duration_seconds = None;
                     }
                 }
-                PlayerCommand::PlayTracks { track_ids } => {
+                PlayerCommand::PlayTracks {
+                    track_ids,
+                    start_index,
+                } => {
                     state.queue = resolve_queue_items(database, &track_ids).await?;
-                    state.position = (!state.queue.is_empty()).then_some(0);
+                    state.position = (!state.queue.is_empty())
+                        .then(|| start_index.min(state.queue.len().saturating_sub(1)));
                     state.status = if state.queue.is_empty() {
                         PlaybackStatus::Stopped
                     } else {
@@ -733,16 +767,23 @@ impl BrowserPlayer {
         self.broadcast().await;
     }
 
-    /// The output tab reports its real playback position and track duration.
+    /// The output tab reports its real playback position and track duration. This
+    /// fires ~1×/second, so it emits only a lightweight position tick — not a full
+    /// `PlaybackState` (which would re-send the whole queue every second). The stored
+    /// state is still updated so the next full snapshot/refresh reflects the position.
     pub async fn report_progress(&self, elapsed_seconds: f64, duration_seconds: Option<f64>) {
-        {
+        let duration = {
             let mut state = self.state.lock().await;
             state.elapsed_seconds = Some(elapsed_seconds);
             if let Some(duration) = duration_seconds {
                 state.duration_seconds = Some(duration);
             }
-        }
-        self.broadcast().await;
+            state.duration_seconds
+        };
+        let _ = self.progress_tx.send(ProgressTick {
+            elapsed_seconds,
+            duration_seconds: duration,
+        });
     }
 }
 
@@ -960,6 +1001,7 @@ mod tests {
             .execute(
                 PlayerCommand::PlayTracks {
                     track_ids: vec![track_id.to_string()],
+                    start_index: 0,
                 },
                 database,
                 "http://localhost",
@@ -1018,6 +1060,101 @@ mod tests {
             assert!(found.contains(id), "recent missing {id}; got {recent:?}");
         }
         assert_eq!(recent.len(), 5, "expected exactly five distinct tracks");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // A position tick (the ~1×/second report from the output tab) must go out as a
+    // lightweight progress frame, NOT a full PlaybackState — otherwise a playing track
+    // re-sends the whole queue every second (the bug that made controls sluggish).
+    #[tokio::test]
+    async fn report_progress_emits_lightweight_tick_not_full_state() {
+        let player = BrowserPlayer::new();
+        let mut states = player.subscribe();
+        let mut ticks = player.subscribe_progress();
+
+        player.report_progress(12.5, Some(200.0)).await;
+
+        let tick = ticks.try_recv().expect("a progress tick was broadcast");
+        assert_eq!(tick.elapsed_seconds, 12.5);
+        assert_eq!(tick.duration_seconds, Some(200.0));
+        assert!(
+            matches!(
+                states.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "a progress tick must not broadcast a full PlaybackState"
+        );
+    }
+
+    // Playing a non-first track must set the queue and start at that position in a
+    // single broadcast — not play_tracks (position 0) then play_queue_index, which
+    // briefly announced the wrong now-playing track and restarted browser audio.
+    #[tokio::test]
+    async fn play_tracks_with_start_index_starts_there_in_one_broadcast() {
+        let db_path = temp_db("start-index");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = library_with_tracks(5);
+        database.save_library(&mut library).await.expect("save");
+
+        let player = BrowserPlayer::new();
+        let mut states = player.subscribe();
+        player
+            .execute(
+                PlayerCommand::PlayTracks {
+                    track_ids: vec![
+                        "track_1".to_string(),
+                        "track_2".to_string(),
+                        "track_3".to_string(),
+                    ],
+                    start_index: 2,
+                },
+                &database,
+            )
+            .await
+            .expect("play");
+
+        let state = states.try_recv().expect("one state frame");
+        assert_eq!(state.queue_position, Some(2));
+        assert_eq!(
+            state.now_playing.and_then(|n| n.track_id),
+            Some("track_3".to_string()),
+            "now-playing is the requested track, not queue index 0"
+        );
+        assert!(
+            matches!(
+                states.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "play_tracks with start_index must be a single broadcast"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // start_index past the end clamps to the last track rather than panicking or
+    // leaving nothing playing.
+    #[tokio::test]
+    async fn play_tracks_start_index_clamps_to_last() {
+        let db_path = temp_db("start-index-clamp");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = library_with_tracks(5);
+        database.save_library(&mut library).await.expect("save");
+
+        let player = BrowserPlayer::new();
+        player
+            .execute(
+                PlayerCommand::PlayTracks {
+                    track_ids: vec!["track_1".to_string(), "track_2".to_string()],
+                    start_index: 99,
+                },
+                &database,
+            )
+            .await
+            .expect("play");
+
+        let snapshot = player.snapshot().await;
+        assert_eq!(snapshot.queue_position, Some(1));
 
         let _ = std::fs::remove_file(db_path);
     }

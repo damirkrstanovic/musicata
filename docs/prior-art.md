@@ -327,6 +327,76 @@ library vs outside", Discogs API (artist releases / masters / collection / wantl
 
 ---
 
+## 8. Artwork storage & caching (acquire → cache → serve)
+
+**Problem:** cover art comes from uneven sources — a `cover.jpg` next to local files,
+an image embedded in tags, a `Folder.jpg` on an SMB share, the Cover Art Archive, or
+(later) a streaming service's URL. Serving it well means: don't re-fetch the original
+on every request (we currently read SMB covers over the wire per request, ~0.3 s each —
+murder on an 11k-album grid), don't bloat the DB, and serve a small thumbnail to a grid
+rather than a 2 MB original. Where should bytes live, and who fetches them?
+
+**How others solve it** — Navidrome and Jellyfin converge on the *same* architecture:
+
+- **Bytes live on disk, never in the DB.** Navidrome caches processed images under
+  `{CacheFolder}/cache/images/` (hash-prefixed dirs); Jellyfin writes resized variants
+  to `{ImageCachePath}/resized-images/{prefix}/{md5}.{ext}`
+  (`src/Jellyfin.Drawing/ImageProcessor.cs`). The **DB stores only references +
+  metadata** — Jellyfin's `BaseItemImageInfo` holds `Path`, `DateModified`,
+  `Width/Height`, `Blurhash` (no pixels); Navidrome stores `image_paths` / uploaded-file
+  names / cached external URLs. **Nobody stores originals as DB blobs.**
+- **The resized cache is keyed by a hash of (source identity + all transform params +
+  source mtime + a global version constant).** Jellyfin: `MD5(path + width + height +
+  quality + format + dateModified + …)`, with a `Version` constant (`'3'`) that
+  invalidates *every* variant when bumped (`ImageProcessor.cs`). Navidrome keys on
+  `ArtworkID{Kind,ID,LastUpdate}` plus the size suffix. So a `?size=300` request maps to
+  its own cached file; mtime change or version bump = automatic miss.
+- **Generation is lazy (on first request).** Jellyfin is purely lazy — `ProcessImage()`
+  checks `File.Exists(cacheFilePath)`, encodes via **SkiaSharp** only on a miss
+  (`ImageProcessor.cs:197`). Navidrome is lazy too, but adds an **eager `CacheWarmer`**
+  that pre-caches original + UI size at scan time (deferred until *after* the DB
+  transaction commits, so the row exists) — best of both: instant first browse, lazy
+  fallback. Image libs: Navidrome `golang.org/x/image/draw` + WebP; Jellyfin SkiaSharp.
+- **Acquisition is source-aware with an explicit precedence.** Navidrome's
+  `CoverArtPriority` default is `cover.*, folder.*, front.*, embedded, external`
+  (`core/artwork/sources.go` chains readers); discs/artists have their own priority
+  lists. Jellyfin's `LocalImageProvider` (order 0) looks for `poster/folder/cover.*` next
+  to media, then remote providers, then embedded — a chain of `IImageProvider`s.
+- **Eviction differs.** Navidrome runs an LRU "haunter" bounded by `ImageCacheSize`
+  (default 100 MB); Jellyfin has **no automatic eviction** (manual version-bump /
+  orphaning only). Covers are small, so a generous cap or keep-all is fine early.
+
+**What Musicata adopts:** the shared model, mapped onto our provider abstraction.
+*Provenance in the DB, bytes in a local cache, acquisition through the provider.*
+
+- **DB** keeps artwork *provenance*, not pixels: source kind + original ref
+  (local path / SMB share-relative path / URL) + a content hash + mtime. (Today
+  `Album.artwork_path` already holds the original ref; this generalizes it.)
+- **A managed cache dir** next to `musicata.db` (`.musicata/artwork/`), keyed by
+  **content hash** (dedupes identical covers across a compilation / various-artists set)
+  with **sized variants** (`{hash}@{size}.{ext}`) generated lazily; the `image` crate
+  (MIT/Apache — AGPL-compatible) for decode/resize/encode.
+- **Acquisition is a provider concern** (fits `ProviderCapabilities` / `ProviderHandle`):
+  a provider returns artwork bytes (or a URL) for an item — local reads the file, SMB
+  fetches it over the wire **once** and the cache holds it (also makes covers survive
+  the NAS going offline), embedded extracts from tags, Cover Art Archive downloads (the
+  candidate/review flow already exists), streaming services may just hand back a URL.
+- **Serving** reads the cache (fast, offline-resilient); a `?size=` param selects a
+  thumbnail — the real win for large-library grid/scroll performance. The SMB
+  read-through I added is the *cache-populate* path, not the hot path.
+- **Lazy first (on-request), then optional eager prefetch** (Navidrome's warmer) once
+  scans can afford it. Start with one grid size + originals; expand sizes if needed.
+  Eviction: keep-all with an optional cap initially.
+
+This is the natural sequel to §4 (network never on the hot path) and §2 (cheap steady
+state — reuse by mtime/hash). See `docs/roadmap.md` M3 for the staged plan.
+
+References: Navidrome `core/artwork/` (sources/cache_warmer/reader_resized) +
+`utils/cache/file_caches.go`; Jellyfin `src/Jellyfin.Drawing/ImageProcessor.cs`,
+`BaseItemImageInfo`, `LocalImageProvider`, `ItemImageProvider`.
+
+---
+
 ## Conventions these led to
 
 - **Enum dispatch over `dyn`** for provider/player handles (async methods, object

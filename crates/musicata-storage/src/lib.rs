@@ -1112,6 +1112,20 @@ impl Database {
         rows.iter().map(track_from_row).collect()
     }
 
+    /// The provider id that owns an album's files (taken from any of its tracks).
+    /// Used to decide how to serve the album's cover art (local disk vs. a network
+    /// source like SMB). Returns `None` for an unknown/empty album.
+    pub async fn album_provider_id(&self, album_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT provider_id FROM tracks WHERE album_id = ?1 LIMIT 1")
+            .bind(album_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => Ok(Some(row.try_get("provider_id")?)),
+            None => Ok(None),
+        }
+    }
+
     /// Browse facets (genre/composer/year/folder), computed in SQL where practical.
     pub async fn browse_index(&self) -> Result<BrowseIndex> {
         let genres = self.text_facet("genres").await?;
