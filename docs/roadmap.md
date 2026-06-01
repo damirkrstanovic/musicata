@@ -111,20 +111,33 @@ Tasks:
 - [x] Add generated tag-heavy embedded metadata fixture.
 - [x] Add generated poorly tagged file fixture for folder fallback coverage.
 - [x] Group compilations under album artist and order multi-disc tracks by disc then track.
-- Source-aware artwork cache (see prior-art §8). Today cover bytes are served straight
-  from the source on every request — fine for local disk, but a network source (SMB)
-  is fetched over the wire per request (~0.3 s each; brutal on a large grid), and a
-  missing/unreadable cover used to 500 (now 404 → monogram fallback). Adopt the
-  Navidrome/Jellyfin model: **DB keeps artwork provenance (source kind + original ref +
-  content hash + mtime), bytes live in a local cache** (`.musicata/artwork/`, keyed by
-  content hash, sized variants generated lazily via the `image` crate), and
-  **acquisition is a provider concern** (local reads the file; SMB fetches once and the
-  cache holds it — also surviving the source going offline; embedded extracts from tags;
-  Cover Art Archive downloads). Serving reads the cache with a `?size=` thumbnail param
-  (the real win for large-library scroll). Stage it: **(1) lazy cache population** —
-  cache the original on first request, serve from cache thereafter; **(2)** sized
-  thumbnails; **(3)** optional eager prefetch at scan time (Navidrome's CacheWarmer) and
-  an LRU/size cap.
+- Source-aware artwork cache (see prior-art §8). Cover bytes were served straight from
+  the source on every request — fine for local disk, but a network source (SMB) was
+  fetched over the wire per request (~0.3 s each; brutal on a large grid), and a
+  missing/unreadable cover used to 500. Adopting the Navidrome/Jellyfin model: **DB
+  keeps artwork provenance (source ref), bytes live in a local cache**
+  (`.musicata/artwork/`), and **acquisition is a provider concern** (local reads the
+  file; SMB fetches once and the cache holds it; embedded/Cover Art Archive later).
+  Staged:
+  - [x] **Missing/unreadable cover → 404** (UI shows its monogram fallback), never a 500.
+  - [x] **SMB covers served through the provider** rather than a failed local-fs read.
+  - [x] **Lazy cache population** — first request fetches the original via the provider
+    and writes it to `.musicata/artwork/{ab}/{key}.{ext}` (sharded, atomic temp+rename);
+    served from disk thereafter (cold ~0.31 s → warm ~0.001 s) and resilient to the
+    source going offline. Local disk unchanged (already fast).
+  - [ ] **Sized thumbnails** — a `?size=` param serving cached resized variants
+    (e.g. 300 px grid, originals on demand) via the `image` crate. The real win for
+    large-library grid/scroll; pairs with the M6 virtualized-list work.
+  - [ ] **Content-hash keying + invalidation** — key cache entries by content hash
+    (dedupes identical covers across compilations/various-artists) and include the
+    source mtime so a changed cover invalidates automatically. Today keyed by the
+    source-path hash with no mtime (a changed cover needs a manual cache clear).
+  - [ ] **Eager prefetch + bounded cache** — optionally warm covers at scan time
+    (Navidrome's CacheWarmer, deferred until after the scan transaction) and add an
+    LRU/size cap (Navidrome defaults to 100 MB); Jellyfin keeps all.
+  - [ ] **Extend acquisition to embedded tags + Cover Art Archive** — populate the cache
+    from embedded artwork (we already count `embedded_artwork_count`) and the existing
+    Cover Art Archive candidate/review flow, behind the same provider-acquisition path.
 
 Done when:
 
