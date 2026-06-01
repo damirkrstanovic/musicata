@@ -19,8 +19,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, anyhow};
 use futures::StreamExt;
 use musicata_core::{
-    BuiltTrack, FsEntry, Library, PriorIndex, ReadSeek, ScanProgress, SourceFs, assemble_library,
-    build_track, discover_audio_files,
+    BuiltTrack, DiscoveredAudioFile, FsEntry, Library, PriorIndex, ReadSeek, ScanIssue,
+    ScanProgress, SourceFs, assemble_library, build_track, list_dir_audio,
 };
 use musicata_storage::SourceRecord;
 
@@ -51,6 +51,61 @@ fn current_unix_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
+}
+
+/// Walk the share's directory tree in parallel — list directories concurrently,
+/// level by level, bounded by the shared adaptive limiter — instead of one folder
+/// at a time. Returns the audio files plus any walk issues, reporting discovery
+/// progress after each level.
+async fn parallel_walk<F>(
+    fs: Arc<SmbFs>,
+    root: PathBuf,
+    limiter: Arc<AdaptiveLimiter>,
+    progress: &mut F,
+) -> (Vec<DiscoveredAudioFile>, Vec<ScanIssue>)
+where
+    F: FnMut(ScanProgress) + Send,
+{
+    let mut files = Vec::new();
+    let mut issues = Vec::new();
+    let mut frontier = vec![root];
+    while !frontier.is_empty() {
+        let level: Vec<_> = futures::stream::iter(frontier.into_iter())
+            .map(|dir| {
+                let fs = fs.clone();
+                let limiter = limiter.clone();
+                async move {
+                    let permit = limiter.acquire().await;
+                    let started = Instant::now();
+                    let listing =
+                        tokio::task::spawn_blocking(move || list_dir_audio(&*fs, &dir)).await;
+                    limiter.record(started.elapsed());
+                    drop(permit);
+                    listing
+                }
+            })
+            .buffer_unordered(MAX_CONCURRENCY)
+            .collect()
+            .await;
+
+        let mut next = Vec::new();
+        for joined in level {
+            match joined {
+                Ok(mut listing) => {
+                    files.append(&mut listing.files);
+                    issues.append(&mut listing.issues);
+                    next.append(&mut listing.subdirs);
+                }
+                Err(error) => issues.push(ScanIssue {
+                    path: String::new(),
+                    message: format!("walk task panicked: {error}"),
+                }),
+            }
+        }
+        frontier = next;
+        progress(ScanProgress::Discovering { found: files.len() });
+    }
+    (files, issues)
 }
 
 /// Build the live progress detail string: throughput, ETA, and parallelism.
@@ -244,54 +299,46 @@ impl SmbProvider {
         let provider_id = self.provider_id.clone();
         let handle = Handle::current();
 
-        // Connect + walk the tree on a blocking thread (the walk is serial — one
-        // listing per folder over the wire). A shared counter lets us tick live
-        // "finding N files…" progress while it runs, so a big tree isn't a silent
-        // stall.
+        // Connect on a blocking thread (block_on), then walk the tree in parallel.
         progress(ScanProgress::Discovering { found: 0 });
-        let discovered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let walk = tokio::task::spawn_blocking({
+        let fs = tokio::task::spawn_blocking({
             let config = config.clone();
             let handle = handle.clone();
-            let discovered = discovered.clone();
-            move || -> anyhow::Result<(SmbFs, Vec<musicata_core::DiscoveredAudioFile>, _)> {
-                let fs = SmbFs::connect(config, handle)?;
-                let root = fs.root().to_path_buf();
-                let (files, errors) = discover_audio_files(&fs, &root, &mut |update| {
-                    if let ScanProgress::Discovering { found } = update {
-                        discovered.store(found, Ordering::Relaxed);
-                    }
-                })
-                .map_err(|error| anyhow!(error.to_string()))?;
-                Ok((fs, files, errors))
-            }
-        });
-        tokio::pin!(walk);
-        let (fs, files, walk_errors) = loop {
-            tokio::select! {
-                result = &mut walk => break result??,
-                _ = tokio::time::sleep(Duration::from_millis(400)) => {
-                    progress(ScanProgress::Discovering {
-                        found: discovered.load(Ordering::Relaxed),
-                    });
-                }
-            }
-        };
-
-        let total = files.len();
-        progress(ScanProgress::Discovered { files: total });
+            move || SmbFs::connect(config, handle)
+        })
+        .await??;
 
         let root = fs.root().to_path_buf();
         let observed_at = current_unix_seconds();
         let index = Arc::new(PriorIndex::from_library(prior.as_deref(), &provider_id));
+        let fs = Arc::new(fs);
+
+        // Each phase gets its own adaptive limiter: directory listings and tag reads
+        // have very different latencies, so sharing one would let the fast walk poison
+        // the read phase's latency baseline (making every read look "slow" and pinning
+        // concurrency). Both still share the io-error counter.
+        let walk_limiter = AdaptiveLimiter::new(
+            INITIAL_CONCURRENCY,
+            MIN_CONCURRENCY,
+            MAX_CONCURRENCY,
+            fs.io_errors(),
+        );
+
+        // Parallel directory walk: list directories concurrently (one round-trip
+        // each), level by level, instead of one-at-a-time.
+        let (mut files, walk_errors) =
+            parallel_walk(fs.clone(), root.clone(), walk_limiter, &mut progress).await;
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let total = files.len();
+        progress(ScanProgress::Discovered { files: total });
+
         let limiter = AdaptiveLimiter::new(
             INITIAL_CONCURRENCY,
             MIN_CONCURRENCY,
             MAX_CONCURRENCY,
             fs.io_errors(),
         );
-        let fs = Arc::new(fs);
-
         let scan_start = Instant::now();
         let mut last_report = Instant::now();
         let mut built: Vec<BuiltTrack> = Vec::with_capacity(total);

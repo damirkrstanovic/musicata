@@ -1462,6 +1462,55 @@ struct ArtistBuilder {
     track_count: usize,
 }
 
+/// The audio files and subdirectories found in one directory (non-recursive).
+#[derive(Default)]
+pub struct DirListing {
+    pub files: Vec<DiscoveredAudioFile>,
+    pub subdirs: Vec<PathBuf>,
+    pub issues: Vec<ScanIssue>,
+}
+
+/// List one directory: classify its entries into audio files (hashing small ones)
+/// and subdirectories. A read error becomes an issue rather than failing. Used by
+/// both the sequential walk and the SMB parallel walk (so each does one round-trip
+/// per directory and shares the classification logic).
+pub fn list_dir_audio(fs: &dyn SourceFs, dir: &Path) -> DirListing {
+    let mut listing = DirListing::default();
+    let entries = match fs.read_dir(dir) {
+        Ok(entries) => entries,
+        Err(source) => {
+            listing.issues.push(ScanIssue {
+                path: dir.display().to_string(),
+                message: source.to_string(),
+            });
+            return listing;
+        }
+    };
+    for entry in entries {
+        if entry.is_dir {
+            listing.subdirs.push(entry.path);
+        } else if entry.is_file && has_extension(&entry.path, AUDIO_EXTENSIONS) {
+            let content_hash = match hash_file_contents_if_small(fs, &entry.path, entry.size) {
+                Ok(hash) => hash,
+                Err(source) => {
+                    listing.issues.push(ScanIssue {
+                        path: entry.path.display().to_string(),
+                        message: source.to_string(),
+                    });
+                    None
+                }
+            };
+            listing.files.push(DiscoveredAudioFile {
+                path: entry.path,
+                file_size_bytes: entry.size,
+                modified_at_unix_seconds: entry.modified_at_unix_seconds,
+                content_hash,
+            });
+        }
+    }
+    listing
+}
+
 fn collect_audio_files(
     fs: &dyn SourceFs,
     dir: &Path,
@@ -1470,52 +1519,23 @@ fn collect_audio_files(
     required: bool,
     progress: &mut dyn FnMut(ScanProgress),
 ) -> Result<(), ScanError> {
-    let entries = match fs.read_dir(dir) {
-        Ok(entries) => entries,
-        Err(source) if required => {
-            return Err(ScanError::Io {
-                path: dir.to_path_buf(),
-                source,
-            });
-        }
-        Err(source) => {
-            scan_errors.push(ScanIssue {
-                path: dir.display().to_string(),
-                message: source.to_string(),
-            });
-            return Ok(());
-        }
-    };
-
-    for entry in entries {
-        let path = entry.path;
-
-        if entry.is_dir {
-            collect_audio_files(fs, &path, files, scan_errors, false, progress)?;
-        } else if entry.is_file && has_extension(&path, AUDIO_EXTENSIONS) {
-            let content_hash = match hash_file_contents_if_small(fs, &path, entry.size) {
-                Ok(hash) => hash,
-                Err(source) => {
-                    scan_errors.push(ScanIssue {
-                        path: path.display().to_string(),
-                        message: source.to_string(),
-                    });
-                    None
-                }
-            };
-            files.push(DiscoveredAudioFile {
-                path,
-                file_size_bytes: entry.size,
-                modified_at_unix_seconds: entry.modified_at_unix_seconds,
-                content_hash,
-            });
-            // Periodic discovery progress so a slow network walk shows life.
-            if files.len() % 200 == 0 {
-                progress(ScanProgress::Discovering { found: files.len() });
-            }
-        }
+    // A read failure on the required root is fatal; deeper failures are issues.
+    if required && let Err(source) = fs.read_dir(dir) {
+        return Err(ScanError::Io {
+            path: dir.to_path_buf(),
+            source,
+        });
     }
 
+    let mut listing = list_dir_audio(fs, dir);
+    files.append(&mut listing.files);
+    scan_errors.append(&mut listing.issues);
+    // Periodic discovery progress so a slow network walk shows life.
+    progress(ScanProgress::Discovering { found: files.len() });
+
+    for subdir in listing.subdirs {
+        collect_audio_files(fs, &subdir, files, scan_errors, false, progress)?;
+    }
     Ok(())
 }
 
