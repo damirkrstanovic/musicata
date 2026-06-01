@@ -1,4 +1,5 @@
 mod activity;
+mod artwork;
 mod mpd;
 mod musicbrainz;
 mod players;
@@ -78,6 +79,9 @@ struct AppState {
     playback_sessions: Arc<RwLock<BTreeMap<String, PlaybackSession>>>,
     next_playback_session: Arc<AtomicU64>,
     subsonic: subsonic::SubsonicAuth,
+    // Read only by network-backed providers (SMB) today; local disk serves directly.
+    #[cfg_attr(not(feature = "provider-smb"), allow(dead_code))]
+    artwork_cache: Arc<artwork::ArtworkCache>,
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +227,15 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Cache fetched cover art next to the database (e.g. `.musicata/artwork/`).
+    let artwork_cache = Arc::new(artwork::ArtworkCache::new(
+        config
+            .database
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("artwork"),
+    ));
+
     tracing::info!("listening on http://{}", config.addr);
     axum::serve(
         listener,
@@ -233,6 +246,7 @@ async fn main() -> Result<()> {
             activity,
             rescan_lock,
             subsonic_auth,
+            artwork_cache,
         ),
     )
     .await
@@ -667,6 +681,7 @@ fn app(
     activity: Arc<activity::ActivityLog>,
     rescan_lock: Arc<Mutex<()>>,
     subsonic_auth: subsonic::SubsonicAuth,
+    artwork_cache: Arc<artwork::ArtworkCache>,
 ) -> Router {
     Router::new()
         .merge(subsonic::routes())
@@ -788,6 +803,7 @@ fn app(
             playback_sessions: Arc::new(RwLock::new(BTreeMap::new())),
             next_playback_session: Arc::new(AtomicU64::new(1)),
             subsonic: subsonic_auth,
+            artwork_cache,
         })
 }
 
@@ -2725,17 +2741,26 @@ async fn album_artwork(
             && let Some(providers::ProviderHandle::Smb(smb)) =
                 state.providers.read().await.get(&provider_id)
         {
-            let item_id = path.to_string_lossy().into_owned();
-            let etag = format!("\"{}\"", artwork_asset_id(&path));
+            let key = artwork_asset_id(&path);
+            let extension = artwork_extension(&path);
+            let etag = format!("\"{key}\"");
             if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
                 return artwork_not_modified(&etag);
             }
+            // Serve the cached copy if we've fetched this cover before; otherwise fetch
+            // it over the wire once, cache it, and serve. Caching keeps the network off
+            // the per-request hot path and lets covers show even when the share is down.
+            if let Some(bytes) = state.artwork_cache.get(&key, extension).await {
+                return artwork_response(bytes, extension, etag);
+            }
             // A missing/unreadable cover on the share is "no artwork" (404 → the UI
             // shows its monogram fallback), never a 500.
+            let item_id = path.to_string_lossy().into_owned();
             let bytes = smb.read_file(&item_id).await.map_err(|error| {
                 AppError::not_found(format!("album artwork unavailable: {error}"))
             })?;
-            return artwork_response(bytes, artwork_extension(&path), etag);
+            state.artwork_cache.put(&key, extension, &bytes).await;
+            return artwork_response(bytes, extension, etag);
         }
     }
 
@@ -5238,6 +5263,7 @@ mod tests {
                     user: "u".to_string(),
                     password: Some("p".to_string()),
                 },
+                std::sync::Arc::new(crate::artwork::ArtworkCache::new(self.root.join("artwork"))),
             )
         }
 
