@@ -44,6 +44,19 @@ const INITIAL_CONCURRENCY: usize = 10;
 const MIN_CONCURRENCY: usize = 4;
 const MAX_CONCURRENCY: usize = 50;
 
+/// Number of independent SMB connections to open per share for scanning. One
+/// connection caps read throughput; a few scale it on a capable NAS. Overridable
+/// via `MUSICATA_SMB_CONNECTIONS` (mainly for tuning/benchmarking).
+const DEFAULT_SMB_CONNECTIONS: usize = 4;
+
+fn smb_pool_size() -> usize {
+    std::env::var("MUSICATA_SMB_CONNECTIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SMB_CONNECTIONS)
+        .clamp(1, 16)
+}
+
 /// Current unix time in seconds (mirrors core's private helper; used as the scan's
 /// observation timestamp).
 fn current_unix_seconds() -> i64 {
@@ -465,7 +478,11 @@ impl SmbProvider {
 /// drives the async client via `Handle::block_on`; this is only valid on a
 /// blocking thread (the scanner runs under `spawn_blocking`).
 struct SmbFs {
-    client: Arc<Client>,
+    /// A pool of independent connections to the share; scan reads are spread across
+    /// them round-robin. A single connection caps throughput (~one in-flight stream
+    /// of completions); several connections scale it on a capable NAS.
+    clients: Vec<Arc<Client>>,
+    next: std::sync::atomic::AtomicUsize,
     config: SmbConfig,
     handle: Handle,
     /// Logical root for the scanner; SMB items hang off "/".
@@ -477,15 +494,34 @@ struct SmbFs {
 
 impl SmbFs {
     fn connect(config: SmbConfig, handle: Handle) -> anyhow::Result<Self> {
-        let client = new_client();
-        handle.block_on(connect_share(&client, &config))?;
+        let pool_size = smb_pool_size();
+        let mut clients = Vec::with_capacity(pool_size);
+        for index in 0..pool_size {
+            let client = new_client();
+            match handle.block_on(connect_share(&client, &config)) {
+                Ok(()) => clients.push(client),
+                // The first connection must succeed; spares failing is non-fatal.
+                Err(error) if index == 0 => return Err(error),
+                Err(error) => {
+                    tracing::warn!(%error, "extra SMB connection failed; continuing with fewer");
+                    break;
+                }
+            }
+        }
         Ok(Self {
-            client,
+            clients,
+            next: std::sync::atomic::AtomicUsize::new(0),
             config,
             handle,
             root: PathBuf::from("/"),
             io_errors: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Pick the next pooled connection, round-robin.
+    fn client(&self) -> &Arc<Client> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        &self.clients[index]
     }
 
     /// Translate a logical scanner path (under `root`) to its share UNC path.
@@ -517,7 +553,7 @@ impl SmbFs {
         let unc = self.unc(logical).map_err(io::Error::other)?;
         let resource = self
             .handle
-            .block_on(self.client.create_file(&unc, &open_read_args()))
+            .block_on(self.client().create_file(&unc, &open_read_args()))
             .map_err(|error| self.io_err(error))?;
         Ok(resource.unwrap_file())
     }
@@ -528,7 +564,7 @@ impl SourceFs for SmbFs {
         let unc = self.unc(dir).map_err(io::Error::other)?;
         self.handle.block_on(async {
             let resource = self
-                .client
+                .client()
                 .create_file(&unc, &open_read_args())
                 .await
                 .map_err(|error| self.io_err(error))?;
@@ -581,7 +617,7 @@ impl SourceFs for SmbFs {
         let unc = self.unc(path).map_err(io::Error::other)?;
         self.handle.block_on(async {
             let resource = self
-                .client
+                .client()
                 .create_file(&unc, &open_read_args())
                 .await
                 .map_err(|error| self.io_err(error))?;
