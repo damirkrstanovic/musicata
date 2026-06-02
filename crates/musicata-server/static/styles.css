@@ -403,6 +403,12 @@ h1 {
   border-top: 1px solid var(--line);
 }
 
+/* Bottom marker each infinite-scroll list watches; reaching it pulls the next page. */
+.scroll-sentinel {
+  height: 1px;
+  pointer-events: none;
+}
+
 .track {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;

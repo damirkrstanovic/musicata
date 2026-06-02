@@ -132,6 +132,10 @@ async function main() {
     const sid = attach.sessionId;
     await send("Runtime.enable", {}, sid);
     await send("Page.enable", {}, sid);
+    // A CDP-created tab has no fixed layout viewport, so `100vh` resolves to the content
+    // height and the app's internal scrollers (the .content panel, the sidebar) never
+    // engage — breaking scroll-driven behavior like infinite scroll. Pin a real viewport.
+    await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false }, sid);
     await send("Page.navigate", { url: base + "/" }, sid);
     const ev = makeEv(sid);
     // Fire an action without waiting for its returned promise (e.g. playTrack/
@@ -159,7 +163,7 @@ async function main() {
       mark: (name) => ev(`window.__push('FLOW', { name: ${JSON.stringify(name)} })`),
       fire,
       log: (m) => { beat(`${label}: ${m}`); if (process.env.UI_VERBOSE) process.stderr.write(`  … ${m}\n`); },
-      budgets: CFG.budgets, loadMs,
+      budgets: CFG.budgets, loadMs, base,
     };
     const results = await flowsFn(ctx);
     try { await send("Target.closeTarget", { targetId: target.targetId }); } catch {}

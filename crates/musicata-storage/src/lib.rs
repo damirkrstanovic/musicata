@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, BrowseTextFacet, BrowseYearFacet, Library,
-    LibrarySummary, MetadataApprovalState, MetadataFieldValue, Playlist, ProviderMapping,
-    RadioStation, ScanIssue, SearchResults, Track, TrackMetadataFieldObservation,
-    TrackMetadataObservation, Zone,
+    LibrarySummary, MetadataApprovalState, MetadataFieldValue, PlaybackStatus, Playlist,
+    ProviderMapping, QueueItem, RadioStation, RepeatMode, ScanIssue, SearchResults, Track,
+    TrackMetadataFieldObservation, TrackMetadataObservation, Zone,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -195,6 +195,13 @@ impl Database {
                 sqlx::query(statement).execute(&self.pool).await?;
             }
             set_user_version(&self.pool, 16).await?;
+        }
+
+        if version < 17 {
+            for statement in MIGRATION_017_PLAYER_QUEUE {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 17).await?;
         }
 
         Ok(())
@@ -752,19 +759,24 @@ impl Database {
     /// ranked best-match-first and capped at `limit` per entity type. Tracks are
     /// returned without their observation provenance (`observed_metadata` is empty);
     /// clients needing that fetch the track or album detail.
-    pub async fn search(&self, query: &str, limit: usize) -> Result<SearchResults> {
+    /// Full-text search across artists, albums, and tracks. `limit`/`offset` page each
+    /// result set identically (artists/albums are short, so later pages there just
+    /// return empty while tracks keep coming — the UI infinite-scrolls tracks).
+    pub async fn search(&self, query: &str, limit: usize, offset: usize) -> Result<SearchResults> {
         let Some(match_query) = fts_match_query(query) else {
             return Ok(SearchResults::default());
         };
         let limit = limit as i64;
+        let offset = offset as i64;
 
         let artist_rows = sqlx::query(
             "SELECT a.id, a.name, a.album_count, a.track_count
              FROM artists_fts f JOIN artists a ON a.rowid = f.rowid
-             WHERE artists_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+             WHERE artists_fts MATCH ?1 ORDER BY rank LIMIT ?2 OFFSET ?3",
         )
         .bind(&match_query)
         .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
         let mut artists = Vec::with_capacity(artist_rows.len());
@@ -780,10 +792,11 @@ impl Database {
         let album_rows = sqlx::query(
             "SELECT a.id, a.title, a.artist_id, a.artist_name, a.year, a.track_count, a.artwork_url, a.artwork_path
              FROM albums_fts f JOIN albums a ON a.rowid = f.rowid
-             WHERE albums_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+             WHERE albums_fts MATCH ?1 ORDER BY rank LIMIT ?2 OFFSET ?3",
         )
         .bind(&match_query)
         .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
         let mut albums = Vec::with_capacity(album_rows.len());
@@ -808,10 +821,11 @@ impl Database {
                     t.file_size_bytes, t.modified_at_unix_seconds, t.content_hash, t.relative_path,
                     t.stream_url, t.added_at_unix_seconds, t.duration_seconds, t.path
              FROM tracks_fts f JOIN tracks t ON t.rowid = f.rowid
-             WHERE tracks_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+             WHERE tracks_fts MATCH ?1 ORDER BY rank LIMIT ?2 OFFSET ?3",
         )
         .bind(&match_query)
         .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
         let mut tracks = Vec::with_capacity(track_rows.len());
@@ -927,6 +941,78 @@ impl Database {
             album_order_clause(sort)
         );
         let rows = sqlx::query(&sql)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut albums = Vec::with_capacity(rows.len());
+        for row in rows {
+            albums.push(album_from_row(&row)?);
+        }
+        Ok((albums, total))
+    }
+
+    /// Like [`list_albums`], but restricted to albums that have at least one track
+    /// matching the browse filter — so browsing by genre/year/composer/folder narrows
+    /// the album grid the same way it narrows the track list. Same filter semantics as
+    /// [`list_tracks`] (genre/composer match any observation's JSON array; folder
+    /// matches a folder or any nested one).
+    pub async fn list_albums_filtered(
+        &self,
+        filter: &BrowseFilter,
+        sort: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Album>, usize)> {
+        let year = filter.year.map(i64::from);
+        let genre = filter
+            .genre
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let composer = filter
+            .composer
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let folder_prefix = filter
+            .folder
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|folder| format!("{}/", folder.trim_end_matches('/')));
+
+        // An album is in the result iff it has a track matching the filter.
+        const MATCH: &str = "EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id
+             AND (?1 IS NULL OR t.year = ?1)
+             AND (?2 IS NULL OR EXISTS (SELECT 1 FROM track_metadata_observations o, json_each(o.genres)
+                  WHERE o.track_id = t.id AND json_each.value = ?2 COLLATE NOCASE))
+             AND (?3 IS NULL OR EXISTS (SELECT 1 FROM track_metadata_observations o, json_each(o.composers)
+                  WHERE o.track_id = t.id AND json_each.value = ?3 COLLATE NOCASE))
+             AND (?4 IS NULL OR substr(t.relative_path, 1, length(?4)) = ?4))";
+
+        let count_sql = format!("SELECT COUNT(*) AS n FROM albums a WHERE {MATCH}");
+        let total = i64_to_usize(
+            sqlx::query(&count_sql)
+                .bind(year)
+                .bind(genre)
+                .bind(composer)
+                .bind(&folder_prefix)
+                .fetch_one(&self.pool)
+                .await?
+                .try_get("n")?,
+            "total",
+        )?;
+
+        let sql = format!(
+            "SELECT {ALBUM_COLUMNS} FROM albums a WHERE {MATCH} ORDER BY {} LIMIT ?5 OFFSET ?6",
+            album_order_clause(sort)
+        );
+        let rows = sqlx::query(&sql)
+            .bind(year)
+            .bind(genre)
+            .bind(composer)
+            .bind(&folder_prefix)
             .bind(limit)
             .bind(offset)
             .fetch_all(&self.pool)
@@ -1269,11 +1355,161 @@ impl Database {
     }
 
     pub async fn delete_player(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM player_queue_items WHERE player_id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM player_queue WHERE player_id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         sqlx::query("DELETE FROM players WHERE id = ?1")
             .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    // ---- Server-owned playback queue (persisted, one per player) -------------
+
+    /// Persist only the lightweight playback row (status/position/elapsed/volume/
+    /// repeat/shuffle) without touching the queue items. Cheap enough to call on
+    /// every playback change and (throttled) on position updates.
+    pub async fn save_player_playback(
+        &self,
+        player_id: &str,
+        playback: &PlayerPlayback,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO player_queue
+                (player_id, status, position, elapsed_seconds, volume, repeat, shuffle, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(player_id) DO UPDATE SET
+                status = ?2, position = ?3, elapsed_seconds = ?4, volume = ?5,
+                repeat = ?6, shuffle = ?7, updated_at = ?8",
+        )
+        .bind(player_id)
+        .bind(playback_status_str(playback.status))
+        .bind(playback.position.map(|p| p as i64))
+        .bind(playback.elapsed_seconds)
+        .bind(playback.volume.map(|v| v as i64))
+        .bind(repeat_mode_str(playback.repeat))
+        .bind(playback.shuffle as i64)
+        .bind(now_unix_seconds())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Replace the player's queue items (in order) and the playback row in one
+    /// transaction. Use when the queue itself changes; otherwise prefer the
+    /// cheaper [`save_player_playback`].
+    pub async fn save_player_queue(
+        &self,
+        player_id: &str,
+        playback: &PlayerPlayback,
+        items: &[QueueItem],
+    ) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let result = async {
+            sqlx::query("DELETE FROM player_queue_items WHERE player_id = ?1")
+                .bind(player_id)
+                .execute(&mut *conn)
+                .await?;
+            for (seq, item) in items.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO player_queue_items
+                        (player_id, seq, track_id, title, artist, album, stream_url, artwork_url)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )
+                .bind(player_id)
+                .bind(seq as i64)
+                .bind(&item.track_id)
+                .bind(&item.title)
+                .bind(&item.artist)
+                .bind(&item.album)
+                .bind(&item.stream_url)
+                .bind(&item.artwork_url)
+                .execute(&mut *conn)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT INTO player_queue
+                    (player_id, status, position, elapsed_seconds, volume, repeat, shuffle, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(player_id) DO UPDATE SET
+                    status = ?2, position = ?3, elapsed_seconds = ?4, volume = ?5,
+                    repeat = ?6, shuffle = ?7, updated_at = ?8",
+            )
+            .bind(player_id)
+            .bind(playback_status_str(playback.status))
+            .bind(playback.position.map(|p| p as i64))
+            .bind(playback.elapsed_seconds)
+            .bind(playback.volume.map(|v| v as i64))
+            .bind(repeat_mode_str(playback.repeat))
+            .bind(playback.shuffle as i64)
+            .bind(now_unix_seconds())
+            .execute(&mut *conn)
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Load a player's persisted queue, or `None` if it has never had one saved.
+    pub async fn load_player_queue(&self, player_id: &str) -> Result<Option<PlayerQueueSnapshot>> {
+        let Some(row) = sqlx::query(
+            "SELECT status, position, elapsed_seconds, volume, repeat, shuffle
+             FROM player_queue WHERE player_id = ?1",
+        )
+        .bind(player_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let playback = PlayerPlayback {
+            status: playback_status_from_str(&row.try_get::<String, _>("status")?),
+            position: row
+                .try_get::<Option<i64>, _>("position")?
+                .map(|p| p as usize),
+            elapsed_seconds: row.try_get("elapsed_seconds")?,
+            volume: row.try_get::<Option<i64>, _>("volume")?.map(|v| v as u8),
+            repeat: repeat_mode_from_str(&row.try_get::<String, _>("repeat")?),
+            shuffle: row.try_get::<i64, _>("shuffle")? != 0,
+        };
+        let item_rows = sqlx::query(
+            "SELECT track_id, title, artist, album, stream_url, artwork_url
+             FROM player_queue_items WHERE player_id = ?1 ORDER BY seq",
+        )
+        .bind(player_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let items = item_rows
+            .iter()
+            .map(|row| {
+                Ok(QueueItem {
+                    track_id: row.try_get("track_id")?,
+                    title: row.try_get("title")?,
+                    artist: row.try_get("artist")?,
+                    album: row.try_get("album")?,
+                    stream_url: row.try_get("stream_url")?,
+                    artwork_url: row.try_get("artwork_url")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(PlayerQueueSnapshot { playback, items }))
     }
 
     pub async fn list_zones(&self) -> Result<Vec<Zone>> {
@@ -1838,6 +2074,57 @@ fn player_record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PlayerRecord>
         name: row.try_get("name")?,
         zone_id: row.try_get("zone_id")?,
     })
+}
+
+/// The lightweight, persisted playback row for a player's server-owned queue —
+/// everything except the queue items themselves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlayerPlayback {
+    pub status: PlaybackStatus,
+    pub position: Option<usize>,
+    pub elapsed_seconds: Option<f64>,
+    pub volume: Option<u8>,
+    pub repeat: RepeatMode,
+    pub shuffle: bool,
+}
+
+/// A player's full persisted queue: the playback row plus the ordered items.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlayerQueueSnapshot {
+    pub playback: PlayerPlayback,
+    pub items: Vec<QueueItem>,
+}
+
+fn playback_status_str(status: PlaybackStatus) -> &'static str {
+    match status {
+        PlaybackStatus::Stopped => "stopped",
+        PlaybackStatus::Playing => "playing",
+        PlaybackStatus::Paused => "paused",
+    }
+}
+
+fn playback_status_from_str(value: &str) -> PlaybackStatus {
+    match value {
+        "playing" => PlaybackStatus::Playing,
+        "paused" => PlaybackStatus::Paused,
+        _ => PlaybackStatus::Stopped,
+    }
+}
+
+fn repeat_mode_str(mode: RepeatMode) -> &'static str {
+    match mode {
+        RepeatMode::Off => "off",
+        RepeatMode::All => "all",
+        RepeatMode::One => "one",
+    }
+}
+
+fn repeat_mode_from_str(value: &str) -> RepeatMode {
+    match value {
+        "all" => RepeatMode::All,
+        "one" => RepeatMode::One,
+        _ => RepeatMode::Off,
+    }
 }
 
 const ALBUM_COLUMNS: &str =
@@ -2561,6 +2848,35 @@ const MIGRATION_010_PLAYERS_AND_ZONES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_players_zone_id ON players(zone_id)",
 ];
 
+// Server-owned persistent playback queue, one queue per player. `player_queue`
+// holds the lightweight playback row (status/position/elapsed/volume/repeat/
+// shuffle) updated frequently; `player_queue_items` holds the ordered queue and
+// is rewritten only when the queue itself changes. On restart the manager reloads
+// these so a queue survives a server restart (not just a page refresh).
+const MIGRATION_017_PLAYER_QUEUE: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS player_queue (
+        player_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        position INTEGER,
+        elapsed_seconds REAL,
+        volume INTEGER,
+        repeat TEXT NOT NULL,
+        shuffle INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS player_queue_items (
+        player_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        track_id TEXT,
+        title TEXT NOT NULL,
+        artist TEXT NOT NULL,
+        album TEXT NOT NULL,
+        stream_url TEXT NOT NULL,
+        artwork_url TEXT,
+        PRIMARY KEY (player_id, seq)
+    )",
+];
+
 // Listening history. One row per confirmed listen (a track that played past the
 // ListenBrainz threshold — see `players::ListenTracker`). `listened_at` is when the
 // track *started*, so ordering by it reflects when each play began. We keep the raw
@@ -2934,13 +3250,13 @@ mod tests {
             .await
             .expect("save library");
 
-        let by_track = database.search("song", 50).await.expect("search");
+        let by_track = database.search("song", 50, 0).await.expect("search");
         assert!(by_track.tracks.iter().any(|track| track.title == "Song"));
 
-        let by_album = database.search("album", 50).await.expect("search");
+        let by_album = database.search("album", 50, 0).await.expect("search");
         assert!(by_album.albums.iter().any(|album| album.title == "Album"));
 
-        let by_artist = database.search("artist", 50).await.expect("search");
+        let by_artist = database.search("artist", 50, 0).await.expect("search");
         assert!(
             by_artist
                 .artists
@@ -2961,7 +3277,7 @@ mod tests {
             .await
             .expect("save library");
 
-        let results = database.search("   ", 50).await.expect("search");
+        let results = database.search("   ", 50, 0).await.expect("search");
         assert!(results.artists.is_empty());
         assert!(results.albums.is_empty());
         assert!(results.tracks.is_empty());
@@ -2982,7 +3298,7 @@ mod tests {
             .expect("save library");
 
         for query in ["motorhead", "MOTÖRHEAD", "Motorhead"] {
-            let results = database.search(query, 50).await.expect("search");
+            let results = database.search(query, 50, 0).await.expect("search");
             assert!(
                 results
                     .artists
@@ -3006,7 +3322,7 @@ mod tests {
             .expect("save library");
 
         // A partial token still matches via prefix, supporting type-ahead.
-        let results = database.search("alb", 50).await.expect("search");
+        let results = database.search("alb", 50, 0).await.expect("search");
         assert!(results.albums.iter().any(|album| album.title == "Album"));
 
         let _ = std::fs::remove_file(db_path);
@@ -3035,7 +3351,7 @@ mod tests {
         .await
         .expect("insert track");
 
-        let results = database.search("zephyr", 50).await.expect("search");
+        let results = database.search("zephyr", 50, 0).await.expect("search");
         assert!(
             results
                 .tracks
@@ -3424,6 +3740,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_albums_filtered_narrows_to_albums_with_matching_tracks() {
+        let db_path = temp_db_path("albums-filtered");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+
+        // The fixture's one track is genre "Dub", so its album is in the dub result.
+        let dub = BrowseFilter {
+            genre: Some("dub".to_string()),
+            ..BrowseFilter::default()
+        };
+        let (albums, total) = database
+            .list_albums_filtered(&dub, None, -1, 0)
+            .await
+            .expect("list albums");
+        assert_eq!(total, 1);
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].id, library.albums[0].id);
+
+        // A genre no track has yields no albums (not the whole library).
+        let jazz = BrowseFilter {
+            genre: Some("jazz".to_string()),
+            ..BrowseFilter::default()
+        };
+        let (albums, total) = database
+            .list_albums_filtered(&jazz, None, -1, 0)
+            .await
+            .expect("list albums");
+        assert_eq!(total, 0);
+        assert!(albums.is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn persists_players_and_zones() {
         let db_path = temp_db_path("players-zones");
         let database = Database::connect(&db_path).await.expect("connect database");
@@ -3691,5 +4045,97 @@ mod tests {
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!("musicata-storage-{name}-{unique}.db"))
+    }
+
+    #[tokio::test]
+    async fn saves_and_loads_a_player_queue() {
+        use musicata_core::{PlaybackStatus, QueueItem, RepeatMode};
+
+        let db_path = temp_db_path("player-queue");
+        let database = Database::connect(&db_path).await.expect("connect");
+
+        // No queue persisted yet.
+        assert!(
+            database
+                .load_player_queue("p1")
+                .await
+                .expect("load")
+                .is_none()
+        );
+
+        let items = vec![
+            QueueItem {
+                track_id: Some("track_1".to_string()),
+                title: "One".to_string(),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                stream_url: "/api/tracks/track_1/stream".to_string(),
+                artwork_url: Some("/api/albums/a/cover".to_string()),
+            },
+            QueueItem {
+                track_id: None,
+                title: "Stream".to_string(),
+                artist: String::new(),
+                album: String::new(),
+                stream_url: "http://radio.example/stream".to_string(),
+                artwork_url: None,
+            },
+        ];
+        let playback = super::PlayerPlayback {
+            status: PlaybackStatus::Playing,
+            position: Some(1),
+            elapsed_seconds: Some(42.5),
+            volume: Some(70),
+            repeat: RepeatMode::All,
+            shuffle: true,
+        };
+        database
+            .save_player_queue("p1", &playback, &items)
+            .await
+            .expect("save queue");
+
+        let loaded = database
+            .load_player_queue("p1")
+            .await
+            .expect("load")
+            .expect("queue present");
+        assert_eq!(loaded.playback, playback);
+        assert_eq!(loaded.items, items);
+
+        // A playback-only save updates the row but leaves the items intact.
+        let moved = super::PlayerPlayback {
+            status: PlaybackStatus::Paused,
+            position: Some(0),
+            elapsed_seconds: Some(0.0),
+            ..playback.clone()
+        };
+        database
+            .save_player_playback("p1", &moved)
+            .await
+            .expect("save playback");
+        let loaded = database
+            .load_player_queue("p1")
+            .await
+            .expect("load")
+            .expect("queue present");
+        assert_eq!(loaded.playback, moved);
+        assert_eq!(
+            loaded.items, items,
+            "items unchanged by a playback-only save"
+        );
+
+        // Shrinking the queue must not leave stale rows behind.
+        database
+            .save_player_queue("p1", &moved, &items[..1])
+            .await
+            .expect("save shorter queue");
+        let loaded = database
+            .load_player_queue("p1")
+            .await
+            .expect("load")
+            .expect("queue present");
+        assert_eq!(loaded.items.len(), 1);
+
+        let _ = std::fs::remove_file(db_path);
     }
 }

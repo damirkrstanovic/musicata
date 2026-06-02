@@ -201,8 +201,18 @@ Tasks:
   from the web UI), persisted in SQLite, and survive restarts.
 - [x] Add zone model — named groups of players used as a control target (a command
   sent to a zone applies to its players). No audio synchronization yet.
-- Add queue model per player/zone. (MPD's own queue is currently driven directly;
-  a server-owned persistent queue is still to come.)
+- [x] Add queue model per player/zone. The **browser player** owns a persistent
+  server-side queue: queue items + playback row (status/position/elapsed/volume/
+  repeat/shuffle) persist to SQLite (migration v17, two tables: `player_queue` +
+  `player_queue_items`) and reload on startup, so a queue survives a server restart,
+  not just a page refresh. A restored queue comes back **paused at its saved
+  position** (no output tab renders audio at startup, so we never silently
+  auto-resume). Queue-mutating commands rewrite both tables; playback-only commands
+  update just the cheap single row; in-track elapsed is persisted from progress ticks
+  throttled to once / 10 s rather than every ~1 Hz tick. **MPD** still drives its own
+  queue directly (MPD persists it independently); making the server the source of
+  truth for MPD's queue is a larger rework left for later. Per-*zone* queues are also
+  future — zones still fan a command out to member players.
 - [x] Add commands: play, pause, stop, seek, next, previous, enqueue, clear,
   shuffle, repeat. (Reorder still to do.)
 - [x] Add WebSocket state updates for controllers.
@@ -267,7 +277,7 @@ Player UX:
 Done when:
 
 - Two browser tabs stay synchronized as controllers.
-- A queue survives page refresh.
+- A queue survives page refresh (and, for the browser player, a server restart).
 - Playback commands go through the server API rather than local UI-only state.
 
 ## Milestone 6: Web Controller Upgrade
@@ -299,10 +309,25 @@ Tasks:
   description/categories/display_override, so the app is installable; the icon is
   served and precached by the service worker. Initial and history loads show a
   shimmer skeleton (respecting `prefers-reduced-motion`).
-- [x] Add virtualized lists for large libraries. Rather than a JS windowing library,
-  track rows use `content-visibility: auto` with `contain-intrinsic-size`, so the
-  browser skips layout/paint for off-screen rows. Revisit a true virtualizer only if
-  this proves insufficient at very large library sizes.
+- [x] Add virtualized lists for large libraries. Two layers: (1) track rows use
+  `content-visibility: auto` with `contain-intrinsic-size`, so the browser skips
+  layout/paint for off-screen rows; (2) **incremental (infinite-scroll) loading** so
+  the app never pulls or builds the whole library up front. The old `loadLibrary` eager-
+  loaded *every* track (~8.3 MB / ~0.8 s for an 11k-track library, then built 11k DOM
+  rows and fired ~1.3k album-artwork requests) before first paint. Now the center track
+  view, browse-filtered tracks, and search results page in 100 rows at a time via a
+  shared `infiniteScroll` helper (an `IntersectionObserver` on a bottom sentinel pulls
+  the next `/api/tracks?limit&offset` — or `/api/search?…&offset`, added for this —
+  page; stops on a short page; no explicit page UI). The album sidebar keeps full album
+  metadata in memory (small) but renders cards a chunk at a time, killing the artwork
+  storm. Album open now fetches its tracks from `/api/albums/{id}` rather than filtering
+  a full client-side track array. Browsing by genre/year/composer narrows the **album
+  grid** too, not just the track list: `/api/albums` takes the same browse-filter params
+  and (when set) returns only albums with a matching track (`list_albums_filtered`, an
+  `EXISTS` over the tracks join), server-paged like everything else. Latency is asserted
+  by the UI smoke suite's scale phase (windowed initial render, a one-page track fetch
+  vs the old ~8.3 MB, interactive under 3 s, "scrolling appends more rows", and "browse
+  filters the album grid").
 - [x] Visual polish pass on the existing controls. The library search and the browse
   selects now share one lighter, translucent control treatment (no hard border until
   a soft gold focus ring), with small uppercase tracked field labels and custom

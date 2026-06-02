@@ -62,8 +62,15 @@ copy (`scripts/ui-smoke.sh` always builds first).
 
 | Flow | Checks |
 |------|--------|
-| initial load at scale | realistic size, full list rendered, app interactive < 20 s, no console errors |
+| initial load at scale | realistic size, **windowed initial render (≤ 400 rows, not the whole library)**, **tracks load one page not the whole table (≤ 200 KB vs ~8.3 MB eager)**, app interactive < 3 s, no console errors |
+| infinite scroll loads more | scrolling to the end appends the next page of rows |
 | library scroll | no scroll long task > 400 ms |
+| search at scale | server responds < 500 ms, page bounded (≤ 100), returns matches |
+
+The scale phase pins the **incremental-loading** work: the app must not pull or build
+the whole library up front. A fixed layout viewport is set over CDP
+(`Emulation.setDeviceMetricsOverride`) so the app's internal scrollers engage and
+scroll-driven paging behaves as in a real browser.
 
 Budgets live in `run.mjs` (`CFG.budgets`). Most behavior checks are **count-based**
 (deterministic) rather than wall-clock, so they pin the exact regressions — e.g. a

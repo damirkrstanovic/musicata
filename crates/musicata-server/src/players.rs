@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
@@ -24,7 +24,7 @@ use musicata_core::{
     PlaybackState, PlaybackStatus, Player, PlayerCapabilities, PlayerCommand, QueueItem,
     RepeatMode, Zone,
 };
-use musicata_storage::{Database, PlayerRecord};
+use musicata_storage::{Database, PlayerPlayback, PlayerRecord};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
 
@@ -205,7 +205,13 @@ impl PlayerManager {
     /// Bring up the runtime entry for a persisted player record.
     async fn bring_up(&self, record: &PlayerRecord) {
         let (handle, task) = match record.kind.as_str() {
-            "browser" => (PlayerHandle::Browser(Arc::new(BrowserPlayer::new())), None),
+            "browser" => {
+                let player = Arc::new(BrowserPlayer::new(self.database.clone(), record.id.clone()));
+                // Reload any queue persisted before the last shutdown so it survives a
+                // server restart, not just a page refresh.
+                player.restore().await;
+                (PlayerHandle::Browser(player), None)
+            }
             _ => {
                 let player = Arc::new(MpdPlayer::new(record.id.clone(), record.address.clone()));
                 let task = player.clone().spawn_state_task(self.database.clone());
@@ -597,6 +603,10 @@ async fn enrich_state(state: &mut PlaybackState, database: &Database) {
 /// across controllers); a tab acting as output drives its `<audio>` from this
 /// state over the WebSocket and reports progress / track-ended back.
 pub struct BrowserPlayer {
+    /// This player's stable id, used as the persistence key.
+    player_id: String,
+    /// Where the server-owned queue is persisted, so it survives a restart.
+    database: Database,
     state: Mutex<BrowserState>,
     state_tx: broadcast::Sender<PlaybackState>,
     /// Lightweight position ticks. The output tab reports progress ~1×/second; rather
@@ -605,6 +615,21 @@ pub struct BrowserPlayer {
     /// (play/pause, track change, queue edits). Kept separate from `state_tx` so the
     /// listen recorder and MPD's `PlayerHandle::subscribe` path are unaffected.
     progress_tx: broadcast::Sender<ProgressTick>,
+    /// Unix second of the last throttled progress persist. Progress ticks arrive
+    /// ~1×/second; we persist the elapsed position at most once per
+    /// [`PROGRESS_PERSIST_SECS`] rather than writing SQLite every tick.
+    last_progress_persist: AtomicI64,
+}
+
+/// Throttle window for persisting in-track elapsed position from progress ticks.
+const PROGRESS_PERSIST_SECS: i64 = 10;
+
+/// Which slice of the persisted queue a change needs written back.
+enum QueuePersist {
+    /// Only the lightweight playback row changed (play/pause/seek/volume/…).
+    Playback(PlayerPlayback),
+    /// The queue items changed too (enqueue/clear/remove/move/play-tracks).
+    Queue(PlayerPlayback, Vec<QueueItem>),
 }
 
 /// A position-only update for controllers: the current elapsed time and (once known)
@@ -627,14 +652,85 @@ struct BrowserState {
     shuffle: bool,
 }
 
+impl BrowserState {
+    /// The lightweight, persistable playback row (everything but the queue items).
+    fn playback(&self) -> PlayerPlayback {
+        PlayerPlayback {
+            status: self.status,
+            position: self.position,
+            elapsed_seconds: self.elapsed_seconds,
+            volume: self.volume,
+            repeat: self.repeat,
+            shuffle: self.shuffle,
+        }
+    }
+}
+
 impl BrowserPlayer {
-    fn new() -> Self {
+    fn new(database: Database, player_id: String) -> Self {
         let (state_tx, _) = broadcast::channel(32);
         let (progress_tx, _) = broadcast::channel(32);
         Self {
+            player_id,
+            database,
             state: Mutex::new(BrowserState::default()),
             state_tx,
             progress_tx,
+            last_progress_persist: AtomicI64::new(0),
+        }
+    }
+
+    /// Reload the queue persisted before the last shutdown. A queue that was
+    /// `Playing` is restored as `Paused` at its saved position — no output tab is
+    /// rendering audio at startup, so we never silently auto-resume; the user
+    /// presses play and continues where they left off.
+    async fn restore(&self) {
+        let snapshot = match self.database.load_player_queue(&self.player_id).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(player = %self.player_id, %error, "failed to load persisted queue");
+                return;
+            }
+        };
+        let mut state = self.state.lock().await;
+        let playback = snapshot.playback;
+        state.queue = snapshot.items;
+        // Guard against a position that no longer indexes the queue.
+        state.position = playback.position.filter(|&index| index < state.queue.len());
+        state.status = match playback.status {
+            PlaybackStatus::Playing => PlaybackStatus::Paused,
+            other if state.position.is_none() => match other {
+                // A queue we can't point into can't be paused/playing.
+                PlaybackStatus::Paused => PlaybackStatus::Stopped,
+                other => other,
+            },
+            other => other,
+        };
+        state.elapsed_seconds = playback.elapsed_seconds;
+        state.duration_seconds = None;
+        state.volume = playback.volume;
+        state.repeat = playback.repeat;
+        state.shuffle = playback.shuffle;
+    }
+
+    /// Write a queue change back to the database. Failures are logged, never
+    /// propagated — persistence must not break live playback control.
+    async fn persist(&self, persist: QueuePersist) {
+        let result = match &persist {
+            QueuePersist::Playback(playback) => {
+                self.database
+                    .save_player_playback(&self.player_id, playback)
+                    .await
+            }
+            QueuePersist::Queue(playback, items) => {
+                self.database
+                    .save_player_queue(&self.player_id, playback, items)
+                    .await
+            }
+        };
+        if let Err(error) = result {
+            tracing::warn!(player = %self.player_id, %error, "failed to persist player queue");
         }
     }
 
@@ -674,7 +770,18 @@ impl BrowserPlayer {
     }
 
     pub async fn execute(&self, command: PlayerCommand, database: &Database) -> Result<()> {
-        {
+        // Commands that change the queue itself need the item list rewritten;
+        // the rest only touch the lightweight playback row.
+        let mutates_queue = matches!(
+            &command,
+            PlayerCommand::PlayTracks { .. }
+                | PlayerCommand::Enqueue { .. }
+                | PlayerCommand::Clear
+                | PlayerCommand::RemoveQueueItem { .. }
+                | PlayerCommand::MoveQueueItem { .. }
+                | PlayerCommand::PlayStream { .. }
+        );
+        let persist = {
             let mut state = self.state.lock().await;
             match command {
                 PlayerCommand::Play => state.status = PlaybackStatus::Playing,
@@ -749,22 +856,33 @@ impl BrowserPlayer {
                     state.elapsed_seconds = Some(0.0);
                 }
             }
-        }
+            let playback = state.playback();
+            if mutates_queue {
+                QueuePersist::Queue(playback, state.queue.clone())
+            } else {
+                QueuePersist::Playback(playback)
+            }
+        };
         self.broadcast().await;
+        self.persist(persist).await;
         Ok(())
     }
 
     /// The output tab finished the current track: advance (honoring repeat).
     pub async fn track_ended(&self) {
-        {
+        let playback = {
             let mut state = self.state.lock().await;
             if state.repeat == RepeatMode::One {
                 state.elapsed_seconds = Some(0.0);
             } else {
                 advance(&mut state, true);
             }
-        }
+            state.playback()
+        };
         self.broadcast().await;
+        // Advancing only moves the position within the same queue, so the item
+        // list is unchanged — persist just the playback row.
+        self.persist(QueuePersist::Playback(playback)).await;
     }
 
     /// The output tab reports its real playback position and track duration. This
@@ -772,18 +890,30 @@ impl BrowserPlayer {
     /// `PlaybackState` (which would re-send the whole queue every second). The stored
     /// state is still updated so the next full snapshot/refresh reflects the position.
     pub async fn report_progress(&self, elapsed_seconds: f64, duration_seconds: Option<f64>) {
-        let duration = {
+        let (duration, playback) = {
             let mut state = self.state.lock().await;
             state.elapsed_seconds = Some(elapsed_seconds);
             if let Some(duration) = duration_seconds {
                 state.duration_seconds = Some(duration);
             }
-            state.duration_seconds
+            (state.duration_seconds, state.playback())
         };
         let _ = self.progress_tx.send(ProgressTick {
             elapsed_seconds,
             duration_seconds: duration,
         });
+        // Persist the elapsed position so a restart resumes mid-track — but at most
+        // once per PROGRESS_PERSIST_SECS, not on every ~1 Hz tick.
+        let now = now_unix();
+        let last = self.last_progress_persist.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= PROGRESS_PERSIST_SECS
+            && self
+                .last_progress_persist
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.persist(QueuePersist::Playback(playback)).await;
+        }
     }
 }
 
@@ -1069,7 +1199,9 @@ mod tests {
     // re-sends the whole queue every second (the bug that made controls sluggish).
     #[tokio::test]
     async fn report_progress_emits_lightweight_tick_not_full_state() {
-        let player = BrowserPlayer::new();
+        let db_path = temp_db("report-progress");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let player = BrowserPlayer::new(database, BROWSER_PLAYER_ID.to_string());
         let mut states = player.subscribe();
         let mut ticks = player.subscribe_progress();
 
@@ -1085,6 +1217,8 @@ mod tests {
             ),
             "a progress tick must not broadcast a full PlaybackState"
         );
+
+        let _ = std::fs::remove_file(db_path);
     }
 
     // Playing a non-first track must set the queue and start at that position in a
@@ -1097,7 +1231,7 @@ mod tests {
         let mut library = library_with_tracks(5);
         database.save_library(&mut library).await.expect("save");
 
-        let player = BrowserPlayer::new();
+        let player = BrowserPlayer::new(database.clone(), BROWSER_PLAYER_ID.to_string());
         let mut states = player.subscribe();
         player
             .execute(
@@ -1141,7 +1275,7 @@ mod tests {
         let mut library = library_with_tracks(5);
         database.save_library(&mut library).await.expect("save");
 
-        let player = BrowserPlayer::new();
+        let player = BrowserPlayer::new(database.clone(), BROWSER_PLAYER_ID.to_string());
         player
             .execute(
                 PlayerCommand::PlayTracks {
@@ -1155,6 +1289,77 @@ mod tests {
 
         let snapshot = player.snapshot().await;
         assert_eq!(snapshot.queue_position, Some(1));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // The browser player's server-owned queue must survive a server restart, not just
+    // a page refresh: play a queue at a non-zero position, drop the manager, reload it
+    // from the same database, and confirm the queue + position come back — paused (no
+    // output tab renders audio at startup), never auto-resumed as playing.
+    #[tokio::test]
+    async fn browser_queue_survives_a_restart_restored_paused() {
+        let db_path = temp_db("queue-restart");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = library_with_tracks(5);
+        database.save_library(&mut library).await.expect("save");
+
+        {
+            let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
+                .await
+                .expect("manager");
+            let browser = manager.get(BROWSER_PLAYER_ID).await.expect("browser");
+            browser
+                .execute(
+                    PlayerCommand::PlayTracks {
+                        track_ids: vec![
+                            "track_1".to_string(),
+                            "track_2".to_string(),
+                            "track_3".to_string(),
+                        ],
+                        start_index: 1,
+                    },
+                    &database,
+                    "http://localhost",
+                )
+                .await
+                .expect("play");
+            browser
+                .execute(
+                    PlayerCommand::SetRepeat {
+                        mode: RepeatMode::All,
+                    },
+                    &database,
+                    "http://localhost",
+                )
+                .await
+                .expect("repeat");
+            // Status is Playing here; the restart should restore it as Paused.
+            assert_eq!(
+                browser.state(&database).await.expect("state").status,
+                PlaybackStatus::Playing
+            );
+        }
+
+        // Fresh manager over the same database = a server restart.
+        let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
+            .await
+            .expect("reload manager");
+        let browser = manager.get(BROWSER_PLAYER_ID).await.expect("browser");
+        let state = browser.state(&database).await.expect("state");
+
+        assert_eq!(state.queue.len(), 3, "queue restored");
+        assert_eq!(state.queue_position, Some(1), "position restored");
+        assert_eq!(
+            state.now_playing.and_then(|n| n.track_id),
+            Some("track_2".to_string())
+        );
+        assert_eq!(state.repeat, RepeatMode::All, "repeat mode restored");
+        assert_eq!(
+            state.status,
+            PlaybackStatus::Paused,
+            "a restored queue is paused, never auto-resumed as playing"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }

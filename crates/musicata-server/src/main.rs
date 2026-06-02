@@ -1111,14 +1111,50 @@ async fn artists(
 
 async fn albums(
     State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<TrackListQuery>,
 ) -> Result<Json<Page<Album>>, AppError> {
-    let (items, total) = state
-        .database
-        .list_albums(query.sort.as_deref(), limit_arg(&query), offset_arg(&query))
-        .await
-        .map_err(db_error)?;
-    Ok(Json(page_envelope(items, total, &query)))
+    let filter = BrowseFilter {
+        genre: query.genre,
+        year: query.year,
+        composer: query.composer,
+        folder: query.folder,
+    };
+    let page = ListQuery {
+        limit: query.limit,
+        offset: query.offset,
+        sort: query.sort,
+    };
+    // When a browse filter is set, narrow to albums whose tracks match it (the album
+    // grid follows the track filter); otherwise list every album (cheaper, no join).
+    let (items, total) = if browse_filter_active(&filter) {
+        state
+            .database
+            .list_albums_filtered(
+                &filter,
+                page.sort.as_deref(),
+                limit_arg(&page),
+                offset_arg(&page),
+            )
+            .await
+    } else {
+        state
+            .database
+            .list_albums(page.sort.as_deref(), limit_arg(&page), offset_arg(&page))
+            .await
+    }
+    .map_err(db_error)?;
+    Ok(Json(page_envelope(items, total, &page)))
+}
+
+/// Whether a browse filter narrows anything (ignoring empty-string params).
+fn browse_filter_active(filter: &BrowseFilter) -> bool {
+    let set = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+    };
+    filter.year.is_some() || set(&filter.genre) || set(&filter.composer) || set(&filter.folder)
 }
 
 async fn list_players(State(state): State<AppState>) -> Result<Json<Vec<Player>>, AppError> {
@@ -2517,6 +2553,7 @@ struct StreamQuery {
 struct SearchQuery {
     q: Option<String>,
     limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 const DEFAULT_SEARCH_LIMIT: usize = 50;
@@ -2527,9 +2564,10 @@ async fn search(
 ) -> Result<Json<SearchResults>, AppError> {
     let q = query.q.unwrap_or_default();
     let limit = query.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let offset = query.offset.unwrap_or(0);
     let results = state
         .database
-        .search(&q, limit)
+        .search(&q, limit, offset)
         .await
         .map_err(|error| AppError::internal(error.to_string()))?;
     Ok(Json(results))

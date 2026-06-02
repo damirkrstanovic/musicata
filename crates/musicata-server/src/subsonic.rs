@@ -448,7 +448,7 @@ async fn get_lyrics(
     let mut text = String::new();
     let mut matched_title = title.to_string();
     if !title.is_empty()
-        && let Ok(results) = state.database.search(title, 5).await
+        && let Ok(results) = state.database.search(title, 5, 0).await
         && let Some(track) = results.tracks.first()
     {
         matched_title = track.title.clone();
@@ -620,7 +620,7 @@ async fn search(
             tracks: Vec::new(),
         }
     } else {
-        match state.database.search(&query, 50).await {
+        match state.database.search(&query, 50, 0).await {
             Ok(results) => results,
             Err(error) => return error_response(format, 0, &error.to_string()),
         }

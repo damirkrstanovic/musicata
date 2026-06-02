@@ -193,37 +193,126 @@ export async function behaviorFlows(ctx) {
 }
 
 export async function scaleFlows(ctx) {
-  const { eval: ev, sleep, snapshot, reset, budgets, loadMs } = ctx;
+  const { eval: ev, sleep, snapshot, reset, budgets, loadMs, base } = ctx;
   const results = [];
 
-  const info = await ev(`({ total: (state.tracks||[]).length, rows: document.querySelectorAll('#track-list .track').length })`);
+  // Library size comes from the already-loaded summary signature ("tracks:albums"),
+  // NOT state.tracks — once tracks page in on scroll, state.tracks holds only the
+  // loaded window. (Reading state avoids a fresh fetch racing the settling load.)
+  const info = await ev(`(() => {
+    const [total, albums] = (state.librarySignature || '0:0').split(':').map(Number);
+    // The fix is "never pull the whole track table up front." The deterministic signal
+    // is the size of the largest /api/tracks response: the old eager load fetched the
+    // entire library in one ~8 MB response; now it's one bounded page. (A total-bytes
+    // metric would be flaky — it races progressively-loading cover <img>s and media art.)
+    const sz = (r) => r.encodedBodySize || r.transferSize || 0;
+    const tracksFetchKB = performance.getEntriesByType('resource')
+      .filter(r => /\\/api\\/tracks\\?/.test(r.name) && (r.initiatorType === 'fetch' || r.initiatorType === 'xmlhttprequest'))
+      .reduce((m, r) => Math.max(m, sz(r)), 0) / 1024;
+    return {
+      total, albums,
+      rows: document.querySelectorAll('#track-list .track').length,
+      loadedTracks: (state.tracks || []).length,
+      tracksFetchKB: Math.round(tracksFetchKB),
+    };
+  })()`);
 
+  // The win: first interactive must NOT wait on the whole library. We assert a
+  // windowed initial render and a one-page track fetch. On the old eager load
+  // (~8.3 MB tracks, 11k rows) these go red — that's the documented baseline; the
+  // paging work turns them green.
   results.push({
     name: "initial load at scale",
     checks: [
-      check("realistic library size", info.total >= 1000, `${info.total} tracks`),
-      check("full list rendered", info.rows >= Math.min(info.total, 1000), `${info.rows} / ${info.total} rows`),
-      check("app interactive within 20s", (loadMs ?? 0) < 20000, `${loadMs}ms to first interactive`),
+      check("realistic library size", info.total >= 1000, `${info.total} tracks, ${info.albums} albums`),
+      check("initial render is windowed (<= 400 rows)", info.rows <= 400, `${info.rows} rows for ${info.total} tracks`),
+      check("tracks load one page, not the whole library", info.tracksFetchKB <= 200, `${info.tracksFetchKB} KB (was ~8.3 MB eager)`),
+      check("app interactive within 3s", (loadMs ?? 0) < 3000, `${loadMs}ms to first interactive`),
       check("no console errors on load", (await ev(`window.__console.length`)) === 0),
     ],
   });
 
-  // Scroll the full library top-to-bottom; content-visibility should keep the main
-  // thread free of long tasks.
+  // Infinite scroll: reaching the end of the list pulls and appends the next page,
+  // with no explicit page UI. Scroll to the bottom and confirm more rows appear.
+  await reset();
+  const before = await ev(`document.querySelectorAll('#track-list .track').length`);
+  let after = before;
+  for (let i = 0; i < 6 && after <= before; i++) {
+    // The scroller is the .content panel, not #track-list itself.
+    await ev(`(() => {
+      const el = document.querySelector('.content') || document.scrollingElement;
+      el.scrollTop = el.scrollHeight;
+    })()`);
+    await sleep(600);
+    after = await ev(`document.querySelectorAll('#track-list .track').length`);
+  }
+  results.push({
+    name: "infinite scroll loads more",
+    checks: [
+      check("scrolling to the end appends more rows", after > before, `${before} → ${after} rows`),
+    ],
+  });
+
+  // Scroll the loaded rows; content-visibility should keep the main thread free of
+  // long tasks even as pages append.
   await reset();
   await ev(`(() => {
-    const el = document.querySelector('#track-list') || document.scrollingElement;
+    const el = document.querySelector('.content') || document.scrollingElement;
     const h = el.scrollHeight; const step = Math.max(400, h / 50);
     for (let y = 0; y <= h; y += step) el.scrollTop = y;
     el.scrollTop = 0;
   })()`);
   await sleep(800);
-  const snap = await snapshot();
-  const long = snap.log.filter((e) => e.kind === "longtask" && e.dur > budgets.longTaskMs);
+  let snap = await snapshot();
+  let long = snap.log.filter((e) => e.kind === "longtask" && e.dur > budgets.longTaskMs);
   results.push({
-    name: `library scroll (${info.rows} rows)`,
+    name: "library scroll stays smooth",
     checks: [check(`no scroll long task > ${budgets.longTaskMs}ms`, long.length === 0, long.map((l) => l.dur + "ms").join(", "))],
   });
+
+  // Search at scale must return a bounded, fast page (not every match). Measured from
+  // Node, not the page — at scale Chromium's 6-connection cap is saturated by the
+  // eager album-artwork image storm, so a page-side fetch would queue behind it.
+  const t = Date.now();
+  const j = await fetch(`${base}/api/search?q=a&limit=100`).then((r) => r.json());
+  const searchInfo = { ms: Date.now() - t, tracks: (j.tracks || []).length, albums: (j.albums || []).length };
+  results.push({
+    name: "search at scale",
+    checks: [
+      check("search responds < 500ms", searchInfo.ms < 500, `${searchInfo.ms}ms`),
+      check("search page is bounded", searchInfo.tracks <= 100, `${searchInfo.tracks} tracks`),
+      check("search returns matches", searchInfo.tracks + searchInfo.albums > 0, `${searchInfo.tracks}t/${searchInfo.albums}a`),
+    ],
+  });
+
+  // Browse by genre narrows the ALBUM grid too, not just the track list. Pick the
+  // rarest genre (fewest tracks → most likely to narrow the album set), apply it, and
+  // confirm the rendered cards are exactly the filtered albums.
+  await reset();
+  const picked = await ev(`(async () => {
+    const totalAlbums = (state.librarySignature || '0:0').split(':').map(Number)[1];
+    const genres = (state.browse.genres || []).slice().sort((a, b) => a.track_count - b.track_count);
+    const g = genres[0];
+    if (!g) return { skip: true };
+    els.browseGenre.value = String(g.value);
+    await applyBrowseFilter();
+    return { genre: String(g.value), totalAlbums };
+  })()`);
+  if (picked.skip) {
+    results.push({ name: "browse filters the album grid", skipped: true, reason: "no genre facets" });
+  } else {
+    await sleep(700);
+    const filtered = await fetch(`${base}/api/albums?genre=${encodeURIComponent(picked.genre)}&limit=500`).then((r) => r.json());
+    const ids = new Set(filtered.items.map((a) => a.id));
+    const renderedIds = await ev(`Array.from(document.querySelectorAll('#albums .album')).map(e => e.dataset.albumId)`);
+    results.push({
+      name: "browse filters the album grid",
+      checks: [
+        check("album grid narrowed to the genre", filtered.total > 0 && filtered.total < picked.totalAlbums, `${filtered.total}/${picked.totalAlbums} albums match "${picked.genre}"`),
+        check("rendered cards are all in the filtered set", renderedIds.length > 0 && renderedIds.every((id) => ids.has(id)), `${renderedIds.length} cards`),
+      ],
+    });
+  }
 
   return results;
 }
