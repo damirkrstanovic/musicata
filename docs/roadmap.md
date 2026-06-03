@@ -211,8 +211,23 @@ Tasks:
   update just the cheap single row; in-track elapsed is persisted from progress ticks
   throttled to once / 10 s rather than every ~1 Hz tick. **MPD** still drives its own
   queue directly (MPD persists it independently); making the server the source of
-  truth for MPD's queue is a larger rework left for later. Per-*zone* queues are also
-  future — zones still fan a command out to member players.
+  truth for MPD's queue is a larger rework left for later.
+  **Per-*zone* queues** are now implemented: a zone owns its own canonical
+  server-side queue, modeled exactly like the browser player (`ZonePlayer` in
+  `players.rs`, persisted to migration v18 tables `zone_queue` + `zone_queue_items`,
+  restored **paused** on startup). A zone is a first-class control target alongside
+  players — `/api/zones/{id}/commands|state|ws` mirror the player surface (the WS loop
+  is shared via a `QueueOutput` trait), and the web app's switcher lists zones in a
+  "Zones" group, subscribes to the zone socket, and routes transport/queue/play
+  actions through it (`commandTarget`). When a zone runs a command it updates its
+  canonical queue and drives members: **browser** members render the zone's
+  now-playing straight off the zone broadcast (the tab reports progress/ended back to
+  the zone socket via `browserOutputsFor`), and **MPD** members are best-effort
+  mirrors the command is forwarded to (queue ops map 1:1; indices stay aligned because
+  MPD mirrors the zone queue). The zone's queue is the single source of truth; there
+  is no audio sample-sync (deferred), so an **MPD-only zone** (no browser output
+  reporting `ended`) can drift in position until the user hits next/previous —
+  mapping MPD state back to the zone is a future improvement.
 - [x] Add commands: play, pause, stop, seek, next, previous, enqueue, clear,
   shuffle, repeat. (Reorder still to do.)
 - [x] Add WebSocket state updates for controllers.

@@ -16,6 +16,7 @@ const state = {
   trackStream: null,
   albumStream: null,
   activePlayerId: null,
+  zones: [],
   activeStatus: "stopped",
   activeNowTrackId: null,
   activeState: null,
@@ -51,6 +52,9 @@ const els = {
   albums: document.querySelector("#albums"),
   playlists: document.querySelector("#playlists"),
   newPlaylist: document.querySelector("#new-playlist"),
+  newPlaylistForm: document.querySelector("#new-playlist-form"),
+  newPlaylistName: document.querySelector("#new-playlist-name"),
+  newPlaylistError: document.querySelector("#new-playlist-error"),
   radio: document.querySelector("#radio"),
   newRadio: document.querySelector("#new-radio"),
   radioDirectory: document.querySelector("#radio-directory"),
@@ -996,7 +1000,7 @@ function renderRadioSidebar() {
 
 function playRadio(station) {
   if (!state.activePlayerId) return;
-  if (state.activePlayerId === browserPlayerId) {
+  if (browserOutputsFor(state.activePlayerId)) {
     claimBrowserOutput();
     // Start within the user gesture so the browser's autoplay policy allows it.
     if (browserAudio) {
@@ -1004,7 +1008,7 @@ function playRadio(station) {
       browserAudio.play().catch(() => {});
     }
   }
-  playerCommand(state.activePlayerId, {
+  commandTarget({
     command: "play_stream",
     url: station.stream_url,
     title: station.name,
@@ -1118,7 +1122,7 @@ async function playTrack(index) {
   if (tracks.length === 0 || !state.activePlayerId) {
     return;
   }
-  if (state.activePlayerId === browserPlayerId) {
+  if (browserOutputsFor(state.activePlayerId)) {
     claimBrowserOutput();
     // Start the clicked track within this user gesture so the browser's autoplay
     // policy lets it play; the server round-trip then keeps it in sync.
@@ -1132,7 +1136,7 @@ async function playTrack(index) {
   // One command sets the whole queue AND the starting position. Sending play_tracks
   // (which starts at 0) followed by play_queue_index would broadcast the wrong
   // now-playing track first, flickering the footer and restarting browser audio.
-  await playerCommand(state.activePlayerId, {
+  await commandTarget({
     command: "play_tracks",
     track_ids: ids,
     start_index: index,
@@ -1964,12 +1968,41 @@ for (const link of els.navLinks) {
     closeDrawerOnMobile();
   });
 }
-els.newPlaylist.addEventListener("click", async () => {
-  const name = window.prompt("Playlist name");
-  if (name && name.trim()) {
-    const detail = await createPlaylist(name.trim());
-    if (detail) openPlaylistView(detail.id);
+// Create-playlist uses an inline input rather than window.prompt(): prompt() is
+// suppressed in installed/standalone PWAs and on mobile, where this controller is
+// meant to run, so the button did nothing there. The input also lets us show errors.
+function toggleNewPlaylist(open) {
+  const show = open ?? els.newPlaylistForm.hidden;
+  els.newPlaylistForm.hidden = !show;
+  els.newPlaylist.setAttribute("aria-expanded", String(show));
+  els.newPlaylistError.hidden = true;
+  if (show) {
+    els.newPlaylistName.value = "";
+    els.newPlaylistName.focus();
   }
+}
+
+els.newPlaylist.addEventListener("click", () => toggleNewPlaylist());
+
+els.newPlaylistForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const name = els.newPlaylistName.value.trim();
+  if (!name) return;
+  els.newPlaylistName.disabled = true;
+  try {
+    const detail = await createPlaylist(name);
+    toggleNewPlaylist(false);
+    if (detail) openPlaylistView(detail.id);
+  } catch (error) {
+    els.newPlaylistError.textContent = `Couldn't create playlist: ${error.message}`;
+    els.newPlaylistError.hidden = false;
+  } finally {
+    els.newPlaylistName.disabled = false;
+  }
+});
+
+els.newPlaylistName.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") toggleNewPlaylist(false);
 });
 els.newRadio.addEventListener("click", openRadioDirectory);
 els.radioDirClose.addEventListener("click", closeRadioDirectory);
@@ -2001,18 +2034,18 @@ window.addEventListener("focus", syncLibrary);
 els.metadataClose.addEventListener("click", closeMetadata);
 // Footer transport targets the active player.
 els.prev.addEventListener("click", () => {
-  if (state.activePlayerId) playerCommand(state.activePlayerId, { command: "previous" });
+  if (state.activePlayerId) commandTarget({ command: "previous" });
 });
 els.next.addEventListener("click", () => {
-  if (state.activePlayerId) playerCommand(state.activePlayerId, { command: "next" });
+  if (state.activePlayerId) commandTarget({ command: "next" });
 });
 els.playPause.addEventListener("click", () => {
   if (!state.activePlayerId) return;
   if (state.activeStatus === "playing") {
-    playerCommand(state.activePlayerId, { command: "pause" });
+    commandTarget({ command: "pause" });
   } else if (state.activeNowTrackId) {
-    if (state.activePlayerId === browserPlayerId) claimBrowserOutput();
-    playerCommand(state.activePlayerId, { command: "play" });
+    if (browserOutputsFor(state.activePlayerId)) claimBrowserOutput();
+    commandTarget({ command: "play" });
   } else {
     // Nothing queued yet: start the current track list.
     playTrack(0);
@@ -2034,14 +2067,14 @@ els.seek.addEventListener("change", () => {
   state.seekDragging = false;
   state.activeElapsed = value;
   if (state.activePlayerId) {
-    playerCommand(state.activePlayerId, { command: "seek", position_seconds: value });
+    commandTarget({ command: "seek", position_seconds: value });
   }
 });
 
 els.shuffle.addEventListener("click", () => {
   if (!state.activePlayerId) return;
   const enabled = !(state.activeState?.shuffle ?? false);
-  playerCommand(state.activePlayerId, { command: "set_shuffle", enabled });
+  commandTarget({ command: "set_shuffle", enabled });
 });
 
 els.repeat.addEventListener("click", () => {
@@ -2049,20 +2082,20 @@ els.repeat.addEventListener("click", () => {
   const order = ["off", "all", "one"];
   const current = state.activeState?.repeat ?? "off";
   const mode = order[(order.indexOf(current) + 1) % order.length];
-  playerCommand(state.activePlayerId, { command: "set_repeat", mode });
+  commandTarget({ command: "set_repeat", mode });
 });
 
 let footerVolumeTimer = 0;
 els.footerVolume.addEventListener("input", () => {
   const volume = Number.parseInt(els.footerVolume.value, 10);
   els.footerVolume.style.setProperty("--fill", `${volume}%`);
-  if (state.activePlayerId === browserPlayerId && browserOutput) {
+  if (browserOutputsFor(state.activePlayerId) && browserOutput) {
     els.audio.volume = Math.min(1, Math.max(0, volume / 100));
   }
   clearTimeout(footerVolumeTimer);
   footerVolumeTimer = setTimeout(() => {
     if (state.activePlayerId) {
-      playerCommand(state.activePlayerId, { command: "set_volume", volume });
+      commandTarget({ command: "set_volume", volume });
     }
   }, 150);
 });
@@ -2081,7 +2114,7 @@ function toggleQueue(open) {
 els.queueToggle.addEventListener("click", () => toggleQueue());
 els.queueClose.addEventListener("click", () => toggleQueue(false));
 els.queueClear.addEventListener("click", () => {
-  if (state.activePlayerId) playerCommand(state.activePlayerId, { command: "clear" });
+  if (state.activePlayerId) commandTarget({ command: "clear" });
 });
 
 function renderQueue() {
@@ -2122,14 +2155,14 @@ els.queueList.addEventListener("click", (event) => {
   if (Number.isNaN(index)) return;
   const action = button.dataset.action;
   if (action === "play-index") {
-    if (state.activePlayerId === browserPlayerId) claimBrowserOutput();
-    playerCommand(state.activePlayerId, { command: "play_queue_index", index });
+    if (browserOutputsFor(state.activePlayerId)) claimBrowserOutput();
+    commandTarget({ command: "play_queue_index", index });
   } else if (action === "remove") {
-    playerCommand(state.activePlayerId, { command: "remove_queue_item", index });
+    commandTarget({ command: "remove_queue_item", index });
   } else if (action === "up") {
-    playerCommand(state.activePlayerId, { command: "move_queue_item", from: index, to: index - 1 });
+    commandTarget({ command: "move_queue_item", from: index, to: index - 1 });
   } else if (action === "down") {
-    playerCommand(state.activePlayerId, { command: "move_queue_item", from: index, to: index + 1 });
+    commandTarget({ command: "move_queue_item", from: index, to: index + 1 });
   }
 });
 
@@ -2182,35 +2215,40 @@ async function apiJson(path, method, body) {
 
 async function loadPlayers() {
   let players;
+  let zones;
   try {
-    players = await api("/api/players");
+    [players, zones] = await Promise.all([api("/api/players"), api("/api/zones")]);
   } catch (error) {
     console.warn("players unavailable", error);
     return;
   }
   playerData = { players };
+  state.zones = zones || [];
   browserPlayerId = players.find((player) => player.kind === "browser")?.id ?? null;
   renderPlayerSwitcher(players);
 
-  // Drop sockets for players that no longer exist; open one per player for live state.
+  // One socket per control target (player or zone) for live state. Drop sockets for
+  // targets that no longer exist.
+  const targetIds = new Set([...players.map((p) => p.id), ...state.zones.map((z) => z.id)]);
   for (const [id, socket] of playerSockets) {
-    if (!players.some((player) => player.id === id)) {
+    if (!targetIds.has(id)) {
       socket.close();
       playerSockets.delete(id);
     }
   }
-  for (const player of players) {
-    if (!playerSockets.has(player.id)) {
-      openPlayerSocket(player.id);
+  for (const id of targetIds) {
+    if (!playerSockets.has(id)) {
+      openPlayerSocket(id);
     }
   }
 }
 
 function openPlayerSocket(id) {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const base = isZoneTarget(id) ? "zones" : "players";
   let socket;
   try {
-    socket = new WebSocket(`${scheme}://${location.host}/api/players/${encodeURIComponent(id)}/ws`);
+    socket = new WebSocket(`${scheme}://${location.host}/api/${base}/${encodeURIComponent(id)}/ws`);
   } catch {
     return;
   }
@@ -2237,11 +2275,9 @@ function openPlayerSocket(id) {
           loadHistoryView("recent");
         }
       }
-      if (
-        id === browserPlayerId &&
-        browserOutput &&
-        state.activePlayerId === browserPlayerId
-      ) {
+      // Render audio only off the active target's socket, and only if this tab is
+      // that target's legitimate output (the browser player, or a zone it's in).
+      if (browserOutput && id === state.activePlayerId && browserOutputsFor(id)) {
         driveBrowserAudio(playback);
       }
       if (id === state.activePlayerId) {
@@ -2272,15 +2308,21 @@ function openPlayerSocket(id) {
 function handlePlayerSocketClosed(id) {
   playerSockets.delete(id);
 
-  if (id === browserPlayerId && browserOutput && browserAudio && !browserAudio.paused) {
+  // If the socket driving this tab's audio (the active target's) dropped, stop —
+  // don't keep playing a stream the server can no longer control.
+  if (
+    id === state.activePlayerId &&
+    browserOutput &&
+    browserOutputsFor(id) &&
+    browserAudio &&
+    !browserAudio.paused
+  ) {
     browserAudio.pause();
     state.playerStatus[id] = "stopped";
-    if (state.activePlayerId === browserPlayerId) {
-      state.activeStatus = "stopped";
-      els.playPause.textContent = "▶";
-      els.miniPlay.textContent = "▶";
-      els.transport.dataset.status = "stopped";
-    }
+    state.activeStatus = "stopped";
+    els.playPause.textContent = "▶";
+    els.miniPlay.textContent = "▶";
+    els.transport.dataset.status = "stopped";
     updateSwitchIndicator();
   }
 
@@ -2289,7 +2331,8 @@ function handlePlayerSocketClosed(id) {
 
 function scheduleSocketReconnect(id) {
   setTimeout(() => {
-    const stillRegistered = (playerData.players || []).some((player) => player.id === id);
+    const stillRegistered =
+      (playerData.players || []).some((player) => player.id === id) || isZoneTarget(id);
     if (stillRegistered && !playerSockets.has(id)) {
       openPlayerSocket(id);
     }
@@ -2346,8 +2389,13 @@ function driveBrowserAudio(playback) {
   }
 }
 
+// Report progress/ended back to whichever target owns the audio this tab renders —
+// the active target's socket (a zone when outputting for a zone, else the browser
+// player), so the server-owned queue advances and elapsed stays live.
 function browserSocketSend(message) {
-  const socket = browserPlayerId ? playerSockets.get(browserPlayerId) : null;
+  const targetId = state.activePlayerId;
+  if (!targetId || !browserOutputsFor(targetId)) return;
+  const socket = playerSockets.get(targetId);
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(message));
   }
@@ -2391,10 +2439,44 @@ function cssEscape(value) {
 
 async function playerCommand(id, command) {
   try {
-    await apiJson(`/api/players/${encodeURIComponent(id)}/commands`, "POST", command);
+    await apiJson(`${targetBase(id)}${encodeURIComponent(id)}/commands`, "POST", command);
   } catch (error) {
     console.error("player command failed", error);
   }
+}
+
+// A control target is either a player or a zone; a zone owns a canonical queue and
+// is controlled through the parallel `/api/zones/...` surface. These helpers route
+// by target so the transport, queue, and play actions work the same for both.
+function isZoneTarget(id) {
+  return state.zones.some((zone) => zone.id === id);
+}
+
+function targetBase(id) {
+  return isZoneTarget(id) ? "/api/zones/" : "/api/players/";
+}
+
+// Send a command to the currently active target (player or zone).
+function commandTarget(command) {
+  if (!state.activePlayerId) return Promise.resolve();
+  return playerCommand(state.activePlayerId, command);
+}
+
+function browserPlayerRecord() {
+  return playerData.players.find((player) => player.id === browserPlayerId);
+}
+
+// Whether this browser tab is the legitimate audio output for a target: the browser
+// player itself, or a zone the browser player is a member of (zones drive their
+// browser members' audio off the zone state, not the member's own queue).
+function browserOutputsFor(targetId) {
+  if (!targetId) return false;
+  if (targetId === browserPlayerId) return true;
+  if (isZoneTarget(targetId)) {
+    const record = browserPlayerRecord();
+    return !!record && record.zone_id === targetId;
+  }
+  return false;
 }
 
 // ---- Active player (footer + main list target) ----------------------------
@@ -2415,24 +2497,40 @@ function dotClass(player) {
   return "pm-dot";
 }
 
+function menuItem(id, name, dot) {
+  const active = id === state.activePlayerId;
+  return `
+        <button class="player-menu-item ${active ? "active" : ""}"
+                data-player="${escapeHtml(id)}" type="button" role="menuitem">
+          <span class="${dot}"></span>
+          <span class="pm-name">${escapeHtml(name)}</span>
+          <span class="pm-check">${active ? "✓" : ""}</span>
+        </button>`;
+}
+
+// A zone is a control target alongside players; it's "online" as long as it exists,
+// "playing" when its canonical queue is.
+function zoneDotClass(zone) {
+  return state.playerStatus[zone.id] === "playing" ? "pm-dot playing" : "pm-dot online";
+}
+
 function renderPlayerSwitcher(players) {
   if (!els.playerMenuList) return;
-  els.playerMenuList.innerHTML = players
-    .map(
-      (player) => `
-        <button class="player-menu-item ${player.id === state.activePlayerId ? "active" : ""}"
-                data-player="${escapeHtml(player.id)}" type="button" role="menuitem">
-          <span class="${dotClass(player)}"></span>
-          <span class="pm-name">${escapeHtml(player.name)}</span>
-          <span class="pm-check">${player.id === state.activePlayerId ? "✓" : ""}</span>
-        </button>`,
-    )
-    .join("");
+  let html = players.map((player) => menuItem(player.id, player.name, dotClass(player))).join("");
+  if (state.zones.length) {
+    html += `<div class="pm-group" role="presentation">Zones</div>`;
+    html += state.zones.map((zone) => menuItem(zone.id, zone.name, zoneDotClass(zone))).join("");
+  }
+  els.playerMenuList.innerHTML = html;
 
-  if (!players.some((player) => player.id === state.activePlayerId)) {
+  const known =
+    players.some((player) => player.id === state.activePlayerId) ||
+    state.zones.some((zone) => zone.id === state.activePlayerId);
+  if (!known) {
     const saved = savedActivePlayer();
     const active =
       players.find((player) => player.id === saved)?.id ||
+      state.zones.find((zone) => zone.id === saved)?.id ||
       browserPlayerId ||
       players[0]?.id ||
       null;
@@ -2457,23 +2555,25 @@ function setActivePlayer(id) {
   } catch {
     /* ignore */
   }
-  if (id !== browserPlayerId) {
-    // A remote player renders its own audio; this tab must stay silent.
+  if (!browserOutputsFor(id)) {
+    // A remote player (or a zone this browser isn't in) renders its own audio;
+    // this tab must stay silent.
     els.audio.pause();
   }
   renderPlayerSwitcher(playerData.players);
   refreshActivePlayerFooter();
 }
 
-// Reflect the active player's name + live status on the switcher button.
+// Reflect the active target's (player or zone) name + live status on the button.
 function updateSwitchIndicator() {
   const player = playerData.players.find((entry) => entry.id === state.activePlayerId);
-  els.switchName.textContent = player ? player.name : "No player";
-  const here = state.activePlayerId === browserPlayerId && browserOutput;
+  const zone = state.zones.find((entry) => entry.id === state.activePlayerId);
+  els.switchName.textContent = player ? player.name : zone ? zone.name : "No player";
+  const here = browserOutput && browserOutputsFor(state.activePlayerId);
   const playing = state.playerStatus[state.activePlayerId] === "playing";
   els.switchSignal.className = "signal";
   if (playing || here) els.switchSignal.classList.add("playing");
-  else if (player?.online) els.switchSignal.classList.add("online");
+  else if (player?.online || zone) els.switchSignal.classList.add("online");
 }
 
 function setPlayerMenu(open) {
@@ -2507,7 +2607,7 @@ async function refreshActivePlayerFooter() {
   if (!state.activePlayerId) return;
   try {
     const playback = await api(
-      `/api/players/${encodeURIComponent(state.activePlayerId)}/state`,
+      `${targetBase(state.activePlayerId)}${encodeURIComponent(state.activePlayerId)}/state`,
     );
     updateFooterFromState(playback);
   } catch {
@@ -2700,12 +2800,12 @@ function setupMediaSession() {
   if (!("mediaSession" in navigator)) return;
   const ms = navigator.mediaSession;
   const send = (body) => {
-    if (state.activePlayerId) playerCommand(state.activePlayerId, body);
+    if (state.activePlayerId) commandTarget(body);
   };
   const handlers = {
     play: () => {
       if (!state.activePlayerId) return;
-      if (state.activePlayerId === browserPlayerId) claimBrowserOutput();
+      if (browserOutputsFor(state.activePlayerId)) claimBrowserOutput();
       if (state.activeNowTrackId) send({ command: "play" });
       else playTrack(0);
     },

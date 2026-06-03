@@ -67,8 +67,12 @@
         <section class="section">
           <div class="section-head">
             <h2>Playlists</h2>
-            <button id="new-playlist" class="ghost-button mini" type="button" title="New playlist">＋</button>
+            <button id="new-playlist" class="ghost-button mini" type="button" title="New playlist" aria-expanded="false">＋</button>
           </div>
+          <form id="new-playlist-form" class="inline-add" hidden>
+            <input id="new-playlist-name" type="text" placeholder="Playlist name…" maxlength="200" autocomplete="off" />
+            <p id="new-playlist-error" class="inline-add-error" hidden></p>
+          </form>
           <div id="playlists" class="playlist-list"></div>
         </section>
 

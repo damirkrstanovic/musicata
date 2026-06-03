@@ -7,7 +7,7 @@ use musicata_core::{
 };
 use sqlx::{
     Row, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -34,7 +34,16 @@ impl Database {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            // WAL lets reads run concurrently with a writer, so a long background write
+            // (the scan's full-library `save_library` rewrite — thousands of rows in one
+            // transaction) no longer blocks foreground reads like `/api/library/summary`.
+            // Under the old rollback (`delete`) journal, that write held an exclusive lock
+            // and every concurrent request hit the 5s busy-timeout and 500'd. `NORMAL`
+            // synchronous is the standard, safe pairing with WAL.
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(std::time::Duration::from_secs(15));
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)
@@ -202,6 +211,13 @@ impl Database {
                 sqlx::query(statement).execute(&self.pool).await?;
             }
             set_user_version(&self.pool, 17).await?;
+        }
+
+        if version < 18 {
+            for statement in MIGRATION_018_ZONE_QUEUE {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 18).await?;
         }
 
         Ok(())
@@ -1512,6 +1528,144 @@ impl Database {
         Ok(Some(PlayerQueueSnapshot { playback, items }))
     }
 
+    // ---- Server-owned playback queue (persisted, one per zone) ---------------
+    // A zone owns a canonical queue just like a player; these mirror the
+    // `save_player_*`/`load_player_queue` trio against the `zone_queue` tables.
+
+    /// Persist only the lightweight playback row for a zone (no queue items).
+    pub async fn save_zone_playback(&self, zone_id: &str, playback: &PlayerPlayback) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO zone_queue
+                (zone_id, status, position, elapsed_seconds, volume, repeat, shuffle, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(zone_id) DO UPDATE SET
+                status = ?2, position = ?3, elapsed_seconds = ?4, volume = ?5,
+                repeat = ?6, shuffle = ?7, updated_at = ?8",
+        )
+        .bind(zone_id)
+        .bind(playback_status_str(playback.status))
+        .bind(playback.position.map(|p| p as i64))
+        .bind(playback.elapsed_seconds)
+        .bind(playback.volume.map(|v| v as i64))
+        .bind(repeat_mode_str(playback.repeat))
+        .bind(playback.shuffle as i64)
+        .bind(now_unix_seconds())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Replace a zone's queue items (in order) and its playback row in one
+    /// transaction. Use when the queue itself changes; otherwise prefer the
+    /// cheaper [`save_zone_playback`].
+    pub async fn save_zone_queue(
+        &self,
+        zone_id: &str,
+        playback: &PlayerPlayback,
+        items: &[QueueItem],
+    ) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let result = async {
+            sqlx::query("DELETE FROM zone_queue_items WHERE zone_id = ?1")
+                .bind(zone_id)
+                .execute(&mut *conn)
+                .await?;
+            for (seq, item) in items.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO zone_queue_items
+                        (zone_id, seq, track_id, title, artist, album, stream_url, artwork_url)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )
+                .bind(zone_id)
+                .bind(seq as i64)
+                .bind(&item.track_id)
+                .bind(&item.title)
+                .bind(&item.artist)
+                .bind(&item.album)
+                .bind(&item.stream_url)
+                .bind(&item.artwork_url)
+                .execute(&mut *conn)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT INTO zone_queue
+                    (zone_id, status, position, elapsed_seconds, volume, repeat, shuffle, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(zone_id) DO UPDATE SET
+                    status = ?2, position = ?3, elapsed_seconds = ?4, volume = ?5,
+                    repeat = ?6, shuffle = ?7, updated_at = ?8",
+            )
+            .bind(zone_id)
+            .bind(playback_status_str(playback.status))
+            .bind(playback.position.map(|p| p as i64))
+            .bind(playback.elapsed_seconds)
+            .bind(playback.volume.map(|v| v as i64))
+            .bind(repeat_mode_str(playback.repeat))
+            .bind(playback.shuffle as i64)
+            .bind(now_unix_seconds())
+            .execute(&mut *conn)
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Load a zone's persisted queue, or `None` if it has never had one saved.
+    pub async fn load_zone_queue(&self, zone_id: &str) -> Result<Option<PlayerQueueSnapshot>> {
+        let Some(row) = sqlx::query(
+            "SELECT status, position, elapsed_seconds, volume, repeat, shuffle
+             FROM zone_queue WHERE zone_id = ?1",
+        )
+        .bind(zone_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let playback = PlayerPlayback {
+            status: playback_status_from_str(&row.try_get::<String, _>("status")?),
+            position: row
+                .try_get::<Option<i64>, _>("position")?
+                .map(|p| p as usize),
+            elapsed_seconds: row.try_get("elapsed_seconds")?,
+            volume: row.try_get::<Option<i64>, _>("volume")?.map(|v| v as u8),
+            repeat: repeat_mode_from_str(&row.try_get::<String, _>("repeat")?),
+            shuffle: row.try_get::<i64, _>("shuffle")? != 0,
+        };
+        let item_rows = sqlx::query(
+            "SELECT track_id, title, artist, album, stream_url, artwork_url
+             FROM zone_queue_items WHERE zone_id = ?1 ORDER BY seq",
+        )
+        .bind(zone_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let items = item_rows
+            .iter()
+            .map(|row| {
+                Ok(QueueItem {
+                    track_id: row.try_get("track_id")?,
+                    title: row.try_get("title")?,
+                    artist: row.try_get("artist")?,
+                    album: row.try_get("album")?,
+                    stream_url: row.try_get("stream_url")?,
+                    artwork_url: row.try_get("artwork_url")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(PlayerQueueSnapshot { playback, items }))
+    }
+
     pub async fn list_zones(&self) -> Result<Vec<Zone>> {
         let rows = sqlx::query("SELECT id, name FROM zones ORDER BY name, id")
             .fetch_all(&self.pool)
@@ -1546,6 +1700,15 @@ impl Database {
     }
 
     pub async fn delete_zone(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM zone_queue_items WHERE zone_id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM zone_queue WHERE zone_id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        // `players.zone_id` FK is ON DELETE SET NULL, so members are un-zoned.
         sqlx::query("DELETE FROM zones WHERE id = ?1")
             .bind(id)
             .execute(&self.pool)
@@ -2877,6 +3040,35 @@ const MIGRATION_017_PLAYER_QUEUE: &[&str] = &[
     )",
 ];
 
+// Server-owned persistent playback queue, one per *zone*. A zone owns a canonical
+// queue (members are outputs it drives), so it persists exactly like a player —
+// same row shapes as `player_queue`/`player_queue_items`, keyed by `zone_id`. Kept
+// in separate tables rather than overloading the player tables so player and zone
+// id keyspaces never collide and `delete_player`/`delete_zone` cleanup stays clear.
+const MIGRATION_018_ZONE_QUEUE: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS zone_queue (
+        zone_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        position INTEGER,
+        elapsed_seconds REAL,
+        volume INTEGER,
+        repeat TEXT NOT NULL,
+        shuffle INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS zone_queue_items (
+        zone_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        track_id TEXT,
+        title TEXT NOT NULL,
+        artist TEXT NOT NULL,
+        album TEXT NOT NULL,
+        stream_url TEXT NOT NULL,
+        artwork_url TEXT,
+        PRIMARY KEY (zone_id, seq)
+    )",
+];
+
 // Listening history. One row per confirmed listen (a track that played past the
 // ListenBrainz threshold — see `players::ListenTracker`). `listened_at` is when the
 // track *started*, so ordering by it reflects when each play began. We keep the raw
@@ -3818,7 +4010,36 @@ mod tests {
         assert_eq!(in_zone.len(), 1);
         assert_eq!(in_zone[0].name, "Renamed");
 
-        // Deleting the zone clears the player's zone (FK ON DELETE SET NULL).
+        // Give the zone a persisted queue so we can assert it's cleaned up too.
+        database
+            .save_zone_queue(
+                "zone-a",
+                &super::PlayerPlayback {
+                    status: musicata_core::PlaybackStatus::Paused,
+                    position: Some(0),
+                    elapsed_seconds: Some(0.0),
+                    volume: None,
+                    repeat: musicata_core::RepeatMode::Off,
+                    shuffle: false,
+                },
+                &[musicata_core::QueueItem {
+                    track_id: Some("t1".to_string()),
+                    title: "One".to_string(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("save zone queue");
+        assert!(
+            database
+                .load_zone_queue("zone-a")
+                .await
+                .expect("load")
+                .is_some()
+        );
+
+        // Deleting the zone clears the player's zone (FK ON DELETE SET NULL) and
+        // drops the zone's persisted queue.
         database.delete_zone("zone-a").await.expect("delete zone");
         assert_eq!(
             database
@@ -3828,6 +4049,14 @@ mod tests {
                 .expect("some")
                 .zone_id,
             None
+        );
+        assert!(
+            database
+                .load_zone_queue("zone-a")
+                .await
+                .expect("load")
+                .is_none(),
+            "zone queue dropped with the zone"
         );
 
         database
@@ -4136,6 +4365,144 @@ mod tests {
             .expect("queue present");
         assert_eq!(loaded.items.len(), 1);
 
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn saves_and_loads_a_zone_queue() {
+        use musicata_core::{PlaybackStatus, QueueItem, RepeatMode};
+
+        let db_path = temp_db_path("zone-queue");
+        let database = Database::connect(&db_path).await.expect("connect");
+
+        // No queue persisted yet.
+        assert!(
+            database
+                .load_zone_queue("z1")
+                .await
+                .expect("load")
+                .is_none()
+        );
+
+        let items = vec![
+            QueueItem {
+                track_id: Some("track_1".to_string()),
+                title: "One".to_string(),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                stream_url: "/api/tracks/track_1/stream".to_string(),
+                artwork_url: Some("/api/albums/a/cover".to_string()),
+            },
+            QueueItem {
+                track_id: Some("track_2".to_string()),
+                title: "Two".to_string(),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                stream_url: "/api/tracks/track_2/stream".to_string(),
+                artwork_url: None,
+            },
+        ];
+        let playback = super::PlayerPlayback {
+            status: PlaybackStatus::Playing,
+            position: Some(1),
+            elapsed_seconds: Some(12.0),
+            volume: Some(55),
+            repeat: RepeatMode::All,
+            shuffle: true,
+        };
+        database
+            .save_zone_queue("z1", &playback, &items)
+            .await
+            .expect("save zone queue");
+
+        let loaded = database
+            .load_zone_queue("z1")
+            .await
+            .expect("load")
+            .expect("queue present");
+        assert_eq!(loaded.playback, playback);
+        assert_eq!(loaded.items, items);
+
+        // A playback-only save updates the row but leaves the items intact.
+        let moved = super::PlayerPlayback {
+            status: PlaybackStatus::Paused,
+            position: Some(0),
+            elapsed_seconds: Some(0.0),
+            ..playback.clone()
+        };
+        database
+            .save_zone_playback("z1", &moved)
+            .await
+            .expect("save playback");
+        let loaded = database
+            .load_zone_queue("z1")
+            .await
+            .expect("load")
+            .expect("queue present");
+        assert_eq!(loaded.playback, moved);
+        assert_eq!(
+            loaded.items, items,
+            "items unchanged by a playback-only save"
+        );
+
+        // Shrinking the queue must not leave stale rows behind.
+        database
+            .save_zone_queue("z1", &moved, &items[..1])
+            .await
+            .expect("save shorter queue");
+        let loaded = database
+            .load_zone_queue("z1")
+            .await
+            .expect("load")
+            .expect("queue present");
+        assert_eq!(loaded.items.len(), 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // A long-held write transaction (like the scan's full-library `save_library`
+    // rewrite) must not block concurrent reads. Under the old rollback journal this
+    // SELECT would wait on the writer and hit the busy-timeout; WAL lets it through.
+    #[tokio::test]
+    async fn a_held_write_does_not_block_reads() {
+        let db_path = temp_db_path("wal-concurrency");
+        let database = Database::connect(&db_path).await.expect("connect");
+
+        // Confirm WAL is actually engaged (the whole point of the fix).
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&database.pool)
+            .await
+            .expect("journal_mode");
+        assert_eq!(mode, "wal", "database must run in WAL mode");
+
+        // Hold an exclusive write transaction open on its own connection.
+        let mut writer = database.pool.acquire().await.expect("writer conn");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .expect("begin write");
+        sqlx::query("INSERT INTO favorites (item_type, item_id, created_at_unix_seconds) VALUES ('track','t1',0)")
+            .execute(&mut *writer)
+            .await
+            .expect("write row");
+
+        // A concurrent read on another pool connection must return promptly — well
+        // under the 15s busy-timeout — rather than blocking on the open writer.
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tracks").fetch_one(&database.pool),
+        )
+        .await;
+        assert!(
+            matches!(read, Ok(Ok(_))),
+            "a read must not block on a held write transaction (got {read:?})"
+        );
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut *writer)
+            .await
+            .expect("rollback");
+        drop(writer);
         let _ = std::fs::remove_file(db_path);
     }
 }

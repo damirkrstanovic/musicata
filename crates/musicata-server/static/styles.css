@@ -553,6 +553,33 @@ h1 {
   gap: 2px;
 }
 
+/* Inline "new playlist" input shown under the section head instead of a prompt(). */
+.inline-add {
+  margin: 4px 0 8px;
+}
+
+.inline-add input {
+  width: 100%;
+  background: var(--panel-strong);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 0.85rem;
+}
+
+.inline-add input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.inline-add-error {
+  margin: 6px 2px 0;
+  color: var(--danger, #e0696b);
+  font-size: 0.78rem;
+}
+
 .muted-hint {
   color: var(--muted);
   font-size: 0.8rem;
@@ -1000,6 +1027,17 @@ h1 {
   color: var(--accent-strong);
   font-size: 0.8rem;
   width: 12px;
+}
+
+/* Group header inside the target switcher (e.g. "Zones") */
+.pm-group {
+  padding: 8px 14px 4px;
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-top: 1px solid var(--line);
+  margin-top: 4px;
 }
 
 .player-menu-config {

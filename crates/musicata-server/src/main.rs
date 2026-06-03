@@ -11,7 +11,7 @@ mod scan_concurrency;
 mod smb;
 mod subsonic;
 
-use crate::players::{BrowserPlayer, PlayerHandle, PlayerManager};
+use crate::players::{BrowserPlayer, PlayerHandle, PlayerManager, ProgressTick, ZonePlayer};
 use crate::providers::{ProviderHandle, ProviderRegistry};
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -719,7 +719,9 @@ fn app(
         .route("/api/players/{id}/ws", get(player_ws))
         .route("/api/zones", get(list_zones).post(create_zone))
         .route("/api/zones/{id}", patch(update_zone).delete(delete_zone))
+        .route("/api/zones/{id}/state", get(zone_state))
         .route("/api/zones/{id}/commands", post(zone_command))
+        .route("/api/zones/{id}/ws", get(zone_ws))
         .route("/api/artists", get(artists))
         .route("/api/artists/{id}", get(artist_detail))
         .route("/api/albums", get(albums))
@@ -1300,13 +1302,33 @@ async fn zone_command(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(command): Json<PlayerCommand>,
-) -> Result<StatusCode, AppError> {
+) -> Result<Json<PlaybackState>, AppError> {
     state
         .players
         .command_zone(&id, command)
         .await
         .map_err(db_error)?;
-    Ok(StatusCode::NO_CONTENT)
+    let playback = state.players.zone_state(&id).await.map_err(db_error)?;
+    Ok(Json(playback))
+}
+
+async fn zone_state(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PlaybackState>, AppError> {
+    let playback = state.players.zone_state(&id).await.map_err(db_error)?;
+    Ok(Json(playback))
+}
+
+async fn zone_ws(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    match state.players.get_zone(&id).await {
+        Some(zone) => upgrade.on_upgrade(move |socket| queue_output_ws_loop(socket, zone)),
+        None => AppError::not_found(format!("unknown zone: {id}")).into_response(),
+    }
 }
 
 async fn player_ws(
@@ -1327,7 +1349,7 @@ async fn player_ws_loop(socket: WebSocket, handle: PlayerHandle, database: Datab
     match handle {
         // The browser player is bidirectional: the tab also reports progress and
         // track-ended back to the server.
-        PlayerHandle::Browser(browser) => browser_ws_loop(socket, browser, database).await,
+        PlayerHandle::Browser(browser) => queue_output_ws_loop(socket, browser).await,
         other => state_push_loop(socket, other, database).await,
     }
 }
@@ -1365,15 +1387,63 @@ async fn state_push_loop(mut socket: WebSocket, handle: PlayerHandle, database: 
     }
 }
 
-/// Bidirectional loop for the browser player: pushes state, and applies inbound
-/// `progress`/`ended` frames from the tab that is rendering audio.
-async fn browser_ws_loop(mut socket: WebSocket, browser: Arc<BrowserPlayer>, _database: Database) {
-    let mut updates = browser.subscribe();
+/// A server-owned queue a controller drives bidirectionally over a WebSocket: it
+/// pushes full state + lightweight progress ticks, and accepts `progress`/`ended`
+/// frames from whichever output is rendering audio. Both the browser player and a
+/// zone implement it, so they share one socket loop.
+trait QueueOutput {
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<PlaybackState>;
+    fn subscribe_progress(&self) -> tokio::sync::broadcast::Receiver<ProgressTick>;
+    async fn snapshot(&self) -> PlaybackState;
+    async fn report_progress(&self, elapsed_seconds: f64, duration_seconds: Option<f64>);
+    async fn track_ended(&self);
+}
+
+impl QueueOutput for BrowserPlayer {
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<PlaybackState> {
+        BrowserPlayer::subscribe(self)
+    }
+    fn subscribe_progress(&self) -> tokio::sync::broadcast::Receiver<ProgressTick> {
+        BrowserPlayer::subscribe_progress(self)
+    }
+    async fn snapshot(&self) -> PlaybackState {
+        BrowserPlayer::snapshot(self).await
+    }
+    async fn report_progress(&self, elapsed_seconds: f64, duration_seconds: Option<f64>) {
+        BrowserPlayer::report_progress(self, elapsed_seconds, duration_seconds).await
+    }
+    async fn track_ended(&self) {
+        BrowserPlayer::track_ended(self).await
+    }
+}
+
+impl QueueOutput for ZonePlayer {
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<PlaybackState> {
+        ZonePlayer::subscribe(self)
+    }
+    fn subscribe_progress(&self) -> tokio::sync::broadcast::Receiver<ProgressTick> {
+        ZonePlayer::subscribe_progress(self)
+    }
+    async fn snapshot(&self) -> PlaybackState {
+        ZonePlayer::snapshot(self).await
+    }
+    async fn report_progress(&self, elapsed_seconds: f64, duration_seconds: Option<f64>) {
+        ZonePlayer::report_progress(self, elapsed_seconds, duration_seconds).await
+    }
+    async fn track_ended(&self) {
+        ZonePlayer::track_ended(self).await
+    }
+}
+
+/// Bidirectional loop for a server-owned queue (browser player or zone): pushes
+/// state, and applies inbound `progress`/`ended` frames from the rendering output.
+async fn queue_output_ws_loop<T: QueueOutput>(mut socket: WebSocket, output: Arc<T>) {
+    let mut updates = output.subscribe();
     // Position ticks arrive on a separate channel as tiny `{type:"progress"}` frames,
     // so a playing track doesn't re-send the whole queue every second.
-    let mut progress = browser.subscribe_progress();
+    let mut progress = output.subscribe_progress();
 
-    if let Ok(text) = serde_json::to_string(&browser.snapshot().await)
+    if let Ok(text) = serde_json::to_string(&output.snapshot().await)
         && socket.send(Message::Text(text.into())).await.is_err()
     {
         return;
@@ -1406,7 +1476,7 @@ async fn browser_ws_loop(mut socket: WebSocket, browser: Arc<BrowserPlayer>, _da
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
             incoming = socket.recv() => match incoming {
-                Some(Ok(Message::Text(text))) => handle_browser_frame(&browser, text.as_str()).await,
+                Some(Ok(Message::Text(text))) => handle_queue_frame(&*output, text.as_str()).await,
                 Some(Ok(_)) => {}
                 _ => break,
             },
@@ -1414,12 +1484,12 @@ async fn browser_ws_loop(mut socket: WebSocket, browser: Arc<BrowserPlayer>, _da
     }
 }
 
-async fn handle_browser_frame(browser: &BrowserPlayer, text: &str) {
+async fn handle_queue_frame<T: QueueOutput>(output: &T, text: &str) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
     match value.get("type").and_then(|kind| kind.as_str()) {
-        Some("ended") => browser.track_ended().await,
+        Some("ended") => output.track_ended().await,
         Some("progress") => {
             if let Some(elapsed) = value
                 .get("elapsed_seconds")
@@ -1429,7 +1499,7 @@ async fn handle_browser_frame(browser: &BrowserPlayer, text: &str) {
                     .get("duration_seconds")
                     .and_then(|value| value.as_f64())
                     .filter(|duration| duration.is_finite() && *duration > 0.0);
-                browser.report_progress(elapsed, duration).await;
+                output.report_progress(elapsed, duration).await;
             }
         }
         _ => {}
@@ -2638,8 +2708,13 @@ async fn stream_track(
     ranged_response(bytes, range_header, content_type)
 }
 
-/// Serve an SMB-backed track, fetching only the requested byte range so large
-/// files never buffer whole.
+/// Serve an SMB-backed track by **streaming** the requested byte range in chunks
+/// (see `smb::read_range_stream`), so the first audio bytes reach the browser after a
+/// single SMB read rather than buffering the whole range. A browser's `<audio>` opens
+/// a track with `Range: bytes=0-`; under the old whole-range buffering that meant
+/// pulling the entire file (~6.5 MB) across the wire before playback could start
+/// (~600 ms) — chunked streaming drops first-byte latency to one read (~tens of ms)
+/// while still honoring the full range and seeks. Mirrors Jellyfin's chunked-copy model.
 #[cfg(feature = "provider-smb")]
 async fn smb_stream_response(
     smb: &smb::SmbProvider,
@@ -2650,34 +2725,42 @@ async fn smb_stream_response(
     let total = track.file_size_bytes.unwrap_or(0) as usize;
     let item_id = &track.provider.item_id;
 
-    if let Some((start, end)) = range.and_then(|range| parse_range(range, total)) {
-        let body = smb
-            .read_range(item_id, start as u64, end as u64)
-            .await
-            .map_err(|error| AppError::internal(error.to_string()))?;
+    if total == 0 {
         return Response::builder()
-            .status(StatusCode::PARTIAL_CONTENT)
+            .status(StatusCode::OK)
             .header(CONTENT_TYPE, content_type)
             .header(ACCEPT_RANGES, "bytes")
-            .header(CONTENT_LENGTH, body.len().to_string())
-            .header(CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
-            .body(Body::from(body))
+            .header(CONTENT_LENGTH, "0")
+            .body(Body::empty())
             .map_err(AppError::from);
     }
 
-    let body = if total == 0 {
-        Vec::new()
-    } else {
-        smb.read_range(item_id, 0, total as u64 - 1)
-            .await
-            .map_err(|error| AppError::internal(error.to_string()))?
-    };
-    Response::builder()
-        .status(StatusCode::OK)
+    let had_range = range.is_some();
+    // An unparseable/absent range is the whole file from offset 0.
+    let (start, end) = range
+        .and_then(|range| parse_range(range, total))
+        .unwrap_or((0, total - 1));
+    let length = end - start + 1;
+
+    let stream = smb
+        .read_range_stream(item_id, start as u64, end as u64)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+
+    // Content-Length is known exactly (the range length) even though the body streams.
+    let mut builder = Response::builder()
         .header(CONTENT_TYPE, content_type)
         .header(ACCEPT_RANGES, "bytes")
-        .header(CONTENT_LENGTH, body.len().to_string())
-        .body(Body::from(body))
+        .header(CONTENT_LENGTH, length.to_string());
+    builder = if had_range {
+        builder
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
+    } else {
+        builder.status(StatusCode::OK)
+    };
+    builder
+        .body(Body::from_stream(stream))
         .map_err(AppError::from)
 }
 
@@ -4017,6 +4100,149 @@ mod tests {
         let playback: serde_json::Value =
             serde_json::from_str(&body_text(response.into_body()).await).unwrap();
         assert_eq!(playback["volume"], 37);
+    }
+
+    #[tokio::test]
+    async fn zone_owns_a_queue_and_serves_state() {
+        let fixture = TestFixture::new("zone-queue-api");
+        let app = fixture.app().await;
+
+        let json_post = |uri: String, body: String| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        // Create a zone and assign an (offline) MPD member to it.
+        let response = app
+            .clone()
+            .oneshot(json_post(
+                "/api/zones".to_string(),
+                r#"{"name":"Living Room"}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+        let zone: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        let zone_id = zone["id"].as_str().expect("zone id").to_string();
+
+        let response = app
+            .clone()
+            .oneshot(json_post(
+                "/api/players".to_string(),
+                r#"{"address":"127.0.0.1:6699","name":"Den"}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+        let player: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        let player_id = player["id"].as_str().expect("id").to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/players/{player_id}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"zone_id":"{zone_id}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Grab three real track ids from the library.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tracks?limit=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let tracks: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        let ids: Vec<String> = tracks["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|track| track["id"].as_str().expect("track id").to_string())
+            .collect();
+        assert!(ids.len() >= 2, "fixture library has at least two tracks");
+        let id_list = ids
+            .iter()
+            .map(|id| format!("\"{id}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Command the zone (not a member): the zone owns the resulting queue.
+        let response = app
+            .clone()
+            .oneshot(json_post(
+                format!("/api/zones/{zone_id}/commands"),
+                format!(r#"{{"command":"play_tracks","track_ids":[{id_list}],"start_index":1}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let playback: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(playback["status"], "playing");
+        assert_eq!(
+            playback["queue"].as_array().expect("queue").len(),
+            ids.len()
+        );
+        assert_eq!(playback["queue_position"], 1);
+        assert_eq!(playback["now_playing"]["track_id"], ids[1]);
+
+        // The dedicated state endpoint reports the same canonical queue.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/zones/{zone_id}/state"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let state: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(state["queue_position"], 1);
+
+        // A reorder runs against the zone's queue.
+        let response = app
+            .clone()
+            .oneshot(json_post(
+                format!("/api/zones/{zone_id}/commands"),
+                r#"{"command":"move_queue_item","from":0,"to":1}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+        let playback: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        // The previously-playing track (index 1) is now at index 0; still now-playing.
+        assert_eq!(playback["queue_position"], 0);
+        assert_eq!(playback["now_playing"]["track_id"], ids[1]);
+
+        // Deleting the zone tears down its runtime; state then 404/500s, not panics.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/zones/{zone_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
