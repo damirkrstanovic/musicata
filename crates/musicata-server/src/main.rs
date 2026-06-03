@@ -1,5 +1,6 @@
 mod activity;
 mod artwork;
+mod artwork_providers;
 mod mpd;
 mod musicbrainz;
 mod players;
@@ -180,8 +181,17 @@ async fn main() -> Result<()> {
     // than before binding) is what keeps the web port available even while a large
     // or offline source is being scanned.
     let rescan_lock = Arc::new(Mutex::new(()));
+    // Cache fetched cover art next to the database (e.g. `.musicata/artwork/`).
+    let artwork_cache = Arc::new(artwork::ArtworkCache::new(
+        config
+            .database
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("artwork"),
+    ));
     // `--no-scan` serves the existing database untouched (no initial scan, no rescans,
     // no watcher) — for a snapshot DB or the UI smoke suite running on the real library.
+    // After each scan, missing covers are auto-filled if enabled in the app's settings.
     if !config.no_scan {
         tokio::spawn(library_scan_loop(
             database.clone(),
@@ -190,6 +200,7 @@ async fn main() -> Result<()> {
             activity.clone(),
             LIBRARY_RESCAN_INTERVAL,
             !config.no_incremental_rescan,
+            artwork_cache.clone(),
         ));
     }
 
@@ -226,15 +237,6 @@ async fn main() -> Result<()> {
              credentials are accepted — set --subsonic-password on untrusted networks"
         );
     }
-
-    // Cache fetched cover art next to the database (e.g. `.musicata/artwork/`).
-    let artwork_cache = Arc::new(artwork::ArtworkCache::new(
-        config
-            .database
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("artwork"),
-    ));
 
     tracing::info!("listening on http://{}", config.addr);
     axum::serve(
@@ -645,6 +647,7 @@ async fn library_scan_loop(
     activity: Arc<activity::ActivityLog>,
     interval: Duration,
     incremental: bool,
+    artwork_cache: Arc<artwork::ArtworkCache>,
 ) {
     scan_and_persist(
         &database,
@@ -655,6 +658,7 @@ async fn library_scan_loop(
         true,
     )
     .await;
+    artwork_fill_pass(&database, &activity, &artwork_cache).await;
     if !incremental {
         return;
     }
@@ -671,6 +675,168 @@ async fn library_scan_loop(
             true,
         )
         .await;
+        artwork_fill_pass(&database, &activity, &artwork_cache).await;
+    }
+}
+
+/// Setting keys edited in the web UI (see `crate::Database::get_setting`).
+const SETTING_ARTWORK_FETCH: &str = "artwork_fetch";
+const SETTING_FANART_TV_KEY: &str = "fanart_tv_key";
+
+/// Whether automatic artwork fetching is enabled (default on). Read from the settings
+/// store so toggling it in the UI takes effect on the next pass, no restart.
+async fn artwork_fetch_enabled(database: &Database) -> bool {
+    database
+        .get_setting(SETTING_ARTWORK_FETCH)
+        .await
+        .ok()
+        .flatten()
+        .map(|value| value != "false" && value != "0")
+        .unwrap_or(true)
+}
+
+/// How long to wait before re-querying providers for an album whose cover wasn't found,
+/// so the periodic rescan doesn't hammer the APIs for genuinely-coverless albums.
+const ARTWORK_RETRY_SECS: i64 = 7 * 24 * 60 * 60;
+/// Albums fetched per fill pass, so one pass can't starve the rescan loop for hours on a
+/// large coverless library; the rest are picked up on later passes.
+const ARTWORK_FILL_BATCH: usize = 100;
+
+/// After a scan, fill in missing album covers from the external artwork providers: first
+/// re-apply already-acquired covers (a rescan rewrites the albums table, wiping their
+/// `artwork_url`), then fetch for the still-coverless albums (rate-limited by the
+/// providers, capped per pass, with a negative cache so misses aren't re-queried every
+/// rescan). Reports progress on the same activity feed as the scan.
+async fn artwork_fill_pass(
+    database: &Database,
+    activity: &Arc<activity::ActivityLog>,
+    artwork_cache: &Arc<artwork::ArtworkCache>,
+) {
+    // Always restore already-acquired covers' artwork_url after the rescan's album
+    // rewrite (DB-only) — even if *fetching* is off, existing covers should still show.
+    if let Err(error) = database.reapply_acquired_artwork().await {
+        tracing::warn!(%error, "artwork: failed to re-apply acquired covers");
+    }
+
+    // Fetching new covers is a user setting (web UI), not a flag — read it live.
+    if !artwork_fetch_enabled(database).await {
+        return;
+    }
+    let fanart_tv_key = database
+        .get_setting(SETTING_FANART_TV_KEY)
+        .await
+        .ok()
+        .flatten()
+        .filter(|key| !key.is_empty());
+    let registry = Arc::new(artwork_providers::ArtworkProviderRegistry::lane(
+        fanart_tv_key,
+    ));
+    if registry.is_empty() {
+        return;
+    }
+
+    let retry_before = now_unix_seconds() - ARTWORK_RETRY_SECS;
+    let targets = match database.albums_missing_artwork(retry_before).await {
+        Ok(targets) => targets,
+        Err(error) => {
+            tracing::warn!(%error, "artwork: failed to list albums missing artwork");
+            return;
+        }
+    };
+    if targets.is_empty() {
+        return;
+    }
+
+    let batch: Vec<_> = targets.into_iter().take(ARTWORK_FILL_BATCH).collect();
+    let total = batch.len();
+    let task = activity.start("artwork", format!("Finding album artwork (0/{total})"));
+    let mut found = 0usize;
+
+    for (index, target) in batch.into_iter().enumerate() {
+        activity.update(
+            task,
+            format!(
+                "Finding album artwork ({}/{total}): {}",
+                index + 1,
+                target.title
+            ),
+        );
+        let (release_mbid, release_group_mbid) = database
+            .album_musicbrainz_ids(&target.album_id)
+            .await
+            .unwrap_or((None, None));
+        let query = artwork_providers::ArtworkQuery {
+            artist: target.artist_name.clone(),
+            album: target.title.clone(),
+            release_mbid,
+            release_group_mbid,
+        };
+
+        // Provider search + image download are synchronous (ureq) → off the runtime.
+        let registry = registry.clone();
+        let fetched = tokio::task::spawn_blocking(move || {
+            let cover = registry.find_cover(&query)?;
+            let (bytes, ext) = artwork_providers::download_image(&cover.image_url).ok()?;
+            Some((cover, bytes, ext))
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let now = now_unix_seconds();
+        match fetched {
+            Some((cover, bytes, ext)) => {
+                let cache_key =
+                    artwork_providers::acquired_cache_key(&target.album_id, &cover.image_url);
+                artwork_cache.put(&cache_key, ext, &bytes).await;
+                let _ = database
+                    .upsert_acquired_artwork(
+                        &target.album_id,
+                        cover.provider,
+                        Some(&cover.image_url),
+                        Some(&cache_key),
+                        Some(ext),
+                        cover.width,
+                        "acquired",
+                        now,
+                    )
+                    .await;
+                let url = format!(
+                    "/api/albums/{}/artwork?asset={}",
+                    target.album_id, cache_key
+                );
+                let _ = database
+                    .set_album_artwork(&target.album_id, None, Some(&url))
+                    .await;
+                found += 1;
+            }
+            None => {
+                // Negative cache: don't re-query this album until the retry window.
+                let _ = database
+                    .upsert_acquired_artwork(
+                        &target.album_id,
+                        "none",
+                        None,
+                        None,
+                        None,
+                        None,
+                        "not_found",
+                        now,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    if found > 0 {
+        activity.finish(
+            task,
+            true,
+            Some(format!("Found artwork for {found} of {total} albums")),
+        );
+    } else {
+        // Nothing found this pass — don't leave a noisy entry in the activity log.
+        activity.remove(task);
     }
 }
 
@@ -755,6 +921,7 @@ fn app(
         .route("/api/sources/{id}/resolve", get(resolve_source))
         .route("/api/activity", get(list_activity))
         .route("/api/activity/ws", get(activity_ws))
+        .route("/api/settings", get(get_settings).patch(update_settings))
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
             get(album_musicbrainz_candidates),
@@ -2042,6 +2209,59 @@ async fn activity_ws_loop(mut socket: WebSocket, activity: Arc<activity::Activit
 
 /// List configured sources: the always-present local library plus any persisted
 /// network sources (SMB shares).
+/// User-editable app settings (the `/admin` Settings panel; persisted in the DB).
+#[derive(Debug, Serialize)]
+struct AppSettings {
+    /// Automatically fetch missing album covers from external providers.
+    artwork_fetch: bool,
+    /// Optional fanart.tv personal API key (empty = unset).
+    fanart_tv_key: String,
+}
+
+async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>, AppError> {
+    let artwork_fetch = artwork_fetch_enabled(&state.database).await;
+    let fanart_tv_key = state
+        .database
+        .get_setting(SETTING_FANART_TV_KEY)
+        .await
+        .map_err(db_error)?
+        .unwrap_or_default();
+    Ok(Json(AppSettings {
+        artwork_fetch,
+        fanart_tv_key,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SettingsUpdate {
+    artwork_fetch: Option<bool>,
+    fanart_tv_key: Option<String>,
+}
+
+async fn update_settings(
+    State(state): State<AppState>,
+    Json(update): Json<SettingsUpdate>,
+) -> Result<Json<AppSettings>, AppError> {
+    if let Some(enabled) = update.artwork_fetch {
+        state
+            .database
+            .set_setting(
+                SETTING_ARTWORK_FETCH,
+                if enabled { "true" } else { "false" },
+            )
+            .await
+            .map_err(db_error)?;
+    }
+    if let Some(key) = update.fanart_tv_key {
+        state
+            .database
+            .set_setting(SETTING_FANART_TV_KEY, key.trim())
+            .await
+            .map_err(db_error)?;
+    }
+    get_settings(State(state)).await
+}
+
 async fn list_sources(State(state): State<AppState>) -> Result<Json<Vec<SourceView>>, AppError> {
     let mut views = vec![
         SourceView {
@@ -2838,6 +3058,35 @@ async fn album_artwork(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    // An externally-acquired cover (iTunes/Deezer/Cover Art Archive) takes precedence —
+    // its bytes live in the artwork cache, keyed by the stored cache_key.
+    if let Ok(Some(acquired)) = state.database.acquired_artwork(&id).await
+        && acquired.status == "acquired"
+        && let Some(key) = acquired.cache_key.clone()
+    {
+        let ext = acquired.ext.clone().unwrap_or_else(|| "jpg".to_string());
+        let etag = format!("\"{key}\"");
+        if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
+            return artwork_not_modified(&etag);
+        }
+        if let Some(bytes) = state.artwork_cache.get(&key, &ext).await {
+            return artwork_response(bytes, &ext, etag);
+        }
+        // Cache miss (cleared/evicted) but we recorded the source — re-fetch once.
+        if let Some(url) = acquired.remote_url.clone() {
+            let downloaded =
+                tokio::task::spawn_blocking(move || artwork_providers::download_image(&url))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+            if let Some((bytes, _)) = downloaded {
+                state.artwork_cache.put(&key, &ext, &bytes).await;
+                return artwork_response(bytes, &ext, etag);
+            }
+        }
+        // Couldn't produce it — fall through to the local/embedded logic (likely 404).
+    }
+
     let album = state
         .database
         .album(&id)

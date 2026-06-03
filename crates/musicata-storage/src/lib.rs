@@ -220,6 +220,20 @@ impl Database {
             set_user_version(&self.pool, 18).await?;
         }
 
+        if version < 19 {
+            for statement in MIGRATION_019_ACQUIRED_ARTWORK {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 19).await?;
+        }
+
+        if version < 20 {
+            for statement in MIGRATION_020_SETTINGS {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 20).await?;
+        }
+
         Ok(())
     }
 
@@ -1307,6 +1321,165 @@ impl Database {
         Ok(())
     }
 
+    // ---- Acquired (externally fetched) album artwork -------------------------
+
+    /// Albums that still need a cover fetched from an external provider: no
+    /// folder/embedded cover (`artwork_url IS NULL`), and either never attempted or
+    /// last marked `not_found` before `retry_before` (so a coverless album isn't
+    /// re-queried on every rescan). Already-`acquired` albums are excluded.
+    pub async fn albums_missing_artwork(
+        &self,
+        retry_before_unix_seconds: i64,
+    ) -> Result<Vec<AlbumArtworkTarget>> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.artist_name, a.title
+             FROM albums a
+             LEFT JOIN acquired_album_artwork q ON q.album_id = a.id
+             WHERE a.artwork_url IS NULL
+               AND (q.album_id IS NULL
+                    OR (q.status = 'not_found' AND q.acquired_at_unix_seconds < ?1))
+             ORDER BY a.artist_name, a.title",
+        )
+        .bind(retry_before_unix_seconds)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(AlbumArtworkTarget {
+                    album_id: row.try_get("id")?,
+                    artist_name: row.try_get("artist_name")?,
+                    title: row.try_get("title")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Record the outcome of an artwork fetch for an album (`acquired` with the cache
+    /// reference, or `not_found`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_acquired_artwork(
+        &self,
+        album_id: &str,
+        provider: &str,
+        remote_url: Option<&str>,
+        cache_key: Option<&str>,
+        ext: Option<&str>,
+        width: Option<u32>,
+        status: &str,
+        now_unix_seconds: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO acquired_album_artwork
+                (album_id, provider, remote_url, cache_key, ext, width, status, acquired_at_unix_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(album_id) DO UPDATE SET
+                provider = ?2, remote_url = ?3, cache_key = ?4, ext = ?5, width = ?6,
+                status = ?7, acquired_at_unix_seconds = ?8",
+        )
+        .bind(album_id)
+        .bind(provider)
+        .bind(remote_url)
+        .bind(cache_key)
+        .bind(ext)
+        .bind(width.map(|w| w as i64))
+        .bind(status)
+        .bind(now_unix_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The acquired-artwork record for an album, if any (used by the serve handler).
+    pub async fn acquired_artwork(&self, album_id: &str) -> Result<Option<AcquiredArtwork>> {
+        let Some(row) = sqlx::query(
+            "SELECT provider, remote_url, cache_key, ext, width, status
+             FROM acquired_album_artwork WHERE album_id = ?1",
+        )
+        .bind(album_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(AcquiredArtwork {
+            provider: row.try_get("provider")?,
+            remote_url: row.try_get("remote_url")?,
+            cache_key: row.try_get("cache_key")?,
+            ext: row.try_get("ext")?,
+            width: row.try_get::<Option<i64>, _>("width")?.map(|w| w as u32),
+            status: row.try_get("status")?,
+        }))
+    }
+
+    /// Re-apply acquired covers' `artwork_url` to the albums table after a rescan wiped
+    /// it (`save_library` rebuilds albums each scan). Pure DB, no network. Returns how
+    /// many albums were restored.
+    pub async fn reapply_acquired_artwork(&self) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE albums SET artwork_url =
+                '/api/albums/' || id || '/artwork?asset=' ||
+                (SELECT cache_key FROM acquired_album_artwork q
+                 WHERE q.album_id = albums.id AND q.status = 'acquired')
+             WHERE artwork_url IS NULL
+               AND EXISTS (SELECT 1 FROM acquired_album_artwork q
+                           WHERE q.album_id = albums.id AND q.status = 'acquired')",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// The first MusicBrainz release / release-group ids found among an album's tracks
+    /// (used to query id-keyed artwork providers like Cover Art Archive).
+    pub async fn album_musicbrainz_ids(
+        &self,
+        album_id: &str,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let row = sqlx::query(
+            "SELECT o.musicbrainz_release_id AS rel, o.musicbrainz_release_group_id AS rg
+             FROM tracks t
+             JOIN track_metadata_observations o ON o.track_id = t.id
+             WHERE t.album_id = ?1
+               AND (o.musicbrainz_release_id IS NOT NULL
+                    OR o.musicbrainz_release_group_id IS NOT NULL)
+             LIMIT 1",
+        )
+        .bind(album_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(row) => (row.try_get("rel")?, row.try_get("rg")?),
+            None => (None, None),
+        })
+    }
+
+    // ---- App settings (user-editable, persisted; edited in the web UI) -------
+
+    /// A stored setting value, or `None` if unset.
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT value FROM settings WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            Some(row) => Some(row.try_get("value")?),
+            None => None,
+        })
+    }
+
+    /// Store (upsert) a setting value.
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // ---- Players & zones -----------------------------------------------------
 
     pub async fn list_players(&self) -> Result<Vec<PlayerRecord>> {
@@ -2258,6 +2431,26 @@ pub struct PlayerQueueSnapshot {
     pub items: Vec<QueueItem>,
 }
 
+/// An album that needs a cover fetched from an external artwork provider.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlbumArtworkTarget {
+    pub album_id: String,
+    pub artist_name: String,
+    pub title: String,
+}
+
+/// The acquired-artwork record for an album (provenance + cache reference).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AcquiredArtwork {
+    pub provider: String,
+    pub remote_url: Option<String>,
+    pub cache_key: Option<String>,
+    pub ext: Option<String>,
+    pub width: Option<u32>,
+    /// `acquired` (cover cached) or `not_found` (negative cache marker).
+    pub status: String,
+}
+
 fn playback_status_str(status: PlaybackStatus) -> &'static str {
     match status {
         PlaybackStatus::Stopped => "stopped",
@@ -3068,6 +3261,32 @@ const MIGRATION_018_ZONE_QUEUE: &[&str] = &[
         PRIMARY KEY (zone_id, seq)
     )",
 ];
+
+// Album cover art acquired from an external artwork provider (iTunes/Deezer/Cover Art
+// Archive/fanart.tv). The image bytes live in the artwork cache (`cache_key`); this row
+// records the provenance and lets the serve handler find them, plus a `not_found` marker
+// so the periodic rescan doesn't re-query a coverless album every 30s. Deliberately
+// **no foreign key to albums**: `save_library` rewrites the albums table every scan, and
+// a cascade would wipe acquired covers — `album_id` is stable across rescans, so a
+// re-added album keeps its art. `status` is `acquired` or `not_found`.
+const MIGRATION_019_ACQUIRED_ARTWORK: &[&str] =
+    &["CREATE TABLE IF NOT EXISTS acquired_album_artwork (
+        album_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        remote_url TEXT,
+        cache_key TEXT,
+        ext TEXT,
+        width INTEGER,
+        status TEXT NOT NULL,
+        acquired_at_unix_seconds INTEGER NOT NULL
+    )"];
+
+// App settings the user edits in the web UI (not flags/config files): a small key/value
+// store, e.g. whether to auto-fetch artwork and an optional fanart.tv key.
+const MIGRATION_020_SETTINGS: &[&str] = &["CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )"];
 
 // Listening history. One row per confirmed listen (a track that played past the
 // ListenBrainz threshold — see `players::ListenTracker`). `listened_at` is when the
@@ -4503,6 +4722,139 @@ mod tests {
             .await
             .expect("rollback");
         drop(writer);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn acquired_artwork_lifecycle() {
+        let db_path = temp_db_path("acquired-artwork");
+        let database = Database::connect(&db_path).await.expect("connect");
+
+        // A cover-less album (no folder/embedded artwork).
+        let mut library = fixture_library();
+        library.albums[0].artwork_url = None;
+        library.albums[0].artwork_path = None;
+        database.save_library(&mut library).await.expect("save");
+
+        // It shows up as needing a fetch.
+        let missing = database.albums_missing_artwork(0).await.expect("missing");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].album_id, "album_1");
+        assert_eq!(missing[0].title, "Album");
+
+        // Record a fetched cover.
+        database
+            .upsert_acquired_artwork(
+                "album_1",
+                "itunes",
+                Some("https://example/cover/600x600.jpg"),
+                Some("abc123key"),
+                Some("jpg"),
+                Some(600),
+                "acquired",
+                1_800_000_000,
+            )
+            .await
+            .expect("upsert");
+
+        let acquired = database
+            .acquired_artwork("album_1")
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(acquired.status, "acquired");
+        assert_eq!(acquired.cache_key.as_deref(), Some("abc123key"));
+        assert_eq!(acquired.width, Some(600));
+
+        // Now it's no longer "missing" (it's acquired, not awaiting a fetch).
+        assert!(
+            database
+                .albums_missing_artwork(2_000_000_000)
+                .await
+                .expect("missing")
+                .is_empty()
+        );
+
+        // Re-apply restores the album's artwork_url (a rescan would have wiped it).
+        let restored = database.reapply_acquired_artwork().await.expect("reapply");
+        assert_eq!(restored, 1);
+        let album = database
+            .album("album_1")
+            .await
+            .expect("album")
+            .expect("some");
+        assert_eq!(
+            album.artwork_url.as_deref(),
+            Some("/api/albums/album_1/artwork?asset=abc123key")
+        );
+
+        // A not_found marker suppresses re-querying until the retry window passes.
+        database
+            .upsert_acquired_artwork(
+                "album_1",
+                "none",
+                None,
+                None,
+                None,
+                None,
+                "not_found",
+                1_000,
+            )
+            .await
+            .expect("upsert not_found");
+        // Within the retry window (retry_before older than the marker): excluded.
+        assert!(
+            database
+                .albums_missing_artwork(500)
+                .await
+                .expect("missing")
+                .is_empty()
+        );
+        // Past the retry window (retry_before newer than the marker): eligible again.
+        // (artwork_url was set above; clear it to model a coverless album.)
+        database
+            .set_album_artwork("album_1", None, None)
+            .await
+            .expect("clear url");
+        assert_eq!(
+            database
+                .albums_missing_artwork(2_000)
+                .await
+                .expect("missing")
+                .len(),
+            1
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip() {
+        let db_path = temp_db_path("settings");
+        let database = Database::connect(&db_path).await.expect("connect");
+
+        assert_eq!(
+            database.get_setting("artwork_fetch").await.expect("get"),
+            None
+        );
+        database
+            .set_setting("artwork_fetch", "false")
+            .await
+            .expect("set");
+        assert_eq!(
+            database.get_setting("artwork_fetch").await.expect("get"),
+            Some("false".to_string())
+        );
+        // Upsert overwrites.
+        database
+            .set_setting("artwork_fetch", "true")
+            .await
+            .expect("set");
+        assert_eq!(
+            database.get_setting("artwork_fetch").await.expect("get"),
+            Some("true".to_string())
+        );
+
         let _ = std::fs::remove_file(db_path);
     }
 }
