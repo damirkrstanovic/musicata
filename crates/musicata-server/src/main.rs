@@ -2848,6 +2848,33 @@ async fn album_artwork(
         .artwork_path
         .ok_or_else(|| AppError::not_found(format!("album has no artwork: {id}")))?;
 
+    // An album with no folder cover falls back to a track's *embedded* artwork — in that
+    // case `artwork_path` points at the audio file, so extract the picture (once) and
+    // cache it, rather than trying to serve the audio file as an image.
+    if is_embedded_artwork(&path) {
+        const EMBEDDED_CACHE_EXT: &str = "embedded";
+        let key = artwork_asset_id(&path);
+        let etag = format!("\"{key}\"");
+        if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
+            return artwork_not_modified(&etag);
+        }
+        if let Some(bytes) = state.artwork_cache.get(&key, EMBEDDED_CACHE_EXT).await {
+            let content_type = sniff_image_content_type(&bytes);
+            return artwork_response_typed(bytes, content_type, etag);
+        }
+        // Read the audio file (over the source provider or local disk) once, extract its
+        // embedded cover, and cache the image so the network stays off the hot path.
+        let audio = read_album_source_file(&state, &id, &path).await?;
+        let image = musicata_core::extract_embedded_cover(&audio, &path)
+            .ok_or_else(|| AppError::not_found(format!("album has no embedded artwork: {id}")))?;
+        state
+            .artwork_cache
+            .put(&key, EMBEDDED_CACHE_EXT, &image)
+            .await;
+        let content_type = sniff_image_content_type(&image);
+        return artwork_response_typed(image, content_type, etag);
+    }
+
     // Route by the album's source. An album whose tracks live on a network source
     // (e.g. SMB) stores its cover's share-relative path, which isn't a local file, so
     // it must be fetched through the provider rather than read off the local disk.
@@ -3065,14 +3092,80 @@ fn artwork_not_modified(etag: &str) -> Result<Response, AppError> {
 }
 
 fn artwork_response(bytes: Vec<u8>, extension: &str, etag: String) -> Result<Response, AppError> {
+    artwork_response_typed(bytes, image_content_type(extension), etag)
+}
+
+/// Like [`artwork_response`] but with an explicit content type — used for embedded
+/// covers, whose image format is sniffed from the extracted bytes rather than a path.
+fn artwork_response_typed(
+    bytes: Vec<u8>,
+    content_type: &'static str,
+    etag: String,
+) -> Result<Response, AppError> {
     Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, image_content_type(extension))
+        .header(CONTENT_TYPE, content_type)
         .header(CONTENT_LENGTH, bytes.len().to_string())
         .header(CACHE_CONTROL, ARTWORK_CACHE_CONTROL)
         .header(ETAG, etag)
         .body(Body::from(bytes))
         .map_err(AppError::from)
+}
+
+/// Whether an album's `artwork_path` points at an audio file (an embedded-cover
+/// fallback) rather than an image file (a folder cover).
+fn is_embedded_artwork(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("mp3" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "wav")
+    )
+}
+
+/// Image content type by magic bytes — embedded covers carry no filename, so the
+/// format is detected from the data (defaulting to JPEG, the common case).
+fn sniff_image_content_type(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    }
+}
+
+/// Read an album's source file (the cover image or, for embedded art, the audio file)
+/// from its provider — over SMB for a network album, else from local disk.
+#[cfg_attr(not(feature = "provider-smb"), allow(unused_variables))]
+async fn read_album_source_file(
+    state: &AppState,
+    album_id: &str,
+    path: &std::path::Path,
+) -> Result<Vec<u8>, AppError> {
+    #[cfg(feature = "provider-smb")]
+    {
+        let provider_id = state
+            .database
+            .album_provider_id(album_id)
+            .await
+            .map_err(db_error)?;
+        if let Some(provider_id) = provider_id
+            && let Some(providers::ProviderHandle::Smb(smb)) =
+                state.providers.read().await.get(&provider_id)
+        {
+            let item_id = path.to_string_lossy().into_owned();
+            return smb.read_file(&item_id).await.map_err(|error| {
+                AppError::not_found(format!("artwork source unavailable: {error}"))
+            });
+        }
+    }
+    tokio::fs::read(path)
+        .await
+        .map_err(|error| AppError::not_found(format!("artwork source unavailable: {error}")))
 }
 
 fn etag_matches(value: Option<&axum::http::HeaderValue>, etag: &str) -> bool {
@@ -4243,6 +4336,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn detects_embedded_vs_folder_artwork_paths() {
+        use super::is_embedded_artwork;
+        use std::path::Path;
+        assert!(is_embedded_artwork(Path::new("Album/track.flac")));
+        assert!(is_embedded_artwork(Path::new("Album/track.MP3")));
+        assert!(!is_embedded_artwork(Path::new("Album/cover.jpg")));
+        assert!(!is_embedded_artwork(Path::new("Album/folder.png")));
+    }
+
+    #[test]
+    fn sniffs_image_content_type_from_magic_bytes() {
+        use super::sniff_image_content_type;
+        assert_eq!(
+            sniff_image_content_type(&[0xff, 0xd8, 0xff, 0xe0]),
+            "image/jpeg"
+        );
+        assert_eq!(
+            sniff_image_content_type(&[0x89, b'P', b'N', b'G']),
+            "image/png"
+        );
+        assert_eq!(sniff_image_content_type(b"GIF89a"), "image/gif");
+        assert_eq!(
+            sniff_image_content_type(b"RIFF\0\0\0\0WEBPVP8 "),
+            "image/webp"
+        );
+        // Unknown bytes default to JPEG (the common embedded-cover case).
+        assert_eq!(sniff_image_content_type(b"\0\0\0\0"), "image/jpeg");
     }
 
     #[tokio::test]

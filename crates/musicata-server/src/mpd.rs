@@ -179,6 +179,44 @@ impl MpdConnection {
         }
         Ok(())
     }
+
+    /// Replace the queue with `uris` but do **not** start playing — used to restore a
+    /// persisted queue paused at startup. The saved position is applied on the first
+    /// `play` so we never emit an audible blip at boot.
+    pub async fn load_queue(&mut self, uris: &[String]) -> Result<()> {
+        self.clear().await?;
+        for uri in uris {
+            self.add(uri).await?;
+        }
+        Ok(())
+    }
+
+    /// Read the playback cursor (status + current song) **without** the queue — the
+    /// server owns the queue, so it only reads which index is playing, the elapsed
+    /// position, and the options back from MPD. Also returns MPD's queue version,
+    /// which increments only on queue edits (not on seeks or song changes), so an
+    /// unexpected bump signals an external client edited the queue.
+    pub async fn read_status(&mut self) -> Result<MpdStatus> {
+        let status = self.command("status").await?;
+        let current = self.command("currentsong").await?;
+        let state = parse_playback_state(&status, &current, &[]);
+        let playlist_version = find(&status, "playlist")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        Ok(MpdStatus {
+            state,
+            playlist_version,
+        })
+    }
+}
+
+/// MPD's playback cursor plus its queue version. `state.queue` is empty — the server
+/// owns the queue and reads only the cursor (position/elapsed/options/now-playing).
+pub struct MpdStatus {
+    pub state: PlaybackState,
+    /// Increments only on queue edits (add/delete/move/clear) — used to detect an
+    /// external client changing the queue out from under the server.
+    pub playlist_version: u64,
 }
 
 /// Quote an MPD command argument: wrap in double quotes, escaping `"` and `\`.
@@ -414,6 +452,53 @@ mod tests {
         assert_eq!(state.queue.len(), 1);
     }
 
+    #[tokio::test]
+    async fn load_queue_adds_without_playing() {
+        // load_queue must issue clear + add but NOT play (restore stays paused).
+        let addr = fake_mpd(vec![
+            ("clear", ""),
+            ("add \"http://host/api/tracks/track_1/stream\"", ""),
+            ("add \"http://host/api/tracks/track_2/stream\"", ""),
+        ])
+        .await;
+
+        let mut connection = MpdConnection::connect(&addr).await.expect("connect");
+        connection
+            .load_queue(&[
+                "http://host/api/tracks/track_1/stream".to_string(),
+                "http://host/api/tracks/track_2/stream".to_string(),
+            ])
+            .await
+            .expect("load queue");
+        // No `play`/`play 0` was scripted; the fake server replies OK to anything, so
+        // the assertion that matters is exercised by the live test. Here we just
+        // confirm the call sequence completes without a play command erroring.
+    }
+
+    #[tokio::test]
+    async fn read_status_reports_cursor_and_playlist_version() {
+        let addr = fake_mpd(vec![
+            (
+                "status",
+                "volume: 60\nstate: pause\nsong: 2\nelapsed: 5.0\nrepeat: 0\nsingle: 0\nrandom: 0\nplaylist: 7\nplaylistlength: 4\n",
+            ),
+            (
+                "currentsong",
+                "file: http://host/api/tracks/track_3/stream\nTitle: Three\n",
+            ),
+        ])
+        .await;
+
+        let mut connection = MpdConnection::connect(&addr).await.expect("connect");
+        let status = connection.read_status().await.expect("read status");
+
+        assert_eq!(status.playlist_version, 7);
+        assert_eq!(status.state.queue_position, Some(2));
+        assert_eq!(status.state.status, PlaybackStatus::Paused);
+        // The server owns the queue, so read_status never fetches it.
+        assert!(status.state.queue.is_empty());
+    }
+
     // ---- Live test against a real `mpd` process -------------------------------
     //
     // Ignored by default because it needs the `mpd` binary installed. Run with:
@@ -505,7 +590,7 @@ mod tests {
              log_file \"{base}/log\"\n\
              bind_to_address \"127.0.0.1\"\n\
              port \"{port}\"\n\
-             audio_output {{\n\ttype \"null\"\n\tname \"null\"\n}}\n",
+             audio_output {{\n\ttype \"null\"\n\tname \"null\"\n\tmixer_type \"software\"\n}}\n",
             music = dir.join("music").display(),
             base = dir.display(),
         );
@@ -587,5 +672,28 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(playing, "mpd did not reach the playing state");
+
+        // read_status reads the cursor + the queue version without fetching the queue.
+        let status = connection.read_status().await.expect("read status");
+        assert!(status.state.queue.is_empty(), "read_status omits the queue");
+        assert_eq!(status.state.queue_position, Some(0));
+        let version_after_play = status.playlist_version;
+
+        // load_queue replaces the queue WITHOUT auto-playing (restore stays paused),
+        // and bumps the queue version (so the server can spot external edits).
+        connection
+            .load_queue(std::slice::from_ref(&url))
+            .await
+            .expect("load queue");
+        let status = connection.read_status().await.expect("read status");
+        assert_ne!(
+            status.state.status,
+            PlaybackStatus::Playing,
+            "load_queue must not start playback"
+        );
+        assert!(
+            status.playlist_version > version_after_play,
+            "a queue edit bumps MPD's playlist version"
+        );
     }
 }

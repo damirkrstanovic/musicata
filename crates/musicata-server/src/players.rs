@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
@@ -28,7 +28,7 @@ use musicata_storage::{Database, PlayerPlayback, PlayerRecord};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
 
-use crate::mpd::MpdConnection;
+use crate::mpd::{MpdConnection, MpdStatus};
 
 /// Stable id of the always-present local browser player.
 pub const BROWSER_PLAYER_ID: &str = "browser-local";
@@ -252,7 +252,15 @@ impl PlayerManager {
                 (PlayerHandle::Browser(player), None)
             }
             _ => {
-                let player = Arc::new(MpdPlayer::new(record.id.clone(), record.address.clone()));
+                let player = Arc::new(MpdPlayer::new(
+                    record.id.clone(),
+                    record.address.clone(),
+                    self.database.clone(),
+                    self.public_base_url.clone(),
+                ));
+                // Restore the server-owned queue (server wins) and push it to MPD before
+                // the idle loop starts; with no persisted queue, adopt MPD's current one.
+                player.restore().await;
                 let task = player.clone().spawn_state_task(self.database.clone());
                 (PlayerHandle::Mpd(player), Some(task))
             }
@@ -441,25 +449,48 @@ fn zone_id(name: &str) -> String {
     format!("zone-{}", slug.trim_matches('-'))
 }
 
+/// An MPD-backed player whose **queue is server-owned**: Musicata owns the queue
+/// content and order (persisted to the `player_queue` tables, like the browser
+/// player), and reconciles MPD to mirror it; **MPD owns the playback cursor** (which
+/// index is playing, elapsed, and its native shuffle/repeat/auto-advance), which the
+/// server reads back. On startup the server queue wins (it's pushed onto MPD, paused);
+/// an external client editing MPD's queue is re-asserted over (server always wins).
 pub struct MpdPlayer {
     id: String,
     addr: String,
+    database: Database,
+    public_base_url: String,
     /// Command connection, reconnected on demand. A separate connection is used
     /// for the blocking idle loop.
     connection: Mutex<Option<MpdConnection>>,
     online: AtomicBool,
+    /// The server-owned queue. MPD is reconciled to match it; the cursor fields are
+    /// refreshed from MPD.
+    state: Mutex<QueueState>,
     state_tx: broadcast::Sender<PlaybackState>,
+    /// MPD's queue version after our last reconcile. An idle `playlist` event with a
+    /// different version is an external edit we re-assert over (queue version bumps
+    /// only on queue edits, not on seeks/song changes).
+    expected_playlist_version: AtomicU64,
+    /// Set after a restore — MPD has the queue loaded but its cursor isn't established,
+    /// so the first `Play` resumes at the saved position rather than MPD's index 0.
+    restored: AtomicBool,
 }
 
 impl MpdPlayer {
-    fn new(id: String, addr: String) -> Self {
+    fn new(id: String, addr: String, database: Database, public_base_url: String) -> Self {
         let (state_tx, _) = broadcast::channel(16);
         Self {
             id,
             addr,
+            database,
+            public_base_url,
             connection: Mutex::new(None),
             online: AtomicBool::new(false),
+            state: Mutex::new(QueueState::default()),
             state_tx,
+            expected_playlist_version: AtomicU64::new(0),
+            restored: AtomicBool::new(false),
         }
     }
 
@@ -471,57 +502,280 @@ impl MpdPlayer {
         self.state_tx.subscribe()
     }
 
-    /// Fetch and enrich the current playback state via the command connection.
-    pub async fn state(&self, database: &Database) -> Result<PlaybackState> {
-        let mut guard = self.connection.lock().await;
-        let result = async {
-            let connection = ensure_connected(&mut guard, &self.addr).await?;
-            connection.playback_state().await
+    /// Build the controller-facing state: the server-owned queue plus the
+    /// MPD-derived cursor (now-playing is the queue item at the cursor position).
+    async fn snapshot(&self) -> PlaybackState {
+        let state = self.state.lock().await;
+        PlaybackState {
+            status: state.status,
+            now_playing: state
+                .position
+                .and_then(|index| state.queue.get(index).cloned()),
+            elapsed_seconds: state.elapsed_seconds,
+            duration_seconds: state.duration_seconds,
+            volume: state.volume,
+            repeat: state.repeat,
+            shuffle: state.shuffle,
+            queue: state.queue.clone(),
+            queue_position: state.position,
         }
-        .await;
-        match result {
-            Ok(mut state) => {
-                self.online.store(true, Ordering::Relaxed);
-                enrich_state(&mut state, database).await;
-                Ok(state)
+    }
+
+    async fn broadcast(&self) {
+        let _ = self.state_tx.send(self.snapshot().await);
+    }
+
+    /// Persist the server-owned queue (failures logged, never propagated).
+    async fn persist(&self, persist: QueuePersist) {
+        let result = match &persist {
+            QueuePersist::Playback(playback) => {
+                self.database.save_player_playback(&self.id, playback).await
+            }
+            QueuePersist::Queue(playback, items) => {
+                self.database
+                    .save_player_queue(&self.id, playback, items)
+                    .await
+            }
+        };
+        if let Err(error) = result {
+            tracing::warn!(player = %self.id, %error, "failed to persist mpd queue");
+        }
+    }
+
+    /// Fold MPD's reported cursor (status + current song) into the server queue state:
+    /// status/position/elapsed/volume/options come from MPD; the queue stays
+    /// server-owned. Records MPD's queue version so our own edits aren't mistaken for
+    /// an external one.
+    async fn apply_cursor(&self, status: MpdStatus) {
+        let mut state = self.state.lock().await;
+        let cursor = status.state;
+        state.status = cursor.status;
+        state.position = cursor
+            .queue_position
+            .filter(|&index| index < state.queue.len());
+        state.elapsed_seconds = cursor.elapsed_seconds;
+        state.duration_seconds = cursor.duration_seconds;
+        if cursor.volume.is_some() {
+            state.volume = cursor.volume;
+        }
+        state.repeat = cursor.repeat;
+        state.shuffle = cursor.shuffle;
+        self.expected_playlist_version
+            .store(status.playlist_version, Ordering::Relaxed);
+    }
+
+    /// Restore the persisted server queue (server wins) and push it to MPD paused. If
+    /// no queue was persisted, adopt MPD's current queue so the UI matches what MPD is
+    /// already playing. Best-effort: an unreachable MPD just leaves the (restored)
+    /// server queue to be re-pushed when it returns.
+    async fn restore(&self) {
+        match self.database.load_player_queue(&self.id).await {
+            Ok(Some(snapshot)) => {
+                {
+                    let mut state = self.state.lock().await;
+                    let playback = snapshot.playback;
+                    state.queue = snapshot.items;
+                    state.position = playback.position.filter(|&i| i < state.queue.len());
+                    // A queue we can't point into can't be paused/playing.
+                    state.status = match playback.status {
+                        PlaybackStatus::Playing => PlaybackStatus::Paused,
+                        other if state.position.is_none() => match other {
+                            PlaybackStatus::Paused => PlaybackStatus::Stopped,
+                            other => other,
+                        },
+                        other => other,
+                    };
+                    state.elapsed_seconds = playback.elapsed_seconds;
+                    state.duration_seconds = None;
+                    state.volume = playback.volume;
+                    state.repeat = playback.repeat;
+                    state.shuffle = playback.shuffle;
+                }
+                self.restored.store(true, Ordering::Relaxed);
+                // Push the restored queue onto MPD without playing (resumed on first Play).
+                let uris = {
+                    let state = self.state.lock().await;
+                    queue_to_mpd_uris(&state.queue, &self.public_base_url)
+                };
+                let mut guard = self.connection.lock().await;
+                if let Ok(connection) = ensure_connected(&mut guard, &self.addr).await {
+                    if connection.load_queue(&uris).await.is_ok() {
+                        self.online.store(true, Ordering::Relaxed);
+                        if let Ok(status) = connection.read_status().await {
+                            self.expected_playlist_version
+                                .store(status.playlist_version, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                // No server queue yet: adopt MPD's current queue (mirror its state — it
+                // may already be playing on its own; don't interrupt it).
+                let mut guard = self.connection.lock().await;
+                let read = async {
+                    let connection = ensure_connected(&mut guard, &self.addr).await?;
+                    let mut adopted = connection.playback_state().await?;
+                    let version = connection.read_status().await?.playlist_version;
+                    Ok::<_, anyhow::Error>((std::mem::take(&mut adopted), version))
+                }
+                .await;
+                drop(guard);
+                if let Ok((mut adopted, version)) = read {
+                    enrich_state(&mut adopted, &self.database).await;
+                    let mut state = self.state.lock().await;
+                    state.status = adopted.status;
+                    state.position = adopted.queue_position.filter(|&i| i < adopted.queue.len());
+                    state.elapsed_seconds = adopted.elapsed_seconds;
+                    state.duration_seconds = adopted.duration_seconds;
+                    state.volume = adopted.volume;
+                    state.repeat = adopted.repeat;
+                    state.shuffle = adopted.shuffle;
+                    state.queue = adopted.queue;
+                    self.online.store(true, Ordering::Relaxed);
+                    self.expected_playlist_version
+                        .store(version, Ordering::Relaxed);
+                }
             }
             Err(error) => {
-                self.online.store(false, Ordering::Relaxed);
-                *guard = None;
-                Err(error)
+                tracing::warn!(player = %self.id, %error, "failed to load persisted mpd queue");
             }
         }
     }
 
-    /// Apply a command, resolving any referenced track ids to stream URLs, then
-    /// broadcast the resulting state to subscribers.
+    /// Serve the current state: refresh the cursor from MPD if reachable, but the
+    /// server queue is always authoritative (so a player offline still shows its queue).
+    pub async fn state(&self, _database: &Database) -> Result<PlaybackState> {
+        let status = {
+            let mut guard = self.connection.lock().await;
+            let result = async {
+                let connection = ensure_connected(&mut guard, &self.addr).await?;
+                connection.read_status().await
+            }
+            .await;
+            match result {
+                Ok(status) => {
+                    self.online.store(true, Ordering::Relaxed);
+                    Some(status)
+                }
+                Err(_) => {
+                    self.online.store(false, Ordering::Relaxed);
+                    *guard = None;
+                    None
+                }
+            }
+        };
+        if let Some(status) = status {
+            self.apply_cursor(status).await;
+        }
+        Ok(self.snapshot().await)
+    }
+
+    /// Apply a command: mutate the server queue for content commands, reconcile MPD,
+    /// read its cursor back, persist, and broadcast.
     pub async fn execute(
         &self,
         command: PlayerCommand,
         database: &Database,
         public_base_url: &str,
     ) -> Result<()> {
-        let result = {
-            let mut guard = self.connection.lock().await;
-            async {
-                let connection = ensure_connected(&mut guard, &self.addr).await?;
-                apply_command(connection, &command, database, public_base_url).await
-            }
-            .await
-        };
-        if let Err(error) = &result {
-            self.online.store(false, Ordering::Relaxed);
-            *self.connection.lock().await = None;
-            return Err(anyhow!(error.to_string()));
+        let mutates_queue = command_mutates_queue(&command);
+        if mutates_queue {
+            let mut state = self.state.lock().await;
+            apply_to_queue_state(&mut state, command.clone(), database).await?;
         }
-        if let Ok(state) = self.state(database).await {
-            let _ = self.state_tx.send(state);
+
+        // First Play after a restore resumes at the saved position instead of MPD's 0.
+        let resume =
+            if matches!(command, PlayerCommand::Play) && self.restored.load(Ordering::Relaxed) {
+                let state = self.state.lock().await;
+                Some((state.position, state.elapsed_seconds))
+            } else {
+                None
+            };
+
+        let status = {
+            let mut guard = self.connection.lock().await;
+            let result = async {
+                let connection = ensure_connected(&mut guard, &self.addr).await?;
+                match resume {
+                    Some((Some(position), elapsed)) => {
+                        connection.play_index(position).await?;
+                        if let Some(seconds) = elapsed.filter(|value| *value > 0.0) {
+                            connection.seek(seconds).await?;
+                        }
+                    }
+                    Some((None, _)) => connection.play().await?,
+                    None => apply_command(connection, &command, database, public_base_url).await?,
+                }
+                connection.read_status().await
+            }
+            .await;
+            match result {
+                Ok(status) => {
+                    self.online.store(true, Ordering::Relaxed);
+                    status
+                }
+                Err(error) => {
+                    self.online.store(false, Ordering::Relaxed);
+                    // Drop the dead connection so the next call reconnects. Reuse the
+                    // held guard — re-locking the same mutex here would deadlock.
+                    *guard = None;
+                    return Err(anyhow!(error.to_string()));
+                }
+            }
+        };
+
+        // Once a play-ish command establishes MPD's cursor, the restore resume is spent.
+        if resume.is_some()
+            || matches!(
+                command,
+                PlayerCommand::Play
+                    | PlayerCommand::PlayQueueIndex { .. }
+                    | PlayerCommand::PlayTracks { .. }
+                    | PlayerCommand::PlayStream { .. }
+                    | PlayerCommand::Next
+                    | PlayerCommand::Previous
+            )
+        {
+            self.restored.store(false, Ordering::Relaxed);
+        }
+
+        self.apply_cursor(status).await;
+        let persist = {
+            let state = self.state.lock().await;
+            if mutates_queue {
+                QueuePersist::Queue(state.playback(), state.queue.clone())
+            } else {
+                QueuePersist::Playback(state.playback())
+            }
+        };
+        self.persist(persist).await;
+        self.broadcast().await;
+        Ok(())
+    }
+
+    /// Re-assert the server queue onto MPD (load it and resume the server's position if
+    /// it was playing) after an external client edited MPD's queue.
+    async fn reassert(&self, connection: &mut MpdConnection) -> Result<()> {
+        let (uris, position, status) = {
+            let state = self.state.lock().await;
+            (
+                queue_to_mpd_uris(&state.queue, &self.public_base_url),
+                state.position,
+                state.status,
+            )
+        };
+        connection.load_queue(&uris).await?;
+        if status == PlaybackStatus::Playing
+            && let Some(index) = position
+        {
+            connection.play_index(index).await?;
         }
         Ok(())
     }
 
-    /// Background task: keep a dedicated idle connection open and broadcast a
-    /// fresh state snapshot whenever MPD reports a change. Reconnects with backoff.
+    /// Background task: keep a dedicated idle connection open and broadcast a fresh
+    /// snapshot whenever MPD reports a change. Reconnects with backoff.
     fn spawn_state_task(self: Arc<Self>, database: Database) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -540,12 +794,55 @@ impl MpdPlayer {
             let _ = self.state_tx.send(state);
         }
         loop {
-            idle.idle().await?;
-            if let Ok(state) = self.state(database).await {
-                let _ = self.state_tx.send(state);
-            }
+            let subsystems = idle.idle().await?;
+
+            // Read the cursor (brief command-connection lock).
+            let status = {
+                let mut guard = self.connection.lock().await;
+                let connection = ensure_connected(&mut guard, &self.addr).await?;
+                connection.read_status().await?
+            };
+
+            // An unexpected queue-version bump on a `playlist` event = an external edit.
+            let drifted = subsystems.iter().any(|name| name == "playlist")
+                && status.playlist_version
+                    != self.expected_playlist_version.load(Ordering::Relaxed);
+
+            let status = if drifted {
+                let refreshed = {
+                    let mut guard = self.connection.lock().await;
+                    let connection = ensure_connected(&mut guard, &self.addr).await?;
+                    self.reassert(connection).await?;
+                    connection.read_status().await?
+                };
+                refreshed
+            } else {
+                status
+            };
+
+            self.apply_cursor(status).await;
+            self.broadcast().await;
+            // Persist the cursor (cheap row); the queue itself is unchanged here.
+            let playback = { self.state.lock().await.playback() };
+            self.persist(QueuePersist::Playback(playback)).await;
         }
     }
+}
+
+/// Turn the server queue into MPD URIs: library tracks get the public base URL
+/// prepended (MPD fetches them over HTTP); external streams (no track id, e.g. a
+/// radio station) are already absolute.
+fn queue_to_mpd_uris(items: &[QueueItem], public_base_url: &str) -> Vec<String> {
+    items
+        .iter()
+        .map(|item| {
+            if item.track_id.is_some() {
+                format!("{public_base_url}{}", item.stream_url)
+            } else {
+                item.stream_url.clone()
+            }
+        })
+        .collect()
 }
 
 async fn ensure_connected<'a>(
@@ -1775,6 +2072,145 @@ mod tests {
             state.status,
             PlaybackStatus::Paused,
             "a restored zone queue is paused, never auto-resumed as playing"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // ---- MPD server-owned queue ----------------------------------------------
+
+    #[test]
+    fn queue_to_mpd_uris_prefixes_library_tracks_only() {
+        let items = vec![
+            QueueItem {
+                track_id: Some("t1".to_string()),
+                stream_url: "/api/tracks/t1/stream".to_string(),
+                ..Default::default()
+            },
+            // An external stream (radio) is already absolute and must not be prefixed.
+            QueueItem {
+                track_id: None,
+                stream_url: "http://radio.example/stream".to_string(),
+                ..Default::default()
+            },
+        ];
+        let uris = queue_to_mpd_uris(&items, "http://host:3030");
+        assert_eq!(uris[0], "http://host:3030/api/tracks/t1/stream");
+        assert_eq!(uris[1], "http://radio.example/stream");
+    }
+
+    // The MPD player's queue is server-owned and persisted like the browser's: a queue
+    // saved under its id is restored Paused at its saved position. (MPD itself is
+    // offline here — `127.0.0.1:1` refuses immediately — so the restore exercises the
+    // server-state path; the push to MPD is best-effort and silently skipped.)
+    #[tokio::test]
+    async fn mpd_player_restores_persisted_queue_paused() {
+        let db_path = temp_db("mpd-restore");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = library_with_tracks(3);
+        database.save_library(&mut library).await.expect("save");
+
+        let items = resolve_queue_items(
+            &database,
+            &[
+                "track_1".to_string(),
+                "track_2".to_string(),
+                "track_3".to_string(),
+            ],
+        )
+        .await
+        .expect("items");
+        let playback = PlayerPlayback {
+            status: PlaybackStatus::Playing,
+            position: Some(2),
+            elapsed_seconds: Some(9.0),
+            volume: Some(50),
+            repeat: RepeatMode::Off,
+            shuffle: false,
+        };
+        database
+            .save_player_queue("mpd-x", &playback, &items)
+            .await
+            .expect("save queue");
+
+        let player = MpdPlayer::new(
+            "mpd-x".to_string(),
+            "127.0.0.1:1".to_string(),
+            database.clone(),
+            "http://host".to_string(),
+        );
+        player.restore().await;
+
+        let snap = player.snapshot().await;
+        assert_eq!(snap.queue.len(), 3, "queue restored");
+        assert_eq!(snap.queue_position, Some(2), "position restored");
+        assert_eq!(
+            snap.now_playing.and_then(|n| n.track_id),
+            Some("track_3".to_string())
+        );
+        assert_eq!(
+            snap.status,
+            PlaybackStatus::Paused,
+            "a restored MPD queue is paused, never auto-resumed"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // MPD owns the cursor: its reported position maps onto the server-owned queue, and
+    // its queue version is recorded so our own edits aren't mistaken for external ones.
+    #[tokio::test]
+    async fn mpd_player_cursor_maps_onto_server_queue() {
+        let db_path = temp_db("mpd-cursor");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = library_with_tracks(3);
+        database.save_library(&mut library).await.expect("save");
+
+        let player = MpdPlayer::new(
+            "mpd-y".to_string(),
+            "127.0.0.1:1".to_string(),
+            database.clone(),
+            "http://host".to_string(),
+        );
+        {
+            let mut state = player.state.lock().await;
+            state.queue = resolve_queue_items(
+                &database,
+                &[
+                    "track_1".to_string(),
+                    "track_2".to_string(),
+                    "track_3".to_string(),
+                ],
+            )
+            .await
+            .expect("items");
+        }
+
+        let status = MpdStatus {
+            state: PlaybackState {
+                status: PlaybackStatus::Playing,
+                queue_position: Some(1),
+                elapsed_seconds: Some(7.5),
+                volume: Some(80),
+                ..Default::default()
+            },
+            playlist_version: 4,
+        };
+        player.apply_cursor(status).await;
+
+        let snap = player.snapshot().await;
+        assert_eq!(snap.status, PlaybackStatus::Playing);
+        assert_eq!(snap.queue_position, Some(1));
+        assert_eq!(
+            snap.now_playing.and_then(|n| n.track_id),
+            Some("track_2".to_string()),
+            "now-playing maps to the server queue item at MPD's cursor"
+        );
+        assert_eq!(snap.elapsed_seconds, Some(7.5));
+        assert_eq!(
+            player.expected_playlist_version.load(Ordering::Relaxed),
+            4,
+            "queue version recorded to distinguish our own edits from external ones"
         );
 
         let _ = std::fs::remove_file(db_path);

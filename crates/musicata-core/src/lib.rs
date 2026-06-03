@@ -4,8 +4,8 @@
 //! deliberately describes music independently from the source that provided it.
 
 use lofty::{
-    config::ParseOptions, file::AudioFile, file::FileType, file::TaggedFileExt, prelude::Accessor,
-    probe::Probe, tag::ItemKey,
+    config::ParseOptions, file::AudioFile, file::FileType, file::TaggedFileExt,
+    picture::PictureType, prelude::Accessor, probe::Probe, tag::ItemKey,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -915,12 +915,19 @@ pub fn build_track(
         file.modified_at_unix_seconds,
         file.content_hash.as_deref(),
     );
-    // Reuse the prior album's cover art if known, else discover it (a dir listing).
+    // Reuse the prior album's cover art if known, else discover a folder cover; failing
+    // that, fall back to this track's *embedded* artwork by pointing `artwork_path` at
+    // the audio file itself (the server extracts the picture on demand). So an album with
+    // no `cover.jpg` but tagged-in art still shows a cover instead of the monogram.
+    let has_embedded_artwork = observed_metadata
+        .iter()
+        .any(|observation| observation.embedded_artwork_count > 0);
     let artwork_path = prior
         .albums
         .get(&album_id)
         .and_then(|(_, _, artwork)| artwork.clone())
-        .or_else(|| find_album_artwork(fs, path.parent().unwrap_or(root)));
+        .or_else(|| find_album_artwork(fs, path.parent().unwrap_or(root)))
+        .or_else(|| has_embedded_artwork.then(|| path.clone()));
 
     let track = Track {
         id: String::new(), // assigned (deduped) in assemble_library
@@ -1064,7 +1071,7 @@ fn aggregate_track(
     album_builders: &mut BTreeMap<String, AlbumBuilder>,
     artist_builders: &mut BTreeMap<String, ArtistBuilder>,
 ) {
-    album_builders
+    let album = album_builders
         .entry(track.album_id.clone())
         .or_insert_with(|| AlbumBuilder {
             id: track.album_id.clone(),
@@ -1073,9 +1080,15 @@ fn aggregate_track(
             artist_name: album_artist_name.to_string(),
             year: track.year,
             track_count: 0,
-            artwork_path,
-        })
-        .track_count += 1;
+            artwork_path: None,
+        });
+    album.track_count += 1;
+    // The album takes the first cover any of its tracks supplies (a folder image or an
+    // embedded fallback), so it isn't left coverless just because its first track lacked
+    // one.
+    if album.artwork_path.is_none() {
+        album.artwork_path = artwork_path;
+    }
 
     // Count the track against its own (track) artist.
     artist_builders
@@ -1882,6 +1895,28 @@ fn clean_optional_lyrics_value(value: Option<&str>) -> Option<String> {
 
 fn u32_to_u16(value: u32) -> Option<u16> {
     u16::try_from(value).ok()
+}
+
+/// Extract the cover picture embedded in an audio file's tags, returning the raw image
+/// bytes (JPEG/PNG/… as stored). `audio_bytes` is the whole file — the picture lives in
+/// its tag block — and `path` only supplies a file-type hint. Prefers the front-cover
+/// picture, else the first one. `None` if the file has no embedded picture or can't be
+/// parsed. The caller decides the image content type (e.g. by sniffing the bytes).
+pub fn extract_embedded_cover(audio_bytes: &[u8], path: &Path) -> Option<Vec<u8>> {
+    let cursor = std::io::Cursor::new(audio_bytes);
+    let probe = Probe::new(cursor).options(ParseOptions::new().read_properties(false));
+    let probe = match FileType::from_path(path) {
+        Some(file_type) => probe.set_file_type(file_type),
+        None => probe.guess_file_type().ok()?,
+    };
+    let tagged = probe.read().ok()?;
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+    let pictures = tag.pictures();
+    let picture = pictures
+        .iter()
+        .find(|picture| picture.pic_type() == PictureType::CoverFront)
+        .or_else(|| pictures.first())?;
+    Some(picture.data().to_vec())
 }
 
 pub fn album_artwork_url(album_id: &str, path: &Path) -> String {
@@ -2737,6 +2772,50 @@ mod tests {
                 && field.confidence == 0.95
                 && field.approval_state == MetadataApprovalState::Observed
         }));
+    }
+
+    // With no folder cover, an album falls back to a track's embedded artwork: its
+    // `artwork_path` points at the audio file (the server extracts the picture), and an
+    // `artwork_url` is emitted so the UI requests it instead of showing the monogram.
+    #[test]
+    fn album_falls_back_to_embedded_artwork_when_no_folder_cover() {
+        let fixture = TestFixture::new("embedded-fallback");
+        fixture.write_rich_tagged_mp3("Album Dir/track.mp3"); // has embedded art, no cover.jpg
+        let library = scan_local_library(&fixture.root).expect("scan fixture");
+
+        let track = library.tracks.first().expect("track");
+        let album = library.albums.first().expect("album");
+        assert_eq!(
+            album.artwork_path.as_deref(),
+            Some(track.path.as_path()),
+            "album artwork falls back to the audio file holding the embedded cover"
+        );
+        assert!(
+            album.artwork_url.is_some(),
+            "an artwork_url is emitted so the UI requests the cover"
+        );
+
+        // The extractor returns the embedded picture bytes from the same file.
+        let bytes = std::fs::read(&track.path).expect("read fixture");
+        let cover = extract_embedded_cover(&bytes, &track.path).expect("embedded cover");
+        assert_eq!(cover, vec![0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0]);
+    }
+
+    // A folder cover still wins over embedded art.
+    #[test]
+    fn folder_cover_preferred_over_embedded() {
+        let fixture = TestFixture::new("folder-over-embedded");
+        fixture.write_rich_tagged_mp3("Album Dir/track.mp3");
+        std::fs::write(fixture.root.join("Album Dir/cover.jpg"), b"folder-cover")
+            .expect("write cover");
+        let library = scan_local_library(&fixture.root).expect("scan fixture");
+
+        let album = library.albums.first().expect("album");
+        assert_eq!(
+            album.artwork_path.as_deref().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("cover.jpg")),
+            "a real folder cover takes precedence over embedded art"
+        );
     }
 
     #[test]

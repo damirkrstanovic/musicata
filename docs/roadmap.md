@@ -135,9 +135,22 @@ Tasks:
   - [ ] **Eager prefetch + bounded cache** — optionally warm covers at scan time
     (Navidrome's CacheWarmer, deferred until after the scan transaction) and add an
     LRU/size cap (Navidrome defaults to 100 MB); Jellyfin keeps all.
-  - [ ] **Extend acquisition to embedded tags + Cover Art Archive** — populate the cache
-    from embedded artwork (we already count `embedded_artwork_count`) and the existing
-    Cover Art Archive candidate/review flow, behind the same provider-acquisition path.
+  - **Extend acquisition to embedded tags + Cover Art Archive** —
+    - [x] **Embedded artwork fallback.** When an album has no folder cover but a track
+      carries embedded art, the scanner points the album's `artwork_path` at the audio
+      file (`build_track`/`aggregate_track` in `musicata-core`; any track's cover fills
+      the album) and emits an `artwork_url` so the UI requests it. The server's
+      `album_artwork` handler detects the audio-file path, reads the file once (local
+      disk or **SMB via `read_album_source_file`**), extracts the front picture
+      (`musicata_core::extract_embedded_cover`, lofty), caches the image
+      (`ArtworkCache`, content type sniffed from the bytes), and serves it — so a
+      tagged-but-coverless library shows real covers instead of monograms. *Note:* the
+      first request reads the whole audio file over the wire to extract; a future
+      optimization is a header-range read. Eager extraction at scan time (the picture is
+      already parsed for `embedded_artwork_count`) is also possible later.
+    - [ ] **Cover Art Archive auto-fill** — populate the cache from the existing CAA
+      candidate/review flow automatically (today on-demand only), behind the same
+      provider-acquisition path.
 
 Done when:
 
@@ -209,9 +222,17 @@ Tasks:
   position** (no output tab renders audio at startup, so we never silently
   auto-resume). Queue-mutating commands rewrite both tables; playback-only commands
   update just the cheap single row; in-track elapsed is persisted from progress ticks
-  throttled to once / 10 s rather than every ~1 Hz tick. **MPD** still drives its own
-  queue directly (MPD persists it independently); making the server the source of
-  truth for MPD's queue is a larger rework left for later.
+  throttled to once / 10 s rather than every ~1 Hz tick. **MPD's queue is now
+  server-owned too**: `MpdPlayer` (`players.rs`) holds the same persisted `QueueState`
+  as the browser player — Musicata owns the queue **content & order** (persisted to the
+  `player_queue` tables, reconciled onto MPD per command) while **MPD owns the playback
+  cursor** (which index is playing, elapsed, and its native shuffle/repeat/
+  auto-advance, read back via `read_status`). On startup the **server queue wins**: it's
+  restored (paused) and pushed onto MPD via `load_queue` (no autoplay; the saved
+  position resumes on the first Play); with no persisted queue the server adopts MPD's
+  current one. If an external MPD client edits the queue, the idle loop detects the
+  unexpected queue-version bump and **re-asserts** the server queue. The queue thus
+  lives in Musicata's DB for every player kind.
   **Per-*zone* queues** are now implemented: a zone owns its own canonical
   server-side queue, modeled exactly like the browser player (`ZonePlayer` in
   `players.rs`, persisted to migration v18 tables `zone_queue` + `zone_queue_items`,
@@ -274,6 +295,31 @@ Player provider design decisions (see also Milestone 10):
 - MPRIS (D-Bus) is a future transport-only provider: it can pause/skip running
   desktop players but cannot reliably choose what plays. Emulating LMS/SlimProto
   or AirPlay (à la Music Assistant) is much later.
+- [ ] **MPD authentication + secure transport** (deferred; see also Milestones 10
+  and 12). Today Musicata only speaks to an unauthenticated MPD over plain TCP, so a
+  password-protected or remote MPD can't be used safely.
+  - **Password auth.** MPD's protocol has a single `password <plaintext>` command
+    (sent after the `OK MPD` greeting); a wrong password returns `ACK [3@…]`, and a
+    secured MPD rejects every command with `ACK [4@…]` until authenticated. Add an
+    optional per-player password, following the **SMB-source credential precedent**
+    (`SourceRecord` stores `username`/`password`; the API DTO redacts them): a
+    `password` column on the `players` table (next migration), threaded through
+    `RegisterPlayerRequest`/`PlayerRecord`/`MpdPlayer` → `MpdConnection::connect`
+    (which must authenticate on **both** the command and idle-loop connections),
+    redacted from the `/api/players` response, and accepted via `--mpd
+    password@host:port` (the `MPD_HOST` convention). Validate on register by probing
+    an authenticated connect (ties into the "address validation/probe" item above).
+  - **Secure transport.** MPD has **no native TLS** (upstream declines it — Issue
+    #297 — favouring an external envelope), and its password crosses the wire in
+    clear text. Pragmatic answer for remote/untrusted networks: an **SSH tunnel or
+    WireGuard/Tailscale VPN** (zero code; encrypts the password too) — document this
+    as the recommended deployment. Optional native support, if wanted, means
+    generalizing `MpdConnection`'s TCP-only stream into an enum
+    `Plain(TcpStream) | Tls(tokio-rustls) | Unix(UnixStream)` so Musicata can dial an
+    **stunnel TLS endpoint** or a same-host **Unix socket** (`local_permissions`, no
+    password needed). `connect` is the single choke point, so this composes cleanly
+    with the password work; the TLS path adds a `tokio-rustls` dependency (license
+    check).
 
 Player UX:
 
@@ -512,7 +558,10 @@ Tasks:
   player-provider plugin interface should define how an endpoint proves its identity
   to the server (and the server to the endpoint) — e.g. a per-player token or shared
   key issued at registration and presented on the command/state channels — so players
-  can't be spoofed or hijacked. (Distinct from user↔server auth in Milestone 12.)
+  can't be spoofed or hijacked. (Distinct from user↔server auth in Milestone 12.) This
+  is the *endpoint→server* direction; the *server→upstream-player* direction (e.g.
+  authenticating to a password-protected/TLS MPD) is scoped under Milestone 5's "MPD
+  authentication + secure transport" item.
 - Research and prototype Squeezelite/LMS bridge behavior.
 - Research Snapcast for synchronized transport.
 - Later evaluate AirPlay, Chromecast, UPnP/DLNA, and MPD integrations.
@@ -549,7 +598,12 @@ Tasks:
 - Add release builds for Linux first.
 - Add systemd service examples.
 - Add Docker or container image if useful.
-- Add user authentication and local-network security model.
+- Add user authentication and local-network security model. Document the recommended
+  deployment for reaching remote services (MPD, SMB) over untrusted networks — an SSH
+  tunnel or WireGuard/Tailscale VPN — since those protocols carry credentials in clear
+  text and MPD has no native TLS (see Milestone 5's "MPD authentication + secure
+  transport"). Note which stored secrets are plaintext at rest (SMB/MPD/Subsonic
+  passwords) and decide whether to encrypt them.
 - Add backup/restore documentation for database and config.
 - Add diagnostics for scan, metadata, provider, and playback failures.
 
@@ -559,7 +613,19 @@ Done when:
 
 ## Immediate Next Steps
 
-Milestones 3 and 4 are complete, including SQLite FTS5 full-text search and the
-move of all read endpoints onto SQL queries (the in-memory library snapshot has
-been removed). The next implementation slice is Milestone 5: player registry,
-queues, zones, and WebSocket state sync.
+Milestones 0–4, 6, and 8 are complete. **Milestone 5** is effectively done — its
+"Done when" criteria are met and the server-owned queue model now covers all player
+kinds: the browser player, **per-zone queues** (`ZonePlayer`, migration v18), and
+**MPD's queue is server-owned** (Musicata owns content/order, MPD owns the cursor;
+restored paused on startup, re-asserted over external edits). What remains in M5 is
+polish — drag-and-drop reorder, player add validation/probe + discovery, deeper
+mobile now-playing sheet — plus the deferred "MPD authentication + secure transport".
+
+The next implementation slice is **Milestone 7 (Listening History And
+Recommendations)**: the history foundation (the `listens` table, recently/most-played,
+playlists, favorites) is in place, so the next work is richer playback events, the
+ListenBrainz completion rule, stats views (never-played / skipped / rediscovery),
+deterministic smart playlists, and metadata-based recommendations. Two high-value
+side-quests outside the strict sequence: **sized artwork thumbnails** (`?size=`, the
+open Milestone 3 staged item — biggest grid perf win) and the **OpenSubsonic/Funkwhale
+upstream provider** (Milestone 9, flagged highest-leverage among new sources).
