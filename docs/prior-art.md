@@ -511,6 +511,67 @@ broader-landscape research reports.
 
 ---
 
+## 10. Progressive media streaming — low-latency playback from a network source
+
+**Problem:** when the audio bytes live on a network source (SMB), how do we get a
+browser `<audio>` playing *fast*? A browser opens a track with `Range: bytes=0-`
+(open-ended). If the server resolves that to "the whole file" and **buffers it before
+sending byte one**, playback waits for the entire file to cross the wire — measured
+**~400–600 ms** to first byte for a 6.5 MB FLAC over SMB (and TTFB ≈ total, i.e. no
+streaming at all). Local files don't show this because the OS already streams them.
+
+**How Jellyfin does it (chunked, never whole-buffer):**
+- Direct play returns ASP.NET's `PhysicalFileResult { EnableRangeProcessing = true }`
+  (`Jellyfin.Api/Helpers/FileStreamResponseHelpers.cs:105`), so range parsing, `206`,
+  and **incremental chunked writes** are handled by the framework — the file is never
+  read whole into memory.
+- Remote HTTP sources: forward the client's `Range` upstream and pull the body with
+  `HttpCompletionOption.ResponseHeadersRead` (returns after headers, streams the body
+  through — no buffering), `FileStreamResponseHelpers.cs:45-57,96`.
+- Copies use an **80 KiB** buffer from `ArrayPool` — `IODefaults.CopyToBufferSize =
+  81920` (`MediaBrowser.Model/IO/IODefaults.cs:13`); `StreamHelper.CopyToAsync`
+  (`src/Jellyfin.LiveTv/IO/StreamHelper.cs:14`) fires an `onStarted` callback on the
+  **first** chunk, so playback begins as soon as the first bytes arrive, not the range.
+- Backpressure/throttling is at the **source** (pause ffmpeg when the client is far
+  ahead — `TranscodingThrottler`), not an output-side rate clamp.
+
+**What Musicata does:** stream the SMB byte range in chunks instead of buffering it.
+`SmbProvider::read_range_stream` (`crates/musicata-server/src/smb.rs`) opens the file
+once and a spawned reader feeds a **small bounded `mpsc` channel** (depth 4); the HTTP
+handler wraps the `ReceiverStream` in `Body::from_stream` (`smb_stream_response` in
+`main.rs`). The first bytes reach the client after a single read; the bounded channel
+is natural backpressure — if the browser pauses/seeks/closes, the channel fills, the
+reader parks, and **no more SMB reads happen** (no whole-file buffering). `Content-
+Length` is still exact (the range length), and open-ended `bytes=0-` is served as a
+streamed full-content `206` (full seek support, no follow-up range request).
+
+**The non-obvious tuning — bigger chunks win on SMB (opposite of local).** Jellyfin's
+80 KiB is right for local files (no per-read latency). Over SMB **every read costs a
+round-trip**, so too-small chunks throttle the fill rate and *delay* `canplay` even
+though they lower time-to-first-byte. Measured click→audible for a FLAC over SMB by
+chunk size: **128 KiB→515 ms · 256 KiB→335 ms · 512 KiB→226 ms · 1 MiB→176 ms**. We
+chose **1 MiB** (`STREAM_CHUNK_BYTES`) — the knee of the curve, ~3.5× faster than the
+old whole-file buffer, bounded memory (channel depth × chunk). So: "smaller chunks
+lower latency" is true for *first byte* and memory, but for a round-trip-bound source
+the metric that matters (time to *enough buffered to play*) favors larger chunks.
+
+**Where the lag is NOT:** measuring the click→audible path end-to-end (headless CDP +
+API timing) showed the **UI/comms overhead is ~2–8 ms** — the browser player sets
+`<audio>.src` and calls `.play()` synchronously inside the click gesture, and the
+`play_tracks` command POST runs *in parallel* (it doesn't gate audio start); the
+`driveBrowserAudio` WebSocket echo reuses the same URL so there's no second fetch
+(`srcReset=0`). The lag was essentially all stream-fetch latency, not the
+track→player handoff. Local-track click→audible is ~50–100 ms for comparison.
+
+**Related (same "network must not stall the server" theme):** the SQLite pool runs in
+**WAL** (`crates/musicata-storage/src/lib.rs`, `journal_mode(Wal)` + `synchronous
+NORMAL`). Under the old rollback (`delete`) journal, the scan's full-library
+`save_library` rewrite held an exclusive write lock and every concurrent read (e.g.
+`/api/library/summary`) hit the 5 s busy-timeout and 500'd; WAL lets reads run
+alongside the writer.
+
+---
+
 ## Conventions these led to
 
 - **Enum dispatch over `dyn`** for provider/player handles (async methods, object
@@ -522,3 +583,6 @@ broader-landscape research reports.
   listings, watch instead of poll, push instead of poll.
 - **Network is never on the hot path of a request** — connect/scan in the background
   with timeouts; the web port binds before any scan.
+- **Stream media bytes, never whole-buffer** — pipe a network source in bounded chunks
+  with backpressure so playback starts on the first read; size the chunk to the
+  source (round-trip-bound SMB wants ~1 MiB, not 80 KiB). See §10.

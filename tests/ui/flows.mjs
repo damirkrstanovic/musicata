@@ -189,6 +189,82 @@ export async function behaviorFlows(ctx) {
     ],
   });
 
+  // Zones — a zone owns a canonical, server-side queue and is a control target like
+  // a player. Put the browser player in a zone, select the zone, and play: the same
+  // single-broadcast / no-restart / ticks-flowing guarantees must hold off the zone
+  // socket, and a reorder must run against /api/zones/{id}/commands.
+  await reset(); log("zone setup");
+  const zoneSetup = await ev(`(async () => {
+    const z = await (await fetch('/api/zones', { method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ name: 'Smoke Zone' }) })).json();
+    await fetch('/api/players/' + encodeURIComponent(browserPlayerId), { method:'PATCH',
+      headers:{'content-type':'application/json'}, body: JSON.stringify({ zone_id: z.id }) });
+    await loadPlayers();                 // pick up the new zone + browser membership
+    setActivePlayer(z.id);
+    return { zoneId: z.id, isZone: isZoneTarget(z.id), outputs: browserOutputsFor(z.id) };
+  })()`);
+  await sleep(400);                       // let the zone socket connect
+
+  await reset(); await mark("zone playTrack(0)"); log("zone playTrack(0)");
+  await fire(`playTrack(0)`);
+  await sleep(1400);
+  snap = await snapshot();
+  {
+    const lat = footerLatency(snap.log, titles[0]);
+    const full = snap.log.filter((e) => e.kind === "fullState" && e.now);
+    results.push({
+      name: "zone owns queue + plays",
+      checks: [
+        check("zone is a control target", zoneSetup.isZone, String(zoneSetup.isZone)),
+        check("browser outputs for the zone", zoneSetup.outputs, String(zoneSetup.outputs)),
+        check("footer shows the track", titleSeen(snap.log, titles[0]), titles[0]),
+        check(`footer updates within ${budgets.footerMs}ms`, lat != null && lat <= budgets.footerMs, `${lat}ms`),
+        check("exactly one full-state broadcast", full.length === 1, `${full.length}`),
+        check("audio not restarted", snap.counts.srcReset === 0, `srcReset=${snap.counts.srcReset}`),
+      ],
+    });
+  }
+
+  // Steady zone playback: position ticks flow over the zone socket.
+  await reset(); log("zone steady");
+  await sleep(2500);
+  snap = await snapshot();
+  results.push({
+    name: "zone steady playback",
+    checks: [
+      check("position ticks flowing", snap.counts.progressTick >= 2, `${snap.counts.progressTick} ticks`),
+      check("no queue rebuild on ticks", (snap.counts.renderQueue || 0) === 0, `${snap.counts.renderQueue}`),
+    ],
+  });
+
+  // Reorder the zone's queue — routed to /api/zones/{id}/commands via commandTarget.
+  await reset(); log("zone reorder");
+  await fire(`document.querySelector('#queue-toggle').click()`);
+  await sleep(300);
+  const zBefore = await ev(`(state.activeState.queue||[]).map(q=>q.track_id||q.title)`);
+  await fire(`commandTarget({ command: 'move_queue_item', from: 0, to: 1 })`);
+  await sleep(700);
+  snap = await snapshot();
+  {
+    const zAfter = await ev(`(state.activeState.queue||[]).map(q=>q.track_id||q.title)`);
+    results.push({
+      name: "zone queue reorder",
+      checks: [
+        check("queue order changed", JSON.stringify(zBefore) !== JSON.stringify(zAfter)),
+        check("queue re-rendered on the change", (snap.counts.renderQueue || 0) >= 1, `${snap.counts.renderQueue}`),
+        check("no audio restart on reorder", snap.counts.srcReset === 0, `srcReset=${snap.counts.srcReset}`),
+      ],
+    });
+    await fire(`document.querySelector('#queue-toggle').click()`);
+  }
+
+  // Cleanup: leave the browser player active and remove the smoke zone.
+  await ev(`(async () => {
+    setActivePlayer(browserPlayerId);
+    await fetch('/api/zones/' + encodeURIComponent(${JSON.stringify(zoneSetup.zoneId)}), { method:'DELETE' });
+    await loadPlayers();
+  })()`);
+
   return results;
 }
 

@@ -159,11 +159,25 @@ fn spawn_listen_recorder(
     })
 }
 
+/// A zone's live runtime: its server-owned queue plus the background task that
+/// records listening history from the zone's state broadcast.
+struct ZoneEntry {
+    player: Arc<ZonePlayer>,
+    recorder: JoinHandle<()>,
+}
+
+impl Drop for ZoneEntry {
+    fn drop(&mut self) {
+        self.recorder.abort();
+    }
+}
+
 /// Registry of registered players and zones, backed by the database.
 pub struct PlayerManager {
     database: Database,
     public_base_url: String,
     players: RwLock<BTreeMap<String, PlayerEntry>>,
+    zones: RwLock<BTreeMap<String, ZoneEntry>>,
 }
 
 impl PlayerManager {
@@ -173,6 +187,7 @@ impl PlayerManager {
             database,
             public_base_url,
             players: RwLock::new(BTreeMap::new()),
+            zones: RwLock::new(BTreeMap::new()),
         });
         // The local browser player always exists.
         if manager
@@ -195,7 +210,31 @@ impl PlayerManager {
         for record in manager.database.list_players().await? {
             manager.bring_up(&record).await;
         }
+        for zone in manager.database.list_zones().await? {
+            manager.bring_up_zone(&zone).await;
+        }
         Ok(manager)
+    }
+
+    /// Bring up the runtime entry for a persisted zone: its server-owned queue
+    /// (restored from the database) plus a listen recorder keyed by the zone id.
+    async fn bring_up_zone(&self, zone: &Zone) {
+        let player = Arc::new(ZonePlayer::new(self.database.clone(), zone.id.clone()));
+        player.restore().await;
+        let recorder =
+            spawn_listen_recorder(zone.id.clone(), player.subscribe(), self.database.clone());
+        self.zones
+            .write()
+            .await
+            .insert(zone.id.clone(), ZoneEntry { player, recorder });
+    }
+
+    pub async fn get_zone(&self, id: &str) -> Option<Arc<ZonePlayer>> {
+        self.zones
+            .read()
+            .await
+            .get(id)
+            .map(|entry| entry.player.clone())
     }
 
     pub fn public_base_url(&self) -> &str {
@@ -328,10 +367,12 @@ impl PlayerManager {
     pub async fn create_zone(&self, name: &str) -> Result<Zone> {
         let id = zone_id(name);
         self.database.insert_zone(&id, name).await?;
-        Ok(Zone {
+        let zone = Zone {
             id,
             name: name.to_string(),
-        })
+        };
+        self.bring_up_zone(&zone).await;
+        Ok(zone)
     }
 
     pub async fn rename_zone(&self, id: &str, name: &str) -> Result<()> {
@@ -339,19 +380,33 @@ impl PlayerManager {
     }
 
     pub async fn delete_zone(&self, id: &str) -> Result<()> {
+        self.zones.write().await.remove(id); // Drop aborts the recorder.
         self.database.delete_zone(id).await
     }
 
-    /// Apply a command to every player in a zone.
+    /// Apply a command to a zone's canonical queue, which then drives its members.
     pub async fn command_zone(&self, zone_id: &str, command: PlayerCommand) -> Result<()> {
+        let zone = self
+            .get_zone(zone_id)
+            .await
+            .ok_or_else(|| anyhow!("unknown zone: {zone_id}"))?;
+        let mut members = Vec::new();
         for record in self.database.players_in_zone(zone_id).await? {
-            if let Some(player) = self.get(&record.id).await {
-                player
-                    .execute(command.clone(), &self.database, &self.public_base_url)
-                    .await?;
+            if let Some(handle) = self.get(&record.id).await {
+                members.push(handle);
             }
         }
-        Ok(())
+        zone.execute(command, &self.database, &self.public_base_url, &members)
+            .await
+    }
+
+    /// The current playback state of a zone's canonical queue.
+    pub async fn zone_state(&self, zone_id: &str) -> Result<PlaybackState> {
+        let zone = self
+            .get_zone(zone_id)
+            .await
+            .ok_or_else(|| anyhow!("unknown zone: {zone_id}"))?;
+        Ok(zone.snapshot().await)
     }
 }
 
@@ -607,7 +662,7 @@ pub struct BrowserPlayer {
     player_id: String,
     /// Where the server-owned queue is persisted, so it survives a restart.
     database: Database,
-    state: Mutex<BrowserState>,
+    state: Mutex<QueueState>,
     state_tx: broadcast::Sender<PlaybackState>,
     /// Lightweight position ticks. The output tab reports progress ~1×/second; rather
     /// than re-broadcast the whole `PlaybackState` (queue and all) on every tick, those
@@ -641,7 +696,7 @@ pub struct ProgressTick {
 }
 
 #[derive(Default)]
-struct BrowserState {
+struct QueueState {
     status: PlaybackStatus,
     queue: Vec<QueueItem>,
     position: Option<usize>,
@@ -652,7 +707,7 @@ struct BrowserState {
     shuffle: bool,
 }
 
-impl BrowserState {
+impl QueueState {
     /// The lightweight, persistable playback row (everything but the queue items).
     fn playback(&self) -> PlayerPlayback {
         PlayerPlayback {
@@ -673,7 +728,7 @@ impl BrowserPlayer {
         Self {
             player_id,
             database,
-            state: Mutex::new(BrowserState::default()),
+            state: Mutex::new(QueueState::default()),
             state_tx,
             progress_tx,
             last_progress_persist: AtomicI64::new(0),
@@ -772,90 +827,10 @@ impl BrowserPlayer {
     pub async fn execute(&self, command: PlayerCommand, database: &Database) -> Result<()> {
         // Commands that change the queue itself need the item list rewritten;
         // the rest only touch the lightweight playback row.
-        let mutates_queue = matches!(
-            &command,
-            PlayerCommand::PlayTracks { .. }
-                | PlayerCommand::Enqueue { .. }
-                | PlayerCommand::Clear
-                | PlayerCommand::RemoveQueueItem { .. }
-                | PlayerCommand::MoveQueueItem { .. }
-                | PlayerCommand::PlayStream { .. }
-        );
+        let mutates_queue = command_mutates_queue(&command);
         let persist = {
             let mut state = self.state.lock().await;
-            match command {
-                PlayerCommand::Play => state.status = PlaybackStatus::Playing,
-                PlayerCommand::Pause => state.status = PlaybackStatus::Paused,
-                PlayerCommand::Stop => {
-                    state.status = PlaybackStatus::Stopped;
-                    state.elapsed_seconds = Some(0.0);
-                }
-                PlayerCommand::Next => advance(&mut state, false),
-                PlayerCommand::Previous => {
-                    state.position = match state.position {
-                        Some(index) if index > 0 => Some(index - 1),
-                        other => other,
-                    };
-                    state.elapsed_seconds = Some(0.0);
-                    state.duration_seconds = None;
-                }
-                PlayerCommand::Seek { position_seconds } => {
-                    state.elapsed_seconds = Some(position_seconds);
-                }
-                PlayerCommand::SetVolume { volume } => state.volume = Some(volume.min(100)),
-                PlayerCommand::SetRepeat { mode } => state.repeat = mode,
-                PlayerCommand::SetShuffle { enabled } => state.shuffle = enabled,
-                PlayerCommand::Clear => {
-                    state.queue.clear();
-                    state.position = None;
-                    state.status = PlaybackStatus::Stopped;
-                    state.elapsed_seconds = Some(0.0);
-                }
-                PlayerCommand::PlayQueueIndex { index } => {
-                    if index < state.queue.len() {
-                        state.position = Some(index);
-                        state.status = PlaybackStatus::Playing;
-                        state.elapsed_seconds = Some(0.0);
-                        state.duration_seconds = None;
-                    }
-                }
-                PlayerCommand::PlayTracks {
-                    track_ids,
-                    start_index,
-                } => {
-                    state.queue = resolve_queue_items(database, &track_ids).await?;
-                    state.position = (!state.queue.is_empty())
-                        .then(|| start_index.min(state.queue.len().saturating_sub(1)));
-                    state.status = if state.queue.is_empty() {
-                        PlaybackStatus::Stopped
-                    } else {
-                        PlaybackStatus::Playing
-                    };
-                    state.duration_seconds = None;
-                    state.elapsed_seconds = Some(0.0);
-                }
-                PlayerCommand::Enqueue { track_ids } => {
-                    state
-                        .queue
-                        .extend(resolve_queue_items(database, &track_ids).await?);
-                }
-                PlayerCommand::RemoveQueueItem { index } => remove_queue_item(&mut state, index),
-                PlayerCommand::MoveQueueItem { from, to } => move_queue_item(&mut state, from, to),
-                PlayerCommand::PlayStream { url, title } => {
-                    state.queue = vec![QueueItem {
-                        track_id: None,
-                        title,
-                        artist: String::new(),
-                        album: String::new(),
-                        stream_url: url,
-                        artwork_url: None,
-                    }];
-                    state.position = Some(0);
-                    state.status = PlaybackStatus::Playing;
-                    state.duration_seconds = None;
-                    state.elapsed_seconds = Some(0.0);
-                }
-            }
+            apply_to_queue_state(&mut state, command, database).await?;
             let playback = state.playback();
             if mutates_queue {
                 QueuePersist::Queue(playback, state.queue.clone())
@@ -917,10 +892,323 @@ impl BrowserPlayer {
     }
 }
 
+/// A zone's server-owned, canonical playback queue. Modeled exactly like
+/// [`BrowserPlayer`] — the queue, position, and playback intent live here and
+/// persist to SQLite (`zone_queue` tables) — but a zone drives *member players* as
+/// outputs rather than a single browser tab. There is no audio sample-sync (see the
+/// roadmap): the zone's [`QueueState`] is the single source of truth for the queue,
+/// position, now-playing, repeat, and shuffle; `elapsed_seconds` is owned by the
+/// browser output that renders the zone. MPD members are best-effort mirrors driven
+/// by forwarding the same command, and the zone does not poll them for position —
+/// so an MPD-only zone (no browser output reporting `ended`) can drift in position
+/// until the user issues next/previous. Mapping MPD state back to the zone is a
+/// future improvement.
+pub struct ZonePlayer {
+    /// This zone's stable id, used as the persistence key.
+    zone_id: String,
+    /// Where the canonical zone queue is persisted, so it survives a restart.
+    database: Database,
+    state: Mutex<QueueState>,
+    state_tx: broadcast::Sender<PlaybackState>,
+    progress_tx: broadcast::Sender<ProgressTick>,
+    last_progress_persist: AtomicI64,
+}
+
+impl ZonePlayer {
+    fn new(database: Database, zone_id: String) -> Self {
+        let (state_tx, _) = broadcast::channel(32);
+        let (progress_tx, _) = broadcast::channel(32);
+        Self {
+            zone_id,
+            database,
+            state: Mutex::new(QueueState::default()),
+            state_tx,
+            progress_tx,
+            last_progress_persist: AtomicI64::new(0),
+        }
+    }
+
+    /// Reload the queue persisted before the last shutdown. As with the browser
+    /// player, a queue that was `Playing` is restored as `Paused` at its saved
+    /// position — no output is rendering at startup, so we never auto-resume.
+    async fn restore(&self) {
+        let snapshot = match self.database.load_zone_queue(&self.zone_id).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(zone = %self.zone_id, %error, "failed to load persisted zone queue");
+                return;
+            }
+        };
+        let mut state = self.state.lock().await;
+        let playback = snapshot.playback;
+        state.queue = snapshot.items;
+        state.position = playback.position.filter(|&index| index < state.queue.len());
+        state.status = match playback.status {
+            PlaybackStatus::Playing => PlaybackStatus::Paused,
+            other if state.position.is_none() => match other {
+                PlaybackStatus::Paused => PlaybackStatus::Stopped,
+                other => other,
+            },
+            other => other,
+        };
+        state.elapsed_seconds = playback.elapsed_seconds;
+        state.duration_seconds = None;
+        state.volume = playback.volume;
+        state.repeat = playback.repeat;
+        state.shuffle = playback.shuffle;
+    }
+
+    async fn persist(&self, persist: QueuePersist) {
+        let result = match &persist {
+            QueuePersist::Playback(playback) => {
+                self.database
+                    .save_zone_playback(&self.zone_id, playback)
+                    .await
+            }
+            QueuePersist::Queue(playback, items) => {
+                self.database
+                    .save_zone_queue(&self.zone_id, playback, items)
+                    .await
+            }
+        };
+        if let Err(error) = result {
+            tracing::warn!(zone = %self.zone_id, %error, "failed to persist zone queue");
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<PlaybackState> {
+        self.state_tx.subscribe()
+    }
+
+    pub fn subscribe_progress(&self) -> broadcast::Receiver<ProgressTick> {
+        self.progress_tx.subscribe()
+    }
+
+    pub async fn snapshot(&self) -> PlaybackState {
+        let state = self.state.lock().await;
+        PlaybackState {
+            status: state.status,
+            now_playing: state
+                .position
+                .and_then(|index| state.queue.get(index).cloned()),
+            elapsed_seconds: state.elapsed_seconds,
+            duration_seconds: state.duration_seconds,
+            volume: state.volume,
+            repeat: state.repeat,
+            shuffle: state.shuffle,
+            queue: state.queue.clone(),
+            queue_position: state.position,
+        }
+    }
+
+    async fn broadcast(&self) {
+        let _ = self.state_tx.send(self.snapshot().await);
+    }
+
+    /// Apply a command to the canonical zone queue, broadcast/persist it, then drive
+    /// member outputs. `members` are the live handles of the zone's players, passed
+    /// in by the manager (avoids a `ZonePlayer`→`PlayerManager` reference cycle).
+    pub async fn execute(
+        &self,
+        command: PlayerCommand,
+        database: &Database,
+        public_base_url: &str,
+        members: &[PlayerHandle],
+    ) -> Result<()> {
+        let mutates_queue = command_mutates_queue(&command);
+        // Phase 1: update the canonical queue exactly like the browser player.
+        let persist = {
+            let mut state = self.state.lock().await;
+            apply_to_queue_state(&mut state, command.clone(), database).await?;
+            let playback = state.playback();
+            if mutates_queue {
+                QueuePersist::Queue(playback, state.queue.clone())
+            } else {
+                QueuePersist::Playback(playback)
+            }
+        };
+        self.broadcast().await;
+        self.persist(persist).await;
+        // Phase 2: drive members. Browser members render the zone's now-playing
+        // straight off the broadcast above (no extra work). MPD members are driven
+        // by forwarding the command — queue ops map 1:1 to MPD and indices stay
+        // aligned because MPD's queue mirrors the zone's.
+        self.drive_members(&command, members, database, public_base_url)
+            .await;
+        Ok(())
+    }
+
+    async fn drive_members(
+        &self,
+        command: &PlayerCommand,
+        members: &[PlayerHandle],
+        database: &Database,
+        public_base_url: &str,
+    ) {
+        for member in members {
+            // Browser members are driven by the zone broadcast; only MPD members
+            // need an out-of-band command. (Forwarding to the single browser player
+            // would give it a second, competing queue.)
+            if !matches!(member, PlayerHandle::Mpd(_)) {
+                continue;
+            }
+            if let Err(error) = member
+                .execute(command.clone(), database, public_base_url)
+                .await
+            {
+                tracing::debug!(zone = %self.zone_id, %error, "zone member command failed");
+            }
+        }
+    }
+
+    /// The browser output rendering this zone finished the current track: advance
+    /// (honoring repeat). MPD members advance on their own — see the type docs.
+    pub async fn track_ended(&self) {
+        let playback = {
+            let mut state = self.state.lock().await;
+            if state.repeat == RepeatMode::One {
+                state.elapsed_seconds = Some(0.0);
+            } else {
+                advance(&mut state, true);
+            }
+            state.playback()
+        };
+        self.broadcast().await;
+        self.persist(QueuePersist::Playback(playback)).await;
+    }
+
+    /// The browser output reports its real position/duration for this zone. Emits a
+    /// lightweight tick (not full state) and persists the elapsed position, throttled.
+    pub async fn report_progress(&self, elapsed_seconds: f64, duration_seconds: Option<f64>) {
+        let (duration, playback) = {
+            let mut state = self.state.lock().await;
+            state.elapsed_seconds = Some(elapsed_seconds);
+            if let Some(duration) = duration_seconds {
+                state.duration_seconds = Some(duration);
+            }
+            (state.duration_seconds, state.playback())
+        };
+        let _ = self.progress_tx.send(ProgressTick {
+            elapsed_seconds,
+            duration_seconds: duration,
+        });
+        let now = now_unix();
+        let last = self.last_progress_persist.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= PROGRESS_PERSIST_SECS
+            && self
+                .last_progress_persist
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.persist(QueuePersist::Playback(playback)).await;
+        }
+    }
+}
+
+/// Whether a command changes the queue items (vs. only the lightweight playback
+/// row). Queue-mutating changes need the item list rewritten on persist.
+fn command_mutates_queue(command: &PlayerCommand) -> bool {
+    matches!(
+        command,
+        PlayerCommand::PlayTracks { .. }
+            | PlayerCommand::Enqueue { .. }
+            | PlayerCommand::Clear
+            | PlayerCommand::RemoveQueueItem { .. }
+            | PlayerCommand::MoveQueueItem { .. }
+            | PlayerCommand::PlayStream { .. }
+    )
+}
+
+/// Apply a command to a server-owned queue, mutating its in-memory state. Shared
+/// by the browser player and the zone player so their queue semantics are
+/// identical — only how the resulting state is *rendered* (a browser tab vs. zone
+/// member outputs) differs.
+async fn apply_to_queue_state(
+    state: &mut QueueState,
+    command: PlayerCommand,
+    database: &Database,
+) -> Result<()> {
+    match command {
+        PlayerCommand::Play => state.status = PlaybackStatus::Playing,
+        PlayerCommand::Pause => state.status = PlaybackStatus::Paused,
+        PlayerCommand::Stop => {
+            state.status = PlaybackStatus::Stopped;
+            state.elapsed_seconds = Some(0.0);
+        }
+        PlayerCommand::Next => advance(state, false),
+        PlayerCommand::Previous => {
+            state.position = match state.position {
+                Some(index) if index > 0 => Some(index - 1),
+                other => other,
+            };
+            state.elapsed_seconds = Some(0.0);
+            state.duration_seconds = None;
+        }
+        PlayerCommand::Seek { position_seconds } => {
+            state.elapsed_seconds = Some(position_seconds);
+        }
+        PlayerCommand::SetVolume { volume } => state.volume = Some(volume.min(100)),
+        PlayerCommand::SetRepeat { mode } => state.repeat = mode,
+        PlayerCommand::SetShuffle { enabled } => state.shuffle = enabled,
+        PlayerCommand::Clear => {
+            state.queue.clear();
+            state.position = None;
+            state.status = PlaybackStatus::Stopped;
+            state.elapsed_seconds = Some(0.0);
+        }
+        PlayerCommand::PlayQueueIndex { index } => {
+            if index < state.queue.len() {
+                state.position = Some(index);
+                state.status = PlaybackStatus::Playing;
+                state.elapsed_seconds = Some(0.0);
+                state.duration_seconds = None;
+            }
+        }
+        PlayerCommand::PlayTracks {
+            track_ids,
+            start_index,
+        } => {
+            state.queue = resolve_queue_items(database, &track_ids).await?;
+            state.position = (!state.queue.is_empty())
+                .then(|| start_index.min(state.queue.len().saturating_sub(1)));
+            state.status = if state.queue.is_empty() {
+                PlaybackStatus::Stopped
+            } else {
+                PlaybackStatus::Playing
+            };
+            state.duration_seconds = None;
+            state.elapsed_seconds = Some(0.0);
+        }
+        PlayerCommand::Enqueue { track_ids } => {
+            state
+                .queue
+                .extend(resolve_queue_items(database, &track_ids).await?);
+        }
+        PlayerCommand::RemoveQueueItem { index } => remove_queue_item(state, index),
+        PlayerCommand::MoveQueueItem { from, to } => move_queue_item(state, from, to),
+        PlayerCommand::PlayStream { url, title } => {
+            state.queue = vec![QueueItem {
+                track_id: None,
+                title,
+                artist: String::new(),
+                album: String::new(),
+                stream_url: url,
+                artwork_url: None,
+            }];
+            state.position = Some(0);
+            state.status = PlaybackStatus::Playing;
+            state.duration_seconds = None;
+            state.elapsed_seconds = Some(0.0);
+        }
+    }
+    Ok(())
+}
+
 /// Advance to the next queue item. When `stop_at_end` is set (a track finished),
 /// stop after the last item unless repeat-all is on; otherwise (an explicit Next)
 /// clamp at the last item.
-fn advance(state: &mut BrowserState, stop_at_end: bool) {
+fn advance(state: &mut QueueState, stop_at_end: bool) {
     let Some(index) = state.position else {
         return;
     };
@@ -957,7 +1245,7 @@ async fn resolve_queue_items(database: &Database, track_ids: &[String]) -> Resul
 
 /// Remove a queue item, keeping `position` pointing at the same playing track
 /// (or stopping if the playing track itself was removed).
-fn remove_queue_item(state: &mut BrowserState, index: usize) {
+fn remove_queue_item(state: &mut QueueState, index: usize) {
     if index >= state.queue.len() {
         return;
     }
@@ -978,7 +1266,7 @@ fn remove_queue_item(state: &mut BrowserState, index: usize) {
 }
 
 /// Move a queue item, keeping `position` pointing at the same playing track.
-fn move_queue_item(state: &mut BrowserState, from: usize, to: usize) {
+fn move_queue_item(state: &mut QueueState, from: usize, to: usize) {
     if from >= state.queue.len() || to >= state.queue.len() || from == to {
         return;
     }
@@ -1359,6 +1647,134 @@ mod tests {
             state.status,
             PlaybackStatus::Paused,
             "a restored queue is paused, never auto-resumed as playing"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // A zone owns a canonical queue just like the browser player: playing a non-first
+    // track sets the queue and starts at that position in a single broadcast. An empty
+    // member list exercises the canonical-queue path with no MPD/browser I/O.
+    #[tokio::test]
+    async fn zone_play_tracks_with_start_index_starts_there_in_one_broadcast() {
+        let db_path = temp_db("zone-start-index");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = library_with_tracks(5);
+        database.save_library(&mut library).await.expect("save");
+
+        let zone = ZonePlayer::new(database.clone(), "zone-living-room".to_string());
+        let mut states = zone.subscribe();
+        zone.execute(
+            PlayerCommand::PlayTracks {
+                track_ids: vec![
+                    "track_1".to_string(),
+                    "track_2".to_string(),
+                    "track_3".to_string(),
+                ],
+                start_index: 2,
+            },
+            &database,
+            "http://localhost",
+            &[],
+        )
+        .await
+        .expect("play");
+
+        let state = states.try_recv().expect("one state frame");
+        assert_eq!(state.queue_position, Some(2));
+        assert_eq!(
+            state.now_playing.and_then(|n| n.track_id),
+            Some("track_3".to_string()),
+            "now-playing is the requested track, not queue index 0"
+        );
+        assert!(
+            matches!(
+                states.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "play_tracks with start_index must be a single broadcast"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // A zone progress report emits a lightweight tick, not a full PlaybackState.
+    #[tokio::test]
+    async fn zone_report_progress_emits_lightweight_tick_not_full_state() {
+        let db_path = temp_db("zone-report-progress");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let zone = ZonePlayer::new(database, "zone-x".to_string());
+        let mut states = zone.subscribe();
+        let mut ticks = zone.subscribe_progress();
+
+        zone.report_progress(8.0, Some(180.0)).await;
+
+        let tick = ticks.try_recv().expect("a progress tick was broadcast");
+        assert_eq!(tick.elapsed_seconds, 8.0);
+        assert_eq!(tick.duration_seconds, Some(180.0));
+        assert!(
+            matches!(
+                states.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "a progress tick must not broadcast a full PlaybackState"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // A zone's canonical queue survives a server restart, restored paused — same
+    // contract as the browser player, driven through the manager lifecycle.
+    #[tokio::test]
+    async fn zone_queue_survives_a_restart_restored_paused() {
+        let db_path = temp_db("zone-queue-restart");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = library_with_tracks(5);
+        database.save_library(&mut library).await.expect("save");
+
+        let zone_id = {
+            let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
+                .await
+                .expect("manager");
+            let zone = manager.create_zone("Living Room").await.expect("zone");
+            manager
+                .command_zone(
+                    &zone.id,
+                    PlayerCommand::PlayTracks {
+                        track_ids: vec![
+                            "track_1".to_string(),
+                            "track_2".to_string(),
+                            "track_3".to_string(),
+                        ],
+                        start_index: 1,
+                    },
+                )
+                .await
+                .expect("play");
+            // Playing here; the restart should restore it as Paused.
+            assert_eq!(
+                manager.zone_state(&zone.id).await.expect("state").status,
+                PlaybackStatus::Playing
+            );
+            zone.id
+        };
+
+        // Fresh manager over the same database = a server restart.
+        let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
+            .await
+            .expect("reload manager");
+        let state = manager.zone_state(&zone_id).await.expect("state");
+
+        assert_eq!(state.queue.len(), 3, "queue restored");
+        assert_eq!(state.queue_position, Some(1), "position restored");
+        assert_eq!(
+            state.now_playing.and_then(|n| n.track_id),
+            Some("track_2".to_string())
+        );
+        assert_eq!(
+            state.status,
+            PlaybackStatus::Paused,
+            "a restored zone queue is paused, never auto-resumed as playing"
         );
 
         let _ = std::fs::remove_file(db_path);

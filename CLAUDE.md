@@ -24,7 +24,8 @@ Other docs: `docs/plugins.md` (Roon research + provider plan), `docs/api.md` (na
   (lofty/serde/sha2); **no tokio**. `MusicProvider`, `SourceFs` VFS,
   `scan_source_incremental`, `merge_libraries`.
 - `crates/musicata-storage` — SQLite via sqlx. Migrations by `PRAGMA user_version`
-  (currently v17). One library cache + separate tables (players, player queues,
+  (currently v18). One library cache + separate tables (players, player queues,
+  zone queues,
   playlists, favorites, radio, sources, activities).
 - `crates/musicata-server` — axum 0.8 (+ws), the providers/registry, players, the
   OpenSubsonic surface, and the embedded web app (`static/`, vanilla HTML/CSS/JS, no
@@ -49,10 +50,9 @@ Other docs: `docs/plugins.md` (Roon research + provider plan), `docs/api.md` (na
 ## Build / test / run
 
 ```
-cargo build                                   # default features
-cargo build --features provider-smb           # + SMB source
-cargo test                                     # all crates
-cargo test --features provider-smb -p musicata-server
+cargo build                                   # default features (incl. SMB source)
+cargo build --no-default-features             # minimal: drop the SMB `smb` dep
+cargo test                                     # all crates (SMB tests run by default)
 cargo run -p musicata-server -- --library <dir> --addr 127.0.0.1:3030
 ```
 
