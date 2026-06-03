@@ -33,6 +33,13 @@ Other docs: `docs/plugins.md` (Roon research + provider plan), `docs/api.md` (na
 
 ## Conventions (hard-won)
 
+- **Configuration lives in the product, not in flags/env/config files.** Musicata is
+  for an ordinary user, not an operator editing YAML. User-facing settings (enable
+  artwork fetching, an API key, a music source, a player) are **persisted in the DB and
+  edited in the web UI** (the `/admin` Settings page) — live, no restart. CLI flags /
+  env vars exist only for *bootstrap* (where the DB and library live, the bind address)
+  and test harnesses, not for features a user would toggle. When adding a feature, add a
+  setting + UI, not a `--flag`.
 - **Enum dispatch, not `dyn`**, for `ProviderHandle` / `PlayerHandle` — async methods
   stay object-safe; a new backend is one variant + match arms, cargo-feature-gated.
 - **Capabilities are advertised** (`ProviderCapabilities`) and callers skip what a

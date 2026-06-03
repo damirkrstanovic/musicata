@@ -2459,6 +2459,21 @@ body.admin {
   font-size: 0.95rem;
 }
 
+/* A checkbox + label row (e.g. the artwork settings toggle). */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  cursor: pointer;
+}
+
+.toggle-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
 .field-grid {
   display: flex;
   flex-wrap: wrap;

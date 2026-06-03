@@ -148,9 +148,22 @@ Tasks:
       first request reads the whole audio file over the wire to extract; a future
       optimization is a header-range read. Eager extraction at scan time (the picture is
       already parsed for `embedded_artwork_count`) is also possible later.
-    - [ ] **Cover Art Archive auto-fill** — populate the cache from the existing CAA
-      candidate/review flow automatically (today on-demand only), behind the same
-      provider-acquisition path.
+    - [x] **External artwork providers — pluggable lane + automatic fill.** A pluggable
+      `ArtworkProvider` lane (`crates/musicata-server/src/artwork_providers.rs`, mirroring
+      the music-source registry) auto-fills coverless albums after each scan: it tries
+      **Cover Art Archive** and **fanart.tv** (MusicBrainz-id keyed; fanart.tv joins when
+      its free API key is entered in the `/admin` Settings panel) first, then **iTunes**
+      and **Deezer** text search, skipping id-only providers when an album has no MBIDs.
+      `artwork_fill_pass` (toggled in Settings — a DB-backed app setting, migration v20,
+      not a flag — default on) downloads the cover, caches it, and writes
+      an `acquired_album_artwork` row (migration v19) + the album's `artwork_url`; a
+      `not_found` marker stops the periodic rescan from re-querying (weekly retry); the
+      serve handler checks the acquired row first. Verified live: testdata's coverless
+      albums auto-filled real 600×600 covers, persisting (and not re-fetching) across
+      restart. ToS notes + the still-open `?size=`/content-hash items in prior-art §8.
+    - [ ] **Manual override** — a "refresh / clear / replace artwork" action so a user
+      can fix a wrong text-search match (the on-demand CAA candidate/review flow already
+      exists for picking a cover; this would also clear/re-trigger an acquired one).
 
 Done when:
 
@@ -537,8 +550,12 @@ Tasks:
     active anti-OSS enforcement). **Apple Music / Amazon Music are infeasible** for
     self-contained playback (MusicKit-locked / Widevine + a ToS that bans self-hosting).
     DRM-circumvention code, if any, stays out of the default build.
-- [ ] Metadata-enrichment lane (distinct from sources): Last.fm/ListenBrainz scrobbling,
-  MusicBrainz/Discogs lookups — a metadata/plugin provider type, not a music source.
+- Metadata-enrichment lane (distinct from sources): a metadata/plugin provider type,
+  not a music source. **Started** — the pluggable **artwork-provider lane**
+  (`artwork_providers.rs`: iTunes/Deezer/Cover Art Archive/fanart.tv, priority + MBID
+  capability, auto-fill after scan; see M3 §8) is the first instance of this pattern.
+  Still open: Last.fm/ListenBrainz scrobbling and MusicBrainz/Discogs *metadata* lookups
+  on the same kind of lane.
 
 Done when:
 

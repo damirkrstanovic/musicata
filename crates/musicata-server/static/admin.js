@@ -357,11 +357,38 @@ function connectActivity() {
   };
 }
 
+// ---- Artwork settings -----------------------------------------------------
+
+async function loadArtworkSettings() {
+  try {
+    const settings = await api("/api/settings");
+    $("#artwork-fetch").checked = !!settings.artwork_fetch;
+    $("#fanart-key").value = settings.fanart_tv_key || "";
+  } catch {
+    /* leave the form at its defaults */
+  }
+}
+
+$("#artwork-settings").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  setStatus($("#artwork-settings-status"), "Saving…");
+  try {
+    await apiSend("/api/settings", "PATCH", {
+      artwork_fetch: $("#artwork-fetch").checked,
+      fanart_tv_key: $("#fanart-key").value.trim(),
+    });
+    setStatus($("#artwork-settings-status"), "Saved.");
+  } catch (error) {
+    setStatus($("#artwork-settings-status"), `Could not save: ${error.message}`, true);
+  }
+});
+
 // ---- Boot -----------------------------------------------------------------
 
 loadSources();
 loadPlayers();
 loadActivity();
+loadArtworkSettings();
 connectActivity();
 // Players still poll (for online status), but slowly — the chatty activity feed
 // is now push-based.

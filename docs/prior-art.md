@@ -391,9 +391,64 @@ rather than a 2 MB original. Where should bytes live, and who fetches them?
 This is the natural sequel to §4 (network never on the hot path) and §2 (cheap steady
 state — reuse by mtime/hash). See `docs/roadmap.md` M3 for the staged plan.
 
+**Implemented — the acquisition lane (embedded + external providers).** Bytes in the
+cache, provenance in the DB, acquisition pluggable, exactly as above:
+- **Embedded artwork** fills coverless albums from a track's tags: the scanner points
+  `Album.artwork_path` at the audio file (`musicata-core`: `build_track`/
+  `aggregate_track`/`extract_embedded_cover`), and the serve handler extracts + caches
+  the picture on demand (local or SMB).
+- **External providers** — a pluggable lane (`crates/musicata-server/src/
+  artwork_providers.rs`, mirroring the music-source `ProviderHandle`/registry): an
+  `ArtworkProvider` trait + a priority registry that tries **MusicBrainz-id matches
+  first** (Cover Art Archive, then **fanart.tv** when an API key is set) then **text
+  search** (iTunes/Apple, Deezer), skipping id-only providers when an album has no
+  MBIDs. Each is a small sync `ureq` client (like `musicbrainz.rs`) with a shared
+  per-provider rate limiter; parsing is pure functions (unit-tested with canned JSON).
+- **Automatic fill** — `artwork_fill_pass` runs after each scan (toggled in the
+  `/admin` **Settings** panel — a DB-backed setting, not a flag — default on): re-apply
+  already-acquired covers (a rescan
+  rewrites the albums table, wiping `artwork_url`), then fetch for still-coverless
+  albums (capped per pass, downloaded → `ArtworkCache` → an `acquired_album_artwork`
+  row, migration v19), reported on the scan's activity feed. A **negative `not_found`
+  marker** stops the 30 s rescan from re-querying coverless albums (weekly retry). The
+  serve handler checks the acquired row first.
+- **ToS note:** Cover Art Archive is open; **iTunes** artwork is licensed "to promote
+  store content" (a gray area widely used by Navidrome/beets/Jellyfin — low risk for a
+  self-hosted personal server, attribute the source); **Deezer** asks for attribution;
+  **fanart.tv** needs a free personal key. Text-search results are auto-applied but
+  user-replaceable, and id-exact providers run first to avoid mismatches.
+- **Still open** (roadmap M3 §8): `?size=` thumbnails, content-hash keying/dedup +
+  invalidation, eager prefetch + a bounded cache.
+
+**Where else artwork lives (candidate sources for the lane).** Adding one is a single
+`ArtworkProvider` + a registry entry; the question is coverage vs. auth/ToS cost:
+- **TheAudioDB** — free key (`123`, ~30 req/min; private key via Patreon), text+MBID,
+  good album *and artist* art. **Easiest high-value next add.**
+- **Wikidata → Wikimedia Commons** — P18 image via the release-group's Wikidata link;
+  free and **openly licensed (CC)** — the best license story — but sparse for albums and
+  multi-step (MB → Wikidata → Commons `imageinfo`). Good long-tail filler.
+- **Discogs** — huge coverage (obscure/vinyl), but **images require OAuth/token auth**
+  (key+secret) and are rate-limited; ToS restricts use. Medium effort.
+- **Spotify Web API** — top-quality covers (and artist images), but needs **OAuth client
+  credentials** (app registration) and display ToS; naturally rides the streaming-
+  provider work (prior-art §9).
+- **Last.fm** — ❌ album-art endpoints were **removed/deprecated** (~2019, returns a
+  placeholder); skip for covers (still useful for scrobbling/metadata).
+- **Better matching, not a source:** **AcoustID/Chromaprint** fingerprinting turns an
+  *untagged* file into an MBID, which then unlocks the id-exact providers (CAA,
+  fanart.tv). The biggest quality lever for poorly-tagged libraries.
+
+**A second axis — artist artwork (not yet implemented).** Today the lane fills *album*
+covers only. Artist images/backgrounds (for artist pages + a now-playing backdrop) are a
+natural extension reusing the same lane: **fanart.tv** (client already exists — artist
+backgrounds/banners/logos), **TheAudioDB** (artist thumb/fanart), **Deezer**/**Spotify**
+(artist picture). Recommended order: TheAudioDB (album+artist, free) → artist-artwork
+axis (fanart.tv/TheAudioDB/Deezer) → Wikidata/Commons (license) → Discogs/Spotify (auth).
+
 References: Navidrome `core/artwork/` (sources/cache_warmer/reader_resized) +
 `utils/cache/file_caches.go`; Jellyfin `src/Jellyfin.Drawing/ImageProcessor.cs`,
-`BaseItemImageInfo`, `LocalImageProvider`, `ItemImageProvider`.
+`BaseItemImageInfo`, `LocalImageProvider`, `ItemImageProvider`. Provider APIs: iTunes
+Search, Deezer API, Cover Art Archive, fanart.tv.
 
 ---
 

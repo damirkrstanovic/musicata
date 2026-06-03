@@ -66,6 +66,26 @@
       </section>
 
       <section class="admin-panel">
+        <header class="admin-panel-head"><h2>Artwork</h2></header>
+        <p class="admin-hint">Albums with no cover can have one fetched automatically from
+          the internet (iTunes, Deezer, Cover Art Archive). Covers are cached locally.</p>
+        <form id="artwork-settings" class="field-form">
+          <label class="toggle-row">
+            <input id="artwork-fetch" type="checkbox">
+            <span>Automatically find missing album covers</span>
+          </label>
+          <label class="field">
+            <span>fanart.tv API key <em>(optional — higher-quality covers for tagged albums)</em></span>
+            <input id="fanart-key" type="text" autocomplete="off" placeholder="leave empty to skip fanart.tv">
+          </label>
+          <div class="field-actions">
+            <button class="primary-button" type="submit">Save</button>
+            <span id="artwork-settings-status" class="form-status"></span>
+          </div>
+        </form>
+      </section>
+
+      <section class="admin-panel">
         <header class="admin-panel-head"><h2>Players &amp; zones</h2></header>
         <p class="admin-hint">Output devices Musicata controls (MPD endpoints, plus this browser).
           Group players into zones to control them together.</p>
