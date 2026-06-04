@@ -1,6 +1,7 @@
 mod activity;
 mod artwork;
 mod artwork_providers;
+mod fingerprint;
 mod mpd;
 mod musicbrainz;
 mod players;
@@ -658,6 +659,9 @@ async fn library_scan_loop(
         true,
     )
     .await;
+    // Fingerprint untagged tracks first (resolves MBIDs) so the artwork pass can reach
+    // the id-exact providers; then fill covers.
+    fingerprint_pass(&database, &providers, &activity).await;
     artwork_fill_pass(&database, &activity, &artwork_cache).await;
     if !incremental {
         return;
@@ -675,6 +679,7 @@ async fn library_scan_loop(
             true,
         )
         .await;
+        fingerprint_pass(&database, &providers, &activity).await;
         artwork_fill_pass(&database, &activity, &artwork_cache).await;
     }
 }
@@ -682,17 +687,21 @@ async fn library_scan_loop(
 /// Setting keys edited in the web UI (see `crate::Database::get_setting`).
 const SETTING_ARTWORK_FETCH: &str = "artwork_fetch";
 const SETTING_FANART_TV_KEY: &str = "fanart_tv_key";
+const SETTING_FINGERPRINT: &str = "fingerprint_enabled";
 
-/// Whether automatic artwork fetching is enabled (default on). Read from the settings
-/// store so toggling it in the UI takes effect on the next pass, no restart.
-async fn artwork_fetch_enabled(database: &Database) -> bool {
+/// Read a default-on boolean setting (toggling it in the UI takes effect next pass).
+async fn setting_enabled(database: &Database, key: &str) -> bool {
     database
-        .get_setting(SETTING_ARTWORK_FETCH)
+        .get_setting(key)
         .await
         .ok()
         .flatten()
         .map(|value| value != "false" && value != "0")
         .unwrap_or(true)
+}
+
+async fn artwork_fetch_enabled(database: &Database) -> bool {
+    setting_enabled(database, SETTING_ARTWORK_FETCH).await
 }
 
 /// How long to wait before re-querying providers for an album whose cover wasn't found,
@@ -838,6 +847,136 @@ async fn artwork_fill_pass(
         // Nothing found this pass — don't leave a noisy entry in the activity log.
         activity.remove(task);
     }
+}
+
+/// Retry window for a track AcoustID couldn't identify, so the rescan doesn't
+/// re-fingerprint it every pass.
+const FINGERPRINT_RETRY_SECS: i64 = 7 * 24 * 60 * 60;
+/// Tracks fingerprinted per pass — decoding ~120 s of audio each is heavier than an
+/// artwork fetch, so keep batches small; the rest are picked up on later passes.
+const FINGERPRINT_BATCH: i64 = 25;
+
+/// After a scan, identify untagged tracks by audio fingerprint (Chromaprint → AcoustID)
+/// and store the resolved MusicBrainz ids, so `album_musicbrainz_ids` can feed the
+/// id-exact artwork providers. Gated by a Settings toggle; no-ops without an AcoustID
+/// key. Mirrors `artwork_fill_pass` (rate-limited, capped, negative cache, activity).
+async fn fingerprint_pass(
+    database: &Database,
+    providers: &Arc<RwLock<ProviderRegistry>>,
+    activity: &Arc<activity::ActivityLog>,
+) {
+    if !setting_enabled(database, SETTING_FINGERPRINT).await {
+        return;
+    }
+    // Until the project compiles in its AcoustID application key, the feature no-ops.
+    if fingerprint::ACOUSTID_CLIENT_KEY.is_empty() {
+        return;
+    }
+
+    let retry_before = now_unix_seconds() - FINGERPRINT_RETRY_SECS;
+    let targets = match database
+        .tracks_missing_fingerprints(retry_before, FINGERPRINT_BATCH)
+        .await
+    {
+        Ok(targets) => targets,
+        Err(error) => {
+            tracing::warn!(%error, "fingerprint: failed to list untagged tracks");
+            return;
+        }
+    };
+    if targets.is_empty() {
+        return;
+    }
+
+    let client = Arc::new(fingerprint::AcoustIdClient::new(
+        fingerprint::ACOUSTID_CLIENT_KEY,
+    ));
+    let total = targets.len();
+    let task = activity.start("fingerprint", format!("Identifying tracks (0/{total})"));
+    let mut resolved = 0usize;
+
+    for (index, target) in targets.into_iter().enumerate() {
+        activity.update(
+            task,
+            format!(
+                "Identifying tracks ({}/{total}): {}",
+                index + 1,
+                target.title
+            ),
+        );
+        // Read the audio (SMB or local); an unreadable file is skipped (not marked, so a
+        // transient failure is retried).
+        let audio = match read_track_source_file(providers, &target).await {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+
+        let extension = target.extension.clone();
+        let client = client.clone();
+        // Decode + fingerprint + AcoustID lookup are synchronous + CPU-heavy.
+        let outcome = tokio::task::spawn_blocking(move || {
+            let (fingerprint, duration) =
+                fingerprint::compute_fingerprint(&audio, &extension).ok()?;
+            client.lookup(&fingerprint, duration).ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let now = now_unix_seconds();
+        match outcome {
+            Some(found) => {
+                let _ = database
+                    .upsert_track_fingerprint(
+                        &target.track_id,
+                        "resolved",
+                        found.recording_mbid.as_deref(),
+                        found.release_mbid.as_deref(),
+                        found.release_group_mbid.as_deref(),
+                        now,
+                    )
+                    .await;
+                resolved += 1;
+            }
+            None => {
+                let _ = database
+                    .upsert_track_fingerprint(&target.track_id, "not_found", None, None, None, now)
+                    .await;
+            }
+        }
+    }
+
+    if resolved > 0 {
+        activity.finish(
+            task,
+            true,
+            Some(format!("Identified {resolved} of {total} tracks")),
+        );
+    } else {
+        activity.remove(task);
+    }
+}
+
+/// Read a track's audio bytes from its provider — SMB over the wire, else local disk.
+#[cfg_attr(not(feature = "provider-smb"), allow(unused_variables))]
+async fn read_track_source_file(
+    providers: &Arc<RwLock<ProviderRegistry>>,
+    target: &musicata_storage::TrackFingerprintTarget,
+) -> Result<Vec<u8>, String> {
+    #[cfg(feature = "provider-smb")]
+    {
+        if let Some(providers::ProviderHandle::Smb(smb)) =
+            providers.read().await.get(&target.provider_id)
+        {
+            return smb
+                .read_file(&target.provider_item_id)
+                .await
+                .map_err(|error| error.to_string());
+        }
+    }
+    tokio::fs::read(&target.path)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn app(
@@ -2216,10 +2355,14 @@ struct AppSettings {
     artwork_fetch: bool,
     /// Optional fanart.tv personal API key (empty = unset).
     fanart_tv_key: String,
+    /// Identify untagged tracks by audio fingerprint (AcoustID) to resolve MusicBrainz
+    /// ids, which the id-exact artwork providers then use.
+    fingerprint_enabled: bool,
 }
 
 async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>, AppError> {
     let artwork_fetch = artwork_fetch_enabled(&state.database).await;
+    let fingerprint_enabled = setting_enabled(&state.database, SETTING_FINGERPRINT).await;
     let fanart_tv_key = state
         .database
         .get_setting(SETTING_FANART_TV_KEY)
@@ -2229,6 +2372,7 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
     Ok(Json(AppSettings {
         artwork_fetch,
         fanart_tv_key,
+        fingerprint_enabled,
     }))
 }
 
@@ -2236,6 +2380,7 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
 struct SettingsUpdate {
     artwork_fetch: Option<bool>,
     fanart_tv_key: Option<String>,
+    fingerprint_enabled: Option<bool>,
 }
 
 async fn update_settings(
@@ -2256,6 +2401,13 @@ async fn update_settings(
         state
             .database
             .set_setting(SETTING_FANART_TV_KEY, key.trim())
+            .await
+            .map_err(db_error)?;
+    }
+    if let Some(enabled) = update.fingerprint_enabled {
+        state
+            .database
+            .set_setting(SETTING_FINGERPRINT, if enabled { "true" } else { "false" })
             .await
             .map_err(db_error)?;
     }

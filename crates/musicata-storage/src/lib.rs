@@ -234,6 +234,13 @@ impl Database {
             set_user_version(&self.pool, 20).await?;
         }
 
+        if version < 21 {
+            for statement in MIGRATION_021_TRACK_FINGERPRINT {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 21).await?;
+        }
+
         Ok(())
     }
 
@@ -1430,18 +1437,25 @@ impl Database {
     }
 
     /// The first MusicBrainz release / release-group ids found among an album's tracks
-    /// (used to query id-keyed artwork providers like Cover Art Archive).
+    /// (used to query id-keyed artwork providers like Cover Art Archive). Prefers ids
+    /// from the embedded tags (observations) and falls back to AcoustID fingerprint
+    /// results, so a fingerprinted untagged album still reaches the id-exact providers.
     pub async fn album_musicbrainz_ids(
         &self,
         album_id: &str,
     ) -> Result<(Option<String>, Option<String>)> {
         let row = sqlx::query(
-            "SELECT o.musicbrainz_release_id AS rel, o.musicbrainz_release_group_id AS rg
+            "SELECT COALESCE(o.musicbrainz_release_id, f.musicbrainz_release_id) AS rel,
+                    COALESCE(o.musicbrainz_release_group_id, f.musicbrainz_release_group_id) AS rg
              FROM tracks t
-             JOIN track_metadata_observations o ON o.track_id = t.id
+             LEFT JOIN track_metadata_observations o ON o.track_id = t.id
+             LEFT JOIN track_fingerprint f
+                    ON f.track_id = t.id AND f.status = 'resolved'
              WHERE t.album_id = ?1
                AND (o.musicbrainz_release_id IS NOT NULL
-                    OR o.musicbrainz_release_group_id IS NOT NULL)
+                    OR o.musicbrainz_release_group_id IS NOT NULL
+                    OR f.musicbrainz_release_id IS NOT NULL
+                    OR f.musicbrainz_release_group_id IS NOT NULL)
              LIMIT 1",
         )
         .bind(album_id)
@@ -1451,6 +1465,85 @@ impl Database {
             Some(row) => (row.try_get("rel")?, row.try_get("rg")?),
             None => (None, None),
         })
+    }
+
+    // ---- AcoustID fingerprint results ----------------------------------------
+
+    /// Tracks that still need fingerprinting: no MusicBrainz recording/release id in
+    /// their tags (observations), and either never fingerprinted or last `not_found`
+    /// before `retry_before` (so an unidentifiable track isn't re-fingerprinted every
+    /// rescan). Returns (track_id, title, artist, extension, provider_id, item_id) so the
+    /// caller can read and decode the file.
+    pub async fn tracks_missing_fingerprints(
+        &self,
+        retry_before_unix_seconds: i64,
+        limit: i64,
+    ) -> Result<Vec<TrackFingerprintTarget>> {
+        let rows = sqlx::query(
+            "SELECT t.id, t.title, t.artist_name, t.extension, t.provider_id,
+                    t.provider_item_id, t.path
+             FROM tracks t
+             LEFT JOIN track_fingerprint f ON f.track_id = t.id
+             WHERE NOT EXISTS (
+                       SELECT 1 FROM track_metadata_observations o
+                       WHERE o.track_id = t.id
+                         AND (o.musicbrainz_recording_id IS NOT NULL
+                              OR o.musicbrainz_release_id IS NOT NULL
+                              OR o.musicbrainz_release_group_id IS NOT NULL))
+               AND (f.track_id IS NULL
+                    OR (f.status = 'not_found'
+                        AND f.fingerprinted_at_unix_seconds < ?1))
+             ORDER BY t.artist_name, t.title
+             LIMIT ?2",
+        )
+        .bind(retry_before_unix_seconds)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(TrackFingerprintTarget {
+                    track_id: row.try_get("id")?,
+                    title: row.try_get("title")?,
+                    artist_name: row.try_get("artist_name")?,
+                    extension: row.try_get("extension")?,
+                    provider_id: row.try_get("provider_id")?,
+                    provider_item_id: row.try_get("provider_item_id")?,
+                    path: row.try_get("path")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Record a fingerprint outcome for a track (`resolved` with MBIDs, or `not_found`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_track_fingerprint(
+        &self,
+        track_id: &str,
+        status: &str,
+        recording_mbid: Option<&str>,
+        release_mbid: Option<&str>,
+        release_group_mbid: Option<&str>,
+        now_unix_seconds: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO track_fingerprint
+                (track_id, status, musicbrainz_recording_id, musicbrainz_release_id,
+                 musicbrainz_release_group_id, fingerprinted_at_unix_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(track_id) DO UPDATE SET
+                status = ?2, musicbrainz_recording_id = ?3, musicbrainz_release_id = ?4,
+                musicbrainz_release_group_id = ?5, fingerprinted_at_unix_seconds = ?6",
+        )
+        .bind(track_id)
+        .bind(status)
+        .bind(recording_mbid)
+        .bind(release_mbid)
+        .bind(release_group_mbid)
+        .bind(now_unix_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     // ---- App settings (user-editable, persisted; edited in the web UI) -------
@@ -2439,6 +2532,20 @@ pub struct AlbumArtworkTarget {
     pub title: String,
 }
 
+/// A track that needs audio fingerprinting (to resolve MusicBrainz ids). Carries enough
+/// to read and decode the file: the provider (SMB reads `provider_item_id`) and the
+/// absolute `path` (local disk reads that).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackFingerprintTarget {
+    pub track_id: String,
+    pub title: String,
+    pub artist_name: String,
+    pub extension: String,
+    pub provider_id: String,
+    pub provider_item_id: String,
+    pub path: String,
+}
+
 /// The acquired-artwork record for an album (provenance + cache reference).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AcquiredArtwork {
@@ -3286,6 +3393,20 @@ const MIGRATION_019_ACQUIRED_ARTWORK: &[&str] =
 const MIGRATION_020_SETTINGS: &[&str] = &["CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
+    )"];
+
+// AcoustID audio-fingerprint results: MusicBrainz ids resolved by fingerprinting a
+// track's audio (for files whose tags carry no MBIDs). Like acquired_album_artwork,
+// deliberately **no foreign key** — `save_library` rewrites tracks/observations every
+// scan, and `track_id` is stable across rescans. `status` is `resolved` or `not_found`
+// (a negative-cache marker so the rescan doesn't re-fingerprint an unidentified track).
+const MIGRATION_021_TRACK_FINGERPRINT: &[&str] = &["CREATE TABLE IF NOT EXISTS track_fingerprint (
+        track_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        musicbrainz_recording_id TEXT,
+        musicbrainz_release_id TEXT,
+        musicbrainz_release_group_id TEXT,
+        fingerprinted_at_unix_seconds INTEGER NOT NULL
     )"];
 
 // Listening history. One row per confirmed listen (a track that played past the
@@ -4853,6 +4974,93 @@ mod tests {
         assert_eq!(
             database.get_setting("artwork_fetch").await.expect("get"),
             Some("true".to_string())
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn track_fingerprint_lifecycle() {
+        let db_path = temp_db_path("track-fingerprint");
+        let database = Database::connect(&db_path).await.expect("connect");
+
+        // An untagged track: no MusicBrainz ids in its observation.
+        let mut library = fixture_library();
+        for obs in &mut library.tracks[0].observed_metadata {
+            obs.musicbrainz_recording_id = None;
+            obs.musicbrainz_track_id = None;
+            obs.musicbrainz_release_id = None;
+            obs.musicbrainz_release_group_id = None;
+        }
+        database.save_library(&mut library).await.expect("save");
+
+        // It needs fingerprinting; the target carries enough to read the file.
+        let missing = database
+            .tracks_missing_fingerprints(0, 10)
+            .await
+            .expect("missing");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].track_id, "track_1");
+        assert_eq!(missing[0].extension, "mp3");
+        assert_eq!(missing[0].provider_item_id, "album/song.mp3");
+
+        // No MBIDs for the album yet.
+        assert_eq!(
+            database
+                .album_musicbrainz_ids("album_1")
+                .await
+                .expect("ids"),
+            (None, None)
+        );
+
+        // Resolve via fingerprint.
+        database
+            .upsert_track_fingerprint(
+                "track_1",
+                "resolved",
+                Some("rec"),
+                Some("rel"),
+                Some("rg"),
+                1_800_000_000,
+            )
+            .await
+            .expect("upsert");
+
+        // No longer missing, and the album now resolves its MBIDs from the fingerprint.
+        assert!(
+            database
+                .tracks_missing_fingerprints(2_000_000_000, 10)
+                .await
+                .expect("missing")
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .album_musicbrainz_ids("album_1")
+                .await
+                .expect("ids"),
+            (Some("rel".to_string()), Some("rg".to_string()))
+        );
+
+        // A not_found marker suppresses re-fingerprinting until the retry window passes.
+        database
+            .upsert_track_fingerprint("track_1", "not_found", None, None, None, 1_000)
+            .await
+            .expect("upsert");
+        assert!(
+            database
+                .tracks_missing_fingerprints(500, 10)
+                .await
+                .expect("missing")
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .tracks_missing_fingerprints(2_000, 10)
+                .await
+                .expect("missing")
+                .len(),
+            1
         );
 
         let _ = std::fs::remove_file(db_path);

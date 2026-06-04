@@ -434,9 +434,19 @@ cache, provenance in the DB, acquisition pluggable, exactly as above:
   provider work (prior-art §9).
 - **Last.fm** — ❌ album-art endpoints were **removed/deprecated** (~2019, returns a
   placeholder); skip for covers (still useful for scrobbling/metadata).
-- **Better matching, not a source:** **AcoustID/Chromaprint** fingerprinting turns an
-  *untagged* file into an MBID, which then unlocks the id-exact providers (CAA,
-  fanart.tv). The biggest quality lever for poorly-tagged libraries.
+- **Better matching, not a source — implemented:** **AcoustID/Chromaprint** audio
+  fingerprinting turns an *untagged* file into an MBID, unlocking the id-exact providers
+  (CAA, fanart.tv) — the biggest quality lever for poorly-tagged libraries. Pure Rust:
+  `symphonia` decodes ~120 s of audio, `rusty-chromaprint` (MIT) computes the
+  fingerprint, and a `ureq` client queries AcoustID (`fingerprint.rs`). A
+  `fingerprint_pass` runs after each scan **before** the artwork pass, finds untagged
+  tracks, decodes+fingerprints+looks-up on `spawn_blocking` (rate-limited to AcoustID's
+  3 req/s, capped per pass, negative-cached), and writes a `track_fingerprint` row
+  (migration v21, FK-less); `album_musicbrainz_ids` `COALESCE`s observation ids with
+  fingerprint ids, so the artwork lane then reaches CAA/fanart.tv. Gated by a Settings
+  toggle; needs Musicata's own free AcoustID **application** key compiled in (no-ops
+  until set). Auto-*applying* the MBIDs' MusicBrainz metadata (retagging) is a separate
+  follow-up.
 
 **A second axis — artist artwork (not yet implemented).** Today the lane fills *album*
 covers only. Artist images/backgrounds (for artist pages + a now-playing backdrop) are a
