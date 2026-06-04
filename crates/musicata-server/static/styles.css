@@ -2636,3 +2636,36 @@ body.admin {
     grid-template-columns: 1fr;
   }
 }
+
+/* Transient status toast (bottom-center) — e.g. a command to an offline player. */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--transport-h) + 20px);
+  transform: translate(-50%, 8px);
+  z-index: 50;
+  max-width: min(92vw, 460px);
+  padding: 10px 16px;
+  background: var(--panel-strong);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  font-size: 0.85rem;
+  line-height: 1.35;
+  opacity: 0;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  pointer-events: none;
+}
+
+.toast.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+@media (max-width: 760px) {
+  .toast {
+    bottom: calc(var(--transport-h) + 12px);
+  }
+}

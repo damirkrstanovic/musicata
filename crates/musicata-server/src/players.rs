@@ -713,34 +713,43 @@ impl MpdPlayer {
             match result {
                 Ok(status) => {
                     self.online.store(true, Ordering::Relaxed);
-                    status
+                    Some(status)
                 }
                 Err(error) => {
+                    // The server queue is authoritative, so an unreachable MPD doesn't
+                    // fail the command: we still persist + broadcast below, leaving the
+                    // track queued and controllers updated. Drop the dead connection so
+                    // the next call (or the idle loop) reconnects and re-asserts; reuse
+                    // the held guard — re-locking the same mutex here would deadlock.
                     self.online.store(false, Ordering::Relaxed);
-                    // Drop the dead connection so the next call reconnects. Reuse the
-                    // held guard — re-locking the same mutex here would deadlock.
                     *guard = None;
-                    return Err(anyhow!(error.to_string()));
+                    tracing::debug!(player = %self.id, %error, "mpd command failed; player offline");
+                    None
                 }
             }
         };
 
-        // Once a play-ish command establishes MPD's cursor, the restore resume is spent.
-        if resume.is_some()
-            || matches!(
-                command,
-                PlayerCommand::Play
-                    | PlayerCommand::PlayQueueIndex { .. }
-                    | PlayerCommand::PlayTracks { .. }
-                    | PlayerCommand::PlayStream { .. }
-                    | PlayerCommand::Next
-                    | PlayerCommand::Previous
-            )
+        let online = status.is_some();
+        // Spend the restore-resume only once the command actually reached MPD — an
+        // offline command keeps the resume so it still applies when MPD reconnects.
+        if online
+            && (resume.is_some()
+                || matches!(
+                    command,
+                    PlayerCommand::Play
+                        | PlayerCommand::PlayQueueIndex { .. }
+                        | PlayerCommand::PlayTracks { .. }
+                        | PlayerCommand::PlayStream { .. }
+                        | PlayerCommand::Next
+                        | PlayerCommand::Previous
+                ))
         {
             self.restored.store(false, Ordering::Relaxed);
         }
 
-        self.apply_cursor(status).await;
+        if let Some(status) = status {
+            self.apply_cursor(status).await;
+        }
         let persist = {
             let state = self.state.lock().await;
             if mutates_queue {
@@ -790,6 +799,23 @@ impl MpdPlayer {
 
     async fn run_idle_loop(&self, database: &Database) -> Result<()> {
         let mut idle = MpdConnection::connect(&self.addr).await?;
+        self.online.store(true, Ordering::Relaxed);
+        // MPD just (re)connected — it may have restarted with an empty queue while we
+        // were offline. Re-push the authoritative server queue and, if we were playing,
+        // resume at the saved position (`reassert` does both), so playback continues
+        // without the user having to click again. At startup `restore` has set the
+        // status to Paused, so this won't surprise-autoplay then.
+        {
+            let mut guard = self.connection.lock().await;
+            if let Ok(connection) = ensure_connected(&mut guard, &self.addr).await {
+                if let Err(error) = self.reassert(connection).await {
+                    tracing::debug!(player = %self.id, %error, "reassert on reconnect failed");
+                } else if let Ok(status) = connection.read_status().await {
+                    self.expected_playlist_version
+                        .store(status.playlist_version, Ordering::Relaxed);
+                }
+            }
+        }
         if let Ok(state) = self.state(database).await {
             let _ = self.state_tx.send(state);
         }

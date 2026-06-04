@@ -1558,6 +1558,15 @@ async fn player_command(
         .execute(command, &state.database, state.players.public_base_url())
         .await
         .map_err(db_error)?;
+    // The command always updates the server queue; an MPD player that couldn't be
+    // reached reports itself offline. Surface that so the controller can show a clear
+    // message — the track is queued and resumes when the player reconnects — rather
+    // than re-probing the dead daemon (another bounded connect) via `state()`.
+    if !player.is_online() {
+        return Err(AppError::player_offline(
+            "This player is offline. The track is queued and will play when it reconnects.",
+        ));
+    }
     let playback = player.state(&state.database).await.map_err(db_error)?;
     Ok(Json(playback))
 }
@@ -3705,6 +3714,17 @@ impl AppError {
             message: message.into(),
         }
     }
+
+    /// The target player is unreachable. The command still updated the authoritative
+    /// server queue (so the track is queued); this tells the controller to surface a
+    /// clear "offline" message instead of a silent failure.
+    fn player_offline(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "player_offline",
+            message: message.into(),
+        }
+    }
 }
 
 impl From<std::io::Error> for AppError {
@@ -4594,6 +4614,85 @@ mod tests {
         let playback: serde_json::Value =
             serde_json::from_str(&body_text(response.into_body()).await).unwrap();
         assert_eq!(playback["volume"], 37);
+    }
+
+    #[tokio::test]
+    async fn offline_mpd_command_queues_track_and_reports_offline() {
+        let fixture = TestFixture::new("offline-mpd-command");
+        let app = fixture.app().await;
+
+        // Register an MPD player at an address with nothing listening (refused fast).
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/players")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"address":"127.0.0.1:6699","name":"Den"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let player: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        let id = player["id"].as_str().expect("id").to_string();
+        assert_eq!(player["online"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tracks?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let tracks: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        let track_id = tracks["items"][0]["id"]
+            .as_str()
+            .expect("track id")
+            .to_string();
+
+        // Playing on the offline player reports offline (503) rather than hanging or a
+        // bare 500 — the controller can show a clear message.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/players/{id}/commands"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"command":"play_tracks","track_ids":["{track_id}"]}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let error: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(error["error"]["code"], "player_offline");
+
+        // But the server queue is authoritative: the track is queued and survives, so it
+        // plays once MPD reconnects.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/players/{id}/state"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let playback: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(playback["queue"].as_array().expect("queue").len(), 1);
+        assert_eq!(playback["now_playing"]["track_id"], track_id);
     }
 
     #[tokio::test]
