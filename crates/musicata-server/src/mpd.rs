@@ -7,11 +7,19 @@
 //! polling. Only the subset Musicata needs is implemented; responses are parsed
 //! by the pure functions at the bottom of this module so they can be unit tested.
 
-use anyhow::{Result, bail};
+use std::time::Duration;
+
+use anyhow::{Result, anyhow, bail};
 use musicata_core::{PlaybackState, PlaybackStatus, QueueItem, RepeatMode};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+
+/// Cap how long a connect can block. An unreachable MPD (host that drops the SYN,
+/// not a fast local refusal) would otherwise stall the caller for the OS default —
+/// seconds to minutes — and command handlers connect on the request's hot path.
+/// Two seconds is plenty for a reachable daemon and bounds the worst case.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A single MPD connection. Not internally synchronized: callers serialize access
 /// (one connection for commands, a separate one for the blocking `idle` loop).
@@ -23,7 +31,9 @@ pub struct MpdConnection {
 impl MpdConnection {
     /// Connect and consume the `OK MPD <version>` greeting.
     pub async fn connect(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| anyhow!("MPD connect to {addr} timed out"))??;
         let (read, writer) = stream.into_split();
         let mut connection = Self {
             reader: BufReader::new(read),

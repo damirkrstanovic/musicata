@@ -43,6 +43,7 @@ const state = {
 };
 
 const els = {
+  toast: document.querySelector("#toast"),
   summary: document.querySelector("#summary"),
   search: document.querySelector("#search"),
   browseGenre: document.querySelector("#browse-genre"),
@@ -2437,11 +2438,33 @@ function cssEscape(value) {
   return value.replace(/["\\]/g, "\\$&");
 }
 
+let toastTimer = null;
+// Brief, self-dismissing status message (bottom-center). Replaces any visible toast
+// so repeated failures don't stack.
+function showToast(message) {
+  if (!els.toast) return;
+  els.toast.textContent = message;
+  els.toast.hidden = false;
+  // Reflow so re-showing the same toast restarts the fade-in transition.
+  void els.toast.offsetWidth;
+  els.toast.classList.add("show");
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    els.toast.classList.remove("show");
+    toastTimer = setTimeout(() => {
+      els.toast.hidden = true;
+    }, 250);
+  }, 3500);
+}
+
 async function playerCommand(id, command) {
   try {
     await apiJson(`${targetBase(id)}${encodeURIComponent(id)}/commands`, "POST", command);
   } catch (error) {
+    // A command can fail because the output is offline (e.g. MPD is down). The track
+    // is still queued server-side; tell the user rather than failing silently.
     console.error("player command failed", error);
+    showToast(error.message || "Couldn't reach the player.");
   }
 }
 
