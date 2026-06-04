@@ -40,7 +40,7 @@ use musicata_core::{
     RadioStation, SearchResults, Track, TrackMetadataFieldObservation, Zone, album_artwork_url,
     artwork_asset_id, find_album_artwork_candidates, merge_libraries,
 };
-use musicata_storage::Database;
+use musicata_storage::{Database, ResolvedMusicBrainzMetadata};
 use musicbrainz::{
     CoverArtArchiveCandidateResponse, MusicBrainzAlbumCandidateSearchResponse, MusicBrainzClient,
     MusicBrainzTrackCandidateSearchResponse, MusicBrainzTrackLookupResponse,
@@ -659,9 +659,10 @@ async fn library_scan_loop(
         true,
     )
     .await;
-    // Fingerprint untagged tracks first (resolves MBIDs) so the artwork pass can reach
-    // the id-exact providers; then fill covers.
+    // Fingerprint untagged tracks first (resolves MBIDs), then enrich their metadata
+    // from MusicBrainz, then fill covers (which can now reach the id-exact providers).
     fingerprint_pass(&database, &providers, &activity).await;
+    musicbrainz_enrich_pass(&database, &activity).await;
     artwork_fill_pass(&database, &activity, &artwork_cache).await;
     if !incremental {
         return;
@@ -680,6 +681,7 @@ async fn library_scan_loop(
         )
         .await;
         fingerprint_pass(&database, &providers, &activity).await;
+        musicbrainz_enrich_pass(&database, &activity).await;
         artwork_fill_pass(&database, &activity, &artwork_cache).await;
     }
 }
@@ -688,6 +690,7 @@ async fn library_scan_loop(
 const SETTING_ARTWORK_FETCH: &str = "artwork_fetch";
 const SETTING_FANART_TV_KEY: &str = "fanart_tv_key";
 const SETTING_FINGERPRINT: &str = "fingerprint_enabled";
+const SETTING_MB_ENRICH: &str = "musicbrainz_enrich_enabled";
 
 /// Read a default-on boolean setting (toggling it in the UI takes effect next pass).
 async fn setting_enabled(database: &Database, key: &str) -> bool {
@@ -977,6 +980,120 @@ async fn read_track_source_file(
     tokio::fs::read(&target.path)
         .await
         .map_err(|error| error.to_string())
+}
+
+/// Retry window for a fingerprinted recording MusicBrainz couldn't resolve.
+const MB_ENRICH_RETRY_SECS: i64 = 7 * 24 * 60 * 60;
+/// Tracks enriched per pass. MusicBrainz allows ~1 req/s and each track is up to two
+/// requests, so a pass is paced; keep batches modest and pick up the rest next pass.
+const MB_ENRICH_BATCH: i64 = 25;
+/// MusicBrainz asks for ≤ 1 request/second; space successive tracks' first request out
+/// (each track's two internal requests are already spaced by the client).
+const MB_REQUEST_INTERVAL: Duration = Duration::from_millis(1100);
+
+/// After fingerprinting, fetch real metadata for tracks whose recording MBID was resolved
+/// and apply it to the canonical library (so an untagged track stops showing folder-derived
+/// junk). DB-only; never overwrites embedded tags (enforced in `reapply_musicbrainz_metadata`).
+/// Gated by a Settings toggle. Mirrors `fingerprint_pass` (capped, paced, negative cache,
+/// activity). Always re-applies resolved enrichment so a fresh scan's folder grouping is
+/// corrected even when no new track is fetched.
+async fn musicbrainz_enrich_pass(database: &Database, activity: &Arc<activity::ActivityLog>) {
+    if !setting_enabled(database, SETTING_MB_ENRICH).await {
+        return;
+    }
+
+    let retry_before = now_unix_seconds() - MB_ENRICH_RETRY_SECS;
+    let targets = match database
+        .tracks_missing_musicbrainz_metadata(retry_before, MB_ENRICH_BATCH)
+        .await
+    {
+        Ok(targets) => targets,
+        Err(error) => {
+            tracing::warn!(%error, "musicbrainz enrich: failed to list targets");
+            return;
+        }
+    };
+    if targets.is_empty() {
+        // No new work, but a fresh scan may have reset grouping to folder-derived —
+        // re-apply any resolved enrichment so it survives the rescan.
+        if let Err(error) = database.reapply_musicbrainz_metadata().await {
+            tracing::warn!(%error, "musicbrainz enrich: reapply failed");
+        }
+        return;
+    }
+
+    let client = Arc::new(MusicBrainzClient::default());
+    let total = targets.len();
+    let task = activity.start("musicbrainz", format!("Enriching metadata (0/{total})"));
+    let mut resolved = 0usize;
+
+    for (index, target) in targets.into_iter().enumerate() {
+        if index > 0 {
+            tokio::time::sleep(MB_REQUEST_INTERVAL).await;
+        }
+        activity.update(task, format!("Enriching metadata ({}/{total})", index + 1));
+
+        let client = client.clone();
+        let recording = target.recording_mbid.clone();
+        let release = target.release_mbid.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            client.fetch_enrichment(&recording, release.as_deref()).ok()
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let now = now_unix_seconds();
+        match outcome {
+            Some(enrichment) if !enrichment.is_empty() => {
+                let meta = ResolvedMusicBrainzMetadata {
+                    title: enrichment.title,
+                    artist_name: enrichment.artist_name,
+                    album_title: enrichment.album_title,
+                    album_artist_name: enrichment.album_artist_name,
+                    track_number: enrichment.track_number,
+                    track_total: enrichment.track_total,
+                    disc_number: enrichment.disc_number,
+                    recording_date: enrichment.recording_date,
+                    year: enrichment.year,
+                    recording_mbid: Some(target.recording_mbid.clone()),
+                    release_mbid: target.release_mbid.clone(),
+                    release_group_mbid: enrichment
+                        .release_group_mbid
+                        .or_else(|| target.release_group_mbid.clone()),
+                    artist_mbid: enrichment.artist_mbid,
+                };
+                let _ = database
+                    .upsert_track_musicbrainz_metadata(&target.track_id, "resolved", &meta, now)
+                    .await;
+                resolved += 1;
+            }
+            _ => {
+                let _ = database
+                    .upsert_track_musicbrainz_metadata(
+                        &target.track_id,
+                        "not_found",
+                        &ResolvedMusicBrainzMetadata::default(),
+                        now,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    if let Err(error) = database.reapply_musicbrainz_metadata().await {
+        tracing::warn!(%error, "musicbrainz enrich: reapply failed");
+    }
+
+    if resolved > 0 {
+        activity.finish(
+            task,
+            true,
+            Some(format!("Enriched {resolved} of {total} tracks")),
+        );
+    } else {
+        activity.remove(task);
+    }
 }
 
 fn app(
@@ -2367,11 +2484,15 @@ struct AppSettings {
     /// Identify untagged tracks by audio fingerprint (AcoustID) to resolve MusicBrainz
     /// ids, which the id-exact artwork providers then use.
     fingerprint_enabled: bool,
+    /// Apply real MusicBrainz metadata (title/artist/album/track number) to fingerprinted
+    /// tracks, without overwriting embedded tags. DB-only; files are never modified.
+    musicbrainz_enrich_enabled: bool,
 }
 
 async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>, AppError> {
     let artwork_fetch = artwork_fetch_enabled(&state.database).await;
     let fingerprint_enabled = setting_enabled(&state.database, SETTING_FINGERPRINT).await;
+    let musicbrainz_enrich_enabled = setting_enabled(&state.database, SETTING_MB_ENRICH).await;
     let fanart_tv_key = state
         .database
         .get_setting(SETTING_FANART_TV_KEY)
@@ -2382,6 +2503,7 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
         artwork_fetch,
         fanart_tv_key,
         fingerprint_enabled,
+        musicbrainz_enrich_enabled,
     }))
 }
 
@@ -2390,6 +2512,7 @@ struct SettingsUpdate {
     artwork_fetch: Option<bool>,
     fanart_tv_key: Option<String>,
     fingerprint_enabled: Option<bool>,
+    musicbrainz_enrich_enabled: Option<bool>,
 }
 
 async fn update_settings(
@@ -2417,6 +2540,13 @@ async fn update_settings(
         state
             .database
             .set_setting(SETTING_FINGERPRINT, if enabled { "true" } else { "false" })
+            .await
+            .map_err(db_error)?;
+    }
+    if let Some(enabled) = update.musicbrainz_enrich_enabled {
+        state
+            .database
+            .set_setting(SETTING_MB_ENRICH, if enabled { "true" } else { "false" })
             .await
             .map_err(db_error)?;
     }
