@@ -559,8 +559,22 @@ Tasks:
     `rusty-chromaprint`; identifies untagged tracks → MusicBrainz ids in
     `track_fingerprint`, migration v21, which the artwork lane then uses to reach the
     id-exact providers). Needs Musicata's own free AcoustID application key compiled in.
-  Still open: auto-*applying* MusicBrainz metadata from those ids (retagging, with
-  review/write-back), Last.fm/ListenBrainz scrobbling, Discogs lookups.
+  - **MusicBrainz metadata auto-fill** (`musicbrainz_enrich_pass` in `main.rs`,
+    `track_musicbrainz_metadata`, migration v22). For tracks whose recording MBID
+    fingerprinting resolved, it fetches the real title/artist/album/album-artist/track
+    number/date from MusicBrainz (`MusicBrainzClient::fetch_enrichment`, the recording +
+    its release tracklist) and applies them to the **canonical** library —
+    `reapply_musicbrainz_metadata` **re-derives the artist/album entities** (reusing the
+    scanner's `regroup_library_with_overrides` in `musicata-core`, so the denormalized
+    track columns and the entity tables stay consistent) and runs after every scan (the
+    rewrite resets grouping to folder-derived). **DB-only — files are never modified** —
+    and it **never clobbers an embedded tag**: a field is filled only when the file had no
+    `embedded_tag` observation for it (empty or folder-derived). Toggled in `/admin`
+    (default on). So a fingerprinted untagged track stops showing `03 - track` and groups
+    under its real artist/album.
+  Still open: a review/override UI for the applied values + optional file **write-back**
+  (the apply path is reversible — the folder/embedded observations are retained),
+  Last.fm/ListenBrainz scrobbling, Discogs lookups.
 
 Done when:
 

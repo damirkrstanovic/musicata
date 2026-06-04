@@ -272,6 +272,48 @@ impl MusicBrainzClient {
 
         Ok(cover_art_archive_candidates(target, &value))
     }
+
+    /// Fetch real metadata for a fingerprinted recording: the recording's title and
+    /// artist, plus — when a release MBID is known — the album, album artist, release
+    /// date, and the track's position within that release (track/disc number). Two
+    /// rate-limited requests; used by the background enrichment pass. Pure parsing lives
+    /// in [`parse_recording_enrichment`] / [`merge_release_enrichment`] (canned-JSON
+    /// tested).
+    pub fn fetch_enrichment(
+        &self,
+        recording_mbid: &str,
+        release_mbid: Option<&str>,
+    ) -> Result<MusicBrainzEnrichment, String> {
+        let recording_url =
+            musicbrainz_entity_url(&self.base_url, MusicBrainzEntityType::Recording, recording_mbid);
+        let recording = self
+            .http
+            .get(&recording_url)
+            .query("fmt", "json")
+            .query("inc", "artist-credits")
+            .call()
+            .map_err(musicbrainz_request_error)?
+            .into_json::<Value>()
+            .map_err(|error| error.to_string())?;
+        let mut enrichment = parse_recording_enrichment(&recording);
+
+        if let Some(release_mbid) = release_mbid {
+            std::thread::sleep(MUSICBRAINZ_REQUEST_INTERVAL);
+            let release_url =
+                musicbrainz_entity_url(&self.base_url, MusicBrainzEntityType::Release, release_mbid);
+            let release = self
+                .http
+                .get(&release_url)
+                .query("fmt", "json")
+                .query("inc", "artist-credits+release-groups+media+recordings")
+                .call()
+                .map_err(musicbrainz_request_error)?
+                .into_json::<Value>()
+                .map_err(|error| error.to_string())?;
+            merge_release_enrichment(&mut enrichment, &release, recording_mbid);
+        }
+        Ok(enrichment)
+    }
 }
 
 fn musicbrainz_request_error(error: ureq::Error) -> String {
@@ -311,6 +353,30 @@ impl MusicBrainzTrackLookupResponse {
             }
             MusicBrainzDocument::Artist(artist) => self.artists.push(artist),
         }
+    }
+}
+
+/// Real metadata resolved for a fingerprinted track, fed into the canonical library by
+/// the enrichment pass. Numbers are `i64` for ease of SQLite storage.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MusicBrainzEnrichment {
+    pub title: Option<String>,
+    pub artist_name: Option<String>,
+    pub artist_mbid: Option<String>,
+    pub album_title: Option<String>,
+    pub album_artist_name: Option<String>,
+    pub release_group_mbid: Option<String>,
+    pub recording_date: Option<String>,
+    pub year: Option<i64>,
+    pub track_number: Option<i64>,
+    pub track_total: Option<i64>,
+    pub disc_number: Option<i64>,
+}
+
+impl MusicBrainzEnrichment {
+    /// True when nothing usable was resolved (so the pass records `not_found`).
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -1039,6 +1105,107 @@ fn string_array_field(value: &Value, field: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The full credited artist string, honoring MusicBrainz join phrases
+/// (e.g. `"A & B"`). `None` when there is no artist credit.
+fn artist_credit_string(value: &Value) -> Option<String> {
+    let credits = value.get("artist-credit").and_then(Value::as_array)?;
+    let mut out = String::new();
+    for credit in credits {
+        if let Some(name) = string_field(credit, "name").or_else(|| {
+            credit
+                .get("artist")
+                .and_then(|artist| string_field(artist, "name"))
+        }) {
+            out.push_str(&name);
+        }
+        if let Some(join) = string_field(credit, "joinphrase") {
+            out.push_str(&join);
+        }
+    }
+    let out = out.trim().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+/// The MBID of the first credited artist, if present.
+fn first_artist_mbid(value: &Value) -> Option<String> {
+    value
+        .get("artist-credit")
+        .and_then(Value::as_array)?
+        .first()
+        .and_then(|credit| credit.get("artist"))
+        .and_then(|artist| string_field(artist, "id"))
+}
+
+/// The four-digit year from a MusicBrainz partial date (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`).
+fn year_from_date(date: &str) -> Option<i64> {
+    date.get(0..4)
+        .and_then(|year| year.parse::<i64>().ok())
+        .filter(|year| *year > 0)
+}
+
+/// Title + artist (+ year) from a MusicBrainz recording document.
+fn parse_recording_enrichment(value: &Value) -> MusicBrainzEnrichment {
+    let recording_date = string_field(value, "first-release-date");
+    let year = recording_date.as_deref().and_then(year_from_date);
+    MusicBrainzEnrichment {
+        title: string_field(value, "title"),
+        artist_name: artist_credit_string(value),
+        artist_mbid: first_artist_mbid(value),
+        recording_date,
+        year,
+        ..Default::default()
+    }
+}
+
+/// Fold a MusicBrainz release document into the enrichment: album title/artist, release
+/// group, and the track's position (track/disc number, track total) located by matching
+/// `recording_mbid` within the release's media tracklist. Falls back to the release date
+/// for the year when the recording carried none.
+fn merge_release_enrichment(
+    enrichment: &mut MusicBrainzEnrichment,
+    value: &Value,
+    recording_mbid: &str,
+) {
+    enrichment.album_title = string_field(value, "title");
+    enrichment.album_artist_name = artist_credit_string(value);
+    enrichment.release_group_mbid = value
+        .get("release-group")
+        .and_then(|group| string_field(group, "id"));
+    let release_year = string_field(value, "date")
+        .as_deref()
+        .and_then(year_from_date);
+
+    if let Some(media) = value.get("media").and_then(Value::as_array) {
+        for medium in media {
+            let disc_number = medium.get("position").and_then(Value::as_i64);
+            let track_total = medium.get("track-count").and_then(Value::as_i64);
+            let Some(tracks) = medium.get("tracks").and_then(Value::as_array) else {
+                continue;
+            };
+            for track in tracks {
+                let recording_id = track
+                    .get("recording")
+                    .and_then(|recording| string_field(recording, "id"));
+                if recording_id.as_deref() == Some(recording_mbid) {
+                    enrichment.track_number = track
+                        .get("position")
+                        .and_then(Value::as_i64)
+                        .or_else(|| string_field(track, "number").and_then(|n| n.parse().ok()));
+                    enrichment.disc_number = disc_number;
+                    enrichment.track_total = track_total;
+                    if enrichment.year.is_none() {
+                        enrichment.year = release_year;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    if enrichment.year.is_none() {
+        enrichment.year = release_year;
+    }
+}
+
 fn artist_credit(value: &Value) -> Vec<String> {
     value
         .get("artist-credit")
@@ -1340,6 +1507,81 @@ mod tests {
             artwork_url: None,
             artwork_path: None,
         }
+    }
+
+    #[test]
+    fn parses_recording_enrichment_with_join_phrase() {
+        let value = serde_json::json!({
+            "id": RECORDING_ID,
+            "title": "Strobe",
+            "first-release-date": "2010-10-05",
+            "artist-credit": [
+                { "name": "deadmau5", "joinphrase": " & ",
+                  "artist": { "id": ARTIST_ID, "name": "deadmau5" } },
+                { "name": "Kaskade",
+                  "artist": { "id": "k-id", "name": "Kaskade" } }
+            ]
+        });
+        let enrichment = parse_recording_enrichment(&value);
+        assert_eq!(enrichment.title.as_deref(), Some("Strobe"));
+        assert_eq!(enrichment.artist_name.as_deref(), Some("deadmau5 & Kaskade"));
+        assert_eq!(enrichment.artist_mbid.as_deref(), Some(ARTIST_ID));
+        assert_eq!(enrichment.year, Some(2010));
+        assert_eq!(enrichment.recording_date.as_deref(), Some("2010-10-05"));
+    }
+
+    #[test]
+    fn merges_release_enrichment_locates_track_in_tracklist() {
+        let mut enrichment = parse_recording_enrichment(&serde_json::json!({
+            "id": RECORDING_ID,
+            "title": "Strobe",
+            "artist-credit": [{ "name": "deadmau5",
+                "artist": { "id": ARTIST_ID, "name": "deadmau5" } }]
+        }));
+        // No recording date → year should fall back to the release date.
+        assert_eq!(enrichment.year, None);
+
+        let release = serde_json::json!({
+            "id": RELEASE_ID,
+            "title": "For Lack of a Better Name",
+            "date": "2009-09-22",
+            "artist-credit": [{ "name": "deadmau5",
+                "artist": { "id": ARTIST_ID, "name": "deadmau5" } }],
+            "release-group": { "id": RELEASE_GROUP_ID, "title": "For Lack of a Better Name" },
+            "media": [{
+                "position": 1,
+                "track-count": 9,
+                "tracks": [
+                    { "position": 1, "number": "1", "recording": { "id": "other-rec" } },
+                    { "position": 7, "number": "7", "recording": { "id": RECORDING_ID } }
+                ]
+            }]
+        });
+        merge_release_enrichment(&mut enrichment, &release, RECORDING_ID);
+
+        assert_eq!(enrichment.album_title.as_deref(), Some("For Lack of a Better Name"));
+        assert_eq!(enrichment.album_artist_name.as_deref(), Some("deadmau5"));
+        assert_eq!(enrichment.release_group_mbid.as_deref(), Some(RELEASE_GROUP_ID));
+        assert_eq!(enrichment.track_number, Some(7));
+        assert_eq!(enrichment.track_total, Some(9));
+        assert_eq!(enrichment.disc_number, Some(1));
+        assert_eq!(enrichment.year, Some(2009));
+    }
+
+    #[test]
+    #[ignore = "live network; run with: cargo test -- --ignored live_musicbrainz_enrichment"]
+    fn live_musicbrainz_enrichment() {
+        // A real, stable recording + release on MusicBrainz (deadmau5 — "Strobe").
+        let recording = "772bf141-684a-4c6a-96d9-3a004ae1676e";
+        let release = "313ffe72-327e-4811-9bd0-ef6a1e1cefd0";
+        let enrichment = MusicBrainzClient::default()
+            .fetch_enrichment(recording, Some(release))
+            .expect("fetch");
+        eprintln!("{enrichment:#?}");
+        assert_eq!(enrichment.title.as_deref(), Some("Strobe"));
+        assert!(enrichment.artist_name.is_some());
+        assert!(enrichment.album_title.is_some());
+        assert!(enrichment.track_number.is_some());
     }
 
     fn fixture_track() -> Track {

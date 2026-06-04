@@ -3,7 +3,8 @@ use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, BrowseTextFacet, BrowseYearFacet, Library,
     LibrarySummary, MetadataApprovalState, MetadataFieldValue, PlaybackStatus, Playlist,
     ProviderMapping, QueueItem, RadioStation, RepeatMode, ScanIssue, SearchResults, Track,
-    TrackMetadataFieldObservation, TrackMetadataObservation, Zone,
+    TrackCanonicalOverride, TrackMetadataFieldObservation, TrackMetadataObservation, Zone,
+    regroup_library_with_overrides,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -239,6 +240,13 @@ impl Database {
                 sqlx::query(statement).execute(&self.pool).await?;
             }
             set_user_version(&self.pool, 21).await?;
+        }
+
+        if version < 22 {
+            for statement in MIGRATION_022_TRACK_MUSICBRAINZ_METADATA {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 22).await?;
         }
 
         Ok(())
@@ -1546,6 +1554,163 @@ impl Database {
         Ok(())
     }
 
+    // ---- MusicBrainz metadata enrichment (from fingerprinted recording MBIDs) -
+
+    /// Tracks that have a **resolved** fingerprint (a recording MBID) but no MusicBrainz
+    /// metadata fetched yet — or whose last fetch was `not_found` before `retry_before`
+    /// (so an unresolvable recording isn't re-fetched every rescan). The caller fetches
+    /// the recording/release from MusicBrainz.
+    pub async fn tracks_missing_musicbrainz_metadata(
+        &self,
+        retry_before_unix_seconds: i64,
+        limit: i64,
+    ) -> Result<Vec<MusicBrainzEnrichTarget>> {
+        let rows = sqlx::query(
+            "SELECT f.track_id, f.musicbrainz_recording_id, f.musicbrainz_release_id,
+                    f.musicbrainz_release_group_id
+             FROM track_fingerprint f
+             LEFT JOIN track_musicbrainz_metadata m ON m.track_id = f.track_id
+             WHERE f.status = 'resolved'
+               AND f.musicbrainz_recording_id IS NOT NULL
+               AND (m.track_id IS NULL
+                    OR (m.status = 'not_found'
+                        AND m.enriched_at_unix_seconds < ?1))
+             LIMIT ?2",
+        )
+        .bind(retry_before_unix_seconds)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(MusicBrainzEnrichTarget {
+                    track_id: row.try_get("track_id")?,
+                    recording_mbid: row.try_get("musicbrainz_recording_id")?,
+                    release_mbid: row.try_get("musicbrainz_release_id")?,
+                    release_group_mbid: row.try_get("musicbrainz_release_group_id")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Record a MusicBrainz fetch outcome for a track (`resolved` with values, or
+    /// `not_found`). The values are applied to the library by
+    /// [`Database::reapply_musicbrainz_metadata`].
+    pub async fn upsert_track_musicbrainz_metadata(
+        &self,
+        track_id: &str,
+        status: &str,
+        meta: &ResolvedMusicBrainzMetadata,
+        now_unix_seconds: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO track_musicbrainz_metadata
+                (track_id, status, title, artist_name, album_title, album_artist_name,
+                 track_number, track_total, disc_number, recording_date, year,
+                 musicbrainz_recording_id, musicbrainz_release_id,
+                 musicbrainz_release_group_id, musicbrainz_artist_id, enriched_at_unix_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             ON CONFLICT(track_id) DO UPDATE SET
+                status = ?2, title = ?3, artist_name = ?4, album_title = ?5,
+                album_artist_name = ?6, track_number = ?7, track_total = ?8,
+                disc_number = ?9, recording_date = ?10, year = ?11,
+                musicbrainz_recording_id = ?12, musicbrainz_release_id = ?13,
+                musicbrainz_release_group_id = ?14, musicbrainz_artist_id = ?15,
+                enriched_at_unix_seconds = ?16",
+        )
+        .bind(track_id)
+        .bind(status)
+        .bind(meta.title.as_deref())
+        .bind(meta.artist_name.as_deref())
+        .bind(meta.album_title.as_deref())
+        .bind(meta.album_artist_name.as_deref())
+        .bind(meta.track_number)
+        .bind(meta.track_total)
+        .bind(meta.disc_number)
+        .bind(meta.recording_date.as_deref())
+        .bind(meta.year)
+        .bind(meta.recording_mbid.as_deref())
+        .bind(meta.release_mbid.as_deref())
+        .bind(meta.release_group_mbid.as_deref())
+        .bind(meta.artist_mbid.as_deref())
+        .bind(now_unix_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Apply resolved MusicBrainz metadata onto the canonical library, **never clobbering
+    /// an embedded tag** (a field is overridden only when the file carries no
+    /// `embedded_tag` observation for it — i.e. it was empty or folder-derived). Re-derives
+    /// the artist/album entities so the denormalized track columns and the entity tables
+    /// stay consistent. Returns the number of tracks that received at least one value.
+    ///
+    /// Must run after every `save_library` (the scan rewrites tracks back to folder-derived
+    /// grouping) — same discipline as [`Database::reapply_acquired_artwork`]. Cheap no-op
+    /// when there is no resolved enrichment.
+    pub async fn reapply_musicbrainz_metadata(&self) -> Result<u64> {
+        let resolved = sqlx::query(
+            "SELECT track_id, title, artist_name, album_title, album_artist_name,
+                    track_number, disc_number, year
+             FROM track_musicbrainz_metadata WHERE status = 'resolved'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        if resolved.is_empty() {
+            return Ok(0);
+        }
+
+        // Fields the file already owns via embedded tags — never overwrite these.
+        let embedded_rows = sqlx::query(
+            "SELECT track_id, field_name FROM track_metadata_field_observations
+             WHERE source = 'embedded_tag'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut embedded: BTreeSet<(String, String)> = BTreeSet::new();
+        for row in &embedded_rows {
+            embedded.insert((row.try_get("track_id")?, row.try_get("field_name")?));
+        }
+
+        let mut overrides: BTreeMap<String, TrackCanonicalOverride> = BTreeMap::new();
+        for row in &resolved {
+            let track_id: String = row.try_get("track_id")?;
+            let allow = |field: &str| !embedded.contains(&(track_id.clone(), field.to_string()));
+            let title: Option<String> = row.try_get("title")?;
+            let artist_name: Option<String> = row.try_get("artist_name")?;
+            let album_title: Option<String> = row.try_get("album_title")?;
+            let album_artist_name: Option<String> = row.try_get("album_artist_name")?;
+            let track_number =
+                optional_i64_to_u16(row.try_get("track_number")?, "track_number")?;
+            let disc_number = optional_i64_to_u16(row.try_get("disc_number")?, "disc_number")?;
+            let year = optional_i64_to_u16(row.try_get("year")?, "year")?;
+            let over = TrackCanonicalOverride {
+                title: title.filter(|_| allow("title")),
+                artist_name: artist_name.filter(|_| allow("artist_name")),
+                album_title: album_title.filter(|_| allow("album_title")),
+                // Album artist regroups the album; gate on the album_artist_name field.
+                album_artist_name: album_artist_name.filter(|_| allow("album_artist_name")),
+                year: year.filter(|_| allow("year")),
+                track_number: track_number.filter(|_| allow("track_number")),
+                disc_number: disc_number.filter(|_| allow("disc_number")),
+            };
+            if !over.is_empty() {
+                overrides.insert(track_id, over);
+            }
+        }
+        if overrides.is_empty() {
+            return Ok(0);
+        }
+
+        let Some(library) = self.load_library().await? else {
+            return Ok(0);
+        };
+        let mut regrouped = regroup_library_with_overrides(library, &overrides);
+        let applied = overrides.len() as u64;
+        self.save_library(&mut regrouped).await?;
+        Ok(applied)
+    }
+
     // ---- App settings (user-editable, persisted; edited in the web UI) -------
 
     /// A stored setting value, or `None` if unset.
@@ -2546,6 +2711,35 @@ pub struct TrackFingerprintTarget {
     pub path: String,
 }
 
+/// A track whose fingerprinted recording MBID is ready to enrich from MusicBrainz.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MusicBrainzEnrichTarget {
+    pub track_id: String,
+    pub recording_mbid: String,
+    pub release_mbid: Option<String>,
+    pub release_group_mbid: Option<String>,
+}
+
+/// Resolved MusicBrainz metadata for a track, stored in `track_musicbrainz_metadata` and
+/// applied to the canonical library by `reapply_musicbrainz_metadata`. Numbers are `i64`
+/// for SQLite binding; `reapply` narrows them to `u16` for the track columns.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResolvedMusicBrainzMetadata {
+    pub title: Option<String>,
+    pub artist_name: Option<String>,
+    pub album_title: Option<String>,
+    pub album_artist_name: Option<String>,
+    pub track_number: Option<i64>,
+    pub track_total: Option<i64>,
+    pub disc_number: Option<i64>,
+    pub recording_date: Option<String>,
+    pub year: Option<i64>,
+    pub recording_mbid: Option<String>,
+    pub release_mbid: Option<String>,
+    pub release_group_mbid: Option<String>,
+    pub artist_mbid: Option<String>,
+}
+
 /// The acquired-artwork record for an album (provenance + cache reference).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AcquiredArtwork {
@@ -3409,6 +3603,32 @@ const MIGRATION_021_TRACK_FINGERPRINT: &[&str] = &["CREATE TABLE IF NOT EXISTS t
         fingerprinted_at_unix_seconds INTEGER NOT NULL
     )"];
 
+// MusicBrainz metadata fetched for a track via its (fingerprinted) recording MBID —
+// real title/artist/album/track-number, applied to the canonical library so an untagged
+// track stops showing folder-derived junk. Like track_fingerprint / acquired_album_artwork,
+// deliberately **no foreign key** (`track_id` is stable across the per-scan track rewrite),
+// and `status` is `resolved` or `not_found` (negative cache so an unresolvable recording
+// isn't re-queried every rescan). Applied to `tracks` by `reapply_musicbrainz_metadata`.
+const MIGRATION_022_TRACK_MUSICBRAINZ_METADATA: &[&str] =
+    &["CREATE TABLE IF NOT EXISTS track_musicbrainz_metadata (
+        track_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        title TEXT,
+        artist_name TEXT,
+        album_title TEXT,
+        album_artist_name TEXT,
+        track_number INTEGER,
+        track_total INTEGER,
+        disc_number INTEGER,
+        recording_date TEXT,
+        year INTEGER,
+        musicbrainz_recording_id TEXT,
+        musicbrainz_release_id TEXT,
+        musicbrainz_release_group_id TEXT,
+        musicbrainz_artist_id TEXT,
+        enriched_at_unix_seconds INTEGER NOT NULL
+    )"];
+
 // Listening history. One row per confirmed listen (a track that played past the
 // ListenBrainz threshold — see `players::ListenTracker`). `listened_at` is when the
 // track *started*, so ordering by it reflects when each play began. We keep the raw
@@ -3632,7 +3852,7 @@ async fn ensure_column(
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivityRecord, Database, SourceRecord};
+    use super::{ActivityRecord, Database, ResolvedMusicBrainzMetadata, SourceRecord};
     use musicata_core::{
         Album, Artist, BrowseFilter, Library, MetadataApprovalState, MetadataFieldValue,
         ProviderMapping, ScanIssue, Track, TrackMetadataObservation,
@@ -5062,6 +5282,165 @@ mod tests {
                 .len(),
             1
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn musicbrainz_reapply_regroups_and_survives_resave() {
+        let db_path = temp_db_path("mb-enrich");
+        let database = Database::connect(&db_path).await.expect("connect");
+
+        // An untagged track: only a folder-derived observation (source "folder_path").
+        let mut library = fixture_library();
+        database.save_library(&mut library).await.expect("save");
+
+        // Fingerprint resolved it; only resolved-fingerprint tracks are enrich targets.
+        database
+            .upsert_track_fingerprint("track_1", "resolved", Some("rec"), None, None, 1)
+            .await
+            .expect("fp");
+        let target = database
+            .tracks_missing_musicbrainz_metadata(0, 10)
+            .await
+            .expect("targets");
+        assert_eq!(target.len(), 1);
+        assert_eq!(target[0].track_id, "track_1");
+        assert_eq!(target[0].recording_mbid, "rec");
+
+        // Enrichment fetched real MusicBrainz values.
+        let meta = ResolvedMusicBrainzMetadata {
+            title: Some("Real Title".to_string()),
+            artist_name: Some("Real Artist".to_string()),
+            album_title: Some("Real Album".to_string()),
+            album_artist_name: Some("Real Artist".to_string()),
+            track_number: Some(4),
+            year: Some(1999),
+            recording_mbid: Some("rec".to_string()),
+            ..Default::default()
+        };
+        database
+            .upsert_track_musicbrainz_metadata("track_1", "resolved", &meta, 1)
+            .await
+            .expect("mb");
+        // No longer a target once enriched.
+        assert!(
+            database
+                .tracks_missing_musicbrainz_metadata(0, 10)
+                .await
+                .expect("targets")
+                .is_empty()
+        );
+
+        let applied = database
+            .reapply_musicbrainz_metadata()
+            .await
+            .expect("reapply");
+        assert_eq!(applied, 1);
+
+        // Canonical track fields updated AND the artist/album entities regrouped
+        // consistently (the track points at the new entity rows; the old "Artist" is gone).
+        let lib = database.load_library().await.expect("load").expect("lib");
+        let track = &lib.tracks[0];
+        assert_eq!(track.title, "Real Title");
+        assert_eq!(track.artist_name, "Real Artist");
+        assert_eq!(track.album_title, "Real Album");
+        assert_eq!(track.track_number, Some(4));
+        let artist = lib
+            .artists
+            .iter()
+            .find(|a| a.name == "Real Artist")
+            .expect("regrouped artist");
+        assert_eq!(track.artist_id, artist.id);
+        let album = lib
+            .albums
+            .iter()
+            .find(|a| a.title == "Real Album")
+            .expect("regrouped album");
+        assert_eq!(track.album_id, album.id);
+        assert!(lib.artists.iter().all(|a| a.name != "Artist"));
+
+        // A later rescan rewrites the track back to folder-derived grouping...
+        let mut rescanned = fixture_library();
+        database.save_library(&mut rescanned).await.expect("resave");
+        let lib = database.load_library().await.expect("load").expect("lib");
+        assert_eq!(lib.tracks[0].title, "Song");
+
+        // ...but reapply restores the enrichment (it must run after every save).
+        database
+            .reapply_musicbrainz_metadata()
+            .await
+            .expect("reapply2");
+        let lib = database.load_library().await.expect("load").expect("lib");
+        assert_eq!(lib.tracks[0].title, "Real Title");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn musicbrainz_reapply_never_clobbers_embedded_tags() {
+        let db_path = temp_db_path("mb-enrich-embedded");
+        let database = Database::connect(&db_path).await.expect("connect");
+
+        // Track carries an embedded *title* tag (only title), plus its folder observation.
+        let mut library = fixture_library();
+        library.tracks[0].title = "Embedded Title".to_string();
+        library
+            .tracks[0]
+            .observed_metadata
+            .push(TrackMetadataObservation {
+                source: "embedded_tag".to_string(),
+                confidence: 0.95,
+                observed_at_unix_seconds: 1_800_000_000,
+                approval_state: MetadataApprovalState::Observed,
+                field_observations: Vec::new(),
+                title: Some("Embedded Title".to_string()),
+                artist_name: None,
+                album_artist_name: None,
+                album_title: None,
+                recording_date: None,
+                year: None,
+                track_number: None,
+                track_total: None,
+                disc_number: None,
+                disc_total: None,
+                genres: Vec::new(),
+                composers: Vec::new(),
+                lyrics: None,
+                musicbrainz_recording_id: None,
+                musicbrainz_track_id: None,
+                musicbrainz_release_id: None,
+                musicbrainz_release_group_id: None,
+                musicbrainz_artist_id: None,
+                musicbrainz_release_artist_id: None,
+                isrc: None,
+                embedded_artwork_count: 0,
+            });
+        database.save_library(&mut library).await.expect("save");
+
+        database
+            .upsert_track_fingerprint("track_1", "resolved", Some("rec"), None, None, 1)
+            .await
+            .expect("fp");
+        let meta = ResolvedMusicBrainzMetadata {
+            title: Some("MB Title".to_string()), // must NOT overwrite the embedded title
+            artist_name: Some("MB Artist".to_string()), // folder-derived → may apply
+            recording_mbid: Some("rec".to_string()),
+            ..Default::default()
+        };
+        database
+            .upsert_track_musicbrainz_metadata("track_1", "resolved", &meta, 1)
+            .await
+            .expect("mb");
+        database
+            .reapply_musicbrainz_metadata()
+            .await
+            .expect("reapply");
+
+        let lib = database.load_library().await.expect("load").expect("lib");
+        let track = &lib.tracks[0];
+        assert_eq!(track.title, "Embedded Title"); // embedded tag preserved
+        assert_eq!(track.artist_name, "MB Artist"); // folder-derived field enriched
 
         let _ = std::fs::remove_file(db_path);
     }

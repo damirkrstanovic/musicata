@@ -148,6 +148,15 @@ Current implementation:
 - `GET /api/metadata/write-back` returns the disabled write-back policy.
 - `POST /api/metadata/write-back` returns `403 write_back_disabled`.
 - Metadata review, artwork selection, and enrichment update only Musicata's database.
+- **Automatic MusicBrainz enrichment** (the AcoustID fingerprint → MusicBrainz pipeline):
+  for tracks whose recording MBID fingerprinting resolved, `musicbrainz_enrich_pass`
+  fetches the real title/artist/album/track number from MusicBrainz and applies them to
+  the canonical library (re-deriving the artist/album entities so grouping stays
+  consistent — `regroup_library_with_overrides` in `musicata-core`). This is **DB-only and
+  never overwrites an embedded tag** — a field is filled only when the file carried no
+  embedded value for it (it was empty or folder/filename-derived). The original
+  folder/embedded observations are retained, so the change is reversible and a future
+  review/override + opt-in write-back can build on it. Toggle in `/admin` (default on).
 
 Future opt-in write-back must require all of the following: provider-declared write support, per-library configuration, a per-operation preview diff, selected fields only, and a metadata snapshot that can support rollback.
 

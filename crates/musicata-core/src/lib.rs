@@ -1002,6 +1002,28 @@ pub fn assemble_library(
         tracks.push(item.track);
     }
 
+    finalize_library(
+        provider_id.to_string(),
+        root.display().to_string(),
+        tracks,
+        album_builders,
+        artist_builders,
+        scan_errors,
+    )
+}
+
+/// Build the sorted artist/album entities from the aggregation builders and assemble
+/// the final library. Shared by `assemble_library` (the scanner) and
+/// [`regroup_library_with_overrides`] (metadata enrichment) so both produce identical
+/// entity rows.
+fn finalize_library(
+    provider_id: String,
+    source_root: String,
+    mut tracks: Vec<Track>,
+    album_builders: BTreeMap<String, AlbumBuilder>,
+    artist_builders: BTreeMap<String, ArtistBuilder>,
+    scan_errors: Vec<ScanIssue>,
+) -> Library {
     let mut artists: Vec<_> = artist_builders
         .into_values()
         .map(|artist| Artist {
@@ -1050,13 +1072,133 @@ pub fn assemble_library(
     });
 
     Library {
-        provider_id: provider_id.to_string(),
-        source_root: root.display().to_string(),
+        provider_id,
+        source_root,
         artists,
         albums,
         tracks,
         scan_errors,
     }
+}
+
+/// Per-track canonical overrides from an external metadata source (MusicBrainz
+/// enrichment). Only `Some` fields are applied; the rest keep the track's current
+/// canonical value. The caller decides which fields to set (e.g. skipping fields the
+/// file already carries as embedded tags).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrackCanonicalOverride {
+    pub title: Option<String>,
+    pub artist_name: Option<String>,
+    pub album_title: Option<String>,
+    /// The album artist (regroups the album). When unset, the track's existing album
+    /// grouping's artist is kept.
+    pub album_artist_name: Option<String>,
+    pub year: Option<u16>,
+    pub track_number: Option<u16>,
+    pub disc_number: Option<u16>,
+}
+
+impl TrackCanonicalOverride {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Apply per-track canonical overrides (keyed by track id) and **re-derive** the
+/// artist/album entities and each track's `artist_id`/`album_id`. Reuses the scanner's
+/// id derivation and aggregation (`aggregate_track` + [`finalize_library`]), so the
+/// result is identical to a fresh scan that had read those values — keeping the
+/// denormalized track columns and the entity tables consistent after enrichment.
+///
+/// Album artwork is carried over from the pre-regroup albums (by their old `album_id`),
+/// so regrouping doesn't drop covers. Track ids, stream urls, provenance, and
+/// `added_at` are preserved untouched.
+pub fn regroup_library_with_overrides(
+    library: Library,
+    overrides: &BTreeMap<String, TrackCanonicalOverride>,
+) -> Library {
+    // Carry over each old album's artwork + its album-artist (used for tracks whose
+    // album-artist isn't being overridden), keyed by the pre-regroup album_id.
+    let mut artwork_by_old_album: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut album_artist_by_old_album: BTreeMap<String, String> = BTreeMap::new();
+    for album in &library.albums {
+        if let Some(path) = &album.artwork_path {
+            artwork_by_old_album.insert(album.id.clone(), path.clone());
+        }
+        album_artist_by_old_album.insert(album.id.clone(), album.artist_name.clone());
+    }
+
+    let Library {
+        provider_id,
+        source_root,
+        mut tracks,
+        scan_errors,
+        ..
+    } = library;
+
+    let mut album_builders: BTreeMap<String, AlbumBuilder> = BTreeMap::new();
+    let mut artist_builders: BTreeMap<String, ArtistBuilder> = BTreeMap::new();
+
+    for track in &mut tracks {
+        let old_album_id = track.album_id.clone();
+        let override_for = overrides.get(&track.id);
+        if let Some(over) = override_for {
+            if let Some(title) = &over.title {
+                track.title = title.clone();
+            }
+            if let Some(artist_name) = &over.artist_name {
+                track.artist_name = artist_name.clone();
+            }
+            if let Some(album_title) = &over.album_title {
+                track.album_title = album_title.clone();
+            }
+            if over.year.is_some() {
+                track.year = over.year;
+            }
+            if over.track_number.is_some() {
+                track.track_number = over.track_number;
+            }
+            if over.disc_number.is_some() {
+                track.disc_number = over.disc_number;
+            }
+        }
+
+        // Album artist: the override wins; else keep the old album's artist; else the
+        // track artist (matching the scanner's fallback in `build_track`).
+        let album_artist_name = override_for
+            .and_then(|over| over.album_artist_name.clone())
+            .or_else(|| album_artist_by_old_album.get(&old_album_id).cloned())
+            .unwrap_or_else(|| track.artist_name.clone());
+
+        // Recompute ids exactly as the scanner does.
+        track.artist_id = stable_id("artist", &track.artist_name.to_ascii_lowercase());
+        let album_artist_id = stable_id("artist", &album_artist_name.to_ascii_lowercase());
+        let album_key = format!(
+            "{}::{}",
+            album_artist_name.to_ascii_lowercase(),
+            track.album_title.to_ascii_lowercase()
+        );
+        track.album_id = stable_id("album", &album_key);
+
+        let artwork_path = artwork_by_old_album.get(&old_album_id).cloned();
+        aggregate_track(
+            track,
+            &album_artist_id,
+            &album_artist_name,
+            artwork_path,
+            &mut album_builders,
+            &mut artist_builders,
+        );
+    }
+
+    finalize_library(
+        provider_id,
+        source_root,
+        tracks,
+        album_builders,
+        artist_builders,
+        scan_errors,
+    )
 }
 
 /// Fold one track into the album/artist aggregates: count it against its own
