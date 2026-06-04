@@ -551,11 +551,16 @@ Tasks:
     self-contained playback (MusicKit-locked / Widevine + a ToS that bans self-hosting).
     DRM-circumvention code, if any, stays out of the default build.
 - Metadata-enrichment lane (distinct from sources): a metadata/plugin provider type,
-  not a music source. **Started** — the pluggable **artwork-provider lane**
-  (`artwork_providers.rs`: iTunes/Deezer/Cover Art Archive/fanart.tv, priority + MBID
-  capability, auto-fill after scan; see M3 §8) is the first instance of this pattern.
-  Still open: Last.fm/ListenBrainz scrobbling and MusicBrainz/Discogs *metadata* lookups
-  on the same kind of lane.
+  not a music source. **Started** — two instances now exist, both running as background
+  passes after a scan, gated by Settings toggles:
+  - the pluggable **artwork-provider lane** (`artwork_providers.rs`: iTunes/Deezer/Cover
+    Art Archive/fanart.tv, priority + MBID capability, auto-fill; see M3 §8), and
+  - **AcoustID audio fingerprinting** (`fingerprint.rs`: pure-Rust `symphonia` decode +
+    `rusty-chromaprint`; identifies untagged tracks → MusicBrainz ids in
+    `track_fingerprint`, migration v21, which the artwork lane then uses to reach the
+    id-exact providers). Needs Musicata's own free AcoustID application key compiled in.
+  Still open: auto-*applying* MusicBrainz metadata from those ids (retagging, with
+  review/write-back), Last.fm/ListenBrainz scrobbling, Discogs lookups.
 
 Done when:
 

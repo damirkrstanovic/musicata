@@ -121,6 +121,39 @@ cargo run -p musicata-server -- --scan-once
 cargo run -p musicata-server -- --scan-once --rescan
 ```
 
+### Where artwork is stored
+
+Musicata splits cover art into two cases:
+
+- **Fetched / acquired covers** (from the artwork-provider lane — iTunes, Deezer,
+  Cover Art Archive, fanart.tv). The image **bytes are cached as files on disk**, next to
+  the database in a content-addressed, sharded layout:
+
+  ```
+  .musicata/artwork/<first-2-chars-of-key>/<cache_key>.<ext>
+  ```
+
+  The cache directory is derived from the database path (`<db parent>/artwork/`). The
+  database stores only **provenance**, not the bytes — the `acquired_album_artwork` table
+  records `album_id, provider, remote_url, cache_key, ext, width, status, acquired_at`,
+  and `cache_key` maps a row to its file on disk. The table is intentionally foreign-key-
+  less so a rescan's album rewrite can't wipe it; acquired covers are re-pointed back onto
+  their albums after every scan.
+
+- **Local / embedded covers** (a folder `cover.jpg`, or art embedded in the audio tags).
+  These are **not copied** — `albums.artwork_path` points straight at the original file
+  (the audio file itself for embedded art). Embedded art is extracted on demand at serve
+  time and then cached in the same `.musicata/artwork/` directory.
+
+Audio fingerprinting (AcoustID) feeds the first case: once an untagged track resolves to
+MusicBrainz IDs, the id-exact providers (Cover Art Archive / fanart.tv) can download its
+cover into that cache. Inspect it with:
+
+```sh
+ls .musicata/artwork/
+sqlite3 .musicata/musicata.db "select album_id, provider, ext, status from acquired_album_artwork limit 10"
+```
+
 Useful endpoints:
 
 - `GET /` web controller.

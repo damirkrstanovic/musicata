@@ -363,6 +363,7 @@ async function loadArtworkSettings() {
   try {
     const settings = await api("/api/settings");
     $("#artwork-fetch").checked = !!settings.artwork_fetch;
+    $("#fingerprint-enabled").checked = !!settings.fingerprint_enabled;
     $("#fanart-key").value = settings.fanart_tv_key || "";
   } catch {
     /* leave the form at its defaults */
@@ -375,6 +376,7 @@ $("#artwork-settings").addEventListener("submit", async (event) => {
   try {
     await apiSend("/api/settings", "PATCH", {
       artwork_fetch: $("#artwork-fetch").checked,
+      fingerprint_enabled: $("#fingerprint-enabled").checked,
       fanart_tv_key: $("#fanart-key").value.trim(),
     });
     setStatus($("#artwork-settings-status"), "Saved.");
