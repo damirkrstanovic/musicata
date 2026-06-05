@@ -1818,7 +1818,7 @@ impl Database {
     ) -> Result<Vec<TrackFingerprintTarget>> {
         let rows = sqlx::query(
             "SELECT t.id, t.title, t.artist_name, t.extension, t.provider_id,
-                    t.provider_item_id, t.path
+                    t.provider_item_id, t.path, t.duration_seconds
              FROM tracks t
              LEFT JOIN track_fingerprint f ON f.track_id = t.id
              WHERE NOT EXISTS (
@@ -1847,6 +1847,7 @@ impl Database {
                     provider_id: row.try_get("provider_id")?,
                     provider_item_id: row.try_get("provider_item_id")?,
                     path: row.try_get("path")?,
+                    duration_seconds: row.try_get("duration_seconds")?,
                 })
             })
             .collect()
@@ -1881,6 +1882,17 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Drop `not_found` fingerprint markers so those tracks are re-fingerprinted on the
+    /// next pass (instead of waiting out the retry window). Used once after a fix that
+    /// changes the lookup (e.g. reporting the real track duration to AcoustID). Returns
+    /// how many markers were cleared.
+    pub async fn clear_not_found_fingerprints(&self) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM track_fingerprint WHERE status = 'not_found'")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     // ---- MusicBrainz metadata enrichment (from fingerprinted recording MBIDs) -
@@ -3167,6 +3179,9 @@ pub struct TrackFingerprintTarget {
     pub provider_id: String,
     pub provider_item_id: String,
     pub path: String,
+    /// The track's full length in seconds (read at scan time). AcoustID filters matches by
+    /// duration, so the lookup must report the *real* length, not the fingerprint window.
+    pub duration_seconds: Option<f64>,
 }
 
 /// A track whose fingerprinted recording MBID is ready to enrich from MusicBrainz.

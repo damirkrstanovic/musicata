@@ -587,6 +587,14 @@ Tasks:
     `rusty-chromaprint`; identifies untagged tracks → MusicBrainz ids in
     `track_fingerprint`, migration v21, which the artwork lane then uses to reach the
     id-exact providers). Needs Musicata's own free AcoustID application key compiled in.
+    **Duration fix:** the fingerprint covers the first ~120 s, but AcoustID filters matches
+    by the track's *full* length — we were reporting the 120 s window, so every track
+    longer than ~127 s was rejected by the duration filter (diagnosed on the real library:
+    100% of `not_found` were >120 s; short tracks resolved 100%). Now the lookup reports the
+    real `duration_seconds` from the scan (matching `fpcalc`), with a one-time clear of stale
+    `not_found` markers (`fingerprint_lookup_version`) and a larger batch so coverage
+    catches up. This is the upstream gate for id-exact artwork *and* automatic variant
+    merging (shared MBIDs).
   - **MusicBrainz metadata auto-fill** (`musicbrainz_enrich_pass` in `main.rs`,
     `track_musicbrainz_metadata`, migration v22). For tracks whose recording MBID
     fingerprinting resolved, it fetches the real title/artist/album/album-artist/track
