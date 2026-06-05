@@ -661,6 +661,36 @@ async function openArtist(artist, back) {
   }
 }
 
+// A "go back to the track list I was on" closure, captured at click time — used when a
+// track row's artist/album link drills into a detail page. Restores the same tracks/title.
+function backToTrackList() {
+  const title = els.viewTitle.textContent;
+  const tracks = state.visibleTracks.slice();
+  const view = state.view;
+  const playlistId = state.currentPlaylistId;
+  return () => {
+    markNavActive(view);
+    renderSort(null);
+    showPanels({ tracks: true });
+    els.viewTitle.textContent = title;
+    if (tracks.length) {
+      renderTracks(tracks, playlistId ? { playlistId } : {});
+    } else {
+      els.trackList.innerHTML = `<p class="empty">Nothing here.</p>`;
+    }
+  };
+}
+
+function openArtistFromTrack(track) {
+  if (!track.artist_id) return;
+  openArtist({ id: track.artist_id, name: track.artist_name }, backToTrackList());
+}
+
+function openAlbumFromTrack(track) {
+  if (!track.album_id) return;
+  openAlbum({ id: track.album_id, title: track.album_title }, backToTrackList());
+}
+
 function renderAlbumHero(detail) {
   const album = detail.album;
   const tracks = detail.tracks || [];
@@ -957,18 +987,39 @@ function buildTrackRow(track, index, options = {}) {
   row.className = "track";
   row.dataset.trackId = track.id;
 
-  const playButton = document.createElement("button");
+  // A clickable row (not a <button>, so it can legally contain the artist/album link
+  // buttons). The row plays the track; the artist and album names navigate to their pages.
+  const playButton = document.createElement("div");
   playButton.className = "track-main";
-  playButton.type = "button";
+  playButton.setAttribute("role", "button");
+  playButton.tabIndex = 0;
   playButton.innerHTML = `
-    <span>
+    <span class="track-titles">
       <strong>${escapeHtml(track.title)}</strong>
-      <span>${escapeHtml(track.artist_name)}</span>
+      <button type="button" class="track-link" data-nav="artist">${escapeHtml(track.artist_name)}</button>
     </span>
-    <span>${escapeHtml(track.album_title)}</span>
+    <button type="button" class="track-link track-album-cell" data-nav="album">${escapeHtml(track.album_title)}</button>
     <small>${track.extension.toUpperCase()}</small>
   `;
   playButton.addEventListener("click", () => playTrack(index));
+  playButton.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      playTrack(index);
+    }
+  });
+  const artistLink = playButton.querySelector('[data-nav="artist"]');
+  artistLink.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openArtistFromTrack(track);
+  });
+  artistLink.disabled = !track.artist_id;
+  const albumLink = playButton.querySelector('[data-nav="album"]');
+  albumLink.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openAlbumFromTrack(track);
+  });
+  albumLink.disabled = !track.album_id;
 
   const stat = options.annotate ? options.annotate(track) : null;
   let statEl = null;

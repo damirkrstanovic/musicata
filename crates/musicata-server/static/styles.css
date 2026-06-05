@@ -468,17 +468,46 @@ h1 {
   min-width: 0;
 }
 
-.track-main > span:first-child {
+.track-main > span:first-child,
+.track-titles {
   display: grid;
   gap: 2px;
 }
 
 .track-main > span,
+.track-main > .track-link,
 .track-main strong,
 .track-main small {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Artist / album names in a track row: muted text that navigates to their page. */
+.track-link {
+  display: block;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  text-align: left;
+  color: var(--muted);
+  cursor: pointer;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.track-link:hover,
+.track-link:focus-visible {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.track-link:disabled {
+  cursor: default;
+  text-decoration: none;
+  color: var(--muted);
 }
 
 .track-action {
