@@ -899,13 +899,16 @@ pub fn build_track(
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| metadata.artist_name.clone());
-    // Stage A: name-based identity (mbid wired in Stage B).
+    // MBID-first identity: key on the MusicBrainz artist id when tagged, else the
+    // normalized name (so a track that later gains the MBID merges its variants).
+    let artist_mbid = observed_artist_mbid(&observed_metadata);
+    let album_artist_mbid = observed_album_artist_mbid(&observed_metadata);
     let (artist_id, album_artist_id, album_id) = derive_ids(
         &metadata.artist_name,
         &album_artist_name,
         &metadata.album_title,
-        None,
-        None,
+        artist_mbid.as_deref(),
+        album_artist_mbid.as_deref(),
     );
     let extension = path
         .extension()
@@ -1176,12 +1179,14 @@ pub fn regroup_library_with_overrides(
             .unwrap_or_else(|| track.artist_name.clone());
 
         // Recompute ids exactly as the scanner does (via the shared `derive_ids`).
+        let artist_mbid = observed_artist_mbid(&track.observed_metadata);
+        let album_artist_mbid = observed_album_artist_mbid(&track.observed_metadata);
         let (artist_id, album_artist_id, album_id) = derive_ids(
             &track.artist_name,
             &album_artist_name,
             &track.album_title,
-            None,
-            None,
+            artist_mbid.as_deref(),
+            album_artist_mbid.as_deref(),
         );
         track.artist_id = artist_id;
         track.album_id = album_id;
@@ -2360,6 +2365,25 @@ pub fn album_identity(
     };
     let album_key = format!("{album_artist_key}::{}", album_title.to_ascii_lowercase());
     stable_id("album", &album_key)
+}
+
+/// The first non-empty MusicBrainz **artist** id among a track's observations (used to key
+/// the track's artist identity). Observations are ordered most-authoritative-first.
+fn observed_artist_mbid(observations: &[TrackMetadataObservation]) -> Option<String> {
+    observations
+        .iter()
+        .find_map(|o| o.musicbrainz_artist_id.clone().filter(|id| !id.is_empty()))
+}
+
+/// The first non-empty MusicBrainz **release-artist** id (the album artist). Deliberately
+/// does NOT fall back to the track-artist id — a featured/track artist isn't the album
+/// artist, and keying the album on it would mis-group.
+fn observed_album_artist_mbid(observations: &[TrackMetadataObservation]) -> Option<String> {
+    observations.iter().find_map(|o| {
+        o.musicbrainz_release_artist_id
+            .clone()
+            .filter(|id| !id.is_empty())
+    })
 }
 
 /// Derive the (artist, album-artist, album) ids for a track from its names + optional
