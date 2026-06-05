@@ -417,8 +417,15 @@ cache, provenance in the DB, acquisition pluggable, exactly as above:
   self-hosted personal server, attribute the source); **Deezer** asks for attribution;
   **fanart.tv** needs a free personal key. Text-search results are auto-applied but
   user-replaceable, and id-exact providers run first to avoid mismatches.
-- **Still open** (roadmap M3 §8): `?size=` thumbnails, content-hash keying/dedup +
-  invalidation, eager prefetch + a bounded cache.
+- **`?size=` thumbnails** (done) — the serve handler (`serve_sized_artwork`, `main.rs`)
+  takes `?size=`, snaps it to a small `{128,300,600}` ladder (bounding variant count),
+  resizes the original with the `image` crate in `spawn_blocking`, and caches the variant
+  next to the original as `{key}.{size}.jpg` (the existing sharded `ArtworkCache`, keyed by
+  the size suffix in the extension — the Navidrome/Jellyfin "size-suffixed cache key"
+  pattern). Size-aware ETag; a decode failure falls back to the original (never a 500). The
+  web album grid requests `?size=300`. Originals served unchanged when no size is asked.
+- **Still open** (roadmap M3 §8): content-hash keying/dedup + invalidation, eager prefetch
+  + a bounded cache.
 
 **Where else artwork lives (candidate sources for the lane).** Adding one is a single
 `ArtworkProvider` + a registry entry; the question is coverage vs. auth/ToS cost:
