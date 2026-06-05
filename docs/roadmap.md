@@ -125,9 +125,14 @@ Tasks:
     and writes it to `.musicata/artwork/{ab}/{key}.{ext}` (sharded, atomic temp+rename);
     served from disk thereafter (cold ~0.31 s → warm ~0.001 s) and resilient to the
     source going offline. Local disk unchanged (already fast).
-  - [ ] **Sized thumbnails** — a `?size=` param serving cached resized variants
-    (e.g. 300 px grid, originals on demand) via the `image` crate. The real win for
-    large-library grid/scroll; pairs with the M6 virtualized-list work.
+  - [x] **Sized thumbnails** — the album-artwork endpoint takes `?size=` and serves a
+    cached, downscaled JPEG variant (`serve_sized_artwork` in `main.rs`: snap to a
+    `{128,300,600}` ladder, resize with the `image` crate in `spawn_blocking`, cache the
+    variant alongside the original in `.musicata/artwork/{ab}/{key}.{size}.jpg`, size-aware
+    ETag, fall back to the original on any decode failure). The web album grid now pulls
+    `?size=300` thumbnails instead of full-resolution originals (the now-playing/large view
+    still loads the original). Biggest large-library grid/scroll win; pairs with the M6
+    virtualized lists. Originals are served unchanged when no `size` is requested.
   - [ ] **Content-hash keying + invalidation** — key cache entries by content hash
     (dedupes identical covers across compilations/various-artists) and include the
     source mtime so a changed cover invalidates automatically. Today keyed by the

@@ -3347,8 +3347,10 @@ async fn update_album_artwork(
 async fn album_artwork(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<ArtworkQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    let size = normalize_size(query.size);
     // An externally-acquired cover (iTunes/Deezer/Cover Art Archive) takes precedence —
     // its bytes live in the artwork cache, keyed by the stored cache_key.
     if let Ok(Some(acquired)) = state.database.acquired_artwork(&id).await
@@ -3356,12 +3358,14 @@ async fn album_artwork(
         && let Some(key) = acquired.cache_key.clone()
     {
         let ext = acquired.ext.clone().unwrap_or_else(|| "jpg".to_string());
-        let etag = format!("\"{key}\"");
+        let etag = artwork_etag(&key, size);
         if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
             return artwork_not_modified(&etag);
         }
+        let content_type = image_content_type(&ext);
         if let Some(bytes) = state.artwork_cache.get(&key, &ext).await {
-            return artwork_response(bytes, &ext, etag);
+            return serve_sized_artwork(&state.artwork_cache, &key, content_type, bytes, size, etag)
+                .await;
         }
         // Cache miss (cleared/evicted) but we recorded the source — re-fetch once.
         if let Some(url) = acquired.remote_url.clone() {
@@ -3372,7 +3376,15 @@ async fn album_artwork(
                     .and_then(Result::ok);
             if let Some((bytes, _)) = downloaded {
                 state.artwork_cache.put(&key, &ext, &bytes).await;
-                return artwork_response(bytes, &ext, etag);
+                return serve_sized_artwork(
+                    &state.artwork_cache,
+                    &key,
+                    content_type,
+                    bytes,
+                    size,
+                    etag,
+                )
+                .await;
             }
         }
         // Couldn't produce it — fall through to the local/embedded logic (likely 404).
@@ -3394,13 +3406,14 @@ async fn album_artwork(
     if is_embedded_artwork(&path) {
         const EMBEDDED_CACHE_EXT: &str = "embedded";
         let key = artwork_asset_id(&path);
-        let etag = format!("\"{key}\"");
+        let etag = artwork_etag(&key, size);
         if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
             return artwork_not_modified(&etag);
         }
         if let Some(bytes) = state.artwork_cache.get(&key, EMBEDDED_CACHE_EXT).await {
             let content_type = sniff_image_content_type(&bytes);
-            return artwork_response_typed(bytes, content_type, etag);
+            return serve_sized_artwork(&state.artwork_cache, &key, content_type, bytes, size, etag)
+                .await;
         }
         // Read the audio file (over the source provider or local disk) once, extract its
         // embedded cover, and cache the image so the network stays off the hot path.
@@ -3412,7 +3425,8 @@ async fn album_artwork(
             .put(&key, EMBEDDED_CACHE_EXT, &image)
             .await;
         let content_type = sniff_image_content_type(&image);
-        return artwork_response_typed(image, content_type, etag);
+        return serve_sized_artwork(&state.artwork_cache, &key, content_type, image, size, etag)
+            .await;
     }
 
     // Route by the album's source. An album whose tracks live on a network source
@@ -3431,15 +3445,24 @@ async fn album_artwork(
         {
             let key = artwork_asset_id(&path);
             let extension = artwork_extension(&path);
-            let etag = format!("\"{key}\"");
+            let etag = artwork_etag(&key, size);
             if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
                 return artwork_not_modified(&etag);
             }
+            let content_type = image_content_type(extension);
             // Serve the cached copy if we've fetched this cover before; otherwise fetch
             // it over the wire once, cache it, and serve. Caching keeps the network off
             // the per-request hot path and lets covers show even when the share is down.
             if let Some(bytes) = state.artwork_cache.get(&key, extension).await {
-                return artwork_response(bytes, extension, etag);
+                return serve_sized_artwork(
+                    &state.artwork_cache,
+                    &key,
+                    content_type,
+                    bytes,
+                    size,
+                    etag,
+                )
+                .await;
             }
             // A missing/unreadable cover on the share is "no artwork" (404 → the UI
             // shows its monogram fallback), never a 500.
@@ -3448,11 +3471,12 @@ async fn album_artwork(
                 AppError::not_found(format!("album artwork unavailable: {error}"))
             })?;
             state.artwork_cache.put(&key, extension, &bytes).await;
-            return artwork_response(bytes, extension, etag);
+            return serve_sized_artwork(&state.artwork_cache, &key, content_type, bytes, size, etag)
+                .await;
         }
     }
 
-    serve_artwork(path, headers).await
+    serve_artwork(&state.artwork_cache, path, size, headers).await
 }
 
 async fn album_artwork_candidate(
@@ -3477,7 +3501,8 @@ async fn album_artwork_candidate(
             })?
     };
 
-    serve_artwork(path, headers).await
+    // Review candidates are shown full-size for inspection — no thumbnailing.
+    serve_artwork(&state.artwork_cache, path, None, headers).await
 }
 
 fn album_artwork_review_response(
@@ -3600,8 +3625,14 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-async fn serve_artwork(path: PathBuf, headers: HeaderMap) -> Result<Response, AppError> {
-    let etag = format!("\"{}\"", artwork_asset_id(&path));
+async fn serve_artwork(
+    cache: &artwork::ArtworkCache,
+    path: PathBuf,
+    size: Option<u32>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let key = artwork_asset_id(&path);
+    let etag = artwork_etag(&key, size);
 
     if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
         return artwork_not_modified(&etag);
@@ -3613,7 +3644,8 @@ async fn serve_artwork(path: PathBuf, headers: HeaderMap) -> Result<Response, Ap
         .await
         .map_err(|error| AppError::not_found(format!("album artwork unavailable: {error}")))?;
 
-    artwork_response(bytes, artwork_extension(&path), etag)
+    let content_type = image_content_type(artwork_extension(&path));
+    serve_sized_artwork(cache, &key, content_type, bytes, size, etag).await
 }
 
 fn artwork_extension(path: &std::path::Path) -> &str {
@@ -3631,12 +3663,9 @@ fn artwork_not_modified(etag: &str) -> Result<Response, AppError> {
         .map_err(AppError::from)
 }
 
-fn artwork_response(bytes: Vec<u8>, extension: &str, etag: String) -> Result<Response, AppError> {
-    artwork_response_typed(bytes, image_content_type(extension), etag)
-}
-
-/// Like [`artwork_response`] but with an explicit content type — used for embedded
-/// covers, whose image format is sniffed from the extracted bytes rather than a path.
+/// Build a 200 artwork response with an explicit content type. The content type is the
+/// image format — from the source path's extension, sniffed embedded bytes, or
+/// `image/jpeg` for a resized variant.
 fn artwork_response_typed(
     bytes: Vec<u8>,
     content_type: &'static str,
@@ -3650,6 +3679,78 @@ fn artwork_response_typed(
         .header(ETAG, etag)
         .body(Body::from(bytes))
         .map_err(AppError::from)
+}
+
+/// Cover-art thumbnail sizes the server will produce, smallest first. A requested size
+/// snaps up to the nearest rung; anything past the top serves the original. Keeping the
+/// ladder tiny bounds the number of cached variants per cover.
+const ARTWORK_SIZES: [u32; 3] = [128, 300, 600];
+
+#[derive(Debug, Deserialize)]
+struct ArtworkQuery {
+    /// Desired max edge in pixels. Absent (or beyond the ladder) → the full original.
+    size: Option<u32>,
+}
+
+/// Snap a requested size up to the nearest ladder rung; `None` (serve the original) when
+/// no size is asked for or it's at/above the largest rung.
+fn normalize_size(requested: Option<u32>) -> Option<u32> {
+    let requested = requested?;
+    ARTWORK_SIZES.iter().copied().find(|&rung| requested <= rung)
+}
+
+/// A size-aware ETag so a client can't reuse a thumbnail body for the full cover (or vice
+/// versa); the unsized form matches the original-bytes etag used elsewhere.
+fn artwork_etag(key: &str, size: Option<u32>) -> String {
+    match size {
+        Some(size) => format!("\"{key}-{size}\""),
+        None => format!("\"{key}\""),
+    }
+}
+
+/// Downscale cover bytes to fit a `size`×`size` box (preserving aspect, never upscaling)
+/// and re-encode as JPEG. `None` if the bytes can't be decoded — the caller then serves
+/// the original untouched. Synchronous + CPU-bound: call inside `spawn_blocking`.
+fn resize_to_jpeg(original: &[u8], size: u32) -> Option<Vec<u8>> {
+    let thumbnail = image::load_from_memory(original).ok()?.thumbnail(size, size);
+    let mut buffer = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, 82)
+        .encode_image(&thumbnail.to_rgb8())
+        .ok()?;
+    Some(buffer)
+}
+
+/// Serve cover art at the requested size: the original bytes when `size` is `None`,
+/// otherwise a cached `size`×`size` JPEG variant (resized once, then served from the
+/// artwork cache). A decode/resize failure falls back to the original — never a 500.
+async fn serve_sized_artwork(
+    cache: &artwork::ArtworkCache,
+    key: &str,
+    original_content_type: &'static str,
+    original: Vec<u8>,
+    size: Option<u32>,
+    etag: String,
+) -> Result<Response, AppError> {
+    let Some(size) = size else {
+        return artwork_response_typed(original, original_content_type, etag);
+    };
+    let variant_ext = format!("{size}.jpg");
+    if let Some(bytes) = cache.get(key, &variant_ext).await {
+        return artwork_response_typed(bytes, "image/jpeg", etag);
+    }
+    let source = original.clone();
+    let resized = tokio::task::spawn_blocking(move || resize_to_jpeg(&source, size))
+        .await
+        .ok()
+        .flatten();
+    match resized {
+        Some(bytes) => {
+            cache.put(key, &variant_ext, &bytes).await;
+            artwork_response_typed(bytes, "image/jpeg", etag)
+        }
+        // Undecodable bytes: serve the original (unscaled) rather than failing.
+        None => artwork_response_typed(original, original_content_type, etag),
+    }
 }
 
 /// Whether an album's `artwork_path` points at an audio file (an embedded-cover
@@ -4213,7 +4314,7 @@ fn init_logging() {
 mod tests {
     use super::{
         ARTWORK_CACHE_CONTROL, Config, PlayerManager, ProviderHandle, ProviderRegistry, app,
-        parse_range,
+        artwork_etag, normalize_size, parse_range, resize_to_jpeg,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -5398,6 +5499,105 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[test]
+    fn normalize_size_snaps_up_and_caps() {
+        assert_eq!(normalize_size(None), None);
+        assert_eq!(normalize_size(Some(50)), Some(128));
+        assert_eq!(normalize_size(Some(128)), Some(128));
+        assert_eq!(normalize_size(Some(200)), Some(300));
+        assert_eq!(normalize_size(Some(600)), Some(600));
+        // Beyond the ladder → serve the original.
+        assert_eq!(normalize_size(Some(601)), None);
+        assert_eq!(normalize_size(Some(5000)), None);
+    }
+
+    #[test]
+    fn artwork_etag_is_size_aware() {
+        assert_eq!(artwork_etag("abc", None), "\"abc\"");
+        assert_eq!(artwork_etag("abc", Some(300)), "\"abc-300\"");
+    }
+
+    #[test]
+    fn resize_to_jpeg_downscales_reencodes_and_tolerates_garbage() {
+        let source = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            1000,
+            800,
+            image::Rgb([10, 20, 30]),
+        ));
+        let mut png = Vec::new();
+        source
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        let out = resize_to_jpeg(&png, 300).expect("resize");
+        assert_eq!(&out[..2], &[0xFF, 0xD8], "JPEG SOI marker");
+        let decoded = image::load_from_memory(&out).expect("decode jpeg");
+        // 1000×800 fit into a 300 box → 300×240, preserving aspect.
+        assert_eq!((decoded.width(), decoded.height()), (300, 240));
+
+        // Undecodable bytes → None (the caller serves the original instead of 500-ing).
+        assert!(resize_to_jpeg(b"not an image", 300).is_none());
+    }
+
+    #[tokio::test]
+    async fn serves_resized_album_artwork_variant() {
+        let fixture = TestFixture::new("artwork-size");
+        // Replace the placeholder cover with a real (decodable) JPEG so the resize path
+        // runs end to end rather than falling back to the original.
+        let mut cover = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            1000,
+            1000,
+            image::Rgb([90, 120, 150]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut cover), image::ImageFormat::Jpeg)
+        .unwrap();
+        fs::write(fixture.root.join("1994 - Paramparcad/cover.jpg"), &cover).unwrap();
+
+        let library = fixture.library();
+        let album_id = library
+            .albums
+            .iter()
+            .find(|album| album.artwork_url.is_some())
+            .expect("album artwork")
+            .id
+            .clone();
+        let app = fixture.app_with_library(library).await;
+
+        let request = |etag: Option<&str>| {
+            let mut builder = Request::builder()
+                .uri(format!("/api/albums/{album_id}/artwork?size=300"));
+            if let Some(etag) = etag {
+                builder = builder.header(IF_NONE_MATCH, etag);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+
+        let response = app.clone().oneshot(request(None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(content_type, "image/jpeg");
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(etag.contains("-300"), "size-aware etag, got {etag}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let decoded = image::load_from_memory(&body).expect("variant decodes");
+        assert!(decoded.width() <= 300 && decoded.height() <= 300);
+
+        // Second request hits the cached variant; with the etag it 304s.
+        let response = app.oneshot(request(Some(&etag))).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
     }
 
