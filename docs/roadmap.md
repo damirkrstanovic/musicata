@@ -603,6 +603,18 @@ Tasks:
   Still open: a review/override UI for the applied values + optional file **write-back**
   (the apply path is reversible — the folder/embedded observations are retained),
   Last.fm/ListenBrainz scrobbling, Discogs lookups.
+  - [x] **Artist identity (variant-name merging)** — three layers (see prior-art §11):
+    **safe normalization** (`normalize_artist_key` folds diacritics + a leading "The" +
+    punctuation, so "Beyoncé"≡"Beyonce", "The Beatles"≡"Beatles" auto-merge while genuine
+    variants stay separate); **MBID-first identity** (`artist_identity` keys on the
+    MusicBrainz artist id when tagged, else the normalized name, so variants sharing one
+    MBID merge once enrichment fills them); and a **manual merge tool** (`artist_aliases`
+    table, `/api/artists/merge`, an `/admin` "Merged artists" panel) for the no-MBID long
+    tail like "Fela Kuti" ≡ "Fela Anikulapo Kuti" ≡ "Fela Ransome Kuti" — reversible, never
+    fuzzy/automatic. A shared `derive_ids` keeps the scanner and the regroup in lockstep;
+    aliases apply in the post-scan/merge `reapply_canonical_grouping`; an `identity_version`
+    migration moves favorites/artwork onto the new ids. Verified on the real library: 15
+    names auto-merged by normalization, and the Fela variants folded 47→67 tracks on merge.
 
 Done when:
 

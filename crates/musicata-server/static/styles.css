@@ -2985,3 +2985,39 @@ body.admin {
   .content-header { flex-wrap: wrap; }
   .browse-grid { grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: 14px; }
 }
+
+/* Merged-artists admin panel */
+.merge-results { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.merge-result {
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.merge-result:hover { border-color: var(--accent-soft); }
+.merge-selected { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.merge-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
+  font-size: 0.85rem;
+}
+.merge-chip.is-canonical { border-color: var(--accent); }
+.merge-canon, .merge-remove, .merge-unmerge {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  padding: 0;
+  font-size: 0.9rem;
+  line-height: 1;
+  color: var(--muted);
+}
+.merge-canon { color: var(--accent); }
+.merge-remove:hover, .merge-unmerge:hover { color: var(--danger); }

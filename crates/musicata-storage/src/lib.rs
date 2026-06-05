@@ -1584,6 +1584,15 @@ impl Database {
     /// (two old ids → one new merges the stars). Run it BEFORE the regroup+save that
     /// rewrites the artist/album rows with the new ids. Returns rows moved.
     pub async fn remap_identity_references(&self) -> Result<u64> {
+        // Resolve names through user artist-merges so a merge moves the member's stars/art
+        // onto the canonical id (matching the regroup's id derivation).
+        let aliases = self.artist_alias_map().await?;
+        let resolve = |name: &str| -> String {
+            aliases
+                .get(&musicata_core::normalize_artist_key(name))
+                .cloned()
+                .unwrap_or_else(|| name.to_string())
+        };
         // old artist id -> new artist id (only where it actually changes).
         let artist_rows = sqlx::query("SELECT id, name FROM artists")
             .fetch_all(&self.pool)
@@ -1592,7 +1601,7 @@ impl Database {
         for row in &artist_rows {
             let old: String = row.try_get("id")?;
             let name: String = row.try_get("name")?;
-            let new = artist_identity(&name, None);
+            let new = artist_identity(&resolve(&name), None);
             if new != old {
                 artist_map.push((old, new));
             }
@@ -1605,7 +1614,7 @@ impl Database {
             let old: String = row.try_get("id")?;
             let artist_name: String = row.try_get("artist_name")?;
             let title: String = row.try_get("title")?;
-            let new = album_identity(&artist_name, &title, None);
+            let new = album_identity(&resolve(&artist_name), &title, None);
             if new != old {
                 album_map.push((old, new));
             }
@@ -1660,6 +1669,108 @@ impl Database {
         }
         tx.commit().await?;
         Ok(moved)
+    }
+
+    // ---- Artist aliases (user-curated merges) --------------------------------
+
+    /// Record that `alias_key` (a normalized artist name key) is the same artist as
+    /// `canonical_key`/`canonical_name`. Flattens chains (if the canonical is itself an
+    /// alias, resolve to the ultimate canonical) and repoints any existing aliases that
+    /// pointed at `alias_key`, so the map stays single-hop. No-op for a self-alias.
+    pub async fn add_artist_alias(
+        &self,
+        alias_key: &str,
+        canonical_key: &str,
+        canonical_name: &str,
+        now_unix_seconds: i64,
+    ) -> Result<()> {
+        if alias_key == canonical_key || alias_key.is_empty() {
+            return Ok(());
+        }
+        // Resolve the canonical through any existing alias chain.
+        let mut canon_key = canonical_key.to_string();
+        let mut canon_name = canonical_name.to_string();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        while let Some(row) = sqlx::query(
+            "SELECT canonical_key, canonical_name FROM artist_aliases WHERE alias_key = ?1",
+        )
+        .bind(&canon_key)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            if !seen.insert(canon_key.clone()) {
+                break; // cycle guard
+            }
+            canon_name = row.try_get("canonical_name")?;
+            canon_key = row.try_get("canonical_key")?;
+            if canon_key == alias_key {
+                return Err(anyhow::anyhow!("artist alias would form a cycle"));
+            }
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO artist_aliases
+                (alias_key, canonical_key, canonical_name, created_at_unix_seconds)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(alias_key)
+        .bind(&canon_key)
+        .bind(&canon_name)
+        .bind(now_unix_seconds)
+        .execute(&mut *tx)
+        .await?;
+        // Any alias that pointed at this newly-aliased key now points one hop further.
+        sqlx::query(
+            "UPDATE artist_aliases SET canonical_key = ?1, canonical_name = ?2
+             WHERE canonical_key = ?3",
+        )
+        .bind(&canon_key)
+        .bind(&canon_name)
+        .bind(alias_key)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Remove a single alias (unmerge one member).
+    pub async fn remove_artist_alias(&self, alias_key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM artist_aliases WHERE alias_key = ?1")
+            .bind(alias_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// All alias rows, ordered by canonical then member (the API groups them).
+    pub async fn list_artist_aliases(&self) -> Result<Vec<ArtistAlias>> {
+        let rows = sqlx::query(
+            "SELECT alias_key, canonical_key, canonical_name FROM artist_aliases
+             ORDER BY canonical_name, alias_key",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(ArtistAlias {
+                    alias_key: row.try_get("alias_key")?,
+                    canonical_key: row.try_get("canonical_key")?,
+                    canonical_name: row.try_get("canonical_name")?,
+                })
+            })
+            .collect()
+    }
+
+    /// The resolver the regroup applies: normalized alias key → canonical display name.
+    pub async fn artist_alias_map(&self) -> Result<BTreeMap<String, String>> {
+        let rows = sqlx::query("SELECT alias_key, canonical_name FROM artist_aliases")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut map = BTreeMap::new();
+        for row in &rows {
+            map.insert(row.try_get("alias_key")?, row.try_get("canonical_name")?);
+        }
+        Ok(map)
     }
 
     /// The first MusicBrainz release / release-group ids found among an album's tracks
@@ -1813,7 +1924,7 @@ impl Database {
 
     /// Record a MusicBrainz fetch outcome for a track (`resolved` with values, or
     /// `not_found`). The values are applied to the library by
-    /// [`Database::reapply_musicbrainz_metadata`].
+    /// [`Database::reapply_canonical_grouping`].
     pub async fn upsert_track_musicbrainz_metadata(
         &self,
         track_id: &str,
@@ -1857,16 +1968,18 @@ impl Database {
         Ok(())
     }
 
-    /// Apply resolved MusicBrainz metadata onto the canonical library, **never clobbering
-    /// an embedded tag** (a field is overridden only when the file carries no
-    /// `embedded_tag` observation for it — i.e. it was empty or folder-derived). Re-derives
-    /// the artist/album entities so the denormalized track columns and the entity tables
-    /// stay consistent. Returns the number of tracks that received at least one value.
+    /// Re-derive the canonical library grouping, applying two server-side layers the pure
+    /// scanner can't: resolved **MusicBrainz metadata** (never clobbering an embedded tag —
+    /// a field is overridden only when the file carries no `embedded_tag` observation for
+    /// it) and user-curated **artist merges** (alias → canonical). Re-derives the
+    /// artist/album entities so the denormalized track columns and the entity tables stay
+    /// consistent. Returns the number of tracks that received MusicBrainz values.
     ///
     /// Must run after every `save_library` (the scan rewrites tracks back to folder-derived
-    /// grouping) — same discipline as [`Database::reapply_acquired_artwork`]. Cheap no-op
-    /// when there is no resolved enrichment.
-    pub async fn reapply_musicbrainz_metadata(&self) -> Result<u64> {
+    /// grouping) and after a merge/unmerge — same discipline as
+    /// [`Database::reapply_acquired_artwork`]. Cheap no-op when there's neither enrichment
+    /// nor any alias.
+    pub async fn reapply_canonical_grouping(&self) -> Result<u64> {
         let resolved = sqlx::query(
             "SELECT track_id, title, artist_name, album_title, album_artist_name,
                     track_number, disc_number, year
@@ -1874,7 +1987,8 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await?;
-        if resolved.is_empty() {
+        let aliases = self.artist_alias_map().await?;
+        if resolved.is_empty() && aliases.is_empty() {
             return Ok(0);
         }
 
@@ -1916,14 +2030,14 @@ impl Database {
                 overrides.insert(track_id, over);
             }
         }
-        if overrides.is_empty() {
+        if overrides.is_empty() && aliases.is_empty() {
             return Ok(0);
         }
 
         let Some(library) = self.load_library().await? else {
             return Ok(0);
         };
-        let mut regrouped = regroup_library_with_overrides(library, &overrides);
+        let mut regrouped = regroup_library_with_overrides(library, &overrides, &aliases);
         let applied = overrides.len() as u64;
         self.save_library(&mut regrouped).await?;
         Ok(applied)
@@ -3033,6 +3147,14 @@ pub struct ArtistArtworkTarget {
     pub name: String,
 }
 
+/// One user-curated artist-merge row: a member name key folded into a canonical artist.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArtistAlias {
+    pub alias_key: String,
+    pub canonical_key: String,
+    pub canonical_name: String,
+}
+
 /// A track that needs audio fingerprinting (to resolve MusicBrainz ids). Carries enough
 /// to read and decode the file: the provider (SMB reads `provider_item_id`) and the
 /// absolute `path` (local disk reads that).
@@ -3057,7 +3179,7 @@ pub struct MusicBrainzEnrichTarget {
 }
 
 /// Resolved MusicBrainz metadata for a track, stored in `track_musicbrainz_metadata` and
-/// applied to the canonical library by `reapply_musicbrainz_metadata`. Numbers are `i64`
+/// applied to the canonical library by `reapply_canonical_grouping`. Numbers are `i64`
 /// for SQLite binding; `reapply` narrows them to `u16` for the track columns.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResolvedMusicBrainzMetadata {
@@ -3945,7 +4067,7 @@ const MIGRATION_021_TRACK_FINGERPRINT: &[&str] = &["CREATE TABLE IF NOT EXISTS t
 // track stops showing folder-derived junk. Like track_fingerprint / acquired_album_artwork,
 // deliberately **no foreign key** (`track_id` is stable across the per-scan track rewrite),
 // and `status` is `resolved` or `not_found` (negative cache so an unresolvable recording
-// isn't re-queried every rescan). Applied to `tracks` by `reapply_musicbrainz_metadata`.
+// isn't re-queried every rescan). Applied to `tracks` by `reapply_canonical_grouping`.
 const MIGRATION_022_TRACK_MUSICBRAINZ_METADATA: &[&str] =
     &["CREATE TABLE IF NOT EXISTS track_musicbrainz_metadata (
         track_id TEXT PRIMARY KEY,
@@ -5766,6 +5888,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artist_aliases_flatten_and_resolve() {
+        let db_path = temp_db_path("artist-aliases");
+        let database = Database::connect(&db_path).await.expect("connect");
+
+        // b -> a, then chain c -> b should flatten to c -> a.
+        database.add_artist_alias("b", "a", "Artist A", 1).await.unwrap();
+        database.add_artist_alias("c", "b", "Artist B", 2).await.unwrap();
+        let map = database.artist_alias_map().await.unwrap();
+        assert_eq!(map.get("b").map(String::as_str), Some("Artist A"));
+        // c flattened to the ultimate canonical name "Artist A" (not "Artist B").
+        assert_eq!(map.get("c").map(String::as_str), Some("Artist A"));
+
+        // Self-alias is a no-op; a cycle is rejected.
+        database.add_artist_alias("a", "a", "Artist A", 3).await.unwrap();
+        assert!(database.artist_alias_map().await.unwrap().get("a").is_none());
+        assert!(database.add_artist_alias("a", "c", "x", 4).await.is_err());
+
+        // Unmerge removes one member.
+        database.remove_artist_alias("c").await.unwrap();
+        assert!(database.artist_alias_map().await.unwrap().get("c").is_none());
+        assert!(database.artist_alias_map().await.unwrap().get("b").is_some());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn settings_round_trip() {
         let db_path = temp_db_path("settings");
         let database = Database::connect(&db_path).await.expect("connect");
@@ -5929,7 +6077,7 @@ mod tests {
         );
 
         let applied = database
-            .reapply_musicbrainz_metadata()
+            .reapply_canonical_grouping()
             .await
             .expect("reapply");
         assert_eq!(applied, 1);
@@ -5964,7 +6112,7 @@ mod tests {
 
         // ...but reapply restores the enrichment (it must run after every save).
         database
-            .reapply_musicbrainz_metadata()
+            .reapply_canonical_grouping()
             .await
             .expect("reapply2");
         let lib = database.load_library().await.expect("load").expect("lib");
@@ -6029,7 +6177,7 @@ mod tests {
             .await
             .expect("mb");
         database
-            .reapply_musicbrainz_metadata()
+            .reapply_canonical_grouping()
             .await
             .expect("reapply");
 

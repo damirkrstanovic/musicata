@@ -506,12 +506,135 @@ $("#artwork-settings").addEventListener("submit", async (event) => {
   }
 });
 
+// ---- Merged artists -------------------------------------------------------
+
+let allArtists = []; // {id, name} for the merge picker
+const mergeSelected = new Map(); // id -> name
+let mergeCanonical = null; // id of the artist that survives
+
+async function loadAliases() {
+  let groups;
+  try {
+    groups = await api("/api/artists/aliases");
+  } catch (error) {
+    $("#aliases-list").innerHTML = `<p class="error">Merges unavailable: ${escapeHtml(error.message)}</p>`;
+    return;
+  }
+  const list = $("#aliases-list");
+  list.innerHTML = "";
+  if (!groups.length) {
+    list.innerHTML = `<p class="admin-hint">No merges yet.</p>`;
+    return;
+  }
+  for (const group of groups) {
+    const row = document.createElement("div");
+    row.className = "admin-list-item";
+    const members = group.members
+      .map(
+        (key) =>
+          `<span class="merge-chip">${escapeHtml(key)}<button type="button" class="merge-unmerge" data-key="${escapeHtml(key)}" title="Unmerge">✕</button></span>`,
+      )
+      .join("");
+    row.innerHTML = `<div><strong>${escapeHtml(group.canonical_name)}</strong> ← ${members}</div>`;
+    list.append(row);
+  }
+  list.querySelectorAll(".merge-unmerge").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await apiSend(`/api/artists/aliases/${encodeURIComponent(button.dataset.key)}`, "DELETE");
+        await loadAliases();
+      } catch (error) {
+        setStatus($("#merge-status"), error.message, true);
+      }
+    });
+  });
+}
+
+async function loadArtistsForMerge() {
+  try {
+    const page = await api("/api/artists?limit=10000");
+    allArtists = (page.items || []).map((artist) => ({ id: artist.id, name: artist.name }));
+  } catch {
+    allArtists = [];
+  }
+}
+
+function renderMergeResults(query) {
+  const results = $("#merge-results");
+  results.innerHTML = "";
+  const needle = query.trim().toLowerCase();
+  if (!needle) return;
+  const matches = allArtists
+    .filter((a) => a.name.toLowerCase().includes(needle) && !mergeSelected.has(a.id))
+    .slice(0, 12);
+  for (const artist of matches) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "merge-result";
+    button.textContent = artist.name;
+    button.addEventListener("click", () => {
+      mergeSelected.set(artist.id, artist.name);
+      if (!mergeCanonical) mergeCanonical = artist.id;
+      $("#merge-search").value = "";
+      renderMergeResults("");
+      renderMergeSelected();
+    });
+    results.append(button);
+  }
+}
+
+function renderMergeSelected() {
+  const box = $("#merge-selected");
+  box.innerHTML = "";
+  for (const [id, name] of mergeSelected) {
+    const chip = document.createElement("span");
+    chip.className = "merge-chip" + (id === mergeCanonical ? " is-canonical" : "");
+    chip.innerHTML =
+      `<button type="button" class="merge-canon" title="Keep this name">${id === mergeCanonical ? "★" : "☆"}</button>` +
+      `${escapeHtml(name)}<button type="button" class="merge-remove" title="Remove">✕</button>`;
+    chip.querySelector(".merge-canon").addEventListener("click", () => {
+      mergeCanonical = id;
+      renderMergeSelected();
+    });
+    chip.querySelector(".merge-remove").addEventListener("click", () => {
+      mergeSelected.delete(id);
+      if (mergeCanonical === id) mergeCanonical = mergeSelected.keys().next().value || null;
+      renderMergeSelected();
+    });
+    box.append(chip);
+  }
+  $("#merge-submit").disabled = mergeSelected.size < 2 || !mergeCanonical;
+}
+
+$("#merge-search").addEventListener("input", (event) => renderMergeResults(event.target.value));
+
+$("#merge-artists").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (mergeSelected.size < 2 || !mergeCanonical) return;
+  const memberIds = [...mergeSelected.keys()].filter((id) => id !== mergeCanonical);
+  try {
+    await apiSend("/api/artists/merge", "POST", {
+      canonical_id: mergeCanonical,
+      member_ids: memberIds,
+    });
+    setStatus($("#merge-status"), "Merged — the library updates in the background.");
+    mergeSelected.clear();
+    mergeCanonical = null;
+    renderMergeSelected();
+    await loadAliases();
+  } catch (error) {
+    setStatus($("#merge-status"), error.message, true);
+  }
+});
+
 // ---- Boot -----------------------------------------------------------------
 
 loadSources();
 loadPlayers();
 loadActivity();
 loadArtworkSettings();
+loadAliases();
+loadArtistsForMerge();
 connectActivity();
 // Players still poll (for online status), but slowly — the chatty activity feed
 // is now push-based.
