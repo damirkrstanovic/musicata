@@ -1124,6 +1124,10 @@ impl TrackCanonicalOverride {
 pub fn regroup_library_with_overrides(
     library: Library,
     overrides: &BTreeMap<String, TrackCanonicalOverride>,
+    // User-curated artist merges: normalized-name key → canonical display name. A track
+    // (or album artist) whose normalized name matches an alias is rewritten to the
+    // canonical name before its id is derived, so the variants group as one artist.
+    aliases: &BTreeMap<String, String>,
 ) -> Library {
     // Carry over each old album's artwork + its album-artist (used for tracks whose
     // album-artist isn't being overridden), keyed by the pre-regroup album_id.
@@ -1177,6 +1181,16 @@ pub fn regroup_library_with_overrides(
             .and_then(|over| over.album_artist_name.clone())
             .or_else(|| album_artist_by_old_album.get(&old_album_id).cloned())
             .unwrap_or_else(|| track.artist_name.clone());
+
+        // Apply user-curated artist merges: rewrite a variant name to its canonical so the
+        // derived id (and the displayed name) is the canonical artist's.
+        if let Some(canonical) = aliases.get(&normalize_artist_key(&track.artist_name)) {
+            track.artist_name = canonical.clone();
+        }
+        let album_artist_name = aliases
+            .get(&normalize_artist_key(&album_artist_name))
+            .cloned()
+            .unwrap_or(album_artist_name);
 
         // Recompute ids exactly as the scanner does (via the shared `derive_ids`).
         let artist_mbid = observed_artist_mbid(&track.observed_metadata);
@@ -2753,6 +2767,35 @@ mod tests {
     }
 
     #[test]
+    fn regroup_applies_artist_aliases() {
+        let files = vec![
+            (PathBuf::from("/A/01 - Fela Kuti - Zombie.mp3"), vec![1u8; 1_200_000]),
+            (PathBuf::from("/A/02 - Fela Anikulapo Kuti - Water.mp3"), vec![2u8; 1_200_000]),
+        ];
+        let fs = FakeFs::new(files);
+        let library = scan_source(&fs, "src").expect("scan");
+        // Without an alias they're two distinct artists.
+        let distinct: BTreeSet<_> = library.tracks.iter().map(|t| t.artist_id.clone()).collect();
+        assert_eq!(distinct.len(), 2);
+
+        // Merge "Fela Anikulapo Kuti" into "Fela Kuti".
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            normalize_artist_key("Fela Anikulapo Kuti"),
+            "Fela Kuti".to_string(),
+        );
+        let merged = regroup_library_with_overrides(library, &BTreeMap::new(), &aliases);
+        let ids: BTreeSet<_> = merged.tracks.iter().map(|t| t.artist_id.clone()).collect();
+        assert_eq!(ids.len(), 1, "both tracks fold into one artist");
+        assert!(
+            merged.tracks.iter().all(|t| t.artist_name == "Fela Kuti"),
+            "the canonical display name is applied"
+        );
+        assert_eq!(merged.artists.len(), 1);
+        assert_eq!(merged.artists[0].name, "Fela Kuti");
+    }
+
+    #[test]
     fn regroup_matches_scanner_ids() {
         let files = vec![
             (PathBuf::from("/A/01 - Beyoncé - Hold Up.mp3"), vec![1u8; 1_200_000]),
@@ -2765,7 +2808,8 @@ mod tests {
             .iter()
             .map(|t| (t.id.clone(), (t.artist_id.clone(), t.album_id.clone())))
             .collect();
-        let regrouped = regroup_library_with_overrides(library, &BTreeMap::new());
+        let regrouped =
+            regroup_library_with_overrides(library, &BTreeMap::new(), &BTreeMap::new());
         for track in &regrouped.tracks {
             assert_eq!(
                 before[&track.id],

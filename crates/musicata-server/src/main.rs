@@ -670,6 +670,12 @@ async fn library_scan_loop(
     // from MusicBrainz, then fill covers (which can now reach the id-exact providers).
     fingerprint_pass(&database, &providers, &activity).await;
     musicbrainz_enrich_pass(&database, &activity).await;
+    // Re-apply resolved enrichment AND user artist-merges over the folder-derived grouping
+    // the scan just reset — unconditionally (so merges apply even with enrichment off),
+    // before artwork fetching so covers key on the final grouping.
+    if let Err(error) = database.reapply_canonical_grouping().await {
+        tracing::warn!(%error, "reapply canonical grouping failed");
+    }
     artwork_fill_pass(&database, &activity, &artwork_cache).await;
     artist_artwork_fill_pass(&database, &activity, &artwork_cache).await;
     if !incremental {
@@ -690,6 +696,9 @@ async fn library_scan_loop(
         .await;
         fingerprint_pass(&database, &providers, &activity).await;
         musicbrainz_enrich_pass(&database, &activity).await;
+        if let Err(error) = database.reapply_canonical_grouping().await {
+            tracing::warn!(%error, "reapply canonical grouping failed");
+        }
         artwork_fill_pass(&database, &activity, &artwork_cache).await;
         artist_artwork_fill_pass(&database, &activity, &artwork_cache).await;
     }
@@ -750,10 +759,11 @@ async fn migrate_identity(database: &Database) {
         }
     }
     // Re-derive ids by regrouping the cached library and saving (empty overrides → only
-    // recomputes ids via the new derivation), then regenerate artwork urls from new ids.
+    // recomputes ids via the new derivation + any aliases), then regenerate artwork urls.
     if let Ok(Some(library)) = database.load_library().await {
+        let aliases = database.artist_alias_map().await.unwrap_or_default();
         let mut regrouped =
-            regroup_library_with_overrides(library, &std::collections::BTreeMap::new());
+            regroup_library_with_overrides(library, &std::collections::BTreeMap::new(), &aliases);
         if let Err(error) = database.save_library(&mut regrouped).await {
             tracing::warn!(%error, "identity: re-derive save failed");
             return;
@@ -1161,7 +1171,7 @@ const MB_REQUEST_INTERVAL: Duration = Duration::from_millis(1100);
 
 /// After fingerprinting, fetch real metadata for tracks whose recording MBID was resolved
 /// and apply it to the canonical library (so an untagged track stops showing folder-derived
-/// junk). DB-only; never overwrites embedded tags (enforced in `reapply_musicbrainz_metadata`).
+/// junk). DB-only; never overwrites embedded tags (enforced in `reapply_canonical_grouping`).
 /// Gated by a Settings toggle. Mirrors `fingerprint_pass` (capped, paced, negative cache,
 /// activity). Always re-applies resolved enrichment so a fresh scan's folder grouping is
 /// corrected even when no new track is fetched.
@@ -1182,11 +1192,8 @@ async fn musicbrainz_enrich_pass(database: &Database, activity: &Arc<activity::A
         }
     };
     if targets.is_empty() {
-        // No new work, but a fresh scan may have reset grouping to folder-derived —
-        // re-apply any resolved enrichment so it survives the rescan.
-        if let Err(error) = database.reapply_musicbrainz_metadata().await {
-            tracing::warn!(%error, "musicbrainz enrich: reapply failed");
-        }
+        // No new work; the unconditional reapply in the scan loop re-applies resolved
+        // enrichment (and aliases) after the rescan reset grouping to folder-derived.
         return;
     }
 
@@ -1249,10 +1256,6 @@ async fn musicbrainz_enrich_pass(database: &Database, activity: &Arc<activity::A
         }
     }
 
-    if let Err(error) = database.reapply_musicbrainz_metadata().await {
-        tracing::warn!(%error, "musicbrainz enrich: reapply failed");
-    }
-
     if resolved > 0 {
         activity.finish(
             task,
@@ -1313,6 +1316,9 @@ fn app(
         .route("/api/zones/{id}/commands", post(zone_command))
         .route("/api/zones/{id}/ws", get(zone_ws))
         .route("/api/artists", get(artists))
+        .route("/api/artists/aliases", get(list_artist_aliases_route))
+        .route("/api/artists/aliases/{alias_key}", delete(unmerge_artists))
+        .route("/api/artists/merge", post(merge_artists))
         .route("/api/artists/{id}", get(artist_detail))
         .route("/api/artists/{id}/artwork", get(artist_artwork))
         .route("/api/albums", get(albums))
@@ -2142,6 +2148,116 @@ async fn artist_detail(
         albums,
         tracks,
     }))
+}
+
+// ---- Artist merges (user-curated identity) --------------------------------
+
+/// A group of artist-name variants merged under one canonical artist.
+#[derive(Debug, Serialize)]
+struct ArtistAliasGroup {
+    canonical_key: String,
+    canonical_name: String,
+    /// The normalized keys of the merged-in members.
+    members: Vec<String>,
+}
+
+async fn alias_groups(database: &Database) -> Result<Vec<ArtistAliasGroup>, AppError> {
+    let rows = database.list_artist_aliases().await.map_err(db_error)?;
+    let mut groups: std::collections::BTreeMap<String, ArtistAliasGroup> =
+        std::collections::BTreeMap::new();
+    for alias in rows {
+        groups
+            .entry(alias.canonical_key.clone())
+            .or_insert_with(|| ArtistAliasGroup {
+                canonical_key: alias.canonical_key.clone(),
+                canonical_name: alias.canonical_name.clone(),
+                members: Vec::new(),
+            })
+            .members
+            .push(alias.alias_key);
+    }
+    Ok(groups.into_values().collect())
+}
+
+async fn list_artist_aliases_route(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ArtistAliasGroup>>, AppError> {
+    Ok(Json(alias_groups(&state.database).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeArtistsRequest {
+    /// The artist that survives; the others fold into it.
+    canonical_id: String,
+    /// Artist ids to merge into the canonical (the canonical id, if present, is ignored).
+    member_ids: Vec<String>,
+}
+
+/// Re-derive grouping and regenerate artwork urls after an alias change. Heavy (regroups
+/// the whole library), so it runs in the background — the alias itself was recorded
+/// synchronously; the library view reflects it once the regroup completes.
+fn spawn_apply_aliases(database: Database) {
+    tokio::spawn(async move {
+        let _ = database.remap_identity_references().await;
+        if let Err(error) = database.reapply_canonical_grouping().await {
+            tracing::warn!(%error, "merge: reapply canonical grouping failed");
+        }
+        let _ = database.reapply_acquired_artwork().await;
+        let _ = database.reapply_acquired_artist_artwork().await;
+    });
+}
+
+async fn merge_artists(
+    State(state): State<AppState>,
+    Json(request): Json<MergeArtistsRequest>,
+) -> Result<Json<Vec<ArtistAliasGroup>>, AppError> {
+    let canonical = state
+        .database
+        .artist(&request.canonical_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| AppError::not_found("unknown canonical artist"))?;
+    let canonical_key = musicata_core::normalize_artist_key(&canonical.name);
+    let members: Vec<&String> = request
+        .member_ids
+        .iter()
+        .filter(|id| **id != request.canonical_id)
+        .collect();
+    if members.is_empty() {
+        return Err(AppError::bad_request(
+            "select at least one other artist to merge into the canonical one",
+        ));
+    }
+    let now = now_unix_seconds();
+    for member_id in members {
+        let member = state
+            .database
+            .artist(member_id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| AppError::not_found(format!("unknown artist: {member_id}")))?;
+        let member_key = musicata_core::normalize_artist_key(&member.name);
+        state
+            .database
+            .add_artist_alias(&member_key, &canonical_key, &canonical.name, now)
+            .await
+            .map_err(|error| AppError::bad_request(error.to_string()))?;
+    }
+    spawn_apply_aliases(state.database.clone());
+    Ok(Json(alias_groups(&state.database).await?))
+}
+
+async fn unmerge_artists(
+    State(state): State<AppState>,
+    Path(alias_key): Path<String>,
+) -> Result<Json<Vec<ArtistAliasGroup>>, AppError> {
+    state
+        .database
+        .remove_artist_alias(&alias_key)
+        .await
+        .map_err(db_error)?;
+    spawn_apply_aliases(state.database.clone());
+    Ok(Json(alias_groups(&state.database).await?))
 }
 
 #[derive(Debug, Serialize)]
@@ -4885,6 +5001,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn merge_and_unmerge_artists() {
+        let fixture = TestFixture::new("merge-artists");
+        // The default fixture has "Darkwood Dub"; add a second artist to merge.
+        fixture.write("2001 - Other/01 - Other Band - A Song.mp3");
+        let library = fixture.library();
+        let darkwood = library
+            .artists
+            .iter()
+            .find(|a| a.name == "Darkwood Dub")
+            .expect("darkwood")
+            .id
+            .clone();
+        let other = library
+            .artists
+            .iter()
+            .find(|a| a.name == "Other Band")
+            .expect("other")
+            .id
+            .clone();
+        let app = fixture.app_with_library(library).await;
+
+        // Empty / self-merge are rejected.
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/artists/merge")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"canonical_id":"{darkwood}","member_ids":["{darkwood}"]}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        // Merge "Other Band" into "Darkwood Dub".
+        let merged: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/artists/merge")
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(format!(
+                                r#"{{"canonical_id":"{darkwood}","member_ids":["{other}"]}}"#
+                            )))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        let groups = merged.as_array().expect("alias groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["canonical_name"], "Darkwood Dub");
+        assert_eq!(groups[0]["members"].as_array().unwrap().len(), 1);
+        let alias_key = groups[0]["members"][0].as_str().unwrap().to_string();
+        let alias_key_enc = alias_key.replace(' ', "%20"); // the UI uses encodeURIComponent
+
+        // Unmerge removes the alias.
+        let after: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("DELETE")
+                            .uri(format!("/api/artists/aliases/{alias_key_enc}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert!(after.as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

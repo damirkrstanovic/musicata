@@ -135,6 +135,27 @@
         </form>
       </section>
 
+      <section class="admin-panel">
+        <header class="admin-panel-head"><h2>Merged artists</h2></header>
+        <p class="admin-hint">Combine name variants that are the same artist (e.g. “Fela
+          Kuti” and “Fela Anikulapo Kuti”) into one. Reversible. Diacritic, “The”, and
+          case variants merge automatically; this is for the rest.</p>
+        <div id="aliases-list" class="admin-list"></div>
+        <form id="merge-artists" class="field-form">
+          <h3>Merge artists</h3>
+          <label class="field">
+            <span>Find artists to merge</span>
+            <input id="merge-search" type="search" autocomplete="off" placeholder="Type a name…">
+          </label>
+          <div id="merge-results" class="merge-results"></div>
+          <div id="merge-selected" class="merge-selected"></div>
+          <div class="field-actions">
+            <button class="primary-button" type="submit" id="merge-submit" disabled>Merge into one</button>
+            <span id="merge-status" class="form-status"></span>
+          </div>
+        </form>
+      </section>
+
       <section class="admin-panel admin-panel-wide">
         <header class="admin-panel-head">
           <h2>Activity</h2>
