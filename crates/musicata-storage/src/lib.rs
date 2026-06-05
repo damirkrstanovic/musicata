@@ -4,7 +4,7 @@ use musicata_core::{
     LibrarySummary, MetadataApprovalState, MetadataFieldValue, PlaybackStatus, Playlist,
     ProviderMapping, QueueItem, RadioStation, RepeatMode, ScanIssue, SearchResults, Track,
     TrackCanonicalOverride, TrackMetadataFieldObservation, TrackMetadataObservation, Zone,
-    regroup_library_with_overrides,
+    album_identity, artist_identity, regroup_library_with_overrides,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -261,6 +261,13 @@ impl Database {
                 sqlx::query(statement).execute(&self.pool).await?;
             }
             set_user_version(&self.pool, 24).await?;
+        }
+
+        if version < 25 {
+            for statement in MIGRATION_025_ARTIST_ALIASES {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 25).await?;
         }
 
         Ok(())
@@ -1567,6 +1574,92 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// Re-point id-referencing rows after the artist/album id derivation changed (e.g. the
+    /// normalization rollout, or a merge). `artist_id`/`album_id` are derived from names,
+    /// so changing the derivation orphans `favorites` and `acquired_*` rows that hold the
+    /// old id (track ids are unaffected). This recomputes old→new from the current
+    /// artist/album rows (name-keyed) and moves those references, collapsing duplicates
+    /// (two old ids → one new merges the stars). Run it BEFORE the regroup+save that
+    /// rewrites the artist/album rows with the new ids. Returns rows moved.
+    pub async fn remap_identity_references(&self) -> Result<u64> {
+        // old artist id -> new artist id (only where it actually changes).
+        let artist_rows = sqlx::query("SELECT id, name FROM artists")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut artist_map: Vec<(String, String)> = Vec::new();
+        for row in &artist_rows {
+            let old: String = row.try_get("id")?;
+            let name: String = row.try_get("name")?;
+            let new = artist_identity(&name, None);
+            if new != old {
+                artist_map.push((old, new));
+            }
+        }
+        let album_rows = sqlx::query("SELECT id, artist_name, title FROM albums")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut album_map: Vec<(String, String)> = Vec::new();
+        for row in &album_rows {
+            let old: String = row.try_get("id")?;
+            let artist_name: String = row.try_get("artist_name")?;
+            let title: String = row.try_get("title")?;
+            let new = album_identity(&artist_name, &title, None);
+            if new != old {
+                album_map.push((old, new));
+            }
+        }
+        if artist_map.is_empty() && album_map.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let mut moved = 0u64;
+        // For each old→new: move the reference if the destination is free (UPDATE OR
+        // IGNORE), then delete any leftover old row (the move was blocked by a duplicate —
+        // the star/cover collapses onto the existing new one).
+        for (kind, map) in [("artist", &artist_map), ("album", &album_map)] {
+            let acquired_table = if kind == "artist" {
+                "acquired_artist_artwork"
+            } else {
+                "acquired_album_artwork"
+            };
+            let acquired_col = if kind == "artist" {
+                "artist_id"
+            } else {
+                "album_id"
+            };
+            for (old, new) in map {
+                let fav = sqlx::query(
+                    "UPDATE OR IGNORE favorites SET item_id = ?1
+                     WHERE item_type = ?2 AND item_id = ?3",
+                )
+                .bind(new)
+                .bind(kind)
+                .bind(old)
+                .execute(&mut *tx)
+                .await?;
+                moved += fav.rows_affected();
+                sqlx::query("DELETE FROM favorites WHERE item_type = ?1 AND item_id = ?2")
+                    .bind(kind)
+                    .bind(old)
+                    .execute(&mut *tx)
+                    .await?;
+                let sql = format!(
+                    "UPDATE OR IGNORE {acquired_table} SET {acquired_col} = ?1 WHERE {acquired_col} = ?2"
+                );
+                sqlx::query(&sql)
+                    .bind(new)
+                    .bind(old)
+                    .execute(&mut *tx)
+                    .await?;
+                let del = format!("DELETE FROM {acquired_table} WHERE {acquired_col} = ?1");
+                sqlx::query(&del).bind(old).execute(&mut *tx).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(moved)
     }
 
     /// The first MusicBrainz release / release-group ids found among an album's tracks
@@ -3920,6 +4013,20 @@ const MIGRATION_024_ARTIST_ARTWORK: &[&str] = &[
     )",
 ];
 
+// User-curated artist merges: "treat these name variants as one artist". Keyed by the
+// NORMALIZED name key (`musicata_core::normalize_artist_key`), not the hash id, so a merge
+// survives any change to id derivation. Applied as a server-side regroup that resolves
+// each artist's key through this map before computing its id. Reversible (delete a row).
+const MIGRATION_025_ARTIST_ALIASES: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS artist_aliases (
+        alias_key TEXT PRIMARY KEY,
+        canonical_key TEXT NOT NULL,
+        canonical_name TEXT NOT NULL,
+        created_at_unix_seconds INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_artist_aliases_canonical ON artist_aliases(canonical_key)",
+];
+
 // Full-text search indexes. These are external-content FTS5 tables (they store
 // only the inverted index and read the text from the base tables) kept in sync by
 // triggers, so any insert/update/delete on tracks/albums/artists — including future
@@ -5598,6 +5705,61 @@ mod tests {
         assert_eq!(
             artist.artwork_url,
             Some(format!("/api/artists/{artist_id}/artwork?asset=artkey1"))
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn remap_identity_moves_favorites_and_artwork() {
+        let db_path = temp_db_path("remap-identity");
+        let database = Database::connect(&db_path).await.expect("connect");
+
+        // Seed two artist rows with stale ids whose names normalize to the SAME new id
+        // ("Beyoncé" and "Beyonce") — modelling a pre-normalization DB.
+        for (old_id, name) in [("artist_old1", "Beyoncé"), ("artist_old2", "Beyonce")] {
+            sqlx::query(
+                "INSERT INTO artists (id, name, album_count, track_count) VALUES (?1, ?2, 1, 1)",
+            )
+            .bind(old_id)
+            .bind(name)
+            .execute(&database.pool)
+            .await
+            .expect("insert artist");
+        }
+        let new_id = musicata_core::artist_identity("Beyoncé", None);
+        assert_ne!(new_id, "artist_old1");
+
+        // Star both stale artists; give one an acquired image.
+        database.set_favorite("artist", "artist_old1", 1).await.unwrap();
+        database.set_favorite("artist", "artist_old2", 2).await.unwrap();
+        database
+            .upsert_acquired_artist_artwork(
+                "artist_old1", "deezer", None, Some("k"), Some("jpg"), Some(1000), "acquired", 9,
+            )
+            .await
+            .unwrap();
+
+        let moved = database.remap_identity_references().await.expect("remap");
+        assert!(moved >= 1);
+
+        // Both stars collapsed onto the single new id (no duplicate, no orphan).
+        let fav_ids = database.favorite_ids("artist").await.unwrap();
+        assert_eq!(fav_ids, vec![new_id.clone()]);
+        // The acquired image moved to the new id.
+        assert!(
+            database
+                .acquired_artist_artwork(&new_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            database
+                .acquired_artist_artwork("artist_old1")
+                .await
+                .unwrap()
+                .is_none()
         );
 
         let _ = std::fs::remove_file(db_path);

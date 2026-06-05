@@ -892,7 +892,6 @@ pub fn build_track(
         &folder_metadata,
         observed_at_unix_seconds,
     );
-    let artist_id = stable_id("artist", &metadata.artist_name.to_ascii_lowercase());
     let album_artist_name = metadata
         .album_artist_name
         .as_deref()
@@ -900,13 +899,14 @@ pub fn build_track(
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| metadata.artist_name.clone());
-    let album_artist_id = stable_id("artist", &album_artist_name.to_ascii_lowercase());
-    let album_key = format!(
-        "{}::{}",
-        album_artist_name.to_ascii_lowercase(),
-        metadata.album_title.to_ascii_lowercase()
+    // Stage A: name-based identity (mbid wired in Stage B).
+    let (artist_id, album_artist_id, album_id) = derive_ids(
+        &metadata.artist_name,
+        &album_artist_name,
+        &metadata.album_title,
+        None,
+        None,
     );
-    let album_id = stable_id("album", &album_key);
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -1175,15 +1175,16 @@ pub fn regroup_library_with_overrides(
             .or_else(|| album_artist_by_old_album.get(&old_album_id).cloned())
             .unwrap_or_else(|| track.artist_name.clone());
 
-        // Recompute ids exactly as the scanner does.
-        track.artist_id = stable_id("artist", &track.artist_name.to_ascii_lowercase());
-        let album_artist_id = stable_id("artist", &album_artist_name.to_ascii_lowercase());
-        let album_key = format!(
-            "{}::{}",
-            album_artist_name.to_ascii_lowercase(),
-            track.album_title.to_ascii_lowercase()
+        // Recompute ids exactly as the scanner does (via the shared `derive_ids`).
+        let (artist_id, album_artist_id, album_id) = derive_ids(
+            &track.artist_name,
+            &album_artist_name,
+            &track.album_title,
+            None,
+            None,
         );
-        track.album_id = stable_id("album", &album_key);
+        track.artist_id = artist_id;
+        track.album_id = album_id;
 
         let artwork_path = artwork_by_old_album.get(&old_album_id).cloned();
         aggregate_track(
@@ -2266,6 +2267,117 @@ fn stable_id(prefix: &str, value: &str) -> String {
     format!("{prefix}_{:016x}", hasher.finish())
 }
 
+/// Fold a lowercase Latin letter carrying a diacritic to its base letter — strictly
+/// combining-mark removal on existing scalars, never transliteration across scripts (so
+/// "Сергей"/"史" are untouched and stay distinct). Covers the accented Latin letters that
+/// actually appear in artist names; returns `None` for anything not folded. Input is
+/// expected already-lowercased.
+fn fold_diacritic(ch: char) -> Option<&'static str> {
+    Some(match ch {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' | 'ª' => "a",
+        'ç' | 'ć' | 'č' | 'ĉ' | 'ċ' => "c",
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => "e",
+        'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => "i",
+        'ñ' | 'ń' | 'ņ' | 'ň' => "n",
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' | 'º' => "o",
+        'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => "u",
+        'ý' | 'ÿ' | 'ŷ' => "y",
+        'đ' | 'ð' => "d",
+        'ł' => "l",
+        'ś' | 'š' | 'ş' | 'ŝ' => "s",
+        'ž' | 'ź' | 'ż' => "z",
+        'ŕ' | 'ř' => "r",
+        'ť' | 'ţ' => "t",
+        'ğ' | 'ĝ' | 'ġ' | 'ģ' => "g",
+        'ß' => "ss",
+        'æ' => "ae",
+        'œ' => "oe",
+        'þ' => "th",
+        _ => return None,
+    })
+}
+
+/// A normalized identity key for an artist name: fold diacritics, lowercase, drop a single
+/// leading whole-word "the ", and collapse runs of non-alphanumerics to single spaces. So
+/// "Beyoncé"≡"Beyonce", "The Beatles"≡"Beatles", "Motörhead"≡"Motorhead" — but genuinely
+/// different names ("Fela Kuti" vs "Fela Anikulapo Kuti", "Therion" vs "The …") stay
+/// distinct. Never returns empty (a name that normalizes away falls back to its raw,
+/// lowercased form, so junk names don't all collapse into one artist).
+pub fn normalize_artist_key(name: &str) -> String {
+    let trimmed = name.trim();
+    // Lowercase (Unicode-aware) then fold diacritics, char by char.
+    let mut folded = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        for lower in ch.to_lowercase() {
+            match fold_diacritic(lower) {
+                Some(base) => folded.push_str(base),
+                None => folded.push(lower),
+            }
+        }
+    }
+    // Strip at most one leading whole-word "the " (guards "Therion"/"Theatre…").
+    let body = folded.strip_prefix("the ").unwrap_or(&folded);
+    // Collapse non-alphanumerics to single spaces.
+    let mut key = String::with_capacity(body.len());
+    let mut last_space = true;
+    for ch in body.chars() {
+        if ch.is_alphanumeric() {
+            key.push(ch);
+            last_space = false;
+        } else if !last_space {
+            key.push(' ');
+            last_space = true;
+        }
+    }
+    let key = key.trim();
+    if key.is_empty() {
+        // Don't key on empty — fall back to the raw name so distinct junk names stay distinct.
+        return trimmed.to_lowercase();
+    }
+    key.to_string()
+}
+
+/// The stable artist id: keyed on the MusicBrainz artist id when present (so variant
+/// spellings that share one MBID merge), else on the normalized name. An mbid-keyed and a
+/// name-keyed artist for the same person are distinct until both carry the MBID.
+pub fn artist_identity(name: &str, mbid: Option<&str>) -> String {
+    match mbid.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(mbid) => stable_id("artist", &format!("mbid:{}", mbid.to_lowercase())),
+        None => stable_id("artist", &normalize_artist_key(name)),
+    }
+}
+
+/// The stable album id: keyed on the (normalized or MBID-keyed) album-artist plus the
+/// lowercased album title, mirroring [`artist_identity`] for the album-artist half.
+pub fn album_identity(
+    album_artist_name: &str,
+    album_title: &str,
+    album_artist_mbid: Option<&str>,
+) -> String {
+    let album_artist_key = match album_artist_mbid.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(mbid) => format!("mbid:{}", mbid.to_lowercase()),
+        None => normalize_artist_key(album_artist_name),
+    };
+    let album_key = format!("{album_artist_key}::{}", album_title.to_ascii_lowercase());
+    stable_id("album", &album_key)
+}
+
+/// Derive the (artist, album-artist, album) ids for a track from its names + optional
+/// MusicBrainz artist ids. The single source of truth so the scanner (`build_track`) and
+/// the re-grouper (`regroup_library_with_overrides`) can't drift.
+fn derive_ids(
+    artist_name: &str,
+    album_artist_name: &str,
+    album_title: &str,
+    artist_mbid: Option<&str>,
+    album_artist_mbid: Option<&str>,
+) -> (String, String, String) {
+    let artist_id = artist_identity(artist_name, artist_mbid);
+    let album_artist_id = artist_identity(album_artist_name, album_artist_mbid);
+    let album_id = album_identity(album_artist_name, album_title, album_artist_mbid);
+    (artist_id, album_artist_id, album_id)
+}
+
 #[derive(Default)]
 struct StableHasher(u64);
 
@@ -2300,6 +2412,65 @@ mod tests {
         tag::{ItemKey, ItemValue, Tag, TagItem, TagType},
     };
     use std::{cell::Cell, collections::BTreeSet, fs, io::Cursor, time::SystemTime};
+
+    // Two names share an artist iff their normalized keys match.
+    fn same_artist(a: &str, b: &str) -> bool {
+        normalize_artist_key(a) == normalize_artist_key(b)
+    }
+
+    #[test]
+    fn normalize_merges_safe_variants() {
+        assert!(same_artist("Beyoncé", "Beyonce"));
+        assert!(same_artist("Björk", "Bjork"));
+        assert!(same_artist("Motörhead", "Motorhead"));
+        assert!(same_artist("Sigur Rós", "Sigur Ros"));
+        assert!(same_artist("The Beatles", "Beatles"));
+        assert!(same_artist("  The   Beatles  ", "beatles"));
+        assert!(same_artist("AC/DC", "AC DC"));
+        assert!(same_artist("Guns N' Roses", "Guns N Roses"));
+    }
+
+    #[test]
+    fn normalize_keeps_genuinely_different_names_apart() {
+        assert!(!same_artist("Fela Kuti", "Fela Anikulapo Kuti"));
+        assert!(!same_artist("The The", "The Beatles"));
+        // Leading "the " is only stripped as a whole word — not inside a word.
+        assert_eq!(normalize_artist_key("Therion"), "therion");
+        assert_eq!(normalize_artist_key("Theatre of Tragedy"), "theatre of tragedy");
+        assert!(!same_artist("Therion", "ion"));
+        // No transliteration across scripts.
+        assert!(!same_artist("Сергей", "Sergei"));
+    }
+
+    #[test]
+    fn normalize_never_keys_on_empty() {
+        // A name that normalizes away falls back to its raw form, so distinct junk names
+        // (and "The ") don't all collapse into one artist.
+        assert!(!normalize_artist_key("The ").is_empty());
+        assert_ne!(normalize_artist_key("???"), normalize_artist_key("!!!"));
+        assert_eq!(normalize_artist_key("The The"), "the");
+    }
+
+    #[test]
+    fn artist_identity_prefers_mbid_then_name() {
+        // Same MBID, different spellings → one artist.
+        assert_eq!(
+            artist_identity("Beatles", Some("mbid-x")),
+            artist_identity("The Beatles", Some("mbid-x"))
+        );
+        // Different MBIDs, same name → distinct (genuinely different artists).
+        assert_ne!(
+            artist_identity("X", Some("a")),
+            artist_identity("X", Some("b"))
+        );
+        // Name-keyed and mbid-keyed for the same name are distinct until both carry it.
+        assert_ne!(artist_identity("X", None), artist_identity("X", Some("a")));
+        // No mbid → falls back to the normalized name (so variants still merge).
+        assert_eq!(
+            artist_identity("Beyoncé", None),
+            artist_identity("Beyonce", None)
+        );
+    }
 
     /// An in-memory [`SourceFs`] for exercising the scanner without a disk or a
     /// network share. Folder structure drives metadata (the fake byte content is
@@ -2527,6 +2698,57 @@ mod tests {
             fs3.opens.get() < first_opens,
             "only the changed file is re-read"
         );
+    }
+
+    #[test]
+    fn scanner_merges_normalized_artist_variants() {
+        // Files >1MB so the walk doesn't hash; folder/filename metadata gives the artist.
+        let files = vec![
+            (PathBuf::from("/A/01 - Beyoncé - Hold Up.mp3"), vec![1u8; 1_200_000]),
+            (PathBuf::from("/A/02 - Beyonce - Sorry.mp3"), vec![2u8; 1_200_000]),
+            (PathBuf::from("/A/03 - The Beatles - Come Together.mp3"), vec![3u8; 1_200_000]),
+            (PathBuf::from("/A/04 - Beatles - Something.mp3"), vec![4u8; 1_200_000]),
+            (PathBuf::from("/A/05 - Fela Kuti - Zombie.mp3"), vec![5u8; 1_200_000]),
+            (PathBuf::from("/A/06 - Fela Anikulapo Kuti - Water.mp3"), vec![6u8; 1_200_000]),
+        ];
+        let fs = FakeFs::new(files);
+        let library = scan_source(&fs, "src").expect("scan");
+        let id_for = |name: &str| -> String {
+            library
+                .tracks
+                .iter()
+                .find(|t| t.artist_name == name)
+                .unwrap_or_else(|| panic!("no track for {name}"))
+                .artist_id
+                .clone()
+        };
+        // Safe variants merge; a genuinely different name stays separate.
+        assert_eq!(id_for("Beyoncé"), id_for("Beyonce"));
+        assert_eq!(id_for("The Beatles"), id_for("Beatles"));
+        assert_ne!(id_for("Fela Kuti"), id_for("Fela Anikulapo Kuti"));
+    }
+
+    #[test]
+    fn regroup_matches_scanner_ids() {
+        let files = vec![
+            (PathBuf::from("/A/01 - Beyoncé - Hold Up.mp3"), vec![1u8; 1_200_000]),
+            (PathBuf::from("/A/02 - Beatles - Something.mp3"), vec![2u8; 1_200_000]),
+        ];
+        let fs = FakeFs::new(files);
+        let library = scan_source(&fs, "src").expect("scan");
+        let before: BTreeMap<String, (String, String)> = library
+            .tracks
+            .iter()
+            .map(|t| (t.id.clone(), (t.artist_id.clone(), t.album_id.clone())))
+            .collect();
+        let regrouped = regroup_library_with_overrides(library, &BTreeMap::new());
+        for track in &regrouped.tracks {
+            assert_eq!(
+                before[&track.id],
+                (track.artist_id.clone(), track.album_id.clone()),
+                "regroup must derive the same ids as the scanner"
+            );
+        }
     }
 
     #[test]
