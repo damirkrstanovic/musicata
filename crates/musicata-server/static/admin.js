@@ -654,15 +654,21 @@ function renderIdentStats(stats) {
        <span class="ident-num">${group.identified.toLocaleString()} / ${group.total.toLocaleString()}</span>
        <span class="ident-label">${label} identified (${pct(group.identified, group.total)}%)</span>
      </div>`;
-  const fp = stats.fingerprint;
+  const queued = stats.queued ?? 0;
+  const processed = stats.processed ?? 0;
+  // Match rate among tracks actually attempted (the real quality signal while it runs).
+  const matched = stats.fingerprint.resolved;
+  const rate = pct(matched, processed);
+  const progressLine = queued > 0
+    ? `<span class="ident-num">${processed.toLocaleString()} / ${stats.tracks.total.toLocaleString()}</span>
+       <span class="ident-label">scanned for IDs — <strong>${queued.toLocaleString()} still queued</strong> (running in the background, ~${rate}% matching so far)</span>`
+    : `<span class="ident-num">Done</span>
+       <span class="ident-label">all ${stats.tracks.total.toLocaleString()} tracks scanned — ${rate}% matched a MusicBrainz id</span>`;
   $("#ident-stats").innerHTML =
+    `<div class="ident-stat ident-progress">${progressLine}</div>` +
     line("Tracks", stats.tracks) +
     line("Albums", stats.albums) +
-    line("Artists", stats.artists) +
-    `<div class="ident-stat">
-       <span class="ident-num">${fp.resolved.toLocaleString()}</span>
-       <span class="ident-label">fingerprint/search matched · ${fp.not_found.toLocaleString()} awaiting retry · ${fp.searched.toLocaleString()} exhausted</span>
-     </div>`;
+    line("Artists", stats.artists);
 }
 
 function renderIdentList(el, items, label) {
