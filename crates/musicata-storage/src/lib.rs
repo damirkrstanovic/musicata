@@ -1961,6 +1961,9 @@ impl Database {
                      (SELECT 1 FROM tracks t WHERE t.artist_id = ar.id AND {identified})"
                 ))
                 .await?,
+            tracks_processed: self
+                .scalar_i64("SELECT COUNT(*) FROM track_fingerprint")
+                .await?,
             fingerprint_resolved: self
                 .scalar_i64("SELECT COUNT(*) FROM track_fingerprint WHERE status = 'resolved'")
                 .await?,
@@ -3309,6 +3312,9 @@ pub struct IdentificationStats {
     pub albums_identified: i64,
     pub artists_total: i64,
     pub artists_identified: i64,
+    /// Tracks the background pass has attempted so far (resolved + not_found + searched);
+    /// `tracks_total - tracks_processed` are still queued — the remaining work.
+    pub tracks_processed: i64,
     pub fingerprint_resolved: i64,
     pub fingerprint_not_found: i64,
     pub fingerprint_searched: i64,

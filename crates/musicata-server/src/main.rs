@@ -1076,10 +1076,14 @@ async fn artist_artwork_fill_pass(
 /// Retry window for a track AcoustID couldn't identify, so the rescan doesn't
 /// re-fingerprint it every pass.
 const FINGERPRINT_RETRY_SECS: i64 = 7 * 24 * 60 * 60;
-/// Tracks fingerprinted per pass — decoding ~120 s of audio each is CPU-heavy, but the
-/// AcoustID lookup is rate-limited (~3/s) anyway, so a larger batch just lets a pass make
-/// more progress before the next rescan tick; the rest are picked up on later passes.
-const FINGERPRINT_BATCH: i64 = 100;
+/// Tracks fingerprinted per pass. The AcoustID lookup is rate-limited (~3/s), so a pass of
+/// N takes ~N/3 s regardless; a big batch keeps the pass running back-to-back (the rescan
+/// tick is consumed while it works) so a large library is identified in ~1 hour rather than
+/// dribbling out 100 at a time.
+const FINGERPRINT_BATCH: i64 = 400;
+/// How many tracks decode concurrently. Decoding is CPU-bound; this keeps it off the
+/// AcoustID-lookup critical path (lookups still serialize through the shared rate limiter).
+const FINGERPRINT_CONCURRENCY: usize = 6;
 
 /// The duration to report to AcoustID for a fingerprint lookup: the track's real length
 /// when the scan read one (AcoustID filters matches by duration, so a long track must
@@ -1129,62 +1133,78 @@ async fn fingerprint_pass(
     ));
     let total = targets.len();
     let task = activity.start("fingerprint", format!("Identifying tracks (0/{total})"));
-    let mut resolved = 0usize;
 
-    for (index, target) in targets.into_iter().enumerate() {
-        activity.update(
-            task,
-            format!(
-                "Identifying tracks ({}/{total}): {}",
-                index + 1,
-                target.title
-            ),
-        );
-        // Read the audio (SMB or local); an unreadable file is skipped (not marked, so a
-        // transient failure is retried).
-        let audio = match read_track_source_file(providers, &target).await {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
+    // Process the batch with bounded concurrency: decoding is CPU-heavy, so let several
+    // tracks decode across cores at once. The AcoustID lookups still serialize through the
+    // client's shared rate limiter (~3/s), so this just keeps decode off the critical path
+    // instead of stacking it on top of the rate limit.
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(FINGERPRINT_CONCURRENCY));
+    let resolved = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut workers = tokio::task::JoinSet::new();
 
-        let extension = target.extension.clone();
+    for target in targets {
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("fingerprint semaphore");
+        let database = database.clone();
+        let providers = providers.clone();
         let client = client.clone();
-        let real_duration = target.duration_seconds;
-        // Decode + fingerprint + AcoustID lookup are synchronous + CPU-heavy.
-        let outcome = tokio::task::spawn_blocking(move || {
-            let (fingerprint, window_duration) =
-                fingerprint::compute_fingerprint(&audio, &extension).ok()?;
-            client
-                .lookup(&fingerprint, acoustid_lookup_duration(real_duration, window_duration))
-                .ok()
-                .flatten()
-        })
-        .await
-        .ok()
-        .flatten();
+        let activity = activity.clone();
+        let resolved = resolved.clone();
+        let done = done.clone();
+        workers.spawn(async move {
+            let _permit = permit;
+            // Read the audio (SMB or local); an unreadable file is skipped (not marked, so
+            // a transient failure is retried).
+            let Ok(audio) = read_track_source_file(&providers, &target).await else {
+                done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            };
+            let extension = target.extension.clone();
+            let real_duration = target.duration_seconds;
+            let lookup_client = client.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let (fingerprint, window_duration) =
+                    fingerprint::compute_fingerprint(&audio, &extension).ok()?;
+                lookup_client
+                    .lookup(&fingerprint, acoustid_lookup_duration(real_duration, window_duration))
+                    .ok()
+                    .flatten()
+            })
+            .await
+            .ok()
+            .flatten();
 
-        let now = now_unix_seconds();
-        match outcome {
-            Some(found) => {
-                let _ = database
-                    .upsert_track_fingerprint(
-                        &target.track_id,
-                        "resolved",
-                        found.recording_mbid.as_deref(),
-                        found.release_mbid.as_deref(),
-                        found.release_group_mbid.as_deref(),
-                        now,
-                    )
-                    .await;
-                resolved += 1;
+            let now = now_unix_seconds();
+            match outcome {
+                Some(found) => {
+                    let _ = database
+                        .upsert_track_fingerprint(
+                            &target.track_id,
+                            "resolved",
+                            found.recording_mbid.as_deref(),
+                            found.release_mbid.as_deref(),
+                            found.release_group_mbid.as_deref(),
+                            now,
+                        )
+                        .await;
+                    resolved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                None => {
+                    let _ = database
+                        .upsert_track_fingerprint(&target.track_id, "not_found", None, None, None, now)
+                        .await;
+                }
             }
-            None => {
-                let _ = database
-                    .upsert_track_fingerprint(&target.track_id, "not_found", None, None, None, now)
-                    .await;
-            }
-        }
+            let count = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            activity.update(task, format!("Identifying tracks ({count}/{total})"));
+        });
     }
+    while workers.join_next().await.is_some() {}
+    let resolved = resolved.load(std::sync::atomic::Ordering::Relaxed);
 
     if resolved > 0 {
         activity.finish(
@@ -2450,6 +2470,8 @@ async fn identification_stats_route(
         "tracks": { "total": stats.tracks_total, "identified": stats.tracks_identified },
         "albums": { "total": stats.albums_total, "identified": stats.albums_identified },
         "artists": { "total": stats.artists_total, "identified": stats.artists_identified },
+        "processed": stats.tracks_processed,
+        "queued": (stats.tracks_total - stats.tracks_processed).max(0),
         "fingerprint": {
             "resolved": stats.fingerprint_resolved,
             "not_found": stats.fingerprint_not_found,
