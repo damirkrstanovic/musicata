@@ -24,7 +24,7 @@ use musicata_core::{
     PlaybackState, PlaybackStatus, Player, PlayerCapabilities, PlayerCommand, QueueItem,
     RepeatMode, Zone,
 };
-use musicata_storage::{Database, PlayerPlayback, PlayerRecord};
+use musicata_storage::{Database, ListenKind, PlayerPlayback, PlayerRecord};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
 
@@ -40,6 +40,9 @@ struct PlayerEntry {
     /// Background idle/state task, for backends that have one (MPD). The browser
     /// player is command-driven and has none.
     task: Option<JoinHandle<()>>,
+    /// Background task that periodically polls MPD's position so elapsed advances on the
+    /// state broadcast (MPD's idle only fires on events). MPD-only.
+    poll: Option<JoinHandle<()>>,
     /// Background task that watches this player's state broadcast and records
     /// listening history. Every player has one.
     recorder: JoinHandle<()>,
@@ -49,6 +52,9 @@ impl Drop for PlayerEntry {
     fn drop(&mut self) {
         if let Some(task) = &self.task {
             task.abort();
+        }
+        if let Some(poll) = &self.poll {
+            poll.abort();
         }
         self.recorder.abort();
     }
@@ -74,6 +80,17 @@ impl PlayerHandle {
         match self {
             PlayerHandle::Mpd(player) => player.subscribe(),
             PlayerHandle::Browser(player) => player.subscribe(),
+        }
+    }
+
+    /// The per-second position tick stream, if the backend emits one. Only the browser
+    /// player does (MPD's elapsed rides its periodic state broadcast instead); the
+    /// listen recorder uses this to see elapsed advance without the hot-path cost of
+    /// re-broadcasting the full state every second.
+    pub fn subscribe_progress(&self) -> Option<broadcast::Receiver<ProgressTick>> {
+        match self {
+            PlayerHandle::Mpd(_) => None,
+            PlayerHandle::Browser(player) => Some(player.subscribe_progress()),
         }
     }
 
@@ -105,56 +122,221 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Watches one player's state stream and decides when a track counts as played. A
-/// play is recorded the moment a (different) track becomes the current track while the
-/// player is playing — i.e. as soon as you start it. Progress ticks, pauses, resumes,
-/// and seeks on the same track don't re-record; switching to another track does.
-#[derive(Default)]
-struct PlayTracker {
-    last_played: Option<String>,
-}
+/// ListenBrainz completion rule: a track counts as a real listen once it has played
+/// past `min(duration/2, 240s)`. A track replaced before that — but after a small noise
+/// floor — is a skip. Below the noise floor it's neither (just channel-flipping noise).
+const LISTEN_CAP_SECONDS: f64 = 240.0;
+/// Progress below this is too little to be either a listen or a skip.
+const NOISE_FLOOR_SECONDS: f64 = 4.0;
+/// An elapsed value this far below the running max means the track restarted (a replay
+/// / repeat-one), as opposed to a small seek-back within the same play.
+const BACKWARD_JUMP_SECONDS: f64 = 4.0;
+/// Durations at or below this (including 0/NaN/negative) are treated as unknown, so we
+/// fall back to the 4-minute cap rather than computing a near-zero half-duration.
+const MIN_DURATION_SECONDS: f64 = 1.0;
 
-impl PlayTracker {
-    /// Returns the track id to record as a play, or `None` if this state doesn't start
-    /// a new track.
-    fn observe(&mut self, state: &PlaybackState) -> Option<String> {
-        if state.status != PlaybackStatus::Playing {
-            return None;
-        }
-        let current = state
-            .now_playing
-            .as_ref()
-            .and_then(|n| n.track_id.clone())?;
-        if self.last_played.as_deref() == Some(current.as_str()) {
-            return None;
-        }
-        self.last_played = Some(current.clone());
-        Some(current)
+/// The play time after which a track is a confirmed listen.
+fn listen_threshold(duration: Option<f64>) -> f64 {
+    match duration {
+        Some(d) if d.is_finite() && d >= MIN_DURATION_SECONDS => (d / 2.0).min(LISTEN_CAP_SECONDS),
+        _ => LISTEN_CAP_SECONDS,
     }
 }
 
-/// Spawns the per-player task that consumes its state broadcast and records plays.
+/// What a single observed tick implies for listening history.
+#[derive(Debug, PartialEq, Eq)]
+enum ListenAction {
+    /// Nothing to record this tick.
+    None,
+    /// This track crossed the listen threshold — a confirmed listen.
+    RecordListen(String),
+    /// This (outgoing) track was abandoned past the noise floor — a skip.
+    RecordSkip(String),
+    /// A coarse tick both finalized the outgoing track as a skip *and* found the
+    /// incoming track already past its threshold (a confirmed listen).
+    RecordSkipThenListen(String, String),
+}
+
+/// The in-flight play the tracker is following.
+struct TrackPlay {
+    track_id: String,
+    /// Running max of observed elapsed — robust to MPD's irregular sampling and to
+    /// small seek-back jitter (a real listen is "we were ever past the threshold").
+    max_elapsed: f64,
+    duration: Option<f64>,
+    /// True once a `RecordListen` has been emitted for this play (never re-fire).
+    listen_recorded: bool,
+}
+
+/// Decides when a track counts as a listen vs a skip from a stream of playback ticks.
+/// Pure (no clock, no DB) so it is exhaustively unit-tested; the recorder stamps the
+/// event time when it writes.
+#[derive(Default)]
+struct ListenTracker {
+    current: Option<TrackPlay>,
+}
+
+impl ListenTracker {
+    /// Finalize the in-flight play: returns its id if it should be recorded as a skip
+    /// (past the floor and not already a listen), clearing it either way.
+    fn finalize(&mut self) -> Option<String> {
+        let prev = self.current.take()?;
+        (!prev.listen_recorded && prev.max_elapsed >= NOISE_FLOOR_SECONDS).then_some(prev.track_id)
+    }
+
+    /// Fold one tick (status + the active library track's id/elapsed/duration) into the
+    /// state machine and report what to record.
+    fn observe(
+        &mut self,
+        status: PlaybackStatus,
+        track_id: Option<&str>,
+        elapsed: Option<f64>,
+        duration: Option<f64>,
+    ) -> ListenAction {
+        // Pause holds the in-flight play untouched (resume continues it).
+        if status == PlaybackStatus::Paused {
+            return ListenAction::None;
+        }
+        // Stopped, or playing something with no library track id (e.g. radio): the
+        // in-flight play is over — finalize it.
+        let Some(id) = track_id.filter(|_| status == PlaybackStatus::Playing) else {
+            return match self.finalize() {
+                Some(skip) => ListenAction::RecordSkip(skip),
+                None => ListenAction::None,
+            };
+        };
+
+        let el = elapsed.unwrap_or(0.0).max(0.0);
+        let restart = match &self.current {
+            Some(p) if p.track_id == id => {
+                // Same track: a large backward jump means a replay (restarted near zero,
+                // or restarted after a completed listen) — a *new* play. A smaller / mid
+                // seek-back stays the same play (don't lower max_elapsed).
+                el < p.max_elapsed - BACKWARD_JUMP_SECONDS
+                    && (el < BACKWARD_JUMP_SECONDS || p.listen_recorded)
+            }
+            _ => true, // different track, or nothing in flight
+        };
+
+        let mut skip_out = None;
+        if restart {
+            skip_out = self.finalize();
+            self.current = Some(TrackPlay {
+                track_id: id.to_string(),
+                max_elapsed: el,
+                duration,
+                listen_recorded: false,
+            });
+        } else if let Some(p) = self.current.as_mut() {
+            p.max_elapsed = p.max_elapsed.max(el);
+            if duration.is_some() {
+                p.duration = duration;
+            }
+        }
+
+        let listen_now = {
+            let p = self.current.as_mut().expect("current set above");
+            if !p.listen_recorded && p.max_elapsed >= listen_threshold(p.duration) {
+                p.listen_recorded = true;
+                true
+            } else {
+                false
+            }
+        };
+
+        match (skip_out, listen_now) {
+            (None, false) => ListenAction::None,
+            (None, true) => ListenAction::RecordListen(id.to_string()),
+            (Some(skip), false) => ListenAction::RecordSkip(skip),
+            (Some(skip), true) => ListenAction::RecordSkipThenListen(skip, id.to_string()),
+        }
+    }
+}
+
+/// Persist whatever a tick decided. The event time is stamped here (`now_unix`), so a
+/// listen confirmed mid-track is timestamped when it crossed the threshold.
+async fn record_action(database: &Database, player_id: &str, action: ListenAction) {
+    let writes: Vec<(&str, ListenKind)> = match &action {
+        ListenAction::None => return,
+        ListenAction::RecordListen(id) => vec![(id.as_str(), ListenKind::Played)],
+        ListenAction::RecordSkip(id) => vec![(id.as_str(), ListenKind::Skipped)],
+        ListenAction::RecordSkipThenListen(skip, listen) => vec![
+            (skip.as_str(), ListenKind::Skipped),
+            (listen.as_str(), ListenKind::Played),
+        ],
+    };
+    let now = now_unix();
+    for (track_id, kind) in writes {
+        if let Err(error) = database.record_listen(track_id, player_id, now, kind).await {
+            tracing::warn!(%player_id, %track_id, ?kind, %error, "failed to record listen");
+        }
+    }
+}
+
+/// Await the next progress tick, or never resolve when there is no progress channel
+/// (MPD/zone) — so the recorder's `select!` simply falls through to state frames.
+async fn next_progress(progress: &mut Option<broadcast::Receiver<ProgressTick>>) -> ProgressTick {
+    loop {
+        match progress {
+            Some(rx) => match rx.recv().await {
+                Ok(tick) => return tick,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => *progress = None,
+            },
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Spawns the per-player task that records listening history under the ListenBrainz
+/// completion rule. It folds two sources into the tracker: full `PlaybackState` frames
+/// (track changes, status, and — for MPD — elapsed) and, when present, the browser's
+/// lightweight per-second `ProgressTick`s (which carry the advancing elapsed the full
+/// state deliberately doesn't re-broadcast every second).
 fn spawn_listen_recorder(
     player_id: String,
     mut states: broadcast::Receiver<PlaybackState>,
+    mut progress: Option<broadcast::Receiver<ProgressTick>>,
     database: Database,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tracker = PlayTracker::default();
+        let mut tracker = ListenTracker::default();
+        // The last library track id / status seen on a full state frame, used to give a
+        // bare progress tick its context.
+        let mut last_track: Option<String> = None;
+        let mut last_status = PlaybackStatus::Stopped;
         loop {
-            match states.recv().await {
-                Ok(state) => {
-                    if let Some(track_id) = tracker.observe(&state)
-                        && let Err(error) = database
-                            .record_listen(&track_id, &player_id, now_unix())
-                            .await
-                    {
-                        tracing::warn!(%player_id, %track_id, %error, "failed to record play");
+            let action = tokio::select! {
+                state = states.recv() => match state {
+                    Ok(state) => {
+                        let track_id = state.now_playing.and_then(|n| n.track_id);
+                        last_track = track_id.clone();
+                        last_status = state.status;
+                        tracker.observe(
+                            state.status,
+                            track_id.as_deref(),
+                            state.elapsed_seconds,
+                            state.duration_seconds,
+                        )
                     }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                tick = next_progress(&mut progress) => {
+                    // Progress only flows while the output is rendering audio, so treat it
+                    // as Playing on the last-known track.
+                    if last_status != PlaybackStatus::Playing {
+                        continue;
+                    }
+                    tracker.observe(
+                        PlaybackStatus::Playing,
+                        last_track.as_deref(),
+                        Some(tick.elapsed_seconds),
+                        tick.duration_seconds,
+                    )
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
+            };
+            record_action(&database, &player_id, action).await;
         }
     })
 }
@@ -221,8 +403,12 @@ impl PlayerManager {
     async fn bring_up_zone(&self, zone: &Zone) {
         let player = Arc::new(ZonePlayer::new(self.database.clone(), zone.id.clone()));
         player.restore().await;
-        let recorder =
-            spawn_listen_recorder(zone.id.clone(), player.subscribe(), self.database.clone());
+        let recorder = spawn_listen_recorder(
+            zone.id.clone(),
+            player.subscribe(),
+            None,
+            self.database.clone(),
+        );
         self.zones
             .write()
             .await
@@ -243,13 +429,13 @@ impl PlayerManager {
 
     /// Bring up the runtime entry for a persisted player record.
     async fn bring_up(&self, record: &PlayerRecord) {
-        let (handle, task) = match record.kind.as_str() {
+        let (handle, task, poll) = match record.kind.as_str() {
             "browser" => {
                 let player = Arc::new(BrowserPlayer::new(self.database.clone(), record.id.clone()));
                 // Reload any queue persisted before the last shutdown so it survives a
                 // server restart, not just a page refresh.
                 player.restore().await;
-                (PlayerHandle::Browser(player), None)
+                (PlayerHandle::Browser(player), None, None)
             }
             _ => {
                 let player = Arc::new(MpdPlayer::new(
@@ -262,16 +448,22 @@ impl PlayerManager {
                 // the idle loop starts; with no persisted queue, adopt MPD's current one.
                 player.restore().await;
                 let task = player.clone().spawn_state_task(self.database.clone());
-                (PlayerHandle::Mpd(player), Some(task))
+                let poll = player.clone().spawn_position_poll();
+                (PlayerHandle::Mpd(player), Some(task), Some(poll))
             }
         };
-        let recorder =
-            spawn_listen_recorder(record.id.clone(), handle.subscribe(), self.database.clone());
+        let recorder = spawn_listen_recorder(
+            record.id.clone(),
+            handle.subscribe(),
+            handle.subscribe_progress(),
+            self.database.clone(),
+        );
         self.players.write().await.insert(
             record.id.clone(),
             PlayerEntry {
                 handle,
                 task,
+                poll,
                 recorder,
             },
         );
@@ -797,6 +989,42 @@ impl MpdPlayer {
         })
     }
 
+    /// Background task: while MPD is playing, periodically refresh its cursor and
+    /// re-broadcast, so elapsed advances between idle events (MPD's `idle` only fires on
+    /// state *changes*, not every second). This is what lets the listen recorder apply
+    /// the completion rule to MPD — its only elapsed source is the state broadcast. Uses
+    /// the command connection (not the dedicated idle connection), so it never interferes
+    /// with the idle loop; it broadcasts only (the throttled persist stays on the idle
+    /// loop and commands).
+    fn spawn_position_poll(self: Arc<Self>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut poll = tokio::time::interval(Duration::from_secs(MPD_POLL_SECS));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                poll.tick().await;
+                if !self.online.load(Ordering::Relaxed) {
+                    continue;
+                }
+                // Only poll while playing — a paused/stopped MPD has nothing to advance,
+                // and we don't want to spam the broadcast (re-sending the queue) at rest.
+                if !matches!(self.state.lock().await.status, PlaybackStatus::Playing) {
+                    continue;
+                }
+                let status = {
+                    let mut guard = self.connection.lock().await;
+                    match ensure_connected(&mut guard, &self.addr).await {
+                        Ok(connection) => connection.read_status().await.ok(),
+                        Err(_) => None,
+                    }
+                };
+                if let Some(status) = status.filter(|s| s.state.status == PlaybackStatus::Playing) {
+                    self.apply_cursor(status).await;
+                    self.broadcast().await;
+                }
+            }
+        })
+    }
+
     async fn run_idle_loop(&self, database: &Database) -> Result<()> {
         let mut idle = MpdConnection::connect(&self.addr).await?;
         self.online.store(true, Ordering::Relaxed);
@@ -1001,6 +1229,11 @@ pub struct BrowserPlayer {
 
 /// Throttle window for persisting in-track elapsed position from progress ticks.
 const PROGRESS_PERSIST_SECS: i64 = 10;
+
+/// How often the MPD position poll refreshes elapsed while playing. Frequent enough for
+/// the listen recorder's completion rule (and a live-ish seek bar), infrequent enough to
+/// avoid spamming the state broadcast.
+const MPD_POLL_SECS: u64 = 5;
 
 /// Which slice of the persisted queue a change needs written back.
 enum QueuePersist {
@@ -1619,60 +1852,171 @@ mod tests {
     use musicata_core::{Album, Artist, Library, ProviderMapping, Track};
     use std::path::PathBuf;
 
-    fn playing(track_id: &str) -> PlaybackState {
-        PlaybackState {
-            status: PlaybackStatus::Playing,
-            now_playing: Some(QueueItem {
-                track_id: Some(track_id.to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
+    // ---- ListenTracker (the completion-rule state machine) ----
+
+    /// A Playing tick for `id` at `elapsed`, duration `dur`.
+    fn tick(
+        tracker: &mut ListenTracker,
+        id: &str,
+        elapsed: f64,
+        dur: Option<f64>,
+    ) -> ListenAction {
+        tracker.observe(PlaybackStatus::Playing, Some(id), Some(elapsed), dur)
+    }
+
+    const D180: Option<f64> = Some(180.0); // threshold 90
+
+    #[test]
+    fn noise_floor_progress_is_neither_listen_nor_skip() {
+        let mut t = ListenTracker::default();
+        assert_eq!(tick(&mut t, "a", 0.0, D180), ListenAction::None);
+        assert_eq!(tick(&mut t, "a", 2.0, D180), ListenAction::None);
+        // Switch away after only 2s — below the floor, so not even a skip.
+        assert_eq!(tick(&mut t, "b", 0.0, D180), ListenAction::None);
+    }
+
+    #[test]
+    fn crossing_half_duration_records_one_listen() {
+        let mut t = ListenTracker::default();
+        assert_eq!(tick(&mut t, "a", 30.0, D180), ListenAction::None);
+        assert_eq!(tick(&mut t, "a", 89.0, D180), ListenAction::None);
+        assert_eq!(
+            tick(&mut t, "a", 91.0, D180),
+            ListenAction::RecordListen("a".into())
+        );
+        // No double-count past the threshold.
+        assert_eq!(tick(&mut t, "a", 120.0, D180), ListenAction::None);
+    }
+
+    #[test]
+    fn four_minute_cap_for_long_tracks() {
+        let mut t = ListenTracker::default();
+        let long = Some(1200.0); // half would be 600, but the cap is 240
+        assert_eq!(tick(&mut t, "a", 239.0, long), ListenAction::None);
+        assert_eq!(
+            tick(&mut t, "a", 241.0, long),
+            ListenAction::RecordListen("a".into())
+        );
+    }
+
+    #[test]
+    fn skip_when_track_changes_before_threshold() {
+        let mut t = ListenTracker::default();
+        assert_eq!(tick(&mut t, "a", 30.0, D180), ListenAction::None);
+        assert_eq!(
+            tick(&mut t, "b", 0.0, D180),
+            ListenAction::RecordSkip("a".into())
+        );
+    }
+
+    #[test]
+    fn no_skip_when_track_changes_after_a_listen() {
+        let mut t = ListenTracker::default();
+        assert_eq!(
+            tick(&mut t, "a", 95.0, D180),
+            ListenAction::RecordListen("a".into())
+        );
+        // "a" already counted, so switching away is not a skip.
+        assert_eq!(tick(&mut t, "b", 0.0, D180), ListenAction::None);
+    }
+
+    #[test]
+    fn replay_of_the_same_track_counts_twice() {
+        let mut t = ListenTracker::default();
+        assert_eq!(
+            tick(&mut t, "a", 95.0, D180),
+            ListenAction::RecordListen("a".into())
+        );
+        // Repeat-one: elapsed resets near zero on the same id — a new play begins.
+        assert_eq!(tick(&mut t, "a", 1.0, D180), ListenAction::None);
+        assert_eq!(
+            tick(&mut t, "a", 95.0, D180),
+            ListenAction::RecordListen("a".into())
+        );
+    }
+
+    #[test]
+    fn mid_track_seek_back_is_not_a_new_play() {
+        let mut t = ListenTracker::default();
+        assert_eq!(tick(&mut t, "a", 60.0, D180), ListenAction::None);
+        // Scrub back to 50 (not near zero, not yet a listen) — same play continues.
+        assert_eq!(tick(&mut t, "a", 50.0, D180), ListenAction::None);
+        // Continue past the threshold → exactly one listen, no spurious skip.
+        assert_eq!(
+            tick(&mut t, "a", 91.0, D180),
+            ListenAction::RecordListen("a".into())
+        );
+    }
+
+    #[test]
+    fn pause_resume_does_not_finalize_or_double_count() {
+        let mut t = ListenTracker::default();
+        assert_eq!(tick(&mut t, "a", 95.0, D180), ListenAction::RecordListen("a".into()));
+        // Pause holds; resume continues; neither records anything.
+        assert_eq!(
+            t.observe(PlaybackStatus::Paused, Some("a"), Some(95.0), D180),
+            ListenAction::None
+        );
+        assert_eq!(tick(&mut t, "a", 96.0, D180), ListenAction::None);
+    }
+
+    #[test]
+    fn stop_finalizes_a_partial_as_a_skip() {
+        let mut t = ListenTracker::default();
+        assert_eq!(tick(&mut t, "a", 30.0, D180), ListenAction::None);
+        assert_eq!(
+            t.observe(PlaybackStatus::Stopped, None, None, None),
+            ListenAction::RecordSkip("a".into())
+        );
+        // Already finalized — a second stop does nothing.
+        assert_eq!(
+            t.observe(PlaybackStatus::Stopped, None, None, None),
+            ListenAction::None
+        );
+    }
+
+    #[test]
+    fn stop_after_a_listen_is_not_a_skip() {
+        let mut t = ListenTracker::default();
+        assert_eq!(tick(&mut t, "a", 95.0, D180), ListenAction::RecordListen("a".into()));
+        assert_eq!(
+            t.observe(PlaybackStatus::Stopped, None, None, None),
+            ListenAction::None
+        );
+    }
+
+    #[test]
+    fn missing_or_absurd_duration_falls_back_to_the_cap() {
+        for dur in [None, Some(0.0), Some(-5.0), Some(f64::NAN)] {
+            let mut t = ListenTracker::default();
+            assert_eq!(tick(&mut t, "a", 200.0, dur), ListenAction::None);
+            assert_eq!(
+                tick(&mut t, "a", 241.0, dur),
+                ListenAction::RecordListen("a".into())
+            );
         }
     }
 
-    fn paused(track_id: &str) -> PlaybackState {
-        PlaybackState {
-            status: PlaybackStatus::Paused,
-            ..playing(track_id)
-        }
-    }
-
-    fn stopped() -> PlaybackState {
-        PlaybackState {
-            status: PlaybackStatus::Stopped,
-            ..Default::default()
-        }
+    #[test]
+    fn radio_without_a_track_id_is_ignored() {
+        let mut t = ListenTracker::default();
+        // Playing, but no library track id (a radio stream).
+        assert_eq!(
+            t.observe(PlaybackStatus::Playing, None, Some(10.0), None),
+            ListenAction::None
+        );
+        assert!(t.current.is_none());
     }
 
     #[test]
-    fn records_a_play_when_a_new_track_starts() {
-        let mut tracker = PlayTracker::default();
-        assert_eq!(tracker.observe(&playing("a")), Some("a".to_string()));
-    }
-
-    #[test]
-    fn does_not_rerecord_the_same_track_on_progress_pause_or_resume() {
-        let mut tracker = PlayTracker::default();
-        assert_eq!(tracker.observe(&playing("a")), Some("a".to_string()));
-        assert_eq!(tracker.observe(&playing("a")), None); // progress tick
-        assert_eq!(tracker.observe(&paused("a")), None); // pause
-        assert_eq!(tracker.observe(&playing("a")), None); // resume same track
-    }
-
-    #[test]
-    fn records_again_after_switching_to_another_track() {
-        let mut tracker = PlayTracker::default();
-        assert_eq!(tracker.observe(&playing("a")), Some("a".to_string()));
-        assert_eq!(tracker.observe(&playing("b")), Some("b".to_string()));
-        // Returning to a previously played track is a new play.
-        assert_eq!(tracker.observe(&playing("a")), Some("a".to_string()));
-    }
-
-    #[test]
-    fn ignores_stopped_and_idle_states() {
-        let mut tracker = PlayTracker::default();
-        assert_eq!(tracker.observe(&stopped()), None);
-        assert_eq!(tracker.observe(&paused("a")), None);
+    fn coarse_tick_can_skip_outgoing_and_confirm_incoming() {
+        let mut t = ListenTracker::default();
+        assert_eq!(tick(&mut t, "a", 30.0, D180), ListenAction::None);
+        // A single coarse poll jumps to a new short track already past its threshold.
+        assert_eq!(
+            tick(&mut t, "b", 250.0, None),
+            ListenAction::RecordSkipThenListen("a".into(), "b".into())
+        );
     }
 
     fn temp_db(name: &str) -> PathBuf {
@@ -1689,6 +2033,7 @@ mod tests {
             name: "Artist".to_string(),
             album_count: 1,
             track_count: count,
+            artwork_url: None,
         };
         let album = Album {
             id: "album_1".to_string(),
@@ -1769,13 +2114,15 @@ mod tests {
         );
     }
 
-    // End-to-end through the real player + recorder wiring: play one track, then four
-    // more, and confirm each played track lands in Recently played.
+    // End-to-end through the real player + recorder wiring: play a track and report
+    // progress past the listen threshold, and confirm each *completed* track lands in
+    // Recently played. (A play with no progress past the threshold is not a listen —
+    // that's the completion rule; this drives real progress.)
     #[tokio::test]
-    async fn recently_played_reflects_each_played_track() {
+    async fn recently_played_reflects_completed_listens() {
         let db_path = temp_db("recent-plays");
         let database = Database::connect(&db_path).await.expect("connect");
-        let mut library = library_with_tracks(5);
+        let mut library = library_with_tracks(5); // each track is 180s -> threshold 90s
         database.save_library(&mut library).await.expect("save");
 
         let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
@@ -1785,15 +2132,20 @@ mod tests {
             .get(BROWSER_PLAYER_ID)
             .await
             .expect("browser player present");
+        let PlayerHandle::Browser(player) = &browser else {
+            panic!("browser player should be a Browser handle");
+        };
 
-        // Play one track -> exactly one entry, and it's that track.
+        // Play a track, then report progress past half its duration -> one listen.
         play(&browser, &database, "track_1").await;
+        player.report_progress(95.0, Some(180.0)).await;
         let recent = wait_for_recent(&database, 1).await;
         assert_eq!(recent, vec!["track_1".to_string()]);
 
-        // Play four more distinct tracks -> all five present.
+        // Four more, each driven past the threshold -> all five present.
         for id in ["track_2", "track_3", "track_4", "track_5"] {
             play(&browser, &database, id).await;
+            player.report_progress(95.0, Some(180.0)).await;
         }
         let recent = wait_for_recent(&database, 5).await;
         let found: std::collections::BTreeSet<&str> = recent.iter().map(String::as_str).collect();
@@ -1803,6 +2155,47 @@ mod tests {
         assert_eq!(recent.len(), 5, "expected exactly five distinct tracks");
 
         let _ = std::fs::remove_file(db_path);
+    }
+
+    // The flip side of the completion rule: a track abandoned early is a skip, not a
+    // listen — it must NOT show in Recently played, but it must show in Most skipped.
+    #[tokio::test]
+    async fn early_abandon_records_a_skip_not_a_listen() {
+        let db_path = temp_db("skip-not-listen");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = library_with_tracks(2);
+        database.save_library(&mut library).await.expect("save");
+
+        let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
+            .await
+            .expect("manager");
+        let browser = manager.get(BROWSER_PLAYER_ID).await.expect("browser");
+        let PlayerHandle::Browser(player) = &browser else {
+            panic!("browser handle");
+        };
+
+        // Start track_1, play 30s (past the floor, below the 90s threshold), then jump
+        // to track_2 and complete it.
+        play(&browser, &database, "track_1").await;
+        player.report_progress(30.0, Some(180.0)).await;
+        play(&browser, &database, "track_2").await;
+        player.report_progress(95.0, Some(180.0)).await;
+
+        // Only the completed track_2 is a listen.
+        let recent = wait_for_recent(&database, 1).await;
+        assert_eq!(recent, vec!["track_2".to_string()]);
+
+        // track_1 surfaces as a skip.
+        for _ in 0..200 {
+            let skipped = database.most_skipped(10).await.expect("skipped");
+            if !skipped.is_empty() {
+                assert_eq!(skipped[0].0.id, "track_1");
+                let _ = std::fs::remove_file(&db_path);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("track_1 was never recorded as a skip");
     }
 
     // A position tick (the ~1×/second report from the output tab) must go out as a

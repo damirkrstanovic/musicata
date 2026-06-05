@@ -331,6 +331,10 @@ pub struct Artist {
     pub name: String,
     pub album_count: usize,
     pub track_count: usize,
+    /// Served URL for an externally-acquired artist image, or `None` (the UI shows a
+    /// monogram). Set by the artwork fill pass, not by the scanner.
+    #[serde(default)]
+    pub artwork_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1031,6 +1035,7 @@ fn finalize_library(
             name: artist.name,
             album_count: artist.album_ids.len(),
             track_count: artist.track_count,
+            artwork_url: None,
         })
         .collect();
     artists.sort_by(|left, right| left.name.cmp(&right.name));

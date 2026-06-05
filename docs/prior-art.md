@@ -644,6 +644,68 @@ alongside the writer.
 
 ---
 
+## 11. Artist identity & variant-name merging
+
+**Problem:** the same artist appears under different name strings — "Fela Kuti" vs "Fela
+Anikulapo Kuti", "The Beatles" vs "Beatles", "Beyoncé" vs "Beyonce", "Marina & the
+Diamonds" vs "Marina and the Diamonds" — and fragments into separate artist entries.
+Musicata today keys identity as `stable_id("artist", name.to_ascii_lowercase())`
+(`musicata-core/src/lib.rs`), so only **case** collapses; diacritics, leading "The", and
+genuine variants all split.
+
+**How the others do it (researched — nobody fuzzy-merges):**
+
+- **Jellyfin** — identity is the **normalized name** (`GetCleanValue`: diacritics removed,
+  lowercased, punctuation→space, whitespace collapsed) with a **MusicBrainz Artist Id**
+  user-data key when present (`MusicArtist.GetUserDataKeys`: `Artist-Musicbrainz-{mbid}`
+  else `Artist-{name-no-diacritics}`). Its **only** automatic merge is **case-insensitive**
+  (a 2026 migration `MergeDuplicateMusicArtists` groups `Name.ToLowerInvariant()`). "Fela
+  Kuti" vs "Fela Anikulapo Kuti" stay **separate**. Multi/featured artists are split on
+  `/ ; | \` + "feat."/"featuring", with a hardcoded whitelist (AC/DC, Smith/Kotzen).
+- **Navidrome** — artist **PID is name-only and not configurable** (album/track PIDs are
+  MBID-first, artists are not), so it can't even *split* two same-name artists that have
+  distinct MBIDs (issue **#3964**, filed by Picard's lead dev). Its creator calls
+  MBID-based identity "the ideal path forward" but blocked on **patchy per-role MBID
+  coverage** (composer/engineer tags often have no MBID slot). No manual-merge UI; the
+  documented fix is *consistent tagging*. Splits multi-value `ARTISTS`/`ALBUMARTISTS` tags,
+  else a separator list (`/`, ` / `, ` feat. `, `; `, …).
+- **MusicBrainz/Picard** — the canonical model: a stable **Artist MBID** plus **aliases**
+  (artist-name / legal-name / search-hint, locale-tagged) that map every variant spelling
+  onto the one MBID ("Fela Anikulapo Kuti" *is* an alias of the Fela Kuti MBID). Picard
+  writes `MUSICBRAINZ_ARTISTID` (multi-valued), `ARTISTS`, `ARTISTSORT`; its "Use
+  standardized artist names" rewrites credited variants to the canonical name at tag time.
+- **Roon** — canonicalizes against a **curated cloud DB** (TiVo/Rovi + MusicBrainz):
+  "there is only one Beethoven." Powerful, but it's *match-to-curated-entity*, not local
+  string fuzzing; unidentified local files degrade to tag munging.
+- **beets** — identity is `mb_artistid` from MusicBrainz; lacking an MBID it keeps things
+  distinct rather than guessing. `duplicates` plugin dedups tracks/albums by MBID keys.
+
+**Why nobody substring/fuzzy-merges:** it silently collapses genuinely distinct same-name
+artists — multiple "John Williams" (film composer vs classical guitarist), the metal-scene
+"Death"/"Depression" bands — and substring is worse ("Marley" ⊂ "Bob Marley"/"Ziggy
+Marley"). It's lossy and hard to undo.
+
+**What Musicata should adopt (for a library with ~0 MBIDs):**
+
+1. **Safe normalization only, automatically** — extend the identity key beyond case to
+   strip diacritics, fold a leading "The ", and normalize punctuation/whitespace (Jellyfin's
+   `GetCleanValue`). This merges the *unambiguous* cases (Beyoncé/Beyonce, The
+   Beatles/Beatles) and nothing risky. Keep the original string as the **display name**.
+   (Re-deriving the key re-groups artists — fine, artist ids are derived, not canonical
+   track ids.)
+2. **MBID-first identity with a name fallback** (kgarner7's `name|mbid` model from #3964):
+   `mbid` when enrichment has one, else the normalized-name hash — so `A|1234`, `A|2345`,
+   `A|` are all distinct and adding MBIDs later auto-merges/splits correctly. Don't drop
+   artists lacking an MBID. This is what makes "Fela Kuti"≡"Fela Anikulapo Kuti" resolve
+   *for free* once MusicBrainz enrichment runs (they share one artist MBID with the other
+   as an alias).
+3. **A manual merge / alias tool** — the honest answer for true variants with no MBID, and
+   the thing every other server *lacks*. A user-curated "treat these names as one artist"
+   mapping, reversible, lives **in the product** (DB + `/admin`), mirroring MusicBrainz
+   aliases. Never fuzzy-merge automatically.
+
+---
+
 ## Conventions these led to
 
 - **Enum dispatch over `dyn`** for provider/player handles (async methods, object

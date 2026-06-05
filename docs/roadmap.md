@@ -433,11 +433,30 @@ Tasks:
   delete/add/remove, a per-track ♥ toggle, and a Favorites view), and the OpenSubsonic
   API (get/create/update/deletePlaylist, star/unstar, getStarred/2, `starred` flags) —
   verified against the real Supersonic client.
-- Record playback events: started, progress, completed, skipped, paused, resumed, loved, disliked, rated, queued, and playlist changes.
-- Use the ListenBrainz completion rule as a default: count a listen after half the track or 4 minutes, whichever is lower.
+- [x] **Use the ListenBrainz completion rule as a default**: count a listen after half
+  the track or 4 minutes, whichever is lower. The per-player recorder
+  (`players.rs::ListenTracker`) is now a pure state machine over playback ticks: a track
+  crossing `min(duration/2, 240s)` is a confirmed listen; one abandoned before that (past
+  a 4s noise floor) is a **skip**; repeats/replays each count; pause/resume and mid-track
+  seek-backs don't double-count or manufacture skips. It folds two elapsed sources — the
+  browser's per-second `ProgressTick`s and, for MPD, a periodic position poll
+  (`spawn_position_poll`, 5s) since MPD's idle only fires on events. `listens` gains an
+  `event_kind` column (migration v23) distinguishing `played` from `skipped`; existing
+  rows backfill to `played`. (Was: recorded a "play" the instant a track started, so a
+  2-second skip counted as a listen.)
+- Record richer playback events: started, progress, paused, resumed, loved, disliked,
+  rated, queued, and playlist changes. (Completed/skipped are done — see above.)
 - Persist history per user, track, player/zone, session, and playback source.
-- Add stats views for most played, recently played, never played, skipped, favorites, and rediscovery.
-- Add deterministic smart playlists before adding ML.
+- Add remaining stats views: most played and recently played exist; **never played,
+  most skipped, and rediscovery** now ship as smart playlists (below). Still open:
+  favorites stats, session/streak views.
+- [x] **Add deterministic smart playlists before adding ML.** A fixed, computed catalog
+  (`/api/smart-playlists`, no stored rows — each is a live query): **Top: last 30 days**
+  (`most_played_since`), **Never played** (`never_played` anti-join), **Forgotten
+  favorites** (`forgotten_favorites` — starred but unplayed in 30 days), and **Most
+  skipped** (`most_skipped`). Surfaced as a read-only "Smart playlists" sidebar section
+  in the web app, opening the same master track view as a user playlist. More facets
+  (genre/year smart lists, never-played-by-decade) are easy follow-ups.
 - Add metadata-based recommendations by genre, year, artist, album artist, composer, and MusicBrainz IDs.
 - Add optional ListenBrainz scrobbling and recommendation import.
 - Design an optional `musicata-ml` service for future audio embeddings, genre/mood inference, and similarity search.
@@ -559,7 +578,11 @@ Tasks:
   not a music source. **Started** — two instances now exist, both running as background
   passes after a scan, gated by Settings toggles:
   - the pluggable **artwork-provider lane** (`artwork_providers.rs`: iTunes/Deezer/Cover
-    Art Archive/fanart.tv, priority + MBID capability, auto-fill; see M3 §8), and
+    Art Archive/fanart.tv, priority + MBID capability, auto-fill; see M3 §8). Now also
+    fetches **artist images** (`artist_artwork_fill_pass`): name-based via Deezer's
+    `/search/artist` (the id-exact CAA/fanart lane can't help — most libraries carry no
+    artist MBIDs), cached + served at `/api/artists/{id}/artwork?size=` (migration v24,
+    `acquired_artist_artwork`), monogram fallback in the UI. And
   - **AcoustID audio fingerprinting** (`fingerprint.rs`: pure-Rust `symphonia` decode +
     `rusty-chromaprint`; identifies untagged tracks → MusicBrainz ids in
     `track_fingerprint`, migration v21, which the artwork lane then uses to reach the
