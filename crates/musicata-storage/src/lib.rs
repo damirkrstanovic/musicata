@@ -1895,6 +1895,111 @@ impl Database {
         Ok(result.rows_affected())
     }
 
+    /// Tracks AcoustID couldn't identify (`track_fingerprint.status = 'not_found'`) that
+    /// still carry no MusicBrainz id — candidates for the text-search fallback. Once
+    /// searched, the row becomes `resolved` (a match) or `search_not_found` (no confident
+    /// match), so each track is searched at most once.
+    pub async fn tracks_for_musicbrainz_search(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<TrackSearchTarget>> {
+        let rows = sqlx::query(
+            "SELECT t.id, t.title, t.artist_name, t.album_title, t.year
+             FROM tracks t
+             JOIN track_fingerprint f ON f.track_id = t.id AND f.status = 'not_found'
+             WHERE NOT EXISTS (
+                       SELECT 1 FROM track_metadata_observations o
+                       WHERE o.track_id = t.id
+                         AND (o.musicbrainz_recording_id IS NOT NULL
+                              OR o.musicbrainz_release_id IS NOT NULL
+                              OR o.musicbrainz_release_group_id IS NOT NULL))
+             ORDER BY t.artist_name, t.title
+             LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(TrackSearchTarget {
+                    track_id: row.try_get("id")?,
+                    title: row.try_get("title")?,
+                    artist_name: row.try_get("artist_name")?,
+                    album_title: row.try_get("album_title")?,
+                    year: optional_i64_to_u16(row.try_get("year")?, "year")?,
+                })
+            })
+            .collect()
+    }
+
+    // ---- Identification stats (MusicBrainz coverage) -------------------------
+
+    async fn scalar_i64(&self, sql: &str) -> Result<i64> {
+        Ok(sqlx::query(sql).fetch_one(&self.pool).await?.try_get(0)?)
+    }
+
+    /// How much of the library has been identified (resolved a MusicBrainz recording id,
+    /// via embedded tags or fingerprint/search), plus the fingerprint status breakdown.
+    pub async fn identification_stats(&self) -> Result<IdentificationStats> {
+        let identified = track_identified_clause("t.id");
+        Ok(IdentificationStats {
+            tracks_total: self.scalar_i64("SELECT COUNT(*) FROM tracks").await?,
+            tracks_identified: self
+                .scalar_i64(&format!("SELECT COUNT(*) FROM tracks t WHERE {identified}"))
+                .await?,
+            albums_total: self.scalar_i64("SELECT COUNT(*) FROM albums").await?,
+            albums_identified: self
+                .scalar_i64(&format!(
+                    "SELECT COUNT(*) FROM albums a WHERE EXISTS
+                     (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND {identified})"
+                ))
+                .await?,
+            artists_total: self.scalar_i64("SELECT COUNT(*) FROM artists").await?,
+            artists_identified: self
+                .scalar_i64(&format!(
+                    "SELECT COUNT(*) FROM artists ar WHERE EXISTS
+                     (SELECT 1 FROM tracks t WHERE t.artist_id = ar.id AND {identified})"
+                ))
+                .await?,
+            fingerprint_resolved: self
+                .scalar_i64("SELECT COUNT(*) FROM track_fingerprint WHERE status = 'resolved'")
+                .await?,
+            fingerprint_not_found: self
+                .scalar_i64("SELECT COUNT(*) FROM track_fingerprint WHERE status = 'not_found'")
+                .await?,
+            fingerprint_searched: self
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM track_fingerprint WHERE status = 'search_not_found'",
+                )
+                .await?,
+        })
+    }
+
+    /// Albums none of whose tracks carry a MusicBrainz recording id, most-tracks first —
+    /// the biggest unidentified targets (no id-exact artwork, no enrichment).
+    pub async fn unidentified_albums(&self, limit: i64) -> Result<Vec<Album>> {
+        let identified = track_identified_clause("t.id");
+        let sql = format!(
+            "SELECT {ALBUM_COLUMNS} FROM albums a
+             WHERE NOT EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND {identified})
+             ORDER BY track_count DESC, title LIMIT ?1"
+        );
+        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.pool).await?;
+        rows.iter().map(album_from_row).collect()
+    }
+
+    /// Artists none of whose tracks carry a MusicBrainz recording id, most-tracks first.
+    pub async fn unidentified_artists(&self, limit: i64) -> Result<Vec<Artist>> {
+        let identified = track_identified_clause("t.id");
+        let sql = format!(
+            "SELECT id, name, album_count, track_count, artwork_url FROM artists ar
+             WHERE NOT EXISTS (SELECT 1 FROM tracks t WHERE t.artist_id = ar.id AND {identified})
+             ORDER BY track_count DESC, name LIMIT ?1"
+        );
+        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.pool).await?;
+        rows.iter().map(artist_from_row).collect()
+    }
+
     // ---- MusicBrainz metadata enrichment (from fingerprinted recording MBIDs) -
 
     /// Tracks that have a **resolved** fingerprint (a recording MBID) but no MusicBrainz
@@ -3182,6 +3287,45 @@ pub struct TrackFingerprintTarget {
     /// The track's full length in seconds (read at scan time). AcoustID filters matches by
     /// duration, so the lookup must report the *real* length, not the fingerprint window.
     pub duration_seconds: Option<f64>,
+}
+
+/// A track to identify by MusicBrainz text search (the AcoustID-fallback path), carrying
+/// the tags the search query is built from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackSearchTarget {
+    pub track_id: String,
+    pub title: String,
+    pub artist_name: String,
+    pub album_title: String,
+    pub year: Option<u16>,
+}
+
+/// Library-wide MusicBrainz identification coverage (for the `/admin` stats panel).
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdentificationStats {
+    pub tracks_total: i64,
+    pub tracks_identified: i64,
+    pub albums_total: i64,
+    pub albums_identified: i64,
+    pub artists_total: i64,
+    pub artists_identified: i64,
+    pub fingerprint_resolved: i64,
+    pub fingerprint_not_found: i64,
+    pub fingerprint_searched: i64,
+}
+
+/// SQL boolean: whether the track referenced by `track_id_expr` (e.g. `"t.id"`) carries a
+/// MusicBrainz recording id — via an embedded-tag observation or a resolved fingerprint/
+/// search. The single definition of "identified" used across the stats queries.
+fn track_identified_clause(track_id_expr: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM track_metadata_observations o
+                  WHERE o.track_id = {tid} AND o.musicbrainz_recording_id IS NOT NULL
+                    AND o.musicbrainz_recording_id <> '')
+          OR EXISTS (SELECT 1 FROM track_fingerprint f
+                     WHERE f.track_id = {tid} AND f.status = 'resolved'))",
+        tid = track_id_expr
+    )
 }
 
 /// A track whose fingerprinted recording MBID is ready to enrich from MusicBrainz.
