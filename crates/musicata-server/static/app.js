@@ -627,19 +627,34 @@ async function openArtist(artist, back) {
   if (back) pushNav(back);
   markNavActive("artist-detail");
   closeDrawerOnMobile();
-  showPanels({ hero: true, grid: true });
+  showPanels({ hero: true });
   renderSort(null);
   els.viewTitle.textContent = artist.name;
   els.detailHero.innerHTML = `<p class="empty">Loading…</p>`;
   try {
     const detail = await api(`/api/artists/${encodeURIComponent(artist.id)}`);
-    renderArtistHero(detail);
     const albums = detail.albums || [];
-    const backToArtist = () => openArtist(detail.artist);
-    streamBrowseGrid(
-      (offset) => albums.slice(offset, offset + ALBUM_PAGE),
-      (album) => buildAlbumCard(album, backToArtist),
-    );
+    const tracks = detail.tracks || [];
+    if (albums.length) {
+      // Has albums → cover-card grid (drill into each album).
+      showPanels({ hero: true, grid: true });
+      renderArtistHero(detail);
+      const backToArtist = () => openArtist(detail.artist);
+      streamBrowseGrid(
+        (offset) => albums.slice(offset, offset + ALBUM_PAGE),
+        (album) => buildAlbumCard(album, backToArtist),
+      );
+    } else {
+      // No albums of their own (e.g. only credited as a track artist) → show the tracks.
+      showPanels({ hero: true, tracks: true });
+      renderArtistHero(detail);
+      state.visibleTracks = tracks;
+      if (tracks.length) {
+        renderTracks(tracks);
+      } else {
+        els.trackList.innerHTML = `<p class="empty">No tracks for this artist.</p>`;
+      }
+    }
   } catch (error) {
     els.detailHero.innerHTML = "";
     els.browseGrid.innerHTML = `<p class="error">Failed to load artist: ${escapeHtml(error.message)}</p>`;
