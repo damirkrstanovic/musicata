@@ -236,6 +236,34 @@ impl MusicBrainzClient {
         normalize_musicbrainz_document(target, &value)
     }
 
+    /// Background text-search fallback: find the best-matching recording for a track by its
+    /// tags (title/artist/album), returning the top candidate's MBIDs + score so the caller
+    /// can confidence-gate it. Used for tracks AcoustID can't fingerprint-match.
+    pub fn search_recording(
+        &self,
+        title: &str,
+        artist: &str,
+        album: &str,
+        year: Option<u16>,
+    ) -> Result<Option<RecordingSearchMatch>, String> {
+        let query = recording_search_query(title, artist, album, year);
+        if query.is_empty() {
+            return Ok(None);
+        }
+        // `Err` = a transport/HTTP failure (caller retries); `Ok(None)` = no candidate.
+        let value = self.fetch_search(MusicBrainzSearchEntityType::Recording, &query, 5)?;
+        let best = recording_candidates(&value)
+            .into_iter()
+            .max_by_key(|candidate| candidate.score.unwrap_or(0));
+        Ok(best.map(|best| RecordingSearchMatch {
+            recording_mbid: best.id,
+            release_mbid: best.releases.first().map(|release| release.id.clone()),
+            score: best.score.unwrap_or(0),
+            artist: best.artist_credit.join(", "),
+            title: best.title.unwrap_or_default(),
+        }))
+    }
+
     fn fetch_search(
         &self,
         entity_type: MusicBrainzSearchEntityType,
@@ -721,15 +749,34 @@ pub fn cover_art_archive_targets(tracks: &[Track], base_url: &str) -> Vec<CoverA
 }
 
 pub fn musicbrainz_track_candidate_query(track: &Track) -> String {
-    let mut parts = Vec::new();
+    recording_search_query(
+        &track.title,
+        &track.artist_name,
+        &track.album_title,
+        track.year,
+    )
+}
 
-    push_musicbrainz_query_field(&mut parts, "recording", &track.title);
-    push_musicbrainz_query_field(&mut parts, "artist", &track.artist_name);
-    push_musicbrainz_query_field(&mut parts, "release", &track.album_title);
-    if let Some(year) = track.year {
+/// The top MusicBrainz recording match for a text search, with enough to confidence-gate it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordingSearchMatch {
+    pub recording_mbid: String,
+    pub release_mbid: Option<String>,
+    /// MusicBrainz relevance score, 0–100.
+    pub score: u64,
+    pub artist: String,
+    pub title: String,
+}
+
+/// Build a MusicBrainz recording-search query from track tags.
+fn recording_search_query(title: &str, artist: &str, album: &str, year: Option<u16>) -> String {
+    let mut parts = Vec::new();
+    push_musicbrainz_query_field(&mut parts, "recording", title);
+    push_musicbrainz_query_field(&mut parts, "artist", artist);
+    push_musicbrainz_query_field(&mut parts, "release", album);
+    if let Some(year) = year {
         parts.push(format!("date:{year}"));
     }
-
     parts.join(" AND ")
 }
 

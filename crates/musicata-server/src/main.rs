@@ -670,6 +670,7 @@ async fn library_scan_loop(
     // Fingerprint untagged tracks first (resolves MBIDs), then enrich their metadata
     // from MusicBrainz, then fill covers (which can now reach the id-exact providers).
     fingerprint_pass(&database, &providers, &activity).await;
+    musicbrainz_search_pass(&database, &activity).await;
     musicbrainz_enrich_pass(&database, &activity).await;
     // Re-apply resolved enrichment AND user artist-merges over the folder-derived grouping
     // the scan just reset — unconditionally (so merges apply even with enrichment off),
@@ -696,6 +697,7 @@ async fn library_scan_loop(
         )
         .await;
         fingerprint_pass(&database, &providers, &activity).await;
+        musicbrainz_search_pass(&database, &activity).await;
         musicbrainz_enrich_pass(&database, &activity).await;
         if let Err(error) = database.reapply_canonical_grouping().await {
             tracing::warn!(%error, "reapply canonical grouping failed");
@@ -1226,6 +1228,121 @@ const MB_ENRICH_BATCH: i64 = 25;
 /// (each track's two internal requests are already spaced by the client).
 const MB_REQUEST_INTERVAL: Duration = Duration::from_millis(1100);
 
+/// Tracks text-searched per pass (each is one MusicBrainz request, paced at ~1/s).
+const MB_SEARCH_BATCH: i64 = 50;
+/// Minimum MusicBrainz relevance score (0–100) to accept a text-search match — high, to
+/// avoid pinning a wrong MBID on a messy-tagged track.
+const MB_SEARCH_MIN_SCORE: u64 = 92;
+
+/// The AcoustID fallback: for tracks fingerprinting couldn't identify, search MusicBrainz
+/// by tags (artist/album/title) and accept a high-scoring, name-matching recording. On a
+/// match the track is marked `resolved` (so enrichment + id-exact artwork pick it up);
+/// otherwise `search_not_found` (terminal, so it isn't re-searched). Gated by the same
+/// MusicBrainz toggle; runs after fingerprinting, before enrichment.
+async fn musicbrainz_search_pass(database: &Database, activity: &Arc<activity::ActivityLog>) {
+    if !setting_enabled(database, SETTING_MB_ENRICH).await {
+        return;
+    }
+    let targets = match database.tracks_for_musicbrainz_search(MB_SEARCH_BATCH).await {
+        Ok(targets) => targets,
+        Err(error) => {
+            tracing::warn!(%error, "musicbrainz search: failed to list targets");
+            return;
+        }
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let client = Arc::new(MusicBrainzClient::default());
+    let total = targets.len();
+    let task = activity.start("musicbrainz", format!("Searching MusicBrainz (0/{total})"));
+    let mut resolved = 0usize;
+
+    for (index, target) in targets.into_iter().enumerate() {
+        if index > 0 {
+            tokio::time::sleep(MB_REQUEST_INTERVAL).await;
+        }
+        activity.update(
+            task,
+            format!("Searching MusicBrainz ({}/{total}): {}", index + 1, target.title),
+        );
+        let client = client.clone();
+        let (title, artist, album, year) = (
+            target.title.clone(),
+            target.artist_name.clone(),
+            target.album_title.clone(),
+            target.year,
+        );
+        let outcome = tokio::task::spawn_blocking(move || {
+            client.search_recording(&title, &artist, &album, year)
+        })
+        .await
+        .ok();
+
+        let now = now_unix_seconds();
+        match outcome {
+            Some(Ok(Some(found))) if mb_search_match_is_confident(&found, &target) => {
+                let _ = database
+                    .upsert_track_fingerprint(
+                        &target.track_id,
+                        "resolved",
+                        Some(&found.recording_mbid),
+                        found.release_mbid.as_deref(),
+                        None,
+                        now,
+                    )
+                    .await;
+                resolved += 1;
+            }
+            Some(Ok(_)) => {
+                // Searched, no confident match → terminal marker (don't re-search).
+                let _ = database
+                    .upsert_track_fingerprint(
+                        &target.track_id,
+                        "search_not_found",
+                        None,
+                        None,
+                        None,
+                        now,
+                    )
+                    .await;
+            }
+            // Transport error / task panic → leave it `not_found` to retry next pass.
+            _ => {}
+        }
+    }
+
+    if resolved > 0 {
+        activity.finish(
+            task,
+            true,
+            Some(format!("Identified {resolved} of {total} tracks by search")),
+        );
+    } else {
+        activity.remove(task);
+    }
+}
+
+/// Accept a text-search match only when it's high-scoring AND its artist + title loosely
+/// match the track's tags — guards against MusicBrainz returning a confident-but-wrong row.
+fn mb_search_match_is_confident(
+    found: &musicbrainz::RecordingSearchMatch,
+    target: &musicata_storage::TrackSearchTarget,
+) -> bool {
+    found.score >= MB_SEARCH_MIN_SCORE
+        && loose_text_match(&found.artist, &target.artist_name)
+        && loose_text_match(&found.title, &target.title)
+}
+
+/// Case/diacritic/punctuation-insensitive containment, reusing the artist-key normalizer.
+fn loose_text_match(left: &str, right: &str) -> bool {
+    let (left, right) = (
+        musicata_core::normalize_artist_key(left),
+        musicata_core::normalize_artist_key(right),
+    );
+    !left.is_empty() && !right.is_empty() && (left.contains(&right) || right.contains(&left))
+}
+
 /// After fingerprinting, fetch real metadata for tracks whose recording MBID was resolved
 /// and apply it to the canonical library (so an untagged track stops showing folder-derived
 /// junk). DB-only; never overwrites embedded tags (enforced in `reapply_canonical_grouping`).
@@ -1376,6 +1493,8 @@ fn app(
         .route("/api/artists/aliases", get(list_artist_aliases_route))
         .route("/api/artists/aliases/{alias_key}", delete(unmerge_artists))
         .route("/api/artists/merge", post(merge_artists))
+        .route("/api/identification/stats", get(identification_stats_route))
+        .route("/api/identification/unidentified", get(unidentified_route))
         .route("/api/artists/{id}", get(artist_detail))
         .route("/api/artists/{id}/artwork", get(artist_artwork))
         .route("/api/albums", get(albums))
@@ -2315,6 +2434,62 @@ async fn unmerge_artists(
         .map_err(db_error)?;
     spawn_apply_aliases(state.database.clone());
     Ok(Json(alias_groups(&state.database).await?))
+}
+
+// ---- Identification (MusicBrainz coverage) stats --------------------------
+
+async fn identification_stats_route(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let stats = state
+        .database
+        .identification_stats()
+        .await
+        .map_err(db_error)?;
+    Ok(Json(serde_json::json!({
+        "tracks": { "total": stats.tracks_total, "identified": stats.tracks_identified },
+        "albums": { "total": stats.albums_total, "identified": stats.albums_identified },
+        "artists": { "total": stats.artists_total, "identified": stats.artists_identified },
+        "fingerprint": {
+            "resolved": stats.fingerprint_resolved,
+            "not_found": stats.fingerprint_not_found,
+            "searched": stats.fingerprint_searched,
+        }
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct UnidentifiedQuery {
+    kind: Option<String>,
+    limit: Option<i64>,
+}
+
+/// The biggest unidentified targets (no MusicBrainz recording id on any track), so the user
+/// can see what's missing. `kind=artist` → artists; anything else → albums.
+async fn unidentified_route(
+    State(state): State<AppState>,
+    Query(query): Query<UnidentifiedQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let items = if query.kind.as_deref() == Some("artist") {
+        serde_json::to_value(
+            state
+                .database
+                .unidentified_artists(limit)
+                .await
+                .map_err(db_error)?,
+        )
+    } else {
+        serde_json::to_value(
+            state
+                .database
+                .unidentified_albums(limit)
+                .await
+                .map_err(db_error)?,
+        )
+    }
+    .map_err(|error| AppError::internal(error.to_string()))?;
+    Ok(Json(items))
 }
 
 #[derive(Debug, Serialize)]
@@ -6614,6 +6789,40 @@ mod tests {
     }
 
     #[test]
+    fn mb_search_confidence_gates_score_and_names() {
+        use crate::musicbrainz::RecordingSearchMatch;
+        use musicata_storage::TrackSearchTarget;
+        let target = TrackSearchTarget {
+            track_id: "t".into(),
+            title: "Zombie".into(),
+            artist_name: "Fela Kuti".into(),
+            album_title: "Zombie".into(),
+            year: None,
+        };
+        let good = RecordingSearchMatch {
+            recording_mbid: "rec".into(),
+            release_mbid: None,
+            score: 95,
+            artist: "Fela Kuti".into(),
+            title: "Zombie".into(),
+        };
+        assert!(super::mb_search_match_is_confident(&good, &target));
+        // Below the score floor → rejected even with matching names.
+        assert!(!super::mb_search_match_is_confident(
+            &RecordingSearchMatch { score: 80, ..good.clone() },
+            &target
+        ));
+        // High score but a different artist → rejected (guards confident-but-wrong rows).
+        assert!(!super::mb_search_match_is_confident(
+            &RecordingSearchMatch { artist: "Some Other Band".into(), ..good.clone() },
+            &target
+        ));
+        // Diacritic/case differences still match; genuinely different names don't.
+        assert!(super::loose_text_match("Beyoncé", "beyonce"));
+        assert!(!super::loose_text_match("Fela Kuti", "Miles Davis"));
+    }
+
+    #[test]
     fn acoustid_lookup_reports_real_duration() {
         // A long track reports its real length (AcoustID's duration filter needs it),
         // not the ~120 s fingerprint window.
@@ -6622,6 +6831,50 @@ mod tests {
         assert_eq!(acoustid_lookup_duration(None, 120), 120);
         assert_eq!(acoustid_lookup_duration(Some(0.0), 120), 120);
         assert_eq!(acoustid_lookup_duration(Some(f64::NAN), 95), 95);
+    }
+
+    #[tokio::test]
+    async fn identification_stats_and_unidentified() {
+        let fixture = TestFixture::new("identification");
+        let app = fixture.app().await; // fixture tracks carry no MusicBrainz ids
+
+        let stats: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/identification/stats")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert!(stats["tracks"]["total"].as_i64().unwrap() > 0);
+        assert_eq!(stats["tracks"]["identified"].as_i64().unwrap(), 0);
+        assert!(stats["albums"].is_object() && stats["fingerprint"].is_object());
+
+        // Unidentified albums list = all of them (nothing identified), biggest first.
+        let albums: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.oneshot(
+                    Request::builder()
+                        .uri("/api/identification/unidentified?kind=album&limit=10")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert!(!albums.as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

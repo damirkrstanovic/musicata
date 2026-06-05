@@ -627,6 +627,58 @@ $("#merge-artists").addEventListener("submit", async (event) => {
   }
 });
 
+// ---- Identification (MusicBrainz coverage) --------------------------------
+
+function pct(part, total) {
+  return total ? Math.round((part / total) * 100) : 0;
+}
+
+async function loadIdentification() {
+  try {
+    const [stats, albums, artists] = await Promise.all([
+      api("/api/identification/stats"),
+      api("/api/identification/unidentified?kind=album&limit=25"),
+      api("/api/identification/unidentified?kind=artist&limit=25"),
+    ]);
+    renderIdentStats(stats);
+    renderIdentList($("#ident-albums"), albums, (a) => `${a.title} — ${a.artist_name}`);
+    renderIdentList($("#ident-artists"), artists, (a) => a.name);
+  } catch (error) {
+    $("#ident-stats").innerHTML = `<p class="error">Stats unavailable: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderIdentStats(stats) {
+  const line = (label, group) =>
+    `<div class="ident-stat">
+       <span class="ident-num">${group.identified.toLocaleString()} / ${group.total.toLocaleString()}</span>
+       <span class="ident-label">${label} identified (${pct(group.identified, group.total)}%)</span>
+     </div>`;
+  const fp = stats.fingerprint;
+  $("#ident-stats").innerHTML =
+    line("Tracks", stats.tracks) +
+    line("Albums", stats.albums) +
+    line("Artists", stats.artists) +
+    `<div class="ident-stat">
+       <span class="ident-num">${fp.resolved.toLocaleString()}</span>
+       <span class="ident-label">fingerprint/search matched · ${fp.not_found.toLocaleString()} awaiting retry · ${fp.searched.toLocaleString()} exhausted</span>
+     </div>`;
+}
+
+function renderIdentList(el, items, label) {
+  el.innerHTML = "";
+  if (!items.length) {
+    el.innerHTML = `<p class="admin-hint">Everything here is identified. 🎉</p>`;
+    return;
+  }
+  for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "admin-list-item";
+    row.innerHTML = `<div>${escapeHtml(label(item))}</div><span class="ident-count">${item.track_count} tracks</span>`;
+    el.append(row);
+  }
+}
+
 // ---- Boot -----------------------------------------------------------------
 
 loadSources();
@@ -635,6 +687,9 @@ loadActivity();
 loadArtworkSettings();
 loadAliases();
 loadArtistsForMerge();
+loadIdentification();
+// Coverage grows as the background passes run; refresh periodically.
+setInterval(loadIdentification, 30000);
 connectActivity();
 // Players still poll (for online status), but slowly — the chatty activity feed
 // is now push-based.
