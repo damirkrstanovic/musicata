@@ -664,6 +664,7 @@ async fn library_scan_loop(
     fingerprint_pass(&database, &providers, &activity).await;
     musicbrainz_enrich_pass(&database, &activity).await;
     artwork_fill_pass(&database, &activity, &artwork_cache).await;
+    artist_artwork_fill_pass(&database, &activity, &artwork_cache).await;
     if !incremental {
         return;
     }
@@ -683,6 +684,7 @@ async fn library_scan_loop(
         fingerprint_pass(&database, &providers, &activity).await;
         musicbrainz_enrich_pass(&database, &activity).await;
         artwork_fill_pass(&database, &activity, &artwork_cache).await;
+        artist_artwork_fill_pass(&database, &activity, &artwork_cache).await;
     }
 }
 
@@ -848,6 +850,112 @@ async fn artwork_fill_pass(
         );
     } else {
         // Nothing found this pass — don't leave a noisy entry in the activity log.
+        activity.remove(task);
+    }
+}
+
+/// After a scan, fetch missing **artist** images. Name-based (the library carries no
+/// artist MBIDs), so only Deezer's artist search applies. Mirrors `artwork_fill_pass`:
+/// re-apply already-acquired images first (the rescan wiped the artists table), then —
+/// if fetching is enabled — fetch for the still-imageless artists, rate-limited and
+/// batched, with a `not_found` negative cache.
+async fn artist_artwork_fill_pass(
+    database: &Database,
+    activity: &Arc<activity::ActivityLog>,
+    artwork_cache: &Arc<artwork::ArtworkCache>,
+) {
+    if let Err(error) = database.reapply_acquired_artist_artwork().await {
+        tracing::warn!(%error, "artist artwork: failed to re-apply acquired images");
+    }
+    if !artwork_fetch_enabled(database).await {
+        return;
+    }
+    let registry = Arc::new(artwork_providers::ArtworkProviderRegistry::new(vec![
+        Box::new(artwork_providers::DeezerProvider::new()),
+    ]));
+
+    let retry_before = now_unix_seconds() - ARTWORK_RETRY_SECS;
+    let targets = match database.artists_missing_artwork(retry_before).await {
+        Ok(targets) => targets,
+        Err(error) => {
+            tracing::warn!(%error, "artist artwork: failed to list artists missing images");
+            return;
+        }
+    };
+    if targets.is_empty() {
+        return;
+    }
+
+    let batch: Vec<_> = targets.into_iter().take(ARTWORK_FILL_BATCH).collect();
+    let total = batch.len();
+    let task = activity.start("artwork", format!("Finding artist images (0/{total})"));
+    let mut found = 0usize;
+
+    for (index, target) in batch.into_iter().enumerate() {
+        activity.update(
+            task,
+            format!("Finding artist images ({}/{total}): {}", index + 1, target.name),
+        );
+        let query = artwork_providers::ArtistArtworkQuery {
+            name: target.name.clone(),
+        };
+        let registry = registry.clone();
+        let fetched = tokio::task::spawn_blocking(move || {
+            let image = registry.find_artist(&query)?;
+            let (bytes, ext) = artwork_providers::download_image(&image.image_url).ok()?;
+            Some((image, bytes, ext))
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let now = now_unix_seconds();
+        match fetched {
+            Some((image, bytes, ext)) => {
+                let cache_key =
+                    artwork_providers::acquired_cache_key(&target.artist_id, &image.image_url);
+                artwork_cache.put(&cache_key, ext, &bytes).await;
+                let _ = database
+                    .upsert_acquired_artist_artwork(
+                        &target.artist_id,
+                        image.provider,
+                        Some(&image.image_url),
+                        Some(&cache_key),
+                        Some(ext),
+                        image.width,
+                        "acquired",
+                        now,
+                    )
+                    .await;
+                found += 1;
+            }
+            None => {
+                let _ = database
+                    .upsert_acquired_artist_artwork(
+                        &target.artist_id,
+                        "none",
+                        None,
+                        None,
+                        None,
+                        None,
+                        "not_found",
+                        now,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    // Publish artwork_url for the artists we just acquired images for.
+    let _ = database.reapply_acquired_artist_artwork().await;
+
+    if found > 0 {
+        activity.finish(
+            task,
+            true,
+            Some(format!("Found images for {found} of {total} artists")),
+        );
+    } else {
         activity.remove(task);
     }
 }
@@ -1146,12 +1254,15 @@ fn app(
         .route("/api/zones/{id}/ws", get(zone_ws))
         .route("/api/artists", get(artists))
         .route("/api/artists/{id}", get(artist_detail))
+        .route("/api/artists/{id}/artwork", get(artist_artwork))
         .route("/api/albums", get(albums))
         .route("/api/albums/{id}", get(album_detail))
         .route("/api/browse", get(browse))
         .route("/api/browse/recently-added", get(recently_added))
         .route("/api/history/recent", get(recently_played))
         .route("/api/history/most-played", get(most_played))
+        .route("/api/smart-playlists", get(list_smart_playlists))
+        .route("/api/smart-playlists/{id}", get(smart_playlist_detail))
         .route(
             "/api/playlists",
             get(list_playlists_route).post(create_playlist_route),
@@ -2125,6 +2236,92 @@ async fn most_played(
     });
 
     Ok(Json(items))
+}
+
+// ---- Smart playlists ----
+
+/// One entry in the fixed catalog of computed ("smart") playlists. Unlike user
+/// playlists these aren't stored — each is a live query over listening history /
+/// favorites, so they stay current as you listen.
+#[derive(Debug, Serialize)]
+struct SmartPlaylist {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+}
+
+const SMART_PLAYLISTS: &[SmartPlaylist] = &[
+    SmartPlaylist {
+        id: "top-30-days",
+        name: "Top: last 30 days",
+        description: "Your most-played tracks over the past month.",
+    },
+    SmartPlaylist {
+        id: "never-played",
+        name: "Never played",
+        description: "Library tracks you haven't listened to yet.",
+    },
+    SmartPlaylist {
+        id: "forgotten-favorites",
+        name: "Forgotten favorites",
+        description: "Starred tracks you haven't played in a while.",
+    },
+    SmartPlaylist {
+        id: "most-skipped",
+        name: "Most skipped",
+        description: "Tracks you tend to skip before they finish.",
+    },
+];
+
+/// How many tracks a smart playlist returns, and the rediscovery/recency window.
+const SMART_PLAYLIST_LIMIT: usize = 100;
+const THIRTY_DAYS_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+async fn list_smart_playlists() -> Json<&'static [SmartPlaylist]> {
+    Json(SMART_PLAYLISTS)
+}
+
+/// A smart playlist plus its computed tracks.
+#[derive(Debug, Serialize)]
+struct SmartPlaylistDetail {
+    #[serde(flatten)]
+    playlist: &'static SmartPlaylist,
+    tracks: Vec<Track>,
+}
+
+async fn smart_playlist_detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SmartPlaylistDetail>, AppError> {
+    let playlist = SMART_PLAYLISTS
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| AppError::not_found(format!("unknown smart playlist: {id}")))?;
+    let db = &state.database;
+    let since = now_unix_seconds() - THIRTY_DAYS_SECONDS;
+    let tracks = match playlist.id {
+        "top-30-days" => db
+            .most_played_since(SMART_PLAYLIST_LIMIT, since)
+            .await
+            .map_err(db_error)?
+            .into_iter()
+            .map(|(track, _)| track)
+            .collect(),
+        "never-played" => db.never_played(SMART_PLAYLIST_LIMIT).await.map_err(db_error)?,
+        "forgotten-favorites" => db
+            .forgotten_favorites(SMART_PLAYLIST_LIMIT, since)
+            .await
+            .map_err(db_error)?,
+        "most-skipped" => db
+            .most_skipped(SMART_PLAYLIST_LIMIT)
+            .await
+            .map_err(db_error)?
+            .into_iter()
+            .map(|(track, _)| track)
+            .collect(),
+        other => unreachable!("smart playlist id validated above: {other}"),
+    };
+    Ok(Json(SmartPlaylistDetail { playlist, tracks }))
 }
 
 // ---- Playlists ----
@@ -3479,6 +3676,54 @@ async fn album_artwork(
     serve_artwork(&state.artwork_cache, path, size, headers).await
 }
 
+/// Serve an artist's externally-acquired image (`?size=` aware). Artist art is
+/// acquired-only — there's no folder/embedded source — so a coverless artist is a 404
+/// and the UI shows its monogram. Mirrors the acquired-cover branch of `album_artwork`.
+async fn artist_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ArtworkQuery>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let size = normalize_size(query.size);
+    if let Ok(Some(acquired)) = state.database.acquired_artist_artwork(&id).await
+        && acquired.status == "acquired"
+        && let Some(key) = acquired.cache_key.clone()
+    {
+        let ext = acquired.ext.clone().unwrap_or_else(|| "jpg".to_string());
+        let etag = artwork_etag(&key, size);
+        if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
+            return artwork_not_modified(&etag);
+        }
+        let content_type = image_content_type(&ext);
+        if let Some(bytes) = state.artwork_cache.get(&key, &ext).await {
+            return serve_sized_artwork(&state.artwork_cache, &key, content_type, bytes, size, etag)
+                .await;
+        }
+        // Cache miss but we recorded the source — re-fetch once.
+        if let Some(url) = acquired.remote_url.clone() {
+            let downloaded =
+                tokio::task::spawn_blocking(move || artwork_providers::download_image(&url))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+            if let Some((bytes, _)) = downloaded {
+                state.artwork_cache.put(&key, &ext, &bytes).await;
+                return serve_sized_artwork(
+                    &state.artwork_cache,
+                    &key,
+                    content_type,
+                    bytes,
+                    size,
+                    etag,
+                )
+                .await;
+            }
+        }
+    }
+    Err(AppError::not_found(format!("artist has no artwork: {id}")))
+}
+
 async fn album_artwork_candidate(
     State(state): State<AppState>,
     Path((id, artwork_id)): Path<(String, String)>,
@@ -4536,6 +4781,50 @@ mod tests {
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body.contains("unknown artist: missing"));
+    }
+
+    #[tokio::test]
+    async fn artist_artwork_is_404_until_acquired() {
+        let fixture = TestFixture::new("artist-artwork");
+        let library = fixture.library();
+        let artist = library
+            .artists
+            .iter()
+            .find(|artist| artist.name == "Darkwood Dub")
+            .expect("artist")
+            .clone();
+        let app = fixture.app_with_library(library).await;
+
+        // The list response carries an artwork_url field, null when none is acquired.
+        let list: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/artists")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert!(list["items"][0].as_object().unwrap().contains_key("artwork_url"));
+
+        // No image acquired yet → the artwork endpoint 404s (UI shows the monogram).
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/artists/{}/artwork", artist.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -6001,6 +6290,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(favorites["tracks"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn smart_playlists_list_and_detail() {
+        let fixture = TestFixture::new("smart-playlists");
+        let app = fixture.app().await;
+
+        // The catalog lists the fixed set of computed playlists.
+        let catalog: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/smart-playlists")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        let ids: Vec<&str> = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"never-played"));
+        assert!(ids.contains(&"top-30-days"));
+
+        // Nothing has been played, so every library track is "never played".
+        let detail: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/smart-playlists/never-played")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(detail["id"], "never-played");
+        assert!(!detail["tracks"].as_array().unwrap().is_empty());
+
+        // An unknown id is a 404.
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/smart-playlists/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

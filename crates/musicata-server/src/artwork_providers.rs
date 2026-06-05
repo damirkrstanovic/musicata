@@ -68,6 +68,13 @@ impl ArtworkQuery {
     }
 }
 
+/// What we know about an artist when looking for their image. Name-based: this library
+/// (like most) carries no artist MusicBrainz ids, so id-keyed providers can't help.
+#[derive(Clone, Debug)]
+pub struct ArtistArtworkQuery {
+    pub name: String,
+}
+
 /// A found cover: where to download it and (best-effort) its width.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArtworkResult {
@@ -84,6 +91,22 @@ pub trait ArtworkProvider: Send + Sync {
     /// Search for the album's cover. `Ok(None)` = no confident match; `Err` = a
     /// transport/HTTP failure (logged, then the next provider is tried).
     fn find_album_cover(&self, query: &ArtworkQuery) -> Result<Option<ArtworkResult>, String>;
+
+    /// Search for an artist image by name. Defaults to `Ok(None)` — only providers with
+    /// a name-based artist endpoint (Deezer) implement it.
+    fn find_artist_image(
+        &self,
+        _query: &ArtistArtworkQuery,
+    ) -> Result<Option<ArtworkResult>, String> {
+        Ok(None)
+    }
+}
+
+/// Whether a candidate artist name loosely matches the query (one contains the other,
+/// after normalization), guarding name search against grabbing the wrong artist.
+fn artist_matches(query_name: &str, cand_name: &str) -> bool {
+    let (a, b) = (normalize(query_name), normalize(cand_name));
+    !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a))
 }
 
 /// A shared per-provider request clock: serializes calls and spaces them by `interval`
@@ -276,6 +299,23 @@ impl ArtworkProvider for DeezerProvider {
         })?;
         Ok(parse_deezer(&value, query))
     }
+
+    fn find_artist_image(
+        &self,
+        query: &ArtistArtworkQuery,
+    ) -> Result<Option<ArtworkResult>, String> {
+        let url = format!("{}/search/artist", self.base_url);
+        let value = self.limiter.run(|| {
+            self.agent
+                .get(&url)
+                .query("q", &query.name)
+                .call()
+                .map_err(http_error)?
+                .into_json::<Value>()
+                .map_err(|error| error.to_string())
+        })?;
+        Ok(parse_deezer_artist(&value, query))
+    }
 }
 
 fn parse_deezer(value: &Value, query: &ArtworkQuery) -> Option<ArtworkResult> {
@@ -298,6 +338,30 @@ fn parse_deezer(value: &Value, query: &ArtworkQuery) -> Option<ArtworkResult> {
     Some(ArtworkResult {
         provider: "deezer",
         image_url: cover.to_string(),
+        width: Some(1000),
+    })
+}
+
+/// Pick an artist image from a Deezer `/search/artist` response: the first candidate
+/// whose name loosely matches, preferring the largest portrait. Deezer serves a generic
+/// silhouette for artists it has no photo for; those URLs contain `/artist//` (an empty
+/// id segment), so skip them.
+fn parse_deezer_artist(value: &Value, query: &ArtistArtworkQuery) -> Option<ArtworkResult> {
+    let data = value.get("data")?.as_array()?;
+    let chosen = data.iter().find(|r| {
+        artist_matches(
+            &query.name,
+            r.get("name").and_then(Value::as_str).unwrap_or(""),
+        )
+    })?;
+    let picture = chosen
+        .get("picture_xl")
+        .or_else(|| chosen.get("picture_big"))
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty() && !url.contains("/artist//"))?;
+    Some(ArtworkResult {
+        provider: "deezer",
+        image_url: picture.to_string(),
         width: Some(1000),
     })
 }
@@ -485,6 +549,20 @@ impl ArtworkProviderRegistry {
         }
         None
     }
+
+    /// Try each provider's artist-image search in order; return the first confident hit.
+    pub fn find_artist(&self, query: &ArtistArtworkQuery) -> Option<ArtworkResult> {
+        for provider in &self.providers {
+            match provider.find_artist_image(query) {
+                Ok(Some(result)) => return Some(result),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(provider = provider.id(), %error, "artist image provider failed");
+                }
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -539,6 +617,36 @@ mod tests {
         assert_eq!(result.provider, "deezer");
         assert_eq!(result.image_url, "https://e-cdn/cover/xl.jpg");
         assert_eq!(result.width, Some(1000));
+    }
+
+    #[test]
+    fn deezer_artist_picks_matching_portrait() {
+        let value = serde_json::json!({
+            "data": [
+                { "name": "Some Other Band", "picture_xl": "https://e-cdn/artist/other.jpg" },
+                { "name": "Azra", "picture_xl": "https://e-cdn/artist/azra-xl.jpg" }
+            ]
+        });
+        let query = ArtistArtworkQuery { name: "Azra".to_string() };
+        let result = parse_deezer_artist(&value, &query).expect("match");
+        assert_eq!(result.provider, "deezer");
+        assert_eq!(result.image_url, "https://e-cdn/artist/azra-xl.jpg");
+    }
+
+    #[test]
+    fn deezer_artist_skips_silhouette_and_mismatch() {
+        // A generic Deezer silhouette URL (empty id segment) is rejected…
+        let silhouette = serde_json::json!({
+            "data": [{ "name": "Azra", "picture_xl": "https://e-cdn/artist//xl.jpg" }]
+        });
+        let query = ArtistArtworkQuery { name: "Azra".to_string() };
+        assert!(parse_deezer_artist(&silhouette, &query).is_none());
+
+        // …and a name that doesn't match is skipped.
+        let mismatch = serde_json::json!({
+            "data": [{ "name": "Completely Different", "picture_xl": "https://e-cdn/artist/x.jpg" }]
+        });
+        assert!(parse_deezer_artist(&mismatch, &query).is_none());
     }
 
     #[test]

@@ -415,11 +415,15 @@ export async function scaleFlows(ctx) {
     await new Promise((r) => setTimeout(r, 700));
     const artistHero = !document.querySelector('#detail-hero').hidden && document.querySelector('#detail-hero .eyebrow')?.textContent === 'Artist';
     const artistAlbums = document.querySelectorAll('#browse-grid .album-card').length;
+    // The artist page is albums-only — the track list must be actually hidden, not just
+    // flagged hidden (a CSS display rule once overrode the [hidden] attribute).
+    const artistTracksVisible =
+      getComputedStyle(document.querySelector('#track-list')).display !== 'none';
     const backShown = !document.querySelector('#back-btn').hidden;
     history.back();
     await new Promise((r) => setTimeout(r, 700));
     const backToAlbum = (document.querySelector('.hero-title')?.textContent || '') === albumTitle;
-    return { heroShown, hasTracks, hasArtistLink, artistHero, artistAlbums, backShown, backToAlbum };
+    return { heroShown, hasTracks, hasArtistLink, artistHero, artistAlbums, artistTracksVisible, backShown, backToAlbum };
   })()`);
   if (detail.skip) {
     results.push({ name: "browse master→detail", skipped: true, reason: "no album cards" });
@@ -429,7 +433,40 @@ export async function scaleFlows(ctx) {
       checks: [
         check("album opens a hero + tracklist", detail.heroShown && detail.hasTracks, `hero=${detail.heroShown} tracks=${detail.hasTracks}`),
         check("artist link opens the artist page", detail.artistHero && detail.artistAlbums > 0, `${detail.artistAlbums} albums`),
+        check("artist page hides the track list", !detail.artistTracksVisible, `tracksVisible=${detail.artistTracksVisible}`),
         check("Back returns to the album", detail.backShown && detail.backToAlbum, `back=${detail.backToAlbum}`),
+      ],
+    });
+  }
+
+  // Long artist names must clip to their card, not bleed into the next column. Switch to
+  // the Artists grid and check the widest name still fits its card.
+  await reset();
+  const artistGrid = await ev(`(async () => {
+    document.querySelector('#segmented .seg[data-view="artists"]').click();
+    await new Promise((r) => setTimeout(r, 700));
+    const cards = [...document.querySelectorAll('#browse-grid .artist-card')];
+    if (!cards.length) return { skip: true };
+    let worst = 0, longest = '';
+    for (const card of cards) {
+      const s = card.querySelector('.card-text strong');
+      if (!s) continue;
+      const over = s.getBoundingClientRect().width - card.getBoundingClientRect().width;
+      if (over > worst) { worst = over; longest = s.textContent; }
+    }
+    return { count: cards.length, worst: Math.round(worst), longest };
+  })()`);
+  if (artistGrid.skip) {
+    results.push({ name: "artist cards clip long names", skipped: true, reason: "no artist cards" });
+  } else {
+    results.push({
+      name: "artist cards clip long names",
+      checks: [
+        check(
+          "names stay within the card",
+          artistGrid.worst <= 1,
+          `worst overflow=${artistGrid.worst}px on "${artistGrid.longest}" across ${artistGrid.count} cards`,
+        ),
       ],
     });
   }
@@ -454,6 +491,33 @@ export async function scaleFlows(ctx) {
     checks: [
       check("a modal appears (no native confirm)", modal.modalShown, `shown=${modal.modalShown}`),
       check("confirming deletes the playlist", modal.gone && modal.closed, `gone=${modal.gone}`),
+    ],
+  });
+
+  // Smart playlists: a fixed catalog of computed views. With nothing played in the
+  // scale library, "Never played" lists tracks. Open it and confirm a master track list
+  // renders (and a track is playable through the normal row).
+  await reset();
+  const smart = await ev(`(async () => {
+    await loadSmartPlaylists();
+    const sidebarCount = document.querySelectorAll('#smart-playlists .playlist-item').length;
+    await openSmartPlaylistView('never-played');
+    await new Promise((r) => setTimeout(r, 500));
+    const active = document.querySelectorAll('#smart-playlists .playlist-item.is-active').length;
+    const title = document.querySelector('#view-title')?.textContent || '';
+    const trackCount = document.querySelectorAll('#track-list .track').length;
+    return { sidebarCount, active, title, trackCount };
+  })()`);
+  results.push({
+    name: "smart playlist opens and lists tracks",
+    checks: [
+      check("catalog renders in the sidebar", smart.sidebarCount >= 3, `count=${smart.sidebarCount}`),
+      check("the opened entry is highlighted", smart.active === 1, `active=${smart.active}`),
+      check(
+        "opening never-played lists tracks",
+        smart.trackCount > 0,
+        `title=${smart.title} tracks=${smart.trackCount}`,
+      ),
     ],
   });
 

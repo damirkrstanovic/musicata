@@ -14,6 +14,8 @@ const state = {
   favoriteTrackIds: new Set(),
   playlists: [],
   currentPlaylistId: null,
+  smartPlaylists: [],
+  currentSmartId: null,
   addMenu: null,
   radio: [],
   trackStream: null,
@@ -54,6 +56,7 @@ const els = {
   browseComposer: document.querySelector("#browse-composer"),
   browseClear: document.querySelector("#browse-clear"),
   playlists: document.querySelector("#playlists"),
+  smartPlaylists: document.querySelector("#smart-playlists"),
   newPlaylist: document.querySelector("#new-playlist"),
   newPlaylistForm: document.querySelector("#new-playlist-form"),
   newPlaylistName: document.querySelector("#new-playlist-name"),
@@ -486,6 +489,22 @@ function sizedArtwork(url, size) {
   return `${url}${url.includes("?") ? "&" : "?"}size=${size}`;
 }
 
+// The monogram shown for a coverless album: first letter of the title (or artist).
+function albumInitial(album) {
+  const source = (album.title || album.artist_name || "?").trim();
+  return (source.charAt(0) || "?").toUpperCase();
+}
+
+// The inside of an artist avatar: their acquired image when present, else a monogram.
+// The <img> falls back to the monogram if it fails to load (e.g. cleared cache).
+function artistAvatarInner(artist, size) {
+  const initial = (artist.name || "?").trim().charAt(0).toUpperCase() || "?";
+  const mono = escapeHtml(initial);
+  if (!artist.artwork_url) return mono;
+  return `<img src="${sizedArtwork(artist.artwork_url, size)}" alt="" loading="lazy"
+    onerror="this.replaceWith(document.createTextNode('${mono}'))">`;
+}
+
 // A cover-forward album card for the browse grid. Click → album detail; the play overlay
 // plays the album; `back` is the closure that re-renders where this card was opened from.
 function buildAlbumCard(album, back) {
@@ -496,7 +515,7 @@ function buildAlbumCard(album, back) {
   card.tabIndex = 0;
   const cover = album.artwork_url
     ? `<img src="${sizedArtwork(album.artwork_url, 300)}" alt="" loading="lazy">`
-    : `<span class="album-placeholder"></span>`;
+    : `<span class="album-placeholder">${escapeHtml(albumInitial(album))}</span>`;
   card.innerHTML = `
     <div class="card-cover">
       ${cover}
@@ -526,9 +545,8 @@ function buildArtistCard(artist, back) {
   card.dataset.artistId = artist.id;
   card.setAttribute("role", "button");
   card.tabIndex = 0;
-  const initial = (artist.name || "?").trim().charAt(0).toUpperCase();
   card.innerHTML = `
-    <div class="artist-avatar" aria-hidden="true">${escapeHtml(initial)}</div>
+    <div class="artist-avatar" aria-hidden="true">${artistAvatarInner(artist, 300)}</div>
     <div class="card-text">
       <strong>${escapeHtml(artist.name)}</strong>
       <span>${countLabel(artist.album_count, "album")} · ${countLabel(artist.track_count, "track")}</span>
@@ -640,7 +658,7 @@ function renderAlbumHero(detail) {
   els.detailHero.innerHTML = `
     <div class="hero-cover">${album.artwork_url
       ? `<img src="${sizedArtwork(album.artwork_url, 600)}" alt="">`
-      : `<span class="album-placeholder"></span>`}</div>
+      : `<span class="album-placeholder">${escapeHtml(albumInitial(album))}</span>`}</div>
     <div class="hero-info">
       <p class="eyebrow">Album</p>
       <h2 class="hero-title">${escapeHtml(album.title)}</h2>
@@ -663,10 +681,9 @@ function renderAlbumHero(detail) {
 function renderArtistHero(detail) {
   const artist = detail.artist;
   const tracks = detail.tracks || [];
-  const initial = (artist.name || "?").trim().charAt(0).toUpperCase();
   const meta = `${countLabel(artist.album_count, "album")} · ${countLabel(artist.track_count, "track")}`;
   els.detailHero.innerHTML = `
-    <div class="hero-cover artist"><span class="artist-avatar large" aria-hidden="true">${escapeHtml(initial)}</span></div>
+    <div class="hero-cover artist"><span class="artist-avatar large" aria-hidden="true">${artistAvatarInner(artist, 600)}</span></div>
     <div class="hero-info">
       <p class="eyebrow">Artist</p>
       <h2 class="hero-title">${escapeHtml(artist.name)}</h2>
@@ -774,7 +791,9 @@ async function setView(view) {
   clearInterval(recentRefreshTimer);
   recentRefreshTimer = 0;
   state.currentPlaylistId = null;
+  state.currentSmartId = null;
   renderPlaylistsSidebar();
+  renderSmartPlaylistsSidebar();
 
   if (view === "albums") {
     await openAlbumsView();
@@ -1061,6 +1080,63 @@ async function loadPlaylists() {
   renderPlaylistsSidebar();
 }
 
+// The smart-playlist catalog is fixed (computed views over history/favorites); fetch it
+// once and render it as a read-only sidebar list.
+async function loadSmartPlaylists() {
+  try {
+    state.smartPlaylists = await api("/api/smart-playlists");
+  } catch {
+    state.smartPlaylists = [];
+  }
+  renderSmartPlaylistsSidebar();
+}
+
+function renderSmartPlaylistsSidebar() {
+  els.smartPlaylists.innerHTML = "";
+  if (!state.smartPlaylists.length) return;
+  for (const smart of state.smartPlaylists) {
+    const row = document.createElement("div");
+    row.className =
+      "playlist-item" + (smart.id === state.currentSmartId ? " is-active" : "");
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "pl-open";
+    open.title = smart.description;
+    open.innerHTML = `<span class="pl-name">${escapeHtml(smart.name)}</span>`;
+    open.addEventListener("click", () => openSmartPlaylistView(smart.id));
+    row.append(open);
+    els.smartPlaylists.append(row);
+  }
+}
+
+// Open a computed playlist: same master view as a user playlist, but read-only and
+// fetched live from /api/smart-playlists/{id}.
+async function openSmartPlaylistView(id) {
+  markNavActive("smart");
+  resetNav();
+  renderSort(null);
+  showPanels({ tracks: true });
+  state.currentPlaylistId = null;
+  state.currentSmartId = id;
+  renderPlaylistsSidebar();
+  renderSmartPlaylistsSidebar();
+  closeDrawerOnMobile();
+  renderLoading(6);
+  try {
+    const detail = await api(`/api/smart-playlists/${encodeURIComponent(id)}`);
+    if (state.currentSmartId !== id) return; // switched away while loading
+    state.visibleTracks = detail.tracks;
+    els.viewTitle.textContent = detail.name;
+    if (!detail.tracks.length) {
+      els.trackList.innerHTML = `<p class="empty">${escapeHtml(detail.description)}<br>Nothing here yet.</p>`;
+    } else {
+      renderTracks(detail.tracks);
+    }
+  } catch (error) {
+    els.trackList.innerHTML = `<p class="error">Failed to load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
 function renderPlaylistsSidebar() {
   els.playlists.innerHTML = "";
   if (!state.playlists.length) {
@@ -1098,7 +1174,9 @@ async function openPlaylistView(id) {
   renderSort(null);
   showPanels({ tracks: true });
   state.currentPlaylistId = id;
+  state.currentSmartId = null;
   renderPlaylistsSidebar();
+  renderSmartPlaylistsSidebar();
   closeDrawerOnMobile();
   renderLoading(6);
   try {
@@ -2477,6 +2555,7 @@ if ("serviceWorker" in navigator) {
 renderLoading();
 loadLibrary();
 loadPlaylists();
+loadSmartPlaylists();
 loadRadio();
 loadFavoriteIds().then(refreshHearts);
 

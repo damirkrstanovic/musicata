@@ -249,6 +249,20 @@ impl Database {
             set_user_version(&self.pool, 22).await?;
         }
 
+        if version < 23 {
+            for statement in MIGRATION_023_LISTEN_EVENT_KIND {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 23).await?;
+        }
+
+        if version < 24 {
+            for statement in MIGRATION_024_ARTIST_ARTWORK {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 24).await?;
+        }
+
         Ok(())
     }
 
@@ -510,6 +524,9 @@ impl Database {
                 name: row.try_get("name")?,
                 album_count: i64_to_usize(row.try_get("album_count")?, "album_count")?,
                 track_count: i64_to_usize(row.try_get("track_count")?, "track_count")?,
+                // The in-memory library snapshot (used for scan/merge) doesn't carry the
+                // served artwork URL — it lives in the DB column, re-applied post-scan.
+                artwork_url: None,
             });
         }
 
@@ -831,6 +848,9 @@ impl Database {
                 name: row.try_get("name")?,
                 album_count: i64_to_usize(row.try_get("album_count")?, "album_count")?,
                 track_count: i64_to_usize(row.try_get("track_count")?, "track_count")?,
+                // The in-memory library snapshot (used for scan/merge) doesn't carry the
+                // served artwork URL — it lives in the DB column, re-applied post-scan.
+                artwork_url: None,
             });
         }
 
@@ -953,7 +973,7 @@ impl Database {
             "total",
         )?;
         let sql = format!(
-            "SELECT id, name, album_count, track_count FROM artists ORDER BY {} LIMIT ?1 OFFSET ?2",
+            "SELECT id, name, album_count, track_count, artwork_url FROM artists ORDER BY {} LIMIT ?1 OFFSET ?2",
             artist_order_clause(sort)
         );
         let rows = sqlx::query(&sql)
@@ -1141,7 +1161,7 @@ impl Database {
 
     pub async fn artist(&self, id: &str) -> Result<Option<Artist>> {
         let row =
-            sqlx::query("SELECT id, name, album_count, track_count FROM artists WHERE id = ?1")
+            sqlx::query("SELECT id, name, album_count, track_count, artwork_url FROM artists WHERE id = ?1")
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -1438,6 +1458,111 @@ impl Database {
              WHERE artwork_url IS NULL
                AND EXISTS (SELECT 1 FROM acquired_album_artwork q
                            WHERE q.album_id = albums.id AND q.status = 'acquired')",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    // ---- Acquired (externally fetched) artist artwork ------------------------
+
+    /// Artists that still need an image fetched: no `artwork_url`, and either never
+    /// attempted or last marked `not_found` before `retry_before` (so a coverless artist
+    /// isn't re-queried on every rescan). Already-`acquired` artists are excluded.
+    pub async fn artists_missing_artwork(
+        &self,
+        retry_before_unix_seconds: i64,
+    ) -> Result<Vec<ArtistArtworkTarget>> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.name
+             FROM artists a
+             LEFT JOIN acquired_artist_artwork q ON q.artist_id = a.id
+             WHERE a.artwork_url IS NULL
+               AND (q.artist_id IS NULL
+                    OR (q.status = 'not_found' AND q.acquired_at_unix_seconds < ?1))
+             ORDER BY a.track_count DESC, a.name",
+        )
+        .bind(retry_before_unix_seconds)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(ArtistArtworkTarget {
+                    artist_id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Record the outcome of an artist-image fetch (`acquired` with the cache reference,
+    /// or `not_found`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_acquired_artist_artwork(
+        &self,
+        artist_id: &str,
+        provider: &str,
+        remote_url: Option<&str>,
+        cache_key: Option<&str>,
+        ext: Option<&str>,
+        width: Option<u32>,
+        status: &str,
+        now_unix_seconds: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO acquired_artist_artwork
+                (artist_id, provider, remote_url, cache_key, ext, width, status, acquired_at_unix_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(artist_id) DO UPDATE SET
+                provider = ?2, remote_url = ?3, cache_key = ?4, ext = ?5, width = ?6,
+                status = ?7, acquired_at_unix_seconds = ?8",
+        )
+        .bind(artist_id)
+        .bind(provider)
+        .bind(remote_url)
+        .bind(cache_key)
+        .bind(ext)
+        .bind(width.map(|w| w as i64))
+        .bind(status)
+        .bind(now_unix_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The acquired-image record for an artist, if any (used by the serve handler).
+    pub async fn acquired_artist_artwork(&self, artist_id: &str) -> Result<Option<AcquiredArtwork>> {
+        let Some(row) = sqlx::query(
+            "SELECT provider, remote_url, cache_key, ext, width, status
+             FROM acquired_artist_artwork WHERE artist_id = ?1",
+        )
+        .bind(artist_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(AcquiredArtwork {
+            provider: row.try_get("provider")?,
+            remote_url: row.try_get("remote_url")?,
+            cache_key: row.try_get("cache_key")?,
+            ext: row.try_get("ext")?,
+            width: row.try_get::<Option<i64>, _>("width")?.map(|w| w as u32),
+            status: row.try_get("status")?,
+        }))
+    }
+
+    /// Re-apply acquired artist images' `artwork_url` after a rescan wiped the artists
+    /// table. Pure DB, no network. Returns how many artists were restored.
+    pub async fn reapply_acquired_artist_artwork(&self) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE artists SET artwork_url =
+                '/api/artists/' || id || '/artwork?asset=' ||
+                (SELECT cache_key FROM acquired_artist_artwork q
+                 WHERE q.artist_id = artists.id AND q.status = 'acquired')
+             WHERE artwork_url IS NULL
+               AND EXISTS (SELECT 1 FROM acquired_artist_artwork q
+                           WHERE q.artist_id = artists.id AND q.status = 'acquired')",
         )
         .execute(&self.pool)
         .await?;
@@ -2147,20 +2272,24 @@ impl Database {
         Ok(())
     }
 
-    /// Records one confirmed listen. `listened_at` is when the track started playing.
+    /// Records one playback event. `listened_at` is when the track started playing;
+    /// `kind` distinguishes a confirmed listen ([`ListenKind::Played`]) from a skip
+    /// ([`ListenKind::Skipped`]).
     pub async fn record_listen(
         &self,
         track_id: &str,
         player_id: &str,
         listened_at: i64,
+        kind: ListenKind,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO listens (track_id, player_id, listened_at_unix_seconds)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO listens (track_id, player_id, listened_at_unix_seconds, event_kind)
+             VALUES (?1, ?2, ?3, ?4)",
         )
         .bind(track_id)
         .bind(player_id)
         .bind(listened_at)
+        .bind(kind.as_str())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2174,6 +2303,7 @@ impl Database {
         let sql = format!(
             "SELECT {columns}, MAX(l.listened_at_unix_seconds) AS last_listen
              FROM listens l JOIN tracks t ON t.id = l.track_id
+             WHERE l.event_kind = 'played'
              GROUP BY l.track_id
              ORDER BY last_listen DESC
              LIMIT ?1"
@@ -2198,13 +2328,47 @@ impl Database {
     }
 
     /// Tracks paired with their listen count, most played first. Ties break on recency.
+    /// Counts confirmed listens only (skips are excluded).
     pub async fn most_played(&self, limit: usize) -> Result<Vec<(Track, i64)>> {
+        self.most_played_since(limit, i64::MIN).await
+    }
+
+    /// Like [`most_played`](Self::most_played) but restricted to listens at or after
+    /// `since_unix` — e.g. "top tracks in the last 30 days". Confirmed listens only.
+    pub async fn most_played_since(
+        &self,
+        limit: usize,
+        since_unix: i64,
+    ) -> Result<Vec<(Track, i64)>> {
         let columns = track_columns("t");
         let sql = format!(
             "SELECT {columns}, COUNT(*) AS plays
              FROM listens l JOIN tracks t ON t.id = l.track_id
+             WHERE l.event_kind = 'played' AND l.listened_at_unix_seconds >= ?2
              GROUP BY l.track_id
              ORDER BY plays DESC, MAX(l.listened_at_unix_seconds) DESC
+             LIMIT ?1"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit as i64)
+            .bind(since_unix)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| Ok((track_from_row(row)?, row.try_get("plays")?)))
+            .collect()
+    }
+
+    /// Tracks most often skipped, most-skipped first. Ties break on the most recent
+    /// skip. Mirrors [`most_played`](Self::most_played) over the `skipped` rows.
+    pub async fn most_skipped(&self, limit: usize) -> Result<Vec<(Track, i64)>> {
+        let columns = track_columns("t");
+        let sql = format!(
+            "SELECT {columns}, COUNT(*) AS skips
+             FROM listens l JOIN tracks t ON t.id = l.track_id
+             WHERE l.event_kind = 'skipped'
+             GROUP BY l.track_id
+             ORDER BY skips DESC, MAX(l.listened_at_unix_seconds) DESC
              LIMIT ?1"
         );
         let rows = sqlx::query(&sql)
@@ -2212,8 +2376,61 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
         rows.iter()
-            .map(|row| Ok((track_from_row(row)?, row.try_get("plays")?)))
+            .map(|row| Ok((track_from_row(row)?, row.try_get("skips")?)))
             .collect()
+    }
+
+    /// Library tracks with no confirmed listen in the retained history window, newest
+    /// additions first. NOTE: history is pruned to a rolling window, so a track last
+    /// played before the window fell off counts as "never played" here — this is
+    /// "never played recently", not lifetime-never. Lifetime tracking would need an
+    /// unpruned per-track counter.
+    pub async fn never_played(&self, limit: usize) -> Result<Vec<Track>> {
+        let columns = track_columns("t");
+        let sql = format!(
+            "SELECT {columns}
+             FROM tracks t
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM listens l
+                 WHERE l.track_id = t.id AND l.event_kind = 'played'
+             )
+             ORDER BY t.added_at_unix_seconds DESC, t.id
+             LIMIT ?1"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(track_from_row).collect()
+    }
+
+    /// Favorited tracks with no confirmed listen since `since_unix` — starred music
+    /// you've drifted away from (rediscovery). Most-recently favorited first.
+    pub async fn forgotten_favorites(
+        &self,
+        limit: usize,
+        since_unix: i64,
+    ) -> Result<Vec<Track>> {
+        let columns = track_columns("t");
+        let sql = format!(
+            "SELECT {columns}
+             FROM favorites f JOIN tracks t ON t.id = f.item_id
+             WHERE f.item_type = 'track'
+               AND NOT EXISTS (
+                 SELECT 1 FROM listens l
+                 WHERE l.track_id = t.id
+                   AND l.event_kind = 'played'
+                   AND l.listened_at_unix_seconds >= ?2
+             )
+             ORDER BY f.created_at_unix_seconds DESC, t.id
+             LIMIT ?1"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit as i64)
+            .bind(since_unix)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(track_from_row).collect()
     }
 
     // ---- Playlists ----
@@ -2415,7 +2632,7 @@ impl Database {
 
     pub async fn starred_artists(&self) -> Result<Vec<Artist>> {
         let rows = sqlx::query(
-            "SELECT id, name, album_count, track_count FROM favorites f
+            "SELECT a.id, a.name, a.album_count, a.track_count, a.artwork_url FROM favorites f
              JOIN artists a ON a.id = f.item_id
              WHERE f.item_type = 'artist' ORDER BY f.created_at_unix_seconds DESC",
         )
@@ -2670,6 +2887,25 @@ fn player_record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PlayerRecord>
     })
 }
 
+/// How a playback event counts in listening history: a confirmed listen or a skip.
+/// Stored as the `event_kind` text column on `listens`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenKind {
+    /// The track played past the ListenBrainz threshold (a real listen).
+    Played,
+    /// The track was abandoned before the threshold (after a small noise floor).
+    Skipped,
+}
+
+impl ListenKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ListenKind::Played => "played",
+            ListenKind::Skipped => "skipped",
+        }
+    }
+}
+
 /// The lightweight, persisted playback row for a player's server-owned queue —
 /// everything except the queue items themselves.
 #[derive(Clone, Debug, PartialEq)]
@@ -2695,6 +2931,13 @@ pub struct AlbumArtworkTarget {
     pub album_id: String,
     pub artist_name: String,
     pub title: String,
+}
+
+/// An artist that needs an image fetched from an external provider (name-based).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArtistArtworkTarget {
+    pub artist_id: String,
+    pub name: String,
 }
 
 /// A track that needs audio fingerprinting (to resolve MusicBrainz ids). Carries enough
@@ -2823,6 +3066,7 @@ fn artist_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Artist> {
         name: row.try_get("name")?,
         album_count: i64_to_usize(row.try_get("album_count")?, "album_count")?,
         track_count: i64_to_usize(row.try_get("track_count")?, "track_count")?,
+        artwork_url: row.try_get("artwork_url")?,
     })
 }
 
@@ -3629,10 +3873,13 @@ const MIGRATION_022_TRACK_MUSICBRAINZ_METADATA: &[&str] =
         enriched_at_unix_seconds INTEGER NOT NULL
     )"];
 
-// Listening history. One row per confirmed listen (a track that played past the
-// ListenBrainz threshold — see `players::ListenTracker`). `listened_at` is when the
-// track *started*, so ordering by it reflects when each play began. We keep the raw
-// log (repeats allowed); "recently played" and "most played" aggregate at read time.
+// Listening history. One row per playback event (see `players::ListenTracker`). A
+// `played` row is a confirmed listen — a track played past the ListenBrainz threshold
+// (`min(duration/2, 240s)`); a `skipped` row is a track abandoned before that (the
+// `event_kind` column is added by MIGRATION_023). `listened_at` is when the track
+// *started*, so ordering by it reflects when each play began. We keep the raw log
+// (repeats allowed); "recently played" and "most played" aggregate at read time over
+// the `played` rows.
 const MIGRATION_011_LISTENS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS listens (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3642,6 +3889,35 @@ const MIGRATION_011_LISTENS: &[&str] = &[
     )",
     "CREATE INDEX IF NOT EXISTS idx_listens_at ON listens(listened_at_unix_seconds)",
     "CREATE INDEX IF NOT EXISTS idx_listens_track ON listens(track_id)",
+];
+
+// Distinguish confirmed listens from skips. Existing rows predate the completion rule
+// (they were recorded on track-start), so they backfill to 'played' — the closest
+// truth available. NOTE: the column is added only here via ALTER, never in the v11
+// CREATE TABLE, so a fresh DB (which runs both in sequence) doesn't hit a duplicate
+// column.
+const MIGRATION_023_LISTEN_EVENT_KIND: &[&str] = &[
+    "ALTER TABLE listens ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'played'",
+    "CREATE INDEX IF NOT EXISTS idx_listens_kind ON listens(event_kind)",
+];
+
+// Artist images. Like albums, artists are rebuilt by `save_library` each scan, so the
+// served `artwork_url` is re-applied after a rescan from the acquired record. Artist art
+// is *acquired-only* (no folder/embedded source) and name-based (the library carries no
+// artist MBIDs): `acquired_artist_artwork` mirrors `acquired_album_artwork` — no foreign
+// key, `artist_id` stable across rescans, `status` is `acquired` or `not_found`.
+const MIGRATION_024_ARTIST_ARTWORK: &[&str] = &[
+    "ALTER TABLE artists ADD COLUMN artwork_url TEXT",
+    "CREATE TABLE IF NOT EXISTS acquired_artist_artwork (
+        artist_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        remote_url TEXT,
+        cache_key TEXT,
+        ext TEXT,
+        width INTEGER,
+        status TEXT NOT NULL,
+        acquired_at_unix_seconds INTEGER NOT NULL
+    )",
 ];
 
 // Full-text search indexes. These are external-content FTS5 tables (they store
@@ -3852,7 +4128,7 @@ async fn ensure_column(
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivityRecord, Database, ResolvedMusicBrainzMetadata, SourceRecord};
+    use super::{ActivityRecord, Database, ListenKind, ResolvedMusicBrainzMetadata, SourceRecord};
     use musicata_core::{
         Album, Artist, BrowseFilter, Library, MetadataApprovalState, MetadataFieldValue,
         ProviderMapping, ScanIssue, Track, TrackMetadataObservation,
@@ -4374,9 +4650,10 @@ mod tests {
         .expect("insert second track");
 
         // track_1 played twice, track_2 once. Newest listen is track_1 at t=300.
-        database.record_listen("track_1", "p", 100).await.unwrap();
-        database.record_listen("track_2", "p", 200).await.unwrap();
-        database.record_listen("track_1", "p", 300).await.unwrap();
+        let played = ListenKind::Played;
+        database.record_listen("track_1", "p", 100, played).await.unwrap();
+        database.record_listen("track_2", "p", 200, played).await.unwrap();
+        database.record_listen("track_1", "p", 300, played).await.unwrap();
 
         // Recently played: distinct tracks, newest-listen first, each with its most
         // recent listen time (track_1's is 300, not 100).
@@ -4394,7 +4671,7 @@ mod tests {
         assert_eq!(most[1].1, 1);
 
         // A listen for a track no longer in the library is dropped by the join.
-        database.record_listen("ghost", "p", 400).await.unwrap();
+        database.record_listen("ghost", "p", 400, played).await.unwrap();
         let recent = database.recently_played(10).await.expect("recent again");
         assert!(recent.iter().all(|(track, _)| track.id != "ghost"));
 
@@ -4406,6 +4683,96 @@ mod tests {
         assert_eq!(most.len(), 1);
         assert_eq!(most[0].0.id, "track_1");
         assert_eq!(most[0].1, 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn listens_distinguish_plays_from_skips() {
+        let db_path = temp_db_path("listens-event-kind");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        // Two bare tracks, inserted directly (no fixture) so never_played's whole-table
+        // scan is predictable.
+        for (id, title) in [("t_a", "Alpha"), ("t_b", "Beta")] {
+            sqlx::query(
+                "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id,
+                    artist_name, album_id, album_title, extension, relative_path, stream_url,
+                    path, added_at_unix_seconds)
+                 VALUES (?1, 'local-disk', ?2, ?3, 'artist_1', 'Artist', 'album_1', 'Album',
+                    'mp3', ?2, ?4, ?5, 10)",
+            )
+            .bind(id)
+            .bind(format!("album/{id}.mp3"))
+            .bind(title)
+            .bind(format!("/api/tracks/{id}/stream"))
+            .bind(format!("/music/album/{id}.mp3"))
+            .execute(&database.pool)
+            .await
+            .expect("insert track");
+        }
+
+        let played = ListenKind::Played;
+        let skipped = ListenKind::Skipped;
+        // t_a: a real listen at t=100 and t=200. t_b: only skips at t=150 and t=250.
+        database.record_listen("t_a", "p", 100, played).await.unwrap();
+        database.record_listen("t_a", "p", 200, played).await.unwrap();
+        database.record_listen("t_b", "p", 150, skipped).await.unwrap();
+        database.record_listen("t_b", "p", 250, skipped).await.unwrap();
+
+        // most_played counts confirmed listens only — t_b's skips don't appear.
+        let most = database.most_played(10).await.unwrap();
+        assert_eq!(most.len(), 1);
+        assert_eq!(most[0].0.id, "t_a");
+        assert_eq!(most[0].1, 2);
+
+        // most_skipped is the mirror over skipped rows.
+        let skips = database.most_skipped(10).await.unwrap();
+        assert_eq!(skips.len(), 1);
+        assert_eq!(skips[0].0.id, "t_b");
+        assert_eq!(skips[0].1, 2);
+
+        // never_played = no confirmed listen. t_b qualifies (only skipped); t_a doesn't.
+        let never: Vec<_> = database
+            .never_played(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(never.contains(&"t_b".to_string()));
+        assert!(!never.contains(&"t_a".to_string()));
+
+        // most_played_since(150) drops t_a's t=100 listen, keeping only t=200.
+        let since = database.most_played_since(10, 150).await.unwrap();
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].0.id, "t_a");
+        assert_eq!(since[0].1, 1);
+
+        // Forgotten favorites: star both. With a cutoff of 300, neither has a confirmed
+        // listen at/after it, so both are "forgotten".
+        database.set_favorite("track", "t_a", 50).await.unwrap();
+        database.set_favorite("track", "t_b", 60).await.unwrap();
+        let forgotten: Vec<_> = database
+            .forgotten_favorites(10, 300)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(forgotten.contains(&"t_a".to_string()));
+        assert!(forgotten.contains(&"t_b".to_string()));
+
+        // A fresh confirmed listen at t=400 takes t_a off the forgotten list.
+        database.record_listen("t_a", "p", 400, played).await.unwrap();
+        let forgotten: Vec<_> = database
+            .forgotten_favorites(10, 300)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(forgotten, ["t_b"]);
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -4754,6 +5121,7 @@ mod tests {
                 name: "Artist".to_string(),
                 album_count: 1,
                 track_count: 1,
+                artwork_url: None,
             }],
             albums: vec![Album {
                 id: "album_1".to_string(),
@@ -5164,6 +5532,72 @@ mod tests {
                 .expect("missing")
                 .len(),
             1
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn acquired_artist_artwork_lifecycle() {
+        let db_path = temp_db_path("acquired-artist-artwork");
+        let database = Database::connect(&db_path).await.expect("connect");
+
+        // fixture_library's artist starts with no image.
+        let mut library = fixture_library();
+        database.save_library(&mut library).await.expect("save");
+        let artist_id = library.artists[0].id.clone();
+
+        // It shows up as needing a fetch (ordered by track count, so highest-track first).
+        let missing = database.artists_missing_artwork(0).await.expect("missing");
+        assert!(missing.iter().any(|a| a.artist_id == artist_id));
+
+        // Record a fetched image.
+        database
+            .upsert_acquired_artist_artwork(
+                &artist_id,
+                "deezer",
+                Some("https://example/artist/1000.jpg"),
+                Some("artkey1"),
+                Some("jpg"),
+                Some(1000),
+                "acquired",
+                1_800_000_000,
+            )
+            .await
+            .expect("upsert");
+
+        let acquired = database
+            .acquired_artist_artwork(&artist_id)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(acquired.status, "acquired");
+        assert_eq!(acquired.cache_key.as_deref(), Some("artkey1"));
+
+        // No longer "missing".
+        assert!(
+            !database
+                .artists_missing_artwork(2_000_000_000)
+                .await
+                .expect("missing")
+                .iter()
+                .any(|a| a.artist_id == artist_id)
+        );
+
+        // Re-apply restores artwork_url (a rescan wipes the artists table).
+        let restored = database
+            .reapply_acquired_artist_artwork()
+            .await
+            .expect("reapply");
+        assert_eq!(restored, 1);
+        let artist = database
+            .artist(&artist_id)
+            .await
+            .expect("artist")
+            .expect("some");
+        assert_eq!(
+            artist.artwork_url,
+            Some(format!("/api/artists/{artist_id}/artwork?asset=artkey1"))
         );
 
         let _ = std::fs::remove_file(db_path);

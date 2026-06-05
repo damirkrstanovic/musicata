@@ -708,7 +708,12 @@ async fn scrobble(state: &AppState, format: Format, params: &HashMap<String, Str
         // A confirmed external listen feeds the same history as local playback.
         let _ = state
             .database
-            .record_listen(id, "subsonic", crate::now_unix_seconds())
+            .record_listen(
+                id,
+                "subsonic",
+                crate::now_unix_seconds(),
+                musicata_storage::ListenKind::Played,
+            )
             .await;
     }
     ok_response(format, Map::new())
