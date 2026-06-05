@@ -471,6 +471,44 @@ export async function scaleFlows(ctx) {
     });
   }
 
+  // A track row's artist and album names navigate to their pages (and Back returns).
+  await reset();
+  const trackNav = await ev(`(async () => {
+    document.querySelector('#segmented .seg[data-view="library"]').click();
+    await new Promise((r) => setTimeout(r, 600));
+    const row = document.querySelector('#track-list .track');
+    const albumBtn = row && row.querySelector('.track-main [data-nav="album"]:not(:disabled)');
+    if (!albumBtn) return { skip: true };
+    albumBtn.click();
+    await new Promise((r) => setTimeout(r, 700));
+    const albumHero = !document.querySelector('#detail-hero').hidden &&
+      document.querySelector('#detail-hero .eyebrow')?.textContent === 'Album';
+    history.back();
+    await new Promise((r) => setTimeout(r, 600));
+    const backToTracks = document.querySelectorAll('#track-list .track').length > 0;
+    const artistBtn = document.querySelector('#track-list .track .track-main [data-nav="artist"]:not(:disabled)');
+    let artistHero = null;
+    if (artistBtn) {
+      artistBtn.click();
+      await new Promise((r) => setTimeout(r, 700));
+      artistHero = !document.querySelector('#detail-hero').hidden &&
+        document.querySelector('#detail-hero .eyebrow')?.textContent === 'Artist';
+    }
+    return { albumHero, backToTracks, artistHero };
+  })()`);
+  if (trackNav.skip) {
+    results.push({ name: "track row links navigate", skipped: true, reason: "no track rows with ids" });
+  } else {
+    results.push({
+      name: "track row links navigate",
+      checks: [
+        check("album name opens the album page", trackNav.albumHero === true, `albumHero=${trackNav.albumHero}`),
+        check("Back returns to the track list", trackNav.backToTracks === true, `back=${trackNav.backToTracks}`),
+        check("artist name opens the artist page", trackNav.artistHero !== false, `artistHero=${trackNav.artistHero}`),
+      ],
+    });
+  }
+
   // Destructive actions use an in-product modal, never a native dialog (which is
   // suppressed in PWAs). Create a playlist, delete it, and confirm the modal drives it.
   await reset();
