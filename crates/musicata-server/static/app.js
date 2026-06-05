@@ -6,6 +6,9 @@ const state = {
   tracks: [],
   visibleTracks: [],
   view: "library",
+  albumSort: "",
+  artistSort: "",
+  navStack: [],
   librarySignature: null,
   lastNow: {},
   favoriteTrackIds: new Set(),
@@ -50,7 +53,6 @@ const els = {
   browseYear: document.querySelector("#browse-year"),
   browseComposer: document.querySelector("#browse-composer"),
   browseClear: document.querySelector("#browse-clear"),
-  albums: document.querySelector("#albums"),
   playlists: document.querySelector("#playlists"),
   newPlaylist: document.querySelector("#new-playlist"),
   newPlaylistForm: document.querySelector("#new-playlist-form"),
@@ -64,7 +66,13 @@ const els = {
   radioResults: document.querySelector("#radio-results"),
   radioAddUrl: document.querySelector("#radio-add-url"),
   trackList: document.querySelector("#track-list"),
+  browseGrid: document.querySelector("#browse-grid"),
+  detailHero: document.querySelector("#detail-hero"),
   navLinks: Array.from(document.querySelectorAll(".library-nav .nav-link")),
+  segButtons: Array.from(document.querySelectorAll("#segmented .seg")),
+  sortControl: document.querySelector(".sort-control"),
+  sortSelect: document.querySelector("#sort-select"),
+  backBtn: document.querySelector("#back-btn"),
   viewTitle: document.querySelector("#view-title"),
   audio: document.querySelector("#audio"),
   nowTitle: document.querySelector("#now-title"),
@@ -212,8 +220,11 @@ function browseApi() {
 
 // One page of /api/albums. With a browse filter set, the server returns only albums
 // whose tracks match it, so the album grid narrows the same way the track list does.
-async function albumsApi(filter = {}, offset = 0, limit = ALBUM_PAGE) {
+async function albumsApi(filter = {}, offset = 0, limit = ALBUM_PAGE, sort = "") {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (sort) {
+    params.set("sort", sort);
+  }
   if (filter.genre) {
     params.set("genre", filter.genre);
   }
@@ -306,36 +317,41 @@ function onScreen(el, root) {
 
 async function loadLibrary() {
   try {
-    // Album metadata is small (a few hundred KB) and powers client-side lookups, so we
-    // still load it whole — but the sidebar renders it incrementally. Tracks are NOT
-    // loaded whole (that was megabytes); the center view pages them in on scroll.
-    const [summary, albumsPage, browse] = await Promise.all([
-      api("/api/library/summary"),
-      api("/api/albums"),
-      browseApi(),
-    ]);
+    // Tracks and albums are paged in by their views on demand (a big library is megabytes),
+    // so startup only needs the summary + the browse facets.
+    const [summary, browse] = await Promise.all([api("/api/library/summary"), browseApi()]);
 
-    state.albums = albumsPage.items;
     state.browse = browse;
     els.summary.textContent = `${summary.track_count} tracks, ${summary.album_count} albums`;
     state.librarySignature = `${summary.track_count}:${summary.album_count}`;
     renderBrowseFilters();
-    renderAlbums(state.albums);
-
-    // Keep whatever view the user is on; only the library views re-render the center.
-    if (state.view === "recent" || state.view === "most") {
-      await loadHistoryView(state.view);
-    } else if (hasBrowseFilter()) {
-      await applyBrowseFilter({ clearSearch: false });
-    } else if (els.search.value.trim()) {
-      await search();
-    } else {
-      showAllTracks();
-    }
-
+    await refreshCurrentView();
     renderMetadataPanel();
   } catch (error) {
     els.trackList.innerHTML = `<p class="error">Failed to load library: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+// Re-render whatever view is active (after a library sync). Detail/playlist views are
+// left untouched so a background refresh doesn't yank the user out of them.
+function refreshCurrentView() {
+  switch (state.view) {
+    case "albums":
+      return openAlbumsView();
+    case "artists":
+      return openArtistsView();
+    case "favorites":
+      return openFavoritesView();
+    case "recent":
+    case "most":
+      return loadHistoryView(state.view);
+    case "album-detail":
+    case "artist-detail":
+    case "playlist":
+      return Promise.resolve();
+    default:
+      if (els.search.value.trim()) return search();
+      return applyBrowseFilter({ clearSearch: false });
   }
 }
 
@@ -359,84 +375,309 @@ async function syncLibrary() {
 // so a large library doesn't build thousands of nodes or fire an image storm up front.
 const ALBUM_PAGE = 80;
 
-// Core: stream album cards into the sidebar from a page source (client-sliced array
-// or a server fetch), appending the next chunk as the sidebar scrolls.
-function renderAlbumList(getPage) {
+// Stream cards into the main browse grid from a page source (server-paged or a
+// client-sliced array), appending the next chunk as the grid scrolls.
+function streamBrowseGrid(getPage, buildCard) {
   state.albumStream?.destroy();
-  els.albums.innerHTML = "";
+  els.browseGrid.innerHTML = "";
   state.albumStream = infiniteScroll(
-    els.albums,
+    els.browseGrid,
     getPage,
-    (batch) => { for (const album of batch) els.albums.append(buildAlbumCard(album)); },
+    (batch) => { for (const item of batch) els.browseGrid.append(buildCard(item)); },
     { pageSize: ALBUM_PAGE },
   );
 }
 
-// In-memory album list (the full library, or a search's matching albums): slice it.
-function renderAlbums(albums) {
-  state.visibleAlbums = albums;
-  renderAlbumList((offset) => albums.slice(offset, offset + ALBUM_PAGE));
+// Show exactly the content panels a view needs; clear the others (and the grid stream).
+function showPanels({ hero = false, grid = false, tracks = false }) {
+  els.detailHero.hidden = !hero;
+  if (!hero) els.detailHero.innerHTML = "";
+  els.browseGrid.hidden = !grid;
+  if (!grid) {
+    state.albumStream?.destroy();
+    state.albumStream = null;
+    els.browseGrid.innerHTML = "";
+  }
+  els.trackList.hidden = !tracks;
 }
 
-// Browse-filtered albums: page from the server (albums whose tracks match the filter),
-// so the grid stays in step with the filtered track list without holding the whole
-// library client-side.
-function renderFilteredAlbums(filter) {
-  state.visibleAlbums = null;
-  renderAlbumList((offset) => albumsApi(filter, offset));
+// --- Browse back-stack: root views (segmented tabs / sidebar nav) reset it; detail
+// views push a "render the previous screen" closure. The browser Back button drives it
+// through popstate, so in-app Back and the browser button behave the same. ---
+function resetNav() {
+  state.navStack = [];
+  els.backBtn.hidden = true;
+}
+function pushNav(renderPrevious) {
+  state.navStack.push(renderPrevious);
+  els.backBtn.hidden = false;
+  history.pushState({ depth: state.navStack.length }, "");
+}
+function popNav() {
+  const renderPrevious = state.navStack.pop();
+  els.backBtn.hidden = state.navStack.length === 0;
+  if (renderPrevious) renderPrevious();
 }
 
-// Open an album: its tracks come from the album-detail endpoint, so this never needs
-// the whole library loaded client-side.
-async function openAlbum(album) {
-  markNavActive("library");
-  els.viewTitle.textContent = album.title;
+// Which segmented tab is highlighted for a given view.
+const SEG_FOR_VIEW = {
+  library: "library",
+  albums: "albums",
+  "album-detail": "albums",
+  artists: "artists",
+  "artist-detail": "artists",
+};
+
+// Sort options per browse view: [value, label]. "" = the server's default order.
+const SORTS = {
+  albums: [["", "Artist"], ["title", "Title (A–Z)"], ["year", "Year"]],
+  artists: [["", "Name (A–Z)"], ["tracks", "Most tracks"], ["albums", "Most albums"]],
+};
+function renderSort(view) {
+  const options = SORTS[view];
+  els.sortControl.hidden = !options;
+  if (!options) return;
+  const current = view === "albums" ? state.albumSort : state.artistSort;
+  els.sortSelect.innerHTML = "";
+  for (const [value, label] of options) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    if (value === current) option.selected = true;
+    els.sortSelect.append(option);
+  }
+}
+
+async function artistsApi(sort = "", offset = 0, limit = ALBUM_PAGE) {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (sort) params.set("sort", sort);
+  const page = await api(`/api/artists?${params}`);
+  return page.items;
+}
+
+// The Albums browse view: a full-width card grid, honoring the active browse filter and
+// sort, paged from the server.
+async function openAlbumsView() {
+  markNavActive("albums");
   closeDrawerOnMobile();
+  showPanels({ grid: true });
+  renderSort("albums");
+  els.viewTitle.textContent = hasBrowseFilter() ? browseTitle(state.browseFilter) : "Albums";
+  streamBrowseGrid(
+    (offset) => albumsApi(state.browseFilter, offset, ALBUM_PAGE, state.albumSort),
+    buildAlbumCard,
+  );
+}
+
+// The Artists browse view: a card grid paged from the server.
+async function openArtistsView() {
+  markNavActive("artists");
+  closeDrawerOnMobile();
+  showPanels({ grid: true });
+  renderSort("artists");
+  els.viewTitle.textContent = "Artists";
+  streamBrowseGrid((offset) => artistsApi(state.artistSort, offset), buildArtistCard);
+}
+
+// Request a downscaled cover variant from the server (a `?size=` thumbnail). Respects an
+// existing query string (acquired covers already carry `?asset=`).
+function sizedArtwork(url, size) {
+  if (!url) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}size=${size}`;
+}
+
+// A cover-forward album card for the browse grid. Click → album detail; the play overlay
+// plays the album; `back` is the closure that re-renders where this card was opened from.
+function buildAlbumCard(album, back) {
+  const card = document.createElement("div");
+  card.className = "card album-card";
+  card.dataset.albumId = album.id;
+  card.setAttribute("role", "button");
+  card.tabIndex = 0;
+  const cover = album.artwork_url
+    ? `<img src="${sizedArtwork(album.artwork_url, 300)}" alt="" loading="lazy">`
+    : `<span class="album-placeholder"></span>`;
+  card.innerHTML = `
+    <div class="card-cover">
+      ${cover}
+      <button class="card-play" type="button" title="Play album" aria-label="Play album">▶</button>
+    </div>
+    <div class="card-text">
+      <strong>${escapeHtml(album.title)}</strong>
+      <span>${escapeHtml(album.artist_name)}${album.year ? ` · ${album.year}` : ""}</span>
+    </div>
+  `;
+  const open = () => openAlbum(album, back);
+  card.addEventListener("click", open);
+  card.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); }
+  });
+  card.querySelector(".card-play").addEventListener("click", (event) => {
+    event.stopPropagation();
+    playAlbum(album);
+  });
+  return card;
+}
+
+// An artist card (monogram + name + counts). Click → artist detail.
+function buildArtistCard(artist, back) {
+  const card = document.createElement("div");
+  card.className = "card artist-card";
+  card.dataset.artistId = artist.id;
+  card.setAttribute("role", "button");
+  card.tabIndex = 0;
+  const initial = (artist.name || "?").trim().charAt(0).toUpperCase();
+  card.innerHTML = `
+    <div class="artist-avatar" aria-hidden="true">${escapeHtml(initial)}</div>
+    <div class="card-text">
+      <strong>${escapeHtml(artist.name)}</strong>
+      <span>${countLabel(artist.album_count, "album")} · ${countLabel(artist.track_count, "track")}</span>
+    </div>
+  `;
+  const open = () => openArtist(artist, back);
+  card.addEventListener("click", open);
+  card.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); }
+  });
+  return card;
+}
+
+function countLabel(n, noun) {
+  return `${n} ${n === 1 ? noun : `${noun}s`}`;
+}
+
+// A whole-track-list total duration, e.g. "42 min" or "1 h 5 min".
+function formatDuration(totalSeconds) {
+  const minutes = Math.round(totalSeconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  return `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+}
+
+function shuffleIds(ids) {
+  const out = ids.slice();
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+// Play a whole album now (from its first track).
+async function playAlbum(album) {
   try {
     const detail = await api(`/api/albums/${encodeURIComponent(album.id)}`);
+    const tracks = detail.tracks || [];
+    playTrackIds(tracks.map((track) => track.id), 0, tracks[0]?.stream_url || null);
+  } catch (error) {
+    showToast(error.message || "Couldn’t play the album.");
+  }
+}
+
+// Wire a hero's Play / Shuffle buttons to a track list (with within-gesture autoplay).
+function wireHeroPlayback(tracks) {
+  const ids = tracks.map((track) => track.id);
+  els.detailHero
+    .querySelector(".hero-play")
+    .addEventListener("click", () => playTrackIds(ids, 0, tracks[0]?.stream_url || null));
+  els.detailHero.querySelector(".hero-shuffle").addEventListener("click", () => {
+    const order = shuffleIds(tracks);
+    playTrackIds(order.map((track) => track.id), 0, order[0]?.stream_url || null);
+  });
+}
+
+// Album detail: a hero header (cover, title, artist link, meta, Play/Shuffle) + tracks.
+async function openAlbum(album, back) {
+  if (back) pushNav(back);
+  markNavActive("album-detail");
+  closeDrawerOnMobile();
+  showPanels({ hero: true, tracks: true });
+  renderSort(null);
+  els.viewTitle.textContent = album.title;
+  els.detailHero.innerHTML = `<p class="empty">Loading…</p>`;
+  try {
+    const detail = await api(`/api/albums/${encodeURIComponent(album.id)}`);
+    renderAlbumHero(detail);
     renderTracks(detail.tracks);
   } catch (error) {
+    els.detailHero.innerHTML = "";
     els.trackList.innerHTML = `<p class="error">Failed to load album: ${escapeHtml(error.message)}</p>`;
   }
 }
 
-function buildAlbumCard(album) {
-  const row = document.createElement("div");
-  row.className = "album";
-  row.dataset.albumId = album.id;
-  row.setAttribute("role", "button");
-  row.tabIndex = 0;
-  row.innerHTML = `
-    ${album.artwork_url ? `<img src="${album.artwork_url}" alt="" loading="lazy">` : `<span class="album-placeholder"></span>`}
-    <span class="album-text">
-      <strong>${escapeHtml(album.title)}</strong>
-      <span>${escapeHtml(album.artist_name)}${album.year ? ` · ${album.year}` : ""}</span>
-    </span>
-  `;
-  row.addEventListener("click", () => openAlbum(album));
-  row.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      openAlbum(album);
-    }
-  });
+// Artist detail: a hero header + the artist's albums as a card grid.
+async function openArtist(artist, back) {
+  if (back) pushNav(back);
+  markNavActive("artist-detail");
+  closeDrawerOnMobile();
+  showPanels({ hero: true, grid: true });
+  renderSort(null);
+  els.viewTitle.textContent = artist.name;
+  els.detailHero.innerHTML = `<p class="empty">Loading…</p>`;
+  try {
+    const detail = await api(`/api/artists/${encodeURIComponent(artist.id)}`);
+    renderArtistHero(detail);
+    const albums = detail.albums || [];
+    const backToArtist = () => openArtist(detail.artist);
+    streamBrowseGrid(
+      (offset) => albums.slice(offset, offset + ALBUM_PAGE),
+      (album) => buildAlbumCard(album, backToArtist),
+    );
+  } catch (error) {
+    els.detailHero.innerHTML = "";
+    els.browseGrid.innerHTML = `<p class="error">Failed to load artist: ${escapeHtml(error.message)}</p>`;
+  }
+}
 
-  const add = document.createElement("button");
-  add.type = "button";
-  add.className = "album-add";
-  add.title = "Add album to playlist";
-  add.textContent = "＋";
-  add.addEventListener("click", async (event) => {
-    event.stopPropagation();
-    try {
-      const detail = await api(`/api/albums/${encodeURIComponent(album.id)}`);
-      openAddToPlaylist(detail.tracks.map((track) => track.id), add, `Add album “${album.title}” to…`);
-    } catch {
-      /* the album endpoint is the same one the grid was built from; ignore a blip */
-    }
-  });
-  row.append(add);
-  return row;
+function renderAlbumHero(detail) {
+  const album = detail.album;
+  const tracks = detail.tracks || [];
+  const total = tracks.reduce((sum, track) => sum + (track.duration_seconds || 0), 0);
+  const meta = [
+    album.year ? String(album.year) : null,
+    countLabel(tracks.length, "track"),
+    total ? formatDuration(total) : null,
+  ].filter(Boolean).join(" · ");
+  els.detailHero.innerHTML = `
+    <div class="hero-cover">${album.artwork_url
+      ? `<img src="${sizedArtwork(album.artwork_url, 600)}" alt="">`
+      : `<span class="album-placeholder"></span>`}</div>
+    <div class="hero-info">
+      <p class="eyebrow">Album</p>
+      <h2 class="hero-title">${escapeHtml(album.title)}</h2>
+      <p class="hero-sub"><button class="link-artist" type="button">${escapeHtml(album.artist_name)}</button><span class="hero-meta"> · ${escapeHtml(meta)}</span></p>
+      <div class="hero-actions">
+        <button class="primary-button hero-play" type="button">▶ Play</button>
+        <button class="ghost-button hero-shuffle" type="button">⤨ Shuffle</button>
+      </div>
+    </div>
+  `;
+  wireHeroPlayback(tracks);
+  const artistLink = els.detailHero.querySelector(".link-artist");
+  if (detail.artist) {
+    artistLink.addEventListener("click", () => openArtist(detail.artist, () => openAlbum(album)));
+  } else {
+    artistLink.disabled = true;
+  }
+}
+
+function renderArtistHero(detail) {
+  const artist = detail.artist;
+  const tracks = detail.tracks || [];
+  const initial = (artist.name || "?").trim().charAt(0).toUpperCase();
+  const meta = `${countLabel(artist.album_count, "album")} · ${countLabel(artist.track_count, "track")}`;
+  els.detailHero.innerHTML = `
+    <div class="hero-cover artist"><span class="artist-avatar large" aria-hidden="true">${escapeHtml(initial)}</span></div>
+    <div class="hero-info">
+      <p class="eyebrow">Artist</p>
+      <h2 class="hero-title">${escapeHtml(artist.name)}</h2>
+      <p class="hero-sub">${escapeHtml(meta)}</p>
+      <div class="hero-actions">
+        <button class="primary-button hero-play" type="button">▶ Play</button>
+        <button class="ghost-button hero-shuffle" type="button">⤨ Shuffle</button>
+      </div>
+    </div>
+  `;
+  wireHeroPlayback(tracks);
 }
 
 function renderBrowseFilters() {
@@ -464,7 +705,6 @@ function renderBrowseSelect(select, emptyLabel, facets, selectedValue) {
 }
 
 async function applyBrowseFilter(options = {}) {
-  markNavActive("library");
   const clearSearch = options.clearSearch !== false;
   state.browseFilter = currentBrowseFilter();
   renderBrowseFilters();
@@ -475,16 +715,23 @@ async function applyBrowseFilter(options = {}) {
     els.search.value = "";
   }
 
-  if (!hasBrowseFilter()) {
-    renderAlbums(state.albums);
-    showAllTracks();
+  // A facet change while browsing Albums re-filters the album grid; otherwise it filters
+  // the track list (the Tracks view).
+  if (SEG_FOR_VIEW[state.view] === "albums") {
+    resetNav();
+    await openAlbumsView();
     return;
   }
 
-  const filter = state.browseFilter;
-  els.viewTitle.textContent = browseTitle(filter);
-  renderFilteredAlbums(filter);
-  streamTracks((offset) => tracksApi(filter, offset));
+  markNavActive("library");
+  renderSort(null);
+  showPanels({ tracks: true });
+  if (!hasBrowseFilter()) {
+    showAllTracks();
+    return;
+  }
+  els.viewTitle.textContent = browseTitle(state.browseFilter);
+  streamTracks((offset) => tracksApi(state.browseFilter, offset));
 }
 
 /// Switch the center panel between the library and the history views. The library
@@ -492,6 +739,10 @@ async function applyBrowseFilter(options = {}) {
 /// views fetch their tracks fresh each time so they reflect the latest listens.
 function markNavActive(view) {
   state.view = view;
+  const seg = SEG_FOR_VIEW[view] || null;
+  for (const button of els.segButtons) {
+    button.classList.toggle("is-active", button.dataset.view === seg);
+  }
   for (const link of els.navLinks) {
     link.classList.toggle("is-active", link.dataset.view === view);
   }
@@ -518,11 +769,25 @@ const RECENT_REFRESH_INTERVAL = 5000;
 let recentRefreshTimer = 0;
 
 async function setView(view) {
-  markNavActive(view);
+  // The segmented tabs and sidebar nav are roots, so a fresh stack and no Back button.
+  resetNav();
   clearInterval(recentRefreshTimer);
   recentRefreshTimer = 0;
   state.currentPlaylistId = null;
   renderPlaylistsSidebar();
+
+  if (view === "albums") {
+    await openAlbumsView();
+    return;
+  }
+  if (view === "artists") {
+    await openArtistsView();
+    return;
+  }
+
+  markNavActive(view);
+  renderSort(null);
+  showPanels({ tracks: true });
 
   if (view === "library") {
     await applyBrowseFilter({ clearSearch: false });
@@ -828,8 +1093,10 @@ function renderPlaylistsSidebar() {
 }
 
 async function openPlaylistView(id) {
-  for (const link of els.navLinks) link.classList.remove("is-active");
-  state.view = "playlist";
+  markNavActive("playlist");
+  resetNav();
+  renderSort(null);
+  showPanels({ tracks: true });
   state.currentPlaylistId = id;
   renderPlaylistsSidebar();
   closeDrawerOnMobile();
@@ -877,7 +1144,11 @@ async function removeFromPlaylist(playlistId, index) {
 }
 
 async function deletePlaylist(id, name) {
-  if (!window.confirm(`Delete playlist "${name}"?`)) return;
+  const ok = await confirmAction({
+    title: "Delete playlist",
+    message: `Delete the playlist “${name}”? This can’t be undone.`,
+  });
+  if (!ok) return;
   try {
     await apiJson(`/api/playlists/${encodeURIComponent(id)}`, "DELETE");
   } catch {
@@ -921,8 +1192,13 @@ function openAddToPlaylist(trackIds, anchor, heading) {
   create.textContent = "New playlist…";
   create.addEventListener("click", async () => {
     closeAddMenu();
-    const name = window.prompt("Playlist name");
-    if (name && name.trim()) await createPlaylist(name.trim(), trackIds);
+    const name = await promptText({
+      title: "New playlist",
+      label: "Playlist name",
+      placeholder: "My playlist",
+      confirmLabel: "Create",
+    });
+    if (name) await createPlaylist(name, trackIds);
   });
   menu.append(create);
 
@@ -1018,7 +1294,12 @@ function playRadio(station) {
 }
 
 async function deleteRadio(id, name) {
-  if (!window.confirm(`Remove station "${name}"?`)) return;
+  const ok = await confirmAction({
+    title: "Remove station",
+    message: `Remove the radio station “${name}”?`,
+    confirmLabel: "Remove",
+  });
+  if (!ok) return;
   try {
     await apiJson(`/api/radio/${encodeURIComponent(id)}`, "DELETE");
   } catch {
@@ -1118,30 +1399,31 @@ function relativeTime(unixSeconds) {
 }
 
 // Play the current track list on the active player, starting at `index`.
-async function playTrack(index) {
-  const tracks = state.visibleTracks;
-  if (tracks.length === 0 || !state.activePlayerId) {
-    return;
-  }
+// Play an arbitrary list of track ids on the active output, starting at `startIndex`.
+// When this tab is the output, start the first track's audio *within the user gesture*
+// (so the browser's autoplay policy allows it); the server round-trip then syncs state.
+// One play_tracks sets the whole queue AND the start position, avoiding a wrong-track
+// flicker that a play_tracks + play_queue_index two-step would cause.
+function playTrackIds(ids, startIndex = 0, startStreamUrl = null) {
+  if (!ids.length || !state.activePlayerId) return Promise.resolve();
   if (browserOutputsFor(state.activePlayerId)) {
     claimBrowserOutput();
-    // Start the clicked track within this user gesture so the browser's autoplay
-    // policy lets it play; the server round-trip then keeps it in sync.
-    const track = tracks[index];
-    if (track) {
-      els.audio.src = track.stream_url;
+    if (startStreamUrl) {
+      els.audio.src = startStreamUrl;
       els.audio.play().catch(() => {});
     }
   }
-  const ids = tracks.map((track) => track.id);
-  // One command sets the whole queue AND the starting position. Sending play_tracks
-  // (which starts at 0) followed by play_queue_index would broadcast the wrong
-  // now-playing track first, flickering the footer and restarting browser audio.
-  await commandTarget({
-    command: "play_tracks",
-    track_ids: ids,
-    start_index: index,
-  });
+  return commandTarget({ command: "play_tracks", track_ids: ids, start_index: startIndex });
+}
+
+async function playTrack(index) {
+  const tracks = state.visibleTracks;
+  if (tracks.length === 0) return;
+  await playTrackIds(
+    tracks.map((track) => track.id),
+    index,
+    tracks[index]?.stream_url || null,
+  );
 }
 
 function markActiveTrack() {
@@ -1525,13 +1807,11 @@ function updateAlbumArtwork(albumId, artworkUrl) {
   if (album) {
     album.artwork_url = artworkUrl;
   }
-  // Patch the rendered card in place — works whether the grid is client-sliced or
-  // server-paged, and avoids re-rendering (which a filtered, streamed grid can't do
-  // from a full in-memory array).
+  // Patch the rendered card in place (the album browse grid), if it's currently shown.
   if (!artworkUrl) {
     return;
   }
-  const card = els.albums.querySelector(`[data-album-id="${CSS.escape(albumId)}"]`);
+  const card = els.browseGrid.querySelector(`[data-album-id="${CSS.escape(albumId)}"]`);
   if (!card) {
     return;
   }
@@ -1542,7 +1822,7 @@ function updateAlbumArtwork(albumId, artworkUrl) {
     img.loading = "lazy";
     card.querySelector(".album-placeholder")?.replaceWith(img);
   }
-  img.src = artworkUrl;
+  img.src = sizedArtwork(artworkUrl, 300);
 }
 
 function renderObservedMetadata(observations) {
@@ -1899,17 +2179,11 @@ function element(tag, className, text) {
 }
 
 async function search() {
-  markNavActive("library");
   const query = els.search.value.trim();
   if (!query) {
     state.searchController?.abort();
     state.searchController = null;
-    if (hasBrowseFilter()) {
-      await applyBrowseFilter({ clearSearch: false });
-      return;
-    }
-    renderAlbums(state.albums);
-    showAllTracks();
+    await applyBrowseFilter({ clearSearch: false });
     return;
   }
 
@@ -1922,15 +2196,22 @@ async function search() {
   state.searchController = controller;
 
   try {
-    // The first page also carries matching albums/artists; later pages just extend the
-    // track results as you scroll.
+    // The first page also carries matching albums; later pages just extend the track
+    // results as you scroll.
     const first = await searchApi(query, controller.signal, 0);
     if (state.searchController !== controller) {
       return;
     }
 
+    markNavActive("library");
+    resetNav();
+    renderSort(null);
+    const albums = first.albums || [];
+    showPanels({ grid: albums.length > 0, tracks: true });
     els.viewTitle.textContent = `Search: ${query}`;
-    renderAlbums(first.albums);
+    if (albums.length) {
+      streamBrowseGrid((offset) => albums.slice(offset, offset + ALBUM_PAGE), buildAlbumCard);
+    }
     streamTracks((offset) =>
       offset === 0
         ? first.tracks
@@ -1969,6 +2250,23 @@ for (const link of els.navLinks) {
     closeDrawerOnMobile();
   });
 }
+for (const button of els.segButtons) {
+  button.addEventListener("click", () => setView(button.dataset.view));
+}
+els.backBtn.addEventListener("click", () => history.back());
+els.sortSelect.addEventListener("change", () => {
+  if (state.view === "albums") {
+    state.albumSort = els.sortSelect.value;
+    openAlbumsView();
+  } else if (state.view === "artists") {
+    state.artistSort = els.sortSelect.value;
+    openArtistsView();
+  }
+});
+// The browser Back button (and our ‹ Back) pop the in-app browse stack.
+window.addEventListener("popstate", () => {
+  if (state.navStack.length) popNav();
+});
 // Create-playlist uses an inline input rather than window.prompt(): prompt() is
 // suppressed in installed/standalone PWAs and on mobile, where this controller is
 // meant to run, so the button did nothing there. The input also lets us show errors.
@@ -2012,16 +2310,21 @@ els.radioDirectory.addEventListener("click", (event) => {
 });
 els.radioSearch.addEventListener("input", debounce(() => searchRadioDirectory(els.radioSearch.value.trim()), 250));
 els.radioAddUrl.addEventListener("click", async () => {
-  const name = window.prompt("Station name");
-  if (!name || !name.trim()) return;
-  const url = window.prompt("Stream URL (http…)");
-  if (!url || !url.trim()) return;
+  const values = await openModal({
+    title: "Add radio station",
+    fields: [
+      { key: "name", label: "Station name", placeholder: "BBC Radio 6" },
+      { key: "url", label: "Stream URL", placeholder: "https://…", type: "url" },
+    ],
+    confirmLabel: "Add",
+  });
+  if (!values || !values.name || !values.url) return;
   try {
-    await apiJson("/api/radio", "POST", { name: name.trim(), stream_url: url.trim() });
+    await apiJson("/api/radio", "POST", { name: values.name, stream_url: values.url });
     await loadRadio();
     closeRadioDirectory();
-  } catch {
-    /* ignore */
+  } catch (error) {
+    showToast(error.message || "Couldn’t add the station.");
   }
 });
 // Auto-refresh the library: poll for filesystem changes and re-check on focus, so
@@ -2455,6 +2758,118 @@ function showToast(message) {
       els.toast.hidden = true;
     }, 250);
   }, 3500);
+}
+
+// --- In-product dialogs (never window.confirm/prompt — those are suppressed in PWAs) ---
+
+// A modal with a title, optional message, optional fields, and confirm/cancel. Resolves
+// to the field values ({} when none) on confirm, or null on cancel. Esc / scrim / Cancel
+// cancel; Enter confirms. Restores focus to the previously-focused element.
+function openModal({ title, message, fields = [], confirmLabel = "OK", danger = false }) {
+  return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const scrim = document.createElement("div");
+    scrim.className = "modal-scrim";
+    const dialog = document.createElement("form");
+    dialog.className = "modal";
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+
+    if (title) {
+      const heading = document.createElement("h2");
+      heading.className = "modal-title";
+      heading.textContent = title;
+      dialog.append(heading);
+    }
+    if (message) {
+      const body = document.createElement("p");
+      body.className = "modal-message";
+      body.textContent = message;
+      dialog.append(body);
+    }
+
+    const inputs = new Map();
+    if (fields.length) {
+      const list = document.createElement("div");
+      list.className = "modal-fields";
+      for (const field of fields) {
+        const label = document.createElement("label");
+        label.className = "field";
+        const span = document.createElement("span");
+        span.textContent = field.label;
+        const input = document.createElement("input");
+        input.type = field.type || "text";
+        input.value = field.value || "";
+        if (field.placeholder) input.placeholder = field.placeholder;
+        if (field.maxLength) input.maxLength = field.maxLength;
+        input.autocomplete = "off";
+        label.append(span, input);
+        list.append(label);
+        inputs.set(field.key, input);
+      }
+      dialog.append(list);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "ghost-button";
+    cancel.textContent = "Cancel";
+    const confirm = document.createElement("button");
+    confirm.type = "submit";
+    confirm.className = danger ? "ghost-button danger" : "primary-button";
+    confirm.textContent = confirmLabel;
+    actions.append(cancel, confirm);
+    dialog.append(actions);
+    scrim.append(dialog);
+    document.body.append(scrim);
+
+    const close = (result) => {
+      scrim.remove();
+      document.removeEventListener("keydown", onKey);
+      if (previousFocus && previousFocus.focus) previousFocus.focus();
+      resolve(result);
+    };
+    const onKey = (event) => {
+      if (event.key === "Escape") close(null);
+    };
+    const values = () => {
+      const out = {};
+      for (const [key, input] of inputs) out[key] = input.value.trim();
+      return out;
+    };
+    dialog.addEventListener("submit", (event) => {
+      event.preventDefault();
+      close(fields.length ? values() : {});
+    });
+    cancel.addEventListener("click", () => close(null));
+    scrim.addEventListener("click", (event) => {
+      if (event.target === scrim) close(null);
+    });
+    document.addEventListener("keydown", onKey);
+    requestAnimationFrame(() => {
+      const first = fields.length ? inputs.values().next().value : confirm;
+      first.focus();
+    });
+  });
+}
+
+// Destructive-action confirmation. Returns true if confirmed.
+async function confirmAction({ title, message, confirmLabel = "Delete", danger = true }) {
+  const result = await openModal({ title, message, confirmLabel, danger });
+  return result !== null;
+}
+
+// Single-field text prompt. Returns the trimmed value, or null if cancelled/empty.
+async function promptText({ title, label, value = "", placeholder, confirmLabel = "Save" }) {
+  const result = await openModal({
+    title,
+    fields: [{ key: "value", label, value, placeholder }],
+    confirmLabel,
+  });
+  if (result === null) return null;
+  return result.value || null;
 }
 
 async function playerCommand(id, command) {

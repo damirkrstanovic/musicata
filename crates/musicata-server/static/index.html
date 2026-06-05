@@ -39,7 +39,6 @@
         </label>
 
         <nav class="library-nav" aria-label="Views">
-          <button class="nav-link is-active" type="button" data-view="library">Tracks</button>
           <button class="nav-link" type="button" data-view="favorites">Favorites</button>
           <button class="nav-link" type="button" data-view="recent">Recently played</button>
           <button class="nav-link" type="button" data-view="most">Most played</button>
@@ -84,20 +83,30 @@
           <div id="radio" class="playlist-list"></div>
         </section>
 
-        <section class="section">
-          <h2>Albums</h2>
-          <div id="albums" class="album-list"></div>
-        </section>
       </aside>
 
       <section class="content">
         <header class="content-header">
-          <div>
+          <button id="back-btn" class="back-btn" type="button" hidden>‹ Back</button>
+          <div class="content-title">
             <p class="eyebrow">Local disk provider</p>
             <h2 id="view-title">Tracks</h2>
           </div>
+          <div class="content-controls">
+            <div id="segmented" class="segmented" role="tablist" aria-label="Browse">
+              <button class="seg" type="button" role="tab" data-view="library">Tracks</button>
+              <button class="seg" type="button" role="tab" data-view="albums">Albums</button>
+              <button class="seg" type="button" role="tab" data-view="artists">Artists</button>
+            </div>
+            <label class="sort-control" hidden>
+              <span class="sort-label">Sort</span>
+              <select id="sort-select"></select>
+            </label>
+          </div>
         </header>
 
+        <div id="detail-hero" class="detail-hero" hidden></div>
+        <div id="browse-grid" class="browse-grid" hidden></div>
         <div id="track-list" class="track-list"></div>
       </section>
 

@@ -17,6 +17,106 @@ async function api(path) {
   return response.json();
 }
 
+// --- In-product dialogs (never window.confirm/prompt — suppressed in PWAs/mobile) ---
+function openModal({ title, message, fields = [], confirmLabel = "OK", danger = false }) {
+  return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const scrim = document.createElement("div");
+    scrim.className = "modal-scrim";
+    const dialog = document.createElement("form");
+    dialog.className = "modal";
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+
+    if (title) {
+      const heading = document.createElement("h2");
+      heading.className = "modal-title";
+      heading.textContent = title;
+      dialog.append(heading);
+    }
+    if (message) {
+      const body = document.createElement("p");
+      body.className = "modal-message";
+      body.textContent = message;
+      dialog.append(body);
+    }
+
+    const inputs = new Map();
+    if (fields.length) {
+      const list = document.createElement("div");
+      list.className = "modal-fields";
+      for (const field of fields) {
+        const label = document.createElement("label");
+        label.className = "field";
+        const span = document.createElement("span");
+        span.textContent = field.label;
+        const input = document.createElement("input");
+        input.type = field.type || "text";
+        input.value = field.value || "";
+        if (field.placeholder) input.placeholder = field.placeholder;
+        input.autocomplete = "off";
+        label.append(span, input);
+        list.append(label);
+        inputs.set(field.key, input);
+      }
+      dialog.append(list);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "ghost-button";
+    cancel.textContent = "Cancel";
+    const confirm = document.createElement("button");
+    confirm.type = "submit";
+    confirm.className = danger ? "ghost-button danger" : "primary-button";
+    confirm.textContent = confirmLabel;
+    actions.append(cancel, confirm);
+    dialog.append(actions);
+    scrim.append(dialog);
+    document.body.append(scrim);
+
+    const close = (result) => {
+      scrim.remove();
+      document.removeEventListener("keydown", onKey);
+      if (previousFocus && previousFocus.focus) previousFocus.focus();
+      resolve(result);
+    };
+    const onKey = (event) => {
+      if (event.key === "Escape") close(null);
+    };
+    dialog.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const out = {};
+      for (const [key, input] of inputs) out[key] = input.value.trim();
+      close(fields.length ? out : {});
+    });
+    cancel.addEventListener("click", () => close(null));
+    scrim.addEventListener("click", (event) => {
+      if (event.target === scrim) close(null);
+    });
+    document.addEventListener("keydown", onKey);
+    requestAnimationFrame(() => {
+      const first = fields.length ? inputs.values().next().value : confirm;
+      first.focus();
+    });
+  });
+}
+
+async function confirmAction({ title, message, confirmLabel = "Delete", danger = true }) {
+  return (await openModal({ title, message, confirmLabel, danger })) !== null;
+}
+
+async function promptText({ title, label, value = "", placeholder, confirmLabel = "Save" }) {
+  const result = await openModal({
+    title,
+    fields: [{ key: "value", label, value, placeholder }],
+    confirmLabel,
+  });
+  return result === null ? null : result.value || null;
+}
+
 async function apiSend(path, method, body) {
   const init = { method };
   if (body !== undefined) {
@@ -85,7 +185,12 @@ async function loadSources() {
 }
 
 async function removeSource(id, name) {
-  if (!window.confirm(`Remove source “${name}”? Its tracks leave the library.`)) return;
+  const ok = await confirmAction({
+    title: "Remove source",
+    message: `Remove “${name}”? Its tracks leave the library.`,
+    confirmLabel: "Remove",
+  });
+  if (!ok) return;
   try {
     await apiSend(`/api/sources/${encodeURIComponent(id)}`, "DELETE");
   } catch (error) {
@@ -208,14 +313,24 @@ function renderPlayers(players) {
 }
 
 async function renamePlayer(player) {
-  const name = window.prompt("Player name", player.name);
+  const name = await promptText({
+    title: "Rename player",
+    label: "Player name",
+    value: player.name,
+    confirmLabel: "Rename",
+  });
   if (!name) return;
   await apiSend(`/api/players/${encodeURIComponent(player.id)}`, "PATCH", { name });
   loadPlayers();
 }
 
 async function removePlayer(player) {
-  if (!window.confirm(`Remove player “${player.name}”?`)) return;
+  const ok = await confirmAction({
+    title: "Remove player",
+    message: `Remove the player “${player.name}”?`,
+    confirmLabel: "Remove",
+  });
+  if (!ok) return;
   await apiSend(`/api/players/${encodeURIComponent(player.id)}`, "DELETE");
   loadPlayers();
 }
@@ -236,7 +351,11 @@ function renderZones() {
     remove.className = "ghost-button danger";
     remove.textContent = "Delete";
     remove.addEventListener("click", async () => {
-      if (!window.confirm(`Delete zone “${zone.name}”?`)) return;
+      const ok = await confirmAction({
+        title: "Delete zone",
+        message: `Delete the zone “${zone.name}”?`,
+      });
+      if (!ok) return;
       await apiSend(`/api/zones/${encodeURIComponent(zone.id)}`, "DELETE");
       loadPlayers();
     });
