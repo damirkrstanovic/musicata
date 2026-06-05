@@ -39,6 +39,7 @@ use musicata_core::{
     MetadataApprovalState, MetadataFieldValue, PlaybackState, Player, PlayerCommand, Playlist,
     RadioStation, SearchResults, Track, TrackMetadataFieldObservation, Zone, album_artwork_url,
     artwork_asset_id, find_album_artwork_candidates, merge_libraries,
+    regroup_library_with_overrides,
 };
 use musicata_storage::{Database, ResolvedMusicBrainzMetadata};
 use musicbrainz::{
@@ -131,6 +132,7 @@ async fn main() -> Result<()> {
 
     // `--scan-once` is the batch path: scan synchronously, persist, exit.
     if config.scan_once {
+        migrate_identity(&database).await;
         let registry = providers.read().await.clone();
         let mut scanned = registry.scan_all().await.context("library scan failed")?;
         database.save_library(&mut scanned).await?;
@@ -650,6 +652,11 @@ async fn library_scan_loop(
     incremental: bool,
     artwork_cache: Arc<artwork::ArtworkCache>,
 ) {
+    // Re-derive ids if the identity scheme changed (normalization rollout), moving
+    // favorites/artwork onto the new ids. Runs here (in the background loop, before the
+    // first scan saves) so it never delays the server binding; it's a one-time pass
+    // (guarded by identity_version) and serializes ahead of the scan below.
+    migrate_identity(&database).await;
     scan_and_persist(
         &database,
         &providers,
@@ -707,6 +714,59 @@ async fn setting_enabled(database: &Database, key: &str) -> bool {
 
 async fn artwork_fetch_enabled(database: &Database) -> bool {
     setting_enabled(database, SETTING_ARTWORK_FETCH).await
+}
+
+/// Bump when the artist/album id derivation changes (normalization, MBID-first) so an
+/// existing DB re-derives ids once and moves favorites/artwork onto them.
+const IDENTITY_VERSION: i64 = 1;
+const SETTING_IDENTITY_VERSION: &str = "identity_version";
+
+/// One-time, idempotent identity migration: when the id derivation changed since this DB
+/// was last grouped, move id-referencing rows (favorites, acquired artwork) onto the new
+/// ids, then re-derive and save the library so the artist/album tables carry the new ids.
+/// Forces the regroup+save even when files are unchanged (a plain rescan would skip the
+/// save and leave the tables on old ids). Runs before any scan.
+async fn migrate_identity(database: &Database) {
+    let stored = database
+        .get_setting(SETTING_IDENTITY_VERSION)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    if stored >= IDENTITY_VERSION {
+        return;
+    }
+    // Move favorites/acquired_* from old ids to new (reads the current, old-id rows) —
+    // must precede the re-derive+save that rewrites the artist/album rows.
+    match database.remap_identity_references().await {
+        Ok(moved) if moved > 0 => {
+            tracing::info!(moved, "identity: remapped favorite/artwork references")
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "identity: reference remap failed; skipping re-derive");
+            return;
+        }
+    }
+    // Re-derive ids by regrouping the cached library and saving (empty overrides → only
+    // recomputes ids via the new derivation), then regenerate artwork urls from new ids.
+    if let Ok(Some(library)) = database.load_library().await {
+        let mut regrouped =
+            regroup_library_with_overrides(library, &std::collections::BTreeMap::new());
+        if let Err(error) = database.save_library(&mut regrouped).await {
+            tracing::warn!(%error, "identity: re-derive save failed");
+            return;
+        }
+        let _ = database.reapply_acquired_artwork().await;
+        let _ = database.reapply_acquired_artist_artwork().await;
+    }
+    if let Err(error) = database
+        .set_setting(SETTING_IDENTITY_VERSION, &IDENTITY_VERSION.to_string())
+        .await
+    {
+        tracing::warn!(%error, "identity: failed to record identity_version");
+    }
 }
 
 /// How long to wait before re-querying providers for an album whose cover wasn't found,
