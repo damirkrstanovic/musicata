@@ -657,6 +657,7 @@ async fn library_scan_loop(
     // first scan saves) so it never delays the server binding; it's a one-time pass
     // (guarded by identity_version) and serializes ahead of the scan below.
     migrate_identity(&database).await;
+    migrate_fingerprint_lookup(&database).await;
     scan_and_persist(
         &database,
         &providers,
@@ -776,6 +777,46 @@ async fn migrate_identity(database: &Database) {
         .await
     {
         tracing::warn!(%error, "identity: failed to record identity_version");
+    }
+}
+
+/// Bump when an AcoustID-lookup fix should re-try tracks previously marked `not_found`.
+const FINGERPRINT_LOOKUP_VERSION: i64 = 1;
+const SETTING_FINGERPRINT_LOOKUP_VERSION: &str = "fingerprint_lookup_version";
+
+/// One-time: after the fix that reports a track's *real* duration to AcoustID (long tracks
+/// were rejected by AcoustID's duration filter), clear the stale `not_found` markers so
+/// those tracks are re-fingerprinted on the next pass instead of waiting out the retry
+/// window. Guarded by a version setting so it runs once.
+async fn migrate_fingerprint_lookup(database: &Database) {
+    let stored = database
+        .get_setting(SETTING_FINGERPRINT_LOOKUP_VERSION)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    if stored >= FINGERPRINT_LOOKUP_VERSION {
+        return;
+    }
+    match database.clear_not_found_fingerprints().await {
+        Ok(cleared) if cleared > 0 => {
+            tracing::info!(cleared, "fingerprint: cleared stale not_found markers for re-lookup")
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "fingerprint: failed to clear not_found markers");
+            return;
+        }
+    }
+    if let Err(error) = database
+        .set_setting(
+            SETTING_FINGERPRINT_LOOKUP_VERSION,
+            &FINGERPRINT_LOOKUP_VERSION.to_string(),
+        )
+        .await
+    {
+        tracing::warn!(%error, "fingerprint: failed to record fingerprint_lookup_version");
     }
 }
 
@@ -1033,9 +1074,21 @@ async fn artist_artwork_fill_pass(
 /// Retry window for a track AcoustID couldn't identify, so the rescan doesn't
 /// re-fingerprint it every pass.
 const FINGERPRINT_RETRY_SECS: i64 = 7 * 24 * 60 * 60;
-/// Tracks fingerprinted per pass — decoding ~120 s of audio each is heavier than an
-/// artwork fetch, so keep batches small; the rest are picked up on later passes.
-const FINGERPRINT_BATCH: i64 = 25;
+/// Tracks fingerprinted per pass — decoding ~120 s of audio each is CPU-heavy, but the
+/// AcoustID lookup is rate-limited (~3/s) anyway, so a larger batch just lets a pass make
+/// more progress before the next rescan tick; the rest are picked up on later passes.
+const FINGERPRINT_BATCH: i64 = 100;
+
+/// The duration to report to AcoustID for a fingerprint lookup: the track's real length
+/// when the scan read one (AcoustID filters matches by duration, so a long track must
+/// report its full length, not the ~120 s fingerprint window — otherwise the filter
+/// rejects every match), else the window length as a fallback.
+fn acoustid_lookup_duration(real_seconds: Option<f64>, window_seconds: u32) -> u32 {
+    real_seconds
+        .filter(|seconds| seconds.is_finite() && *seconds >= 1.0)
+        .map(|seconds| seconds.round() as u32)
+        .unwrap_or(window_seconds)
+}
 
 /// After a scan, identify untagged tracks by audio fingerprint (Chromaprint → AcoustID)
 /// and store the resolved MusicBrainz ids, so `album_musicbrainz_ids` can feed the
@@ -1094,11 +1147,15 @@ async fn fingerprint_pass(
 
         let extension = target.extension.clone();
         let client = client.clone();
+        let real_duration = target.duration_seconds;
         // Decode + fingerprint + AcoustID lookup are synchronous + CPU-heavy.
         let outcome = tokio::task::spawn_blocking(move || {
-            let (fingerprint, duration) =
+            let (fingerprint, window_duration) =
                 fingerprint::compute_fingerprint(&audio, &extension).ok()?;
-            client.lookup(&fingerprint, duration).ok().flatten()
+            client
+                .lookup(&fingerprint, acoustid_lookup_duration(real_duration, window_duration))
+                .ok()
+                .flatten()
         })
         .await
         .ok()
@@ -4734,8 +4791,8 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ARTWORK_CACHE_CONTROL, Config, PlayerManager, ProviderHandle, ProviderRegistry, app,
-        artwork_etag, normalize_size, parse_range, resize_to_jpeg,
+        ARTWORK_CACHE_CONTROL, Config, PlayerManager, ProviderHandle, ProviderRegistry,
+        acoustid_lookup_duration, app, artwork_etag, normalize_size, parse_range, resize_to_jpeg,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -6554,6 +6611,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(favorites["tracks"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn acoustid_lookup_reports_real_duration() {
+        // A long track reports its real length (AcoustID's duration filter needs it),
+        // not the ~120 s fingerprint window.
+        assert_eq!(acoustid_lookup_duration(Some(240.1), 120), 240);
+        // Missing/zero/NaN duration falls back to the window length.
+        assert_eq!(acoustid_lookup_duration(None, 120), 120);
+        assert_eq!(acoustid_lookup_duration(Some(0.0), 120), 120);
+        assert_eq!(acoustid_lookup_duration(Some(f64::NAN), 95), 95);
     }
 
     #[tokio::test]
