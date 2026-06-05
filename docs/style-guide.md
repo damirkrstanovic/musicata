@@ -14,6 +14,19 @@ no-build, vanilla HTML/CSS/JS PWA — keep it that way.
 Keep the split clean: if a control manages configuration or shows background
 progress/errors, it belongs on `/admin`.
 
+## Browsing (player)
+
+The content header carries a **segmented switcher** — Tracks · Albums · Artists — backed
+by `setView()`; the sidebar nav keeps the *smart* views (Favorites / Recently / Most) plus
+Playlists and Radio. **Albums and Artists render as cover-forward cards** in a full-width
+grid (`.browse-grid` → `.card`/`.album-card`/`.artist-card`), paged with `infiniteScroll`
+and a contextual **sort** select. Browsing is **master→detail**: a card opens a **hero
+header** (`.detail-hero` — large cover, serif title, a clickable artist link, year ·
+tracks · duration, and **Play** / **Shuffle**) above the tracklist (album) or an albums
+grid (artist). Drill-downs push a back-stack (`pushNav`/`popNav`); the **‹ Back** button
+and the browser Back button both pop it via `popstate`. Album covers in grids request the
+`?size=300` thumbnail; hero covers `?size=600`.
+
 ## Aesthetic
 
 Warm hi-fi, dark, gold accent. Use the CSS variables in `:root` (`--bg`, `--panel`,
@@ -48,8 +61,12 @@ fields read as sloppy and make the form harder to scan.
 - Show the **root cause**, not a status code: surface the API's
   `{ error: { message } }` body (see `apiSend`/`apiJson`). Errors get the mono font
   and `--danger`.
-- Confirm destructive actions (`window.confirm`). Disable a submit button while its
-  request is in flight.
+- **Never use native browser dialogs** (`window.confirm`/`alert`/`prompt`) — they're
+  unstyled and silently suppressed in installed PWAs/mobile. Confirm destructive actions
+  with the in-product `confirmAction({ title, message, confirmLabel })` modal; collect
+  input with `promptText(...)` or an inline form (mirror `new-playlist-form`); show
+  transient messages with `showToast(...)`. (`confirmAction`/`promptText`/`openModal` live
+  in both `app.js` and `admin.js`.) Disable a submit button while its request is in flight.
 
 ## PWA / caching
 

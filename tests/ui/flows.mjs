@@ -361,15 +361,17 @@ export async function scaleFlows(ctx) {
     ],
   });
 
-  // Browse by genre narrows the ALBUM grid too, not just the track list. Pick the
-  // rarest genre (fewest tracks → most likely to narrow the album set), apply it, and
-  // confirm the rendered cards are exactly the filtered albums.
+  // The Albums view renders cover cards (with ?size= thumbnails), and a browse facet
+  // narrows that grid. Switch to Albums, pick the rarest genre, and confirm the rendered
+  // cards are exactly the filtered albums.
   await reset();
   const picked = await ev(`(async () => {
     const totalAlbums = (state.librarySignature || '0:0').split(':').map(Number)[1];
+    document.querySelector('#segmented .seg[data-view="albums"]').click();
+    await new Promise((r) => setTimeout(r, 400));
     const genres = (state.browse.genres || []).slice().sort((a, b) => a.track_count - b.track_count);
     const g = genres[0];
-    if (!g) return { skip: true };
+    if (!g) return { skip: true, gridVisible: !document.querySelector('#browse-grid').hidden };
     els.browseGenre.value = String(g.value);
     await applyBrowseFilter();
     return { genre: String(g.value), totalAlbums };
@@ -380,15 +382,80 @@ export async function scaleFlows(ctx) {
     await sleep(700);
     const filtered = await fetch(`${base}/api/albums?genre=${encodeURIComponent(picked.genre)}&limit=500`).then((r) => r.json());
     const ids = new Set(filtered.items.map((a) => a.id));
-    const renderedIds = await ev(`Array.from(document.querySelectorAll('#albums .album')).map(e => e.dataset.albumId)`);
+    const grid = await ev(`(() => ({
+      visible: !document.querySelector('#browse-grid').hidden,
+      ids: Array.from(document.querySelectorAll('#browse-grid .album-card')).map((e) => e.dataset.albumId),
+      sized: Array.from(document.querySelectorAll('#browse-grid .album-card img')).every((i) => i.src.includes('size=300')),
+    }))()`);
     results.push({
       name: "browse filters the album grid",
       checks: [
         check("album grid narrowed to the genre", filtered.total > 0 && filtered.total < picked.totalAlbums, `${filtered.total}/${picked.totalAlbums} albums match "${picked.genre}"`),
-        check("rendered cards are all in the filtered set", renderedIds.length > 0 && renderedIds.every((id) => ids.has(id)), `${renderedIds.length} cards`),
+        check("rendered cards are all in the filtered set", grid.visible && grid.ids.length > 0 && grid.ids.every((id) => ids.has(id)), `${grid.ids.length} cards`),
+        check("cards request sized thumbnails", grid.sized, "?size=300"),
       ],
     });
   }
+
+  // Master→detail: open an album from the grid → hero header + tracklist; open its artist
+  // → albums grid; Back returns to the album.
+  await reset();
+  const detail = await ev(`(async () => {
+    document.querySelector('#segmented .seg[data-view="albums"]').click();
+    await new Promise((r) => setTimeout(r, 600));
+    const card = document.querySelector('#browse-grid .album-card');
+    if (!card) return { skip: true };
+    card.click();
+    await new Promise((r) => setTimeout(r, 700));
+    const heroShown = !document.querySelector('#detail-hero').hidden && !!document.querySelector('.hero-title');
+    const hasTracks = document.querySelectorAll('#track-list .track').length > 0;
+    const hasArtistLink = !!document.querySelector('.link-artist');
+    const albumTitle = document.querySelector('.hero-title')?.textContent || '';
+    document.querySelector('.link-artist')?.click();
+    await new Promise((r) => setTimeout(r, 700));
+    const artistHero = !document.querySelector('#detail-hero').hidden && document.querySelector('#detail-hero .eyebrow')?.textContent === 'Artist';
+    const artistAlbums = document.querySelectorAll('#browse-grid .album-card').length;
+    const backShown = !document.querySelector('#back-btn').hidden;
+    history.back();
+    await new Promise((r) => setTimeout(r, 700));
+    const backToAlbum = (document.querySelector('.hero-title')?.textContent || '') === albumTitle;
+    return { heroShown, hasTracks, hasArtistLink, artistHero, artistAlbums, backShown, backToAlbum };
+  })()`);
+  if (detail.skip) {
+    results.push({ name: "browse master→detail", skipped: true, reason: "no album cards" });
+  } else {
+    results.push({
+      name: "browse master→detail",
+      checks: [
+        check("album opens a hero + tracklist", detail.heroShown && detail.hasTracks, `hero=${detail.heroShown} tracks=${detail.hasTracks}`),
+        check("artist link opens the artist page", detail.artistHero && detail.artistAlbums > 0, `${detail.artistAlbums} albums`),
+        check("Back returns to the album", detail.backShown && detail.backToAlbum, `back=${detail.backToAlbum}`),
+      ],
+    });
+  }
+
+  // Destructive actions use an in-product modal, never a native dialog (which is
+  // suppressed in PWAs). Create a playlist, delete it, and confirm the modal drives it.
+  await reset();
+  const modal = await ev(`(async () => {
+    const made = await apiJson('/api/playlists', 'POST', { name: 'Smoke Modal PL' });
+    await loadPlaylists();
+    deletePlaylist(made.id, made.name);
+    await new Promise((r) => setTimeout(r, 250));
+    const modalShown = !!document.querySelector('.modal-scrim .modal');
+    document.querySelector('.modal-scrim .primary-button, .modal-scrim .ghost-button.danger')?.click();
+    await new Promise((r) => setTimeout(r, 400));
+    const gone = (await api('/api/playlists')).every((p) => p.id !== made.id);
+    const closed = !document.querySelector('.modal-scrim');
+    return { modalShown, gone, closed };
+  })()`);
+  results.push({
+    name: "delete uses an in-product modal",
+    checks: [
+      check("a modal appears (no native confirm)", modal.modalShown, `shown=${modal.modalShown}`),
+      check("confirming deletes the playlist", modal.gone && modal.closed, `gone=${modal.gone}`),
+    ],
+  });
 
   return results;
 }
