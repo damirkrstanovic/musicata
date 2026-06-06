@@ -18,11 +18,11 @@
     }
   }}
 >
-  <div class="card-cover">
+  <div class="artist-avatar" aria-hidden="true">
     {#if image}
       <img src={image} alt="" loading="lazy" />
     {:else}
-      <span class="album-placeholder">{initial(artist.name)}</span>
+      {initial(artist.name)}
     {/if}
   </div>
   <div class="card-text">

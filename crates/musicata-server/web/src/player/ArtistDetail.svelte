@@ -27,12 +27,14 @@
 {#if detail}
   {@const image = sizedArtwork(detail.artist.artwork_url, 400)}
   <section class="detail-hero">
-    <div class="hero-cover">
-      {#if image}
-        <img src={image} alt="" />
-      {:else}
-        <span class="album-placeholder">{initial(detail.artist.name)}</span>
-      {/if}
+    <div class="hero-cover artist">
+      <span class="artist-avatar large" aria-hidden="true">
+        {#if image}
+          <img src={image} alt="" />
+        {:else}
+          {initial(detail.artist.name)}
+        {/if}
+      </span>
     </div>
     <div class="hero-info">
       <h2 class="hero-title">{detail.artist.name}</h2>

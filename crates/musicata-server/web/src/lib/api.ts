@@ -260,6 +260,7 @@ export const api = {
   librarySummary: () => getJson<LibrarySummary>("/api/library/summary"),
   artists: (params?: ListParams) => getJson<Page<Artist>>("/api/artists", params),
   albums: (params?: BrowseParams) => getJson<Page<Album>>("/api/albums", params),
+  tracks: (params?: BrowseParams) => getJson<Page<TrackRow>>("/api/tracks", params),
   browse: () => getJson<BrowseIndex>("/api/browse"),
 
   // Playlists, smart playlists, favorites

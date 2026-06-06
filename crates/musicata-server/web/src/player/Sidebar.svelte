@@ -32,7 +32,7 @@
       if (value.trim()) {
         if (nav.current.name !== "search") nav.root({ name: "search" });
       } else if (nav.current.name === "search") {
-        nav.root({ name: "library" });
+        nav.root({ name: "tracks" });
       }
     }, 220);
   }

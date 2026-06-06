@@ -15,6 +15,7 @@
   import Modal from "../lib/Modal.svelte";
   import Sidebar from "./Sidebar.svelte";
   import Footer from "./Footer.svelte";
+  import TracksView from "./TracksView.svelte";
   import LibraryGrid from "./LibraryGrid.svelte";
   import ArtistsGrid from "./ArtistsGrid.svelte";
   import AlbumDetail from "./AlbumDetail.svelte";
@@ -35,9 +36,11 @@
 
   // Center-panel title for the current route.
   const title = $derived(
-    route.name === "library"
-      ? "Albums"
-      : route.name === "artists"
+    route.name === "tracks"
+      ? "Tracks"
+      : route.name === "library"
+        ? "Albums"
+        : route.name === "artists"
         ? "Artists"
         : route.name === "favorites"
           ? "Favorites"
@@ -150,6 +153,12 @@
         <div class="segmented" role="tablist" aria-label="Browse">
           <button
             class="seg"
+            class:is-active={route.name === "tracks"}
+            type="button"
+            onclick={() => nav.root({ name: "tracks" })}>Tracks</button
+          >
+          <button
+            class="seg"
             class:is-active={route.name === "library"}
             type="button"
             onclick={() => nav.root({ name: "library" })}>Albums</button
@@ -165,7 +174,9 @@
       </div>
     </header>
 
-    {#if route.name === "library"}
+    {#if route.name === "tracks"}
+      <TracksView />
+    {:else if route.name === "library"}
       <LibraryGrid />
     {:else if route.name === "artists"}
       <ArtistsGrid />

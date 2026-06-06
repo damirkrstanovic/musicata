@@ -39,8 +39,7 @@ await send("Page.enable");
 await sleep(2500);
 
 // --- Hot path: a progress tick must move only the elapsed text, never now-title. ---
-await js(`document.querySelector('.album-card')?.click()`);
-await sleep(1000);
+// The landing view is the flat Tracks list, so a track row is present immediately.
 await js(`document.querySelector('.track-main')?.click()`);
 await sleep(1500);
 await js(`(() => {

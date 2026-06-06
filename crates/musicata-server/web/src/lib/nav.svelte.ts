@@ -1,6 +1,7 @@
 // In-page navigation: a stack of routes synced to the History API for the Back button,
 // mirroring the old player's nav-stack (the player is one page, not a client router).
 export type Route =
+  | { name: "tracks" }
   | { name: "library" }
   | { name: "artists" }
   | { name: "favorites" }
@@ -13,7 +14,7 @@ export type Route =
   | { name: "smart"; id: string; label: string };
 
 class Nav {
-  stack = $state<Route[]>([{ name: "library" }]);
+  stack = $state<Route[]>([{ name: "tracks" }]);
 
   get current(): Route {
     return this.stack[this.stack.length - 1];
