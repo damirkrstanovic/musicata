@@ -18,13 +18,17 @@ MutationObserver asserts a progress tick moves only the elapsed/seek text, never
 now-title — the hot path, now proven structurally rather than by counting global-function
 calls.
 
-**Optional follow-ups (not blocking):**
-- **PWA** — `vite-plugin-pwa` service worker (the old hand-versioned `sw.js` is gone; the app
-  works without offline caching until this lands).
-- **ts-rs for the metadata-observation graph** — the review panel's shapes are currently
-  hand-typed; generate them like the rest for end-to-end type safety.
-- Broaden `v2-flows.mjs` toward the old suite's coverage (zone flows, radio playback, the
-  scale-phase `--no-scan` pass).
+**Follow-ups — all done:**
+- **Broadened smoke suite** — `v2-flows.mjs` runs two phases (behavior on testdata + scale on
+  a real-DB `--no-scan` copy) with zone + radio flows and the windowed-render/infinite-scroll
+  scale checks.
+- **ts-rs for the metadata-observation graph** — the review panel's shapes are now generated
+  (`MetadataFieldValue`/`MetadataApprovalState`/`TrackMetadataFieldObservation` + the server
+  review structs); api.ts re-exports them. No more hand-typed metadata shapes.
+- **PWA** — `vite-plugin-pwa` (autoUpdate) generates the service worker + web manifest;
+  installable + offline app shell. The server's fallback serves the dist-root files
+  (`/sw.js`, `/manifest.webmanifest`, `/icon.svg`, …). Replaces the old hand-versioned
+  `sw.js`.
 
 - **Phase 0 (toolchain) — done.** `web/` (Svelte 5 + TS + Vite, two entries) builds via
   `build.rs`, embeds through `rust-embed`, served at `/v2` + `/v2/admin`. Headless-verified

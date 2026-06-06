@@ -1683,8 +1683,14 @@ async fn svelte_asset(Path(path): Path<String>) -> Response {
     )
 }
 
-async fn fallback() -> AppError {
-    AppError::not_found("route not found")
+async fn fallback(uri: axum::http::Uri) -> Response {
+    // Serve PWA root files embedded in the bundle (service worker, web manifest, icon,
+    // registerSW.js, workbox-*.js) by their path; anything else is a genuine 404.
+    let path = uri.path().trim_start_matches('/');
+    if !path.is_empty() && WebAssets::get(path).is_some() {
+        return web_asset(path, APP_SHELL_CACHE);
+    }
+    AppError::not_found("route not found").into_response()
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
