@@ -12,6 +12,9 @@ default = ["provider-smb"]
 # Read music from an SMB/CIFS network share directly (pure Rust, no mount). Pulls
 # in the `smb` crate; see crate::smb.
 provider-smb = ["dep:smb", "dep:futures"]
+# Generate TypeScript types for the web client from the server's response structs (the
+# admin DTOs). Off by default; see scripts/gen-web-types.sh.
+ts = ["dep:ts-rs", "musicata-core/ts"]
 
 [dependencies]
 anyhow.workspace = true
@@ -35,6 +38,11 @@ symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac
 # Cover-art thumbnail resizing (`?size=`). Minimal codec set — only the formats we
 # decode for covers — to keep the build lean. MIT/Apache-2.0 (AGPL-compatible).
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+# Embeds the Vite-built web app (`web/dist/`, produced by build.rs) into the binary.
+# `mime-guess` gives each asset its content type. MIT (AGPL-compatible).
+rust-embed = { version = "8", features = ["mime-guess"] }
+# Only pulled in under the `ts` feature (type generation); MIT/Apache-2.0.
+ts-rs = { version = "10", optional = true }
 
 [dev-dependencies]
 tower.workspace = true

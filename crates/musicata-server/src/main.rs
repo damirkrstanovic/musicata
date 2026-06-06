@@ -643,6 +643,23 @@ fn spawn_library_scan(state: &AppState, label: &str) {
 /// Background library task: scan once right away (so a fresh database is populated
 /// and an existing one refreshed), then re-scan on the interval unless incremental
 /// rescanning is disabled. Never blocks serving.
+/// A scan rewrites albums/artists to folder-derived rows, clearing their acquired
+/// `artwork_url` and resetting grouping to folder-derived. Republish acquired album/artist
+/// covers and re-apply enrichment + user merges *immediately* after the scan — otherwise
+/// they're only restored at the end of the cycle, after the slow fingerprint/MusicBrainz
+/// passes, so for minutes each cycle artists/albums would show no artwork.
+async fn restore_after_scan(database: &Database) {
+    if let Err(error) = database.reapply_canonical_grouping().await {
+        tracing::warn!(%error, "reapply canonical grouping failed");
+    }
+    if let Err(error) = database.reapply_acquired_artwork().await {
+        tracing::warn!(%error, "reapply acquired album artwork failed");
+    }
+    if let Err(error) = database.reapply_acquired_artist_artwork().await {
+        tracing::warn!(%error, "reapply acquired artist artwork failed");
+    }
+}
+
 async fn library_scan_loop(
     database: Database,
     providers: Arc<RwLock<ProviderRegistry>>,
@@ -667,6 +684,7 @@ async fn library_scan_loop(
         true,
     )
     .await;
+    restore_after_scan(&database).await;
     // Fingerprint untagged tracks first (resolves MBIDs), then enrich their metadata
     // from MusicBrainz, then fill covers (which can now reach the id-exact providers).
     fingerprint_pass(&database, &providers, &activity).await;
@@ -696,6 +714,7 @@ async fn library_scan_loop(
             true,
         )
         .await;
+        restore_after_scan(&database).await;
         fingerprint_pass(&database, &providers, &activity).await;
         musicbrainz_search_pass(&database, &activity).await;
         musicbrainz_enrich_pass(&database, &activity).await;
@@ -1472,14 +1491,11 @@ fn app(
 ) -> Router {
     Router::new()
         .merge(subsonic::routes())
-        .route("/", get(index))
-        .route("/admin", get(admin_page))
-        .route("/admin.js", get(admin_js))
-        .route("/app.js", get(app_js))
-        .route("/styles.css", get(styles_css))
-        .route("/manifest.webmanifest", get(manifest))
-        .route("/icon.svg", get(app_icon))
-        .route("/sw.js", get(service_worker))
+        // The embedded Svelte app (built from web/ by build.rs). Hashed bundles under
+        // /assets/* are immutable; the HTML entries are no-cache.
+        .route("/", get(svelte_player))
+        .route("/admin", get(svelte_admin))
+        .route("/assets/{*path}", get(svelte_asset))
         .route("/api/health", get(health))
         .route("/api/library/summary", get(library_summary))
         .route("/api/library/rescan", post(rescan_library))
@@ -1629,80 +1645,41 @@ async fn log_request(request: Request, next: Next) -> Response {
 // a stale copy. Content is embedded, so revalidation is a tiny full refetch.
 const APP_SHELL_CACHE: &str = "no-cache";
 
-async fn index() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "text/html; charset=utf-8"),
-            (CACHE_CONTROL, APP_SHELL_CACHE),
-        ],
-        include_str!("../static/index.html"),
-    )
+// The Svelte app built by build.rs (web/dist). Served at parallel paths (`/v2`, `/v2/admin`)
+// during the migration so the current vanilla app at `/` keeps working; cutover (Phase 5)
+// will flip these to `/` and `/admin` and drop the include_str! handlers + static/.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "web/dist"]
+struct WebAssets;
+
+/// Serve one embedded file from the Svelte build, guessing its content type.
+fn web_asset(path: &str, cache: &str) -> Response {
+    match WebAssets::get(path) {
+        Some(file) => {
+            let mime = file.metadata.mimetype().to_string();
+            (
+                [(CONTENT_TYPE, mime), (CACHE_CONTROL, cache.to_string())],
+                file.data.into_owned(),
+            )
+                .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
-async fn admin_page() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "text/html; charset=utf-8"),
-            (CACHE_CONTROL, APP_SHELL_CACHE),
-        ],
-        include_str!("../static/admin.html"),
-    )
+async fn svelte_player() -> Response {
+    web_asset("index.html", APP_SHELL_CACHE)
 }
 
-async fn admin_js() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "application/javascript; charset=utf-8"),
-            (CACHE_CONTROL, APP_SHELL_CACHE),
-        ],
-        include_str!("../static/admin.js"),
-    )
+async fn svelte_admin() -> Response {
+    web_asset("admin.html", APP_SHELL_CACHE)
 }
 
-async fn app_js() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "application/javascript; charset=utf-8"),
-            (CACHE_CONTROL, APP_SHELL_CACHE),
-        ],
-        include_str!("../static/app.js"),
-    )
-}
-
-async fn styles_css() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "text/css; charset=utf-8"),
-            (CACHE_CONTROL, APP_SHELL_CACHE),
-        ],
-        include_str!("../static/styles.css"),
-    )
-}
-
-async fn manifest() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "application/manifest+json; charset=utf-8")],
-        include_str!("../static/manifest.webmanifest"),
-    )
-}
-
-async fn app_icon() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
-            (CACHE_CONTROL, "public, max-age=86400"),
-        ],
-        include_str!("../static/icon.svg"),
-    )
-}
-
-async fn service_worker() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "application/javascript; charset=utf-8"),
-            (CACHE_CONTROL, APP_SHELL_CACHE),
-        ],
-        include_str!("../static/sw.js"),
+/// Hashed Vite bundles (`/assets/*`) are content-addressed, so cache them immutably.
+async fn svelte_asset(Path(path): Path<String>) -> Response {
+    web_asset(
+        &format!("assets/{path}"),
+        "public, max-age=31536000, immutable",
     )
 }
 
@@ -2350,6 +2327,7 @@ async fn artist_detail(
 
 /// A group of artist-name variants merged under one canonical artist.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct ArtistAliasGroup {
     canonical_key: String,
     canonical_name: String,
@@ -3045,6 +3023,7 @@ async fn delete_radio(
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct SourceView {
     id: String,
     kind: String,
@@ -3103,6 +3082,7 @@ async fn activity_ws_loop(mut socket: WebSocket, activity: Arc<activity::Activit
 /// network sources (SMB shares).
 /// User-editable app settings (the `/admin` Settings panel; persisted in the DB).
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct AppSettings {
     /// Automatically fetch missing album covers from external providers.
     artwork_fetch: bool,

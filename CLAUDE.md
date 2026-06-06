@@ -28,8 +28,9 @@ Other docs: `docs/plugins.md` (Roon research + provider plan), `docs/api.md` (na
   zone queues,
   playlists, favorites, radio, sources, activities).
 - `crates/musicata-server` — axum 0.8 (+ws), the providers/registry, players, the
-  OpenSubsonic surface, and the embedded web app (`static/`, vanilla HTML/CSS/JS, no
-  build step; two pages: `/` player, `/admin`).
+  OpenSubsonic surface, and the embedded web app (`web/` — Svelte 5 + TypeScript + Vite,
+  built by `build.rs` and embedded via `rust-embed`; two pages: `/` player, `/admin`).
+  Wire types are generated from the Rust structs by ts-rs (`scripts/gen-web-types.sh`).
 
 ## Conventions (hard-won)
 
@@ -50,8 +51,10 @@ Other docs: `docs/plugins.md` (Roon research + provider plan), `docs/api.md` (na
 - **Network is never on a request's hot path**: bind the web port before scanning;
   connect/scan in the background with timeouts; surface progress/errors via the
   activity log + WebSocket, not blocking calls or polling.
-- **Static assets are served `no-cache`** and embedded via `include_str!`; bump the
-  `CACHE` version in `static/sw.js` whenever a static asset changes.
+- **The web app is built by `build.rs`** (Vite) and embedded via `rust-embed` from
+  `web/dist/`. Hashed `/assets/*` bundles are served immutable; the HTML entries
+  `no-cache`. `cargo build` therefore needs Node+npm (or `MUSICATA_SKIP_WEB_BUILD=1` with a
+  prebuilt `web/dist/`). Edit components in `web/src/`; run `npm run check` (svelte-check).
 - AGPL-3.0; check a new dependency's license before adding it.
 
 ## Build / test / run
@@ -63,18 +66,23 @@ cargo test                                     # all crates (SMB tests run by de
 cargo run -p musicata-server -- --library <dir> --addr 127.0.0.1:3030
 ```
 
+- **Frontend** is Svelte 5 + TS + Vite in `crates/musicata-server/web/`; `build.rs` runs
+  the Vite build on every `cargo build`, so **Node + npm are build dependencies** (set
+  `MUSICATA_SKIP_WEB_BUILD=1` with a prebuilt `web/dist/` to skip offline). Regenerate the
+  Rust→TS wire types with `scripts/gen-web-types.sh` after changing a `#[derive(ts_rs::TS)]`
+  struct. (See `docs/svelte-migration.md` for the migration history.)
 - **Before testing against a *running* server, `cargo build`** — `cargo test` only
   builds the test harness, not the `target/debug/musicata-server` binary.
 - `cargo fmt` reformats multi-line edits — re-read before editing a region you just
   changed.
 - The repo has a real fixture library at `testdata/`.
 - Verify UI changes with the headless browser at
-  `~/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome` (launch with
-  `--headless=new --no-sandbox`). The **`scripts/ui-smoke.sh`** suite (see
-  `tests/ui/README.md`) automates this: it drives the real web app over CDP and
-  asserts on user flows *and* lag (footer latency, no audio restarts, no full-state
-  broadcast or DOM sweep on position ticks). `cargo test` covers the server only — it
-  does **not** touch `static/`, so run the smoke suite after changing the web app.
+  `~/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome`. The **`scripts/ui-smoke.sh`**
+  suite (→ `scripts/v2-smoke.sh` + `tests/ui/v2-flows.mjs`) drives the Svelte app over CDP
+  and asserts user flows *and* the playback hot path — via a MutationObserver, a progress
+  tick must move only the elapsed/seek text, never the now-title. `cargo test` covers the
+  server only and does **not** build `web/`, so run the smoke suite after changing the UI.
+  Run `npm run check` in `web/` for typecheck.
   Rust-level guards for the playback hot path live in `players.rs` tests.
 
 ## Git

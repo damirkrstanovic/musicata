@@ -32,6 +32,7 @@ const INLINE_CONTENT_HASH_LIMIT_BYTES: u64 = 1024 * 1024;
 /// source can only stream. Each provider advertises its capabilities so the API
 /// and UI can hide affordances a source does not support.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct ProviderCapabilities {
     /// Can enumerate its whole catalogue into the merged library (`scan`).
     pub can_scan: bool,
@@ -317,6 +318,7 @@ impl Library {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct LibrarySummary {
     pub provider_id: String,
     pub source_root: String,
@@ -326,6 +328,7 @@ pub struct LibrarySummary {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Artist {
     pub id: String,
     pub name: String,
@@ -338,6 +341,7 @@ pub struct Artist {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Album {
     pub id: String,
     pub title: String,
@@ -347,29 +351,35 @@ pub struct Album {
     pub track_count: usize,
     pub artwork_url: Option<String>,
     #[serde(skip)]
+    #[cfg_attr(feature = "ts", ts(skip))]
     pub artwork_path: Option<PathBuf>,
 }
 
 /// An internet radio station — a named external stream. The first non-library music
 /// source (see docs/plugins.md).
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct RadioStation {
     pub id: String,
     pub name: String,
     pub stream_url: String,
     pub homepage_url: Option<String>,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub created_at_unix_seconds: i64,
 }
 
 /// A user-created playlist. Its tracks are stored separately (ordered) and returned
 /// with the detail view.
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Playlist {
     pub id: String,
     pub name: String,
     pub comment: Option<String>,
     pub song_count: usize,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub created_at_unix_seconds: i64,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub updated_at_unix_seconds: i64,
 }
 
@@ -517,6 +527,7 @@ pub struct BrowseYearFacet {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum PlaybackStatus {
     #[default]
@@ -526,6 +537,7 @@ pub enum PlaybackStatus {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum RepeatMode {
     #[default]
@@ -535,6 +547,7 @@ pub enum RepeatMode {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct PlayerCapabilities {
     pub seek: bool,
     pub volume: bool,
@@ -544,6 +557,7 @@ pub struct PlayerCapabilities {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Player {
     pub id: String,
     pub name: String,
@@ -560,6 +574,7 @@ pub struct Player {
 /// A named group of players. Commands sent to a zone apply to its players; there
 /// is no audio synchronization between them.
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Zone {
     pub id: String,
     pub name: String,
@@ -568,6 +583,7 @@ pub struct Zone {
 /// What a controller knows about a track queued on a player. `stream_url` is what
 /// the player actually fetches; `track_id` links back to the library when known.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct QueueItem {
     pub track_id: Option<String>,
     pub title: String,
@@ -578,6 +594,7 @@ pub struct QueueItem {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct PlaybackState {
     pub status: PlaybackStatus,
     pub now_playing: Option<QueueItem>,
