@@ -63,6 +63,12 @@ cargo test                                     # all crates (SMB tests run by de
 cargo run -p musicata-server -- --library <dir> --addr 127.0.0.1:3030
 ```
 
+- **Frontend (in migration to Svelte):** the new web app lives in
+  `crates/musicata-server/web/` (Svelte 5 + TS + Vite). `build.rs` runs the Vite build on
+  every `cargo build`, so **Node + npm are now build dependencies**; set
+  `MUSICATA_SKIP_WEB_BUILD=1` (with a prebuilt `web/dist/`) to skip it offline. The Svelte
+  app is served at `/v2` + `/v2/admin` during the migration; the old vanilla app in
+  `static/` still serves `/` + `/admin` until cutover. See `docs/svelte-migration.md`.
 - **Before testing against a *running* server, `cargo build`** — `cargo test` only
   builds the test harness, not the `target/debug/musicata-server` binary.
 - `cargo fmt` reformats multi-line edits — re-read before editing a region you just

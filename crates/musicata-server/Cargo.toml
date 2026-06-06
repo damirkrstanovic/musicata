@@ -35,6 +35,9 @@ symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac
 # Cover-art thumbnail resizing (`?size=`). Minimal codec set — only the formats we
 # decode for covers — to keep the build lean. MIT/Apache-2.0 (AGPL-compatible).
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+# Embeds the Vite-built web app (`web/dist/`, produced by build.rs) into the binary.
+# `mime-guess` gives each asset its content type. MIT (AGPL-compatible).
+rust-embed = { version = "8", features = ["mime-guess"] }
 
 [dev-dependencies]
 tower.workspace = true

@@ -1480,6 +1480,10 @@ fn app(
         .route("/manifest.webmanifest", get(manifest))
         .route("/icon.svg", get(app_icon))
         .route("/sw.js", get(service_worker))
+        // Svelte app under migration (parallel paths; cutover flips these to / and /admin).
+        .route("/v2", get(svelte_player))
+        .route("/v2/admin", get(svelte_admin))
+        .route("/assets/{*path}", get(svelte_asset))
         .route("/api/health", get(health))
         .route("/api/library/summary", get(library_summary))
         .route("/api/library/rescan", post(rescan_library))
@@ -1628,6 +1632,44 @@ async fn log_request(request: Request, next: Next) -> Response {
 // revalidates and picks up a rebuilt binary's assets on reload, instead of running
 // a stale copy. Content is embedded, so revalidation is a tiny full refetch.
 const APP_SHELL_CACHE: &str = "no-cache";
+
+// The Svelte app built by build.rs (web/dist). Served at parallel paths (`/v2`, `/v2/admin`)
+// during the migration so the current vanilla app at `/` keeps working; cutover (Phase 5)
+// will flip these to `/` and `/admin` and drop the include_str! handlers + static/.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "web/dist"]
+struct WebAssets;
+
+/// Serve one embedded file from the Svelte build, guessing its content type.
+fn web_asset(path: &str, cache: &str) -> Response {
+    match WebAssets::get(path) {
+        Some(file) => {
+            let mime = file.metadata.mimetype().to_string();
+            (
+                [(CONTENT_TYPE, mime), (CACHE_CONTROL, cache.to_string())],
+                file.data.into_owned(),
+            )
+                .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn svelte_player() -> Response {
+    web_asset("index.html", APP_SHELL_CACHE)
+}
+
+async fn svelte_admin() -> Response {
+    web_asset("admin.html", APP_SHELL_CACHE)
+}
+
+/// Hashed Vite bundles (`/assets/*`) are content-addressed, so cache them immutably.
+async fn svelte_asset(Path(path): Path<String>) -> Response {
+    web_asset(
+        &format!("assets/{path}"),
+        "public, max-age=31536000, immutable",
+    )
+}
 
 async fn index() -> impl IntoResponse {
     (
