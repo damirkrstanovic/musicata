@@ -9,7 +9,9 @@
   import { sendCommand } from "../lib/commands";
   import { setMediaMetadata, setMediaPosition, setMediaHandlers } from "../lib/media";
   import { search } from "../lib/search.svelte";
+  import { favorites } from "../lib/favorites.svelte";
   import type { PlaybackState } from "../types/PlaybackState";
+  import Modal from "../lib/Modal.svelte";
   import Footer from "./Footer.svelte";
   import LibraryGrid from "./LibraryGrid.svelte";
   import ArtistsGrid from "./ArtistsGrid.svelte";
@@ -17,6 +19,10 @@
   import ArtistDetail from "./ArtistDetail.svelte";
   import SearchResults from "./SearchResults.svelte";
   import QueueDrawer from "./QueueDrawer.svelte";
+  import FavoritesView from "./FavoritesView.svelte";
+  import PlaylistsIndex from "./PlaylistsIndex.svelte";
+  import PlaylistView from "./PlaylistView.svelte";
+  import SmartPlaylistView from "./SmartPlaylistView.svelte";
 
   let audioEl: HTMLAudioElement;
   let audio: BrowserAudio | null = null;
@@ -64,6 +70,7 @@
       },
     });
 
+    favorites.load();
     const players = await api.players();
     const browser = players.find((p) => p.kind === "browser") ?? players[0];
     if (!browser) return;
@@ -111,6 +118,18 @@
         type="button"
         onclick={() => nav.root({ name: "artists" })}>Artists</button
       >
+      <button
+        class="tab"
+        class:active={route.name === "favorites"}
+        type="button"
+        onclick={() => nav.root({ name: "favorites" })}>Favorites</button
+      >
+      <button
+        class="tab"
+        class:active={route.name === "playlists"}
+        type="button"
+        onclick={() => nav.root({ name: "playlists" })}>Playlists</button
+      >
     </nav>
     <label class="search">
       <input type="search" autocomplete="off" placeholder="Search" oninput={(e) => onSearchInput(e.currentTarget.value)} />
@@ -123,16 +142,25 @@
       <LibraryGrid />
     {:else if route.name === "artists"}
       <ArtistsGrid />
+    {:else if route.name === "favorites"}
+      <FavoritesView />
+    {:else if route.name === "playlists"}
+      <PlaylistsIndex />
     {:else if route.name === "search"}
       <SearchResults />
     {:else if route.name === "album"}
       <AlbumDetail id={route.id} />
     {:else if route.name === "artist"}
       <ArtistDetail id={route.id} />
+    {:else if route.name === "playlist"}
+      <PlaylistView id={route.id} />
+    {:else if route.name === "smart"}
+      <SmartPlaylistView id={route.id} />
     {/if}
   </main>
 
   <Footer />
   <QueueDrawer />
+  <Modal />
   <audio bind:this={audioEl} preload="none" hidden></audio>
 </div>

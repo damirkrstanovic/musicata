@@ -3,9 +3,13 @@
 export type Route =
   | { name: "library" }
   | { name: "artists" }
+  | { name: "favorites" }
+  | { name: "playlists" }
   | { name: "search" }
   | { name: "album"; id: string; title: string }
-  | { name: "artist"; id: string; label: string };
+  | { name: "artist"; id: string; label: string }
+  | { name: "playlist"; id: string; label: string }
+  | { name: "smart"; id: string; label: string };
 
 class Nav {
   stack = $state<Route[]>([{ name: "library" }]);

@@ -4,6 +4,7 @@
   import { playTracks } from "../lib/playback";
   import { player } from "../lib/player.svelte";
   import { nav } from "../lib/nav.svelte";
+  import { favorites } from "../lib/favorites.svelte";
 
   // Clicking a row plays the whole list starting there (matches the old player).
   let { tracks }: { tracks: TrackRow[] } = $props();
@@ -37,6 +38,16 @@
         </span>
       </div>
       <span class="track-stat">{track.duration_seconds ? formatTime(track.duration_seconds) : ""}</span>
+      <span class="track-actions">
+        <button
+          class="icon-toggle heart"
+          class:active={favorites.has(track.id)}
+          type="button"
+          title="Favorite"
+          aria-pressed={favorites.has(track.id)}
+          onclick={() => favorites.toggleTrack(track.id)}>{favorites.has(track.id) ? "♥" : "♡"}</button
+        >
+      </span>
     </div>
   {/each}
 </div>

@@ -87,6 +87,59 @@ export interface SearchResults {
   tracks: TrackRow[];
 }
 
+export interface Playlist {
+  id: string;
+  name: string;
+  comment: string | null;
+  song_count: number;
+  created_at_unix_seconds: number;
+  updated_at_unix_seconds: number;
+}
+
+export interface PlaylistDetail extends Playlist {
+  tracks: TrackRow[];
+}
+
+export interface SmartPlaylist {
+  id: string;
+  name: string;
+  description: string;
+}
+
+export interface SmartPlaylistDetail extends SmartPlaylist {
+  tracks: TrackRow[];
+}
+
+export interface Favorites {
+  tracks: TrackRow[];
+  albums: Album[];
+  artists: Artist[];
+}
+
+export type FavoriteKind = "track" | "album" | "artist";
+
+export interface BrowseFacet {
+  value: string;
+  track_count: number;
+}
+export interface BrowseYearFacet {
+  value: number;
+  track_count: number;
+}
+export interface BrowseIndex {
+  genres: BrowseFacet[];
+  years: BrowseYearFacet[];
+  composers: BrowseFacet[];
+  folders: BrowseFacet[];
+}
+
+/** Album/track list filters (browse facets), layered onto the paging params. */
+export type BrowseParams = ListParams & {
+  genre?: string;
+  year?: number;
+  composer?: string;
+};
+
 export type { SourceView, AppSettings, ArtistAliasGroup, Activity, Player, Zone };
 
 export interface CreateSourceRequest {
@@ -156,7 +209,26 @@ export const api = {
   // Library
   librarySummary: () => getJson<LibrarySummary>("/api/library/summary"),
   artists: (params?: ListParams) => getJson<Page<Artist>>("/api/artists", params),
-  albums: (params?: ListParams) => getJson<Page<Album>>("/api/albums", params),
+  albums: (params?: BrowseParams) => getJson<Page<Album>>("/api/albums", params),
+  browse: () => getJson<BrowseIndex>("/api/browse"),
+
+  // Playlists, smart playlists, favorites
+  playlists: () => getJson<Playlist[]>("/api/playlists"),
+  playlistDetail: (id: string) => getJson<PlaylistDetail>(`/api/playlists/${encodeURIComponent(id)}`),
+  createPlaylist: (name: string) => sendJson<Playlist>("/api/playlists", "POST", { name }),
+  addToPlaylist: (id: string, trackIds: string[]) =>
+    sendJson(`/api/playlists/${encodeURIComponent(id)}`, "PATCH", { add_track_ids: trackIds }),
+  deletePlaylist: (id: string) => sendJson(`/api/playlists/${encodeURIComponent(id)}`, "DELETE"),
+  smartPlaylists: () => getJson<SmartPlaylist[]>("/api/smart-playlists"),
+  smartPlaylistDetail: (id: string) =>
+    getJson<SmartPlaylistDetail>(`/api/smart-playlists/${encodeURIComponent(id)}`),
+  favorites: () => getJson<Favorites>("/api/favorites"),
+  star: (kind: FavoriteKind, id: string) =>
+    sendJson(`/api/favorites/${kind}/${encodeURIComponent(id)}`, "PUT"),
+  unstar: (kind: FavoriteKind, id: string) =>
+    sendJson(`/api/favorites/${kind}/${encodeURIComponent(id)}`, "DELETE"),
+
+  // Radio
   radio: () => getJson<RadioStation[]>("/api/radio"),
 
   // Sources
