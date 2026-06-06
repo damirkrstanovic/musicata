@@ -5,7 +5,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Generate TypeScript types for the web client from the wire structs. Off by default so
+# the core stays dependency-light; enabled only when regenerating:
+#   TS_RS_EXPORT_DIR=$PWD/crates/musicata-server/web/src/types \
+#     cargo test -p musicata-core --features ts
+ts = ["dep:ts-rs"]
+
 [dependencies]
 lofty = "0.24.0"
 serde.workspace = true
 sha2.workspace = true
+# Only pulled in under the `ts` feature (type generation); MIT/Apache-2.0.
+ts-rs = { version = "10", optional = true }

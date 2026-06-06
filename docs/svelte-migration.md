@@ -3,6 +3,24 @@
 Plan for rewriting the embedded web app (`crates/musicata-server/static/`) as a
 Svelte + TypeScript app, built with Vite and embedded into the server binary.
 
+## Status
+
+- **Phase 0 (toolchain) — done.** `web/` (Svelte 5 + TS + Vite, two entries) builds via
+  `build.rs`, embeds through `rust-embed`, served at `/v2` + `/v2/admin`. Headless-verified
+  the Svelte app mounts. Old app at `/` untouched.
+- **Phase 1 (shared types) — in progress.** `ts` feature on `musicata-core` (off by default)
+  generates TS via ts-rs; `scripts/gen-web-types.sh` regenerates into `web/src/types/`.
+  Typed `web/src/lib/api.ts`. The `/v2` shell renders real `/api/library/summary` data
+  through the typed client; `svelte-check` is clean.
+  - **Done:** the flat library types — `LibrarySummary`, `Artist`, `Album`, `Playlist`,
+    `RadioStation`, `Zone`.
+  - **Deferred (typed with their components, not speculatively):** `Track` + the metadata
+    observation graph, `Player`/`PlayerCapabilities`, `PlaybackState`/`QueueItem`/enums,
+    `PlayerCommand`. The generic `Page<T>` envelope is hand-typed in `api.ts` (ts-rs doesn't
+    export the wrapper); element types are generated.
+  - **`json!` triage:** the ~95 ad-hoc response sites get promoted to structs (then
+    ts-rs-derived) or hand-typed as their endpoints are consumed.
+
 **Decisions (locked):**
 - **Svelte 5 (runes) + TypeScript**, plain Svelte + **Vite** (no SvelteKit — we serve a
   static SPA from axum, no SSR/Node runtime).

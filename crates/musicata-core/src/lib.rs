@@ -317,6 +317,7 @@ impl Library {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct LibrarySummary {
     pub provider_id: String,
     pub source_root: String,
@@ -326,6 +327,7 @@ pub struct LibrarySummary {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Artist {
     pub id: String,
     pub name: String,
@@ -338,6 +340,7 @@ pub struct Artist {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Album {
     pub id: String,
     pub title: String,
@@ -347,12 +350,14 @@ pub struct Album {
     pub track_count: usize,
     pub artwork_url: Option<String>,
     #[serde(skip)]
+    #[cfg_attr(feature = "ts", ts(skip))]
     pub artwork_path: Option<PathBuf>,
 }
 
 /// An internet radio station — a named external stream. The first non-library music
 /// source (see docs/plugins.md).
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct RadioStation {
     pub id: String,
     pub name: String,
@@ -364,6 +369,7 @@ pub struct RadioStation {
 /// A user-created playlist. Its tracks are stored separately (ordered) and returned
 /// with the detail view.
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Playlist {
     pub id: String,
     pub name: String,
@@ -560,6 +566,7 @@ pub struct Player {
 /// A named group of players. Commands sent to a zone apply to its players; there
 /// is no audio synchronization between them.
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Zone {
     pub id: String,
     pub name: String,
