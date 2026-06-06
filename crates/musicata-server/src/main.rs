@@ -3413,6 +3413,7 @@ async fn tracks(
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct TrackMetadataReviewResponse {
     track_id: String,
     canonical: TrackCanonicalMetadataResponse,
@@ -3420,6 +3421,7 @@ struct TrackMetadataReviewResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct TrackCanonicalMetadataResponse {
     title: String,
     artist_name: String,
@@ -3429,17 +3431,21 @@ struct TrackCanonicalMetadataResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct MetadataObservationReviewResponse {
     source: String,
     confidence: f32,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     observed_at_unix_seconds: i64,
     approval_state: MetadataApprovalState,
     fields: Vec<TrackMetadataFieldObservation>,
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct MetadataFieldReviewUpdate {
     source: String,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     observed_at_unix_seconds: i64,
     field_name: String,
     value: MetadataFieldValue,

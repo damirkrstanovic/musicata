@@ -456,16 +456,19 @@ pub struct TrackMetadataObservation {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct TrackMetadataFieldObservation {
     pub source: String,
     pub field_name: String,
     pub value: MetadataFieldValue,
     pub confidence: f32,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub observed_at_unix_seconds: i64,
     pub approval_state: MetadataApprovalState,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum MetadataFieldValue {
     Text(String),
@@ -475,6 +478,7 @@ pub enum MetadataFieldValue {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum MetadataApprovalState {
     Observed,
