@@ -4,4 +4,4 @@
  * An internet radio station — a named external stream. The first non-library music
  * source (see docs/plugins.md).
  */
-export type RadioStation = { id: string, name: string, stream_url: string, homepage_url: string | null, created_at_unix_seconds: bigint, };
+export type RadioStation = { id: string, name: string, stream_url: string, homepage_url: string | null, created_at_unix_seconds: number, };

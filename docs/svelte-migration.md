@@ -8,6 +8,13 @@ Svelte + TypeScript app, built with Vite and embedded into the server binary.
 - **Phase 0 (toolchain) — done.** `web/` (Svelte 5 + TS + Vite, two entries) builds via
   `build.rs`, embeds through `rust-embed`, served at `/v2` + `/v2/admin`. Headless-verified
   the Svelte app mounts. Old app at `/` untouched.
+- **Phase 2 (admin page) — done.** `/v2/admin` is a full Svelte port: Sources, Artwork &
+  Settings, Players & Zones, Merged artists, Identification, Activity (live WS). Reuses the
+  promise-based `Modal`, the typed `api` client, and the existing `styles.css`. Server admin
+  DTOs (`SourceView`, `AppSettings`, `ArtistAliasGroup`, `Activity`) + `Player`/
+  `ProviderCapabilities` are now ts-rs-generated; `i64`/`u64` wire fields overridden to
+  `number` (ts-rs defaults them to `bigint`). Headless-verified: all panels render real data,
+  remove-button rules correct (local source / browser player excluded). `svelte-check` clean.
 - **Phase 1 (shared types) — in progress.** `ts` feature on `musicata-core` (off by default)
   generates TS via ts-rs; `scripts/gen-web-types.sh` regenerates into `web/src/types/`.
   Typed `web/src/lib/api.ts`. The `/v2` shell renders real `/api/library/summary` data

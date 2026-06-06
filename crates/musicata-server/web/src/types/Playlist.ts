@@ -4,4 +4,4 @@
  * A user-created playlist. Its tracks are stored separately (ordered) and returned
  * with the detail view.
  */
-export type Playlist = { id: string, name: string, comment: string | null, song_count: number, created_at_unix_seconds: bigint, updated_at_unix_seconds: bigint, };
+export type Playlist = { id: string, name: string, comment: string | null, song_count: number, created_at_unix_seconds: number, updated_at_unix_seconds: number, };

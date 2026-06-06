@@ -32,6 +32,7 @@ const INLINE_CONTENT_HASH_LIMIT_BYTES: u64 = 1024 * 1024;
 /// source can only stream. Each provider advertises its capabilities so the API
 /// and UI can hide affordances a source does not support.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct ProviderCapabilities {
     /// Can enumerate its whole catalogue into the merged library (`scan`).
     pub can_scan: bool,
@@ -363,6 +364,7 @@ pub struct RadioStation {
     pub name: String,
     pub stream_url: String,
     pub homepage_url: Option<String>,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub created_at_unix_seconds: i64,
 }
 
@@ -375,7 +377,9 @@ pub struct Playlist {
     pub name: String,
     pub comment: Option<String>,
     pub song_count: usize,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub created_at_unix_seconds: i64,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub updated_at_unix_seconds: i64,
 }
 
@@ -541,6 +545,7 @@ pub enum RepeatMode {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct PlayerCapabilities {
     pub seek: bool,
     pub volume: bool,
@@ -550,6 +555,7 @@ pub struct PlayerCapabilities {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Player {
     pub id: String,
     pub name: String,

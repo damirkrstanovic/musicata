@@ -2392,6 +2392,7 @@ async fn artist_detail(
 
 /// A group of artist-name variants merged under one canonical artist.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct ArtistAliasGroup {
     canonical_key: String,
     canonical_name: String,
@@ -3087,6 +3088,7 @@ async fn delete_radio(
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct SourceView {
     id: String,
     kind: String,
@@ -3145,6 +3147,7 @@ async fn activity_ws_loop(mut socket: WebSocket, activity: Arc<activity::Activit
 /// network sources (SMB shares).
 /// User-editable app settings (the `/admin` Settings panel; persisted in the DB).
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct AppSettings {
     /// Automatically fetch missing album covers from external providers.
     artwork_fetch: bool,

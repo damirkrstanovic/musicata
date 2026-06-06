@@ -16,7 +16,11 @@ use tokio::sync::watch;
 const MAX_ACTIVITIES: usize = 60;
 
 #[derive(Clone, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Activity {
+    // Wire ints are JSON numbers (well within JS safe-integer range); override ts-rs's
+    // default i64/u64 → bigint so the generated TS matches the runtime `number`.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub id: u64,
     /// Coarse category, e.g. "scan".
     pub kind: String,
@@ -24,7 +28,9 @@ pub struct Activity {
     pub label: String,
     /// "running" | "ok" | "error".
     pub status: String,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub started_at_unix_seconds: i64,
+    #[cfg_attr(feature = "ts", ts(type = "number | null"))]
     pub finished_at_unix_seconds: Option<i64>,
     /// Result summary, or the failure with its root cause.
     pub message: Option<String>,
