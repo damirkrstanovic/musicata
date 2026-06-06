@@ -1,11 +1,46 @@
-// Hot-path + flow smoke for the Svelte app (the old run.mjs/instrument.mjs wrap globals the
-// Svelte app doesn't have). Assumes a server with a scanned testdata library is running and
-// a headless Chrome with CDP is on :9222. Args: <port> [basePath=/v2]. Exits non-zero on any
-// failed assertion.
+// Hot-path + flow smoke for the Svelte app. Two phases (see scripts/v2-smoke.sh):
+//   behavior — playback/flows against the light testdata fixture (this is where the hot
+//              path and most flows are pinned).
+//   scale    — render/scroll/search against a copy of the real ~11k-track DB (--no-scan):
+//              the app must window its rendering, not pull the whole library up front.
+// Args: <port> <basePath> <mode=behavior|scale>. Assumes Chrome CDP on :9222. Exits
+// non-zero on any failed assertion.
 const PORT = process.argv[2];
 const PATH = process.argv[3] || "/v2";
+const MODE = process.argv[4] || "behavior";
 const base = `http://127.0.0.1:${PORT}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const api = (path, init) => fetch(base + path, init).then((r) => (r.ok ? r.json().catch(() => null) : null));
+
+let failures = 0;
+function check(name, ok, detail = "") {
+  console.log(`  ${ok ? "✓" : "✗"} ${name}${ok ? "" : "  <-- " + detail}`);
+  if (!ok) failures++;
+}
+
+// Behavior phase: pre-create a zone (holding the browser player) and a radio station via the
+// API, so the page loads with them present.
+if (MODE === "behavior") {
+  const players = (await api("/api/players")) || [];
+  const browser = players.find((p) => p.kind === "browser");
+  const zone = await api("/api/zones", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "Smoke Zone" }),
+  });
+  if (browser && zone) {
+    await api(`/api/players/${browser.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ zone_id: zone.id }),
+    });
+  }
+  await api("/api/radio", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "Smoke FM", stream_url: "http://127.0.0.1:1/stream" }),
+  });
+}
 
 const target = await (
   await fetch("http://127.0.0.1:9222/json/new?" + encodeURIComponent(base + PATH), { method: "PUT" })
@@ -14,12 +49,12 @@ const ws = new WebSocket(target.webSocketDebuggerUrl);
 await new Promise((r) => (ws.onopen = r));
 let id = 0;
 const pending = new Map();
-const consoleErrors = [];
+const exceptions = [];
 ws.addEventListener("message", (e) => {
   const m = JSON.parse(e.data);
   if (m.id && pending.has(m.id)) (pending.get(m.id)(m.result), pending.delete(m.id));
   if (m.method === "Runtime.exceptionThrown")
-    consoleErrors.push(m.params.exceptionDetails.exception?.description || m.params.exceptionDetails.text);
+    exceptions.push(m.params.exceptionDetails.exception?.description || m.params.exceptionDetails.text);
 });
 const send = (method, params = {}) =>
   new Promise((res) => (pending.set(++id, res), ws.send(JSON.stringify({ id, method, params }))));
@@ -28,18 +63,38 @@ const js = async (expr) =>
 const clickText = (sel, text) =>
   js(`[...document.querySelectorAll(${JSON.stringify(sel)})].find(b=>b.textContent.trim()===${JSON.stringify(text)})?.click()`);
 
-let failures = 0;
-function check(name, ok, detail = "") {
-  console.log(`  ${ok ? "✓" : "✗"} ${name}${ok ? "" : "  <-- " + detail}`);
-  if (!ok) failures++;
-}
-
 await send("Runtime.enable");
 await send("Page.enable");
+// A real viewport so the app's internal scrollers engage (scroll-driven infinite scroll).
+await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
 await sleep(2500);
 
-// --- Hot path: a progress tick must move only the elapsed text, never now-title. ---
-// The landing view is the flat Tracks list, so a track row is present immediately.
+console.log(`Svelte UI smoke (${PATH}, ${MODE}):`);
+
+if (MODE === "scale") {
+  const total = (await api("/api/library/summary"))?.track_count ?? 0;
+  const initial = await js(`document.querySelectorAll('.track-list .track').length`);
+  check("library is large", total > 2000, `tracks=${total}`);
+  check("initial render is windowed (not the whole library)", initial > 0 && initial <= 200, `rows=${initial}`);
+  // Infinite scroll: pull the sentinel into view, more rows append.
+  await js(`document.querySelector('.scroll-sentinel')?.scrollIntoView()`);
+  await sleep(900);
+  const after = await js(`document.querySelectorAll('.track-list .track').length`);
+  check("infinite scroll appends a page", after > initial, `before=${initial} after=${after}`);
+  // Search at scale stays bounded.
+  await js(`(()=>{const el=document.querySelector('.search input'); el.value='a'; el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+  await sleep(1000);
+  const results = await js(`document.querySelectorAll('.track-list .track').length`);
+  check("search at scale returns a bounded page", results > 0 && results <= 300, `results=${results}`);
+  check("no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
+  console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);
+  ws.close();
+  process.exit(failures ? 1 : 0);
+}
+
+// ---- behavior phase ----
+
+// Hot path: a progress tick must move only the elapsed text, never now-title.
 await js(`document.querySelector('.track-main')?.click()`);
 await sleep(1500);
 await js(`(() => {
@@ -50,57 +105,66 @@ await js(`(() => {
   if (title) new MutationObserver(() => window.__n++).observe(title, { childList: true, characterData: true, subtree: true });
 })()`);
 await sleep(4200);
-const timeMut = await js(`window.__t`);
-const titleMut = await js(`window.__n`);
-const playing = await js(`document.querySelector('.transport')?.dataset.status`);
-check("playback started", playing === "playing", `status=${playing}`);
-check("hot path: elapsed text updates on ticks", timeMut >= 2, `timeMut=${timeMut}`);
-check("hot path: now-title NOT swept on ticks", titleMut === 0, `titleMut=${titleMut}`);
+check("playback started", (await js(`document.querySelector('.transport')?.dataset.status`)) === "playing");
+check("hot path: elapsed text updates on ticks", (await js(`window.__t`)) >= 2);
+check("hot path: now-title NOT swept on ticks", (await js(`window.__n`)) === 0);
 
-// --- Queue drawer ---
+// Queue
 await js(`document.querySelector('.queue-btn')?.click()`);
 await sleep(500);
 check("queue drawer lists tracks", (await js(`document.querySelectorAll('.queue-row').length`)) > 0);
 await clickText(".queue-head button", "Close");
 
-// --- Browse filter narrows the grid ---
-await clickText(".seg", "Albums");
-await sleep(500);
-const all = await js(`document.querySelectorAll('.album-card').length`);
-await js(`(()=>{const s=document.querySelector('.browse-filters select'); if(s&&s.options.length>1){s.value=s.options[1].value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
-await sleep(1000);
-const filtered = await js(`document.querySelectorAll('.album-card').length`);
-check("browse filter changes the grid", filtered > 0 && filtered <= all, `all=${all} filtered=${filtered}`);
-await clickText("button", "Clear");
-
-// --- Search is a per-segment filter that persists across segment switches ---
+// Browse filter + search persistence
 await clickText(".seg", "Albums");
 await sleep(400);
+const all = await js(`document.querySelectorAll('.album-card').length`);
+await js(`(()=>{const s=document.querySelector('.browse-filters select'); if(s&&s.options.length>1){s.value=s.options[1].value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
+await sleep(900);
+check("browse filter changes the grid", (await js(`document.querySelectorAll('.album-card').length`)) <= all);
+await clickText("button", "Clear");
 await js(`(()=>{const el=document.querySelector('.search input'); el.value='dar'; el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
 await sleep(900);
-const titleOnAlbums = await js(`document.querySelector('.content-title h2')?.textContent`);
+const tA = await js(`document.querySelector('.content-title h2')?.textContent`);
 await clickText(".seg", "Artists");
 await sleep(900);
-const titleOnArtists = await js(`document.querySelector('.content-title h2')?.textContent`);
-check("search shows on the segment", /search/i.test(titleOnAlbums || ""), `title=${titleOnAlbums}`);
-check("search persists across segment switch", /search/i.test(titleOnArtists || ""), `title=${titleOnArtists}`);
-// clear search before the next flows
+const tB = await js(`document.querySelector('.content-title h2')?.textContent`);
+check("search shows on the segment", /search/i.test(tA || ""), `title=${tA}`);
+check("search persists across segment switch", /search/i.test(tB || ""), `title=${tB}`);
 await js(`(()=>{const el=document.querySelector('.search input'); el.value=''; el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
 await sleep(400);
 
-// --- Smart playlist (sidebar) opens + lists tracks ---
+// Smart playlist
 await js(`[...document.querySelectorAll('.library-panel .nav-link')].find(b=>/never played/i.test(b.textContent))?.click()`);
 await sleep(900);
 check("smart playlist opens + lists tracks", (await js(`document.querySelectorAll('.track-list .track').length`)) > 0);
 
-// --- Metadata editor ---
+// Metadata
 await js(`document.querySelector('.track-meta')?.click()`);
 await sleep(900);
 check("metadata panel opens", await js(`!!document.querySelector('.metadata-drawer')`));
 await clickText(".queue-head button", "Close");
 
-check("no uncaught exceptions", consoleErrors.length === 0, consoleErrors.slice(0, 3).join(" | "));
+// Radio: the station shows in the sidebar; playing it sets now-playing.
+check("radio station listed", await js(`[...document.querySelectorAll('.library-panel .nav-link')].some(b=>/smoke fm/i.test(b.textContent))`));
+await js(`[...document.querySelectorAll('.library-panel .nav-link')].find(b=>/smoke fm/i.test(b.textContent))?.click()`);
+await sleep(900);
+check("radio play sets now-playing", /smoke fm/i.test((await js(`document.querySelector('#now-title')?.textContent`)) || ""));
 
+// Zone: switch the output to the zone (which holds the browser player) and play.
+await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>/zone/i.test(o.textContent)); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
+await sleep(1200);
+check("switched output to a zone", /zone/i.test((await js(`document.querySelector('.player-switch-btn')?.value`)) || ""));
+await clickText(".seg", "Tracks");
+await sleep(600);
+await js(`document.querySelector('.track-main')?.click()`);
+await sleep(2000);
+const z1 = await js(`document.querySelector('.seek-row .time')?.textContent`);
+await sleep(2200);
+const z2 = await js(`document.querySelector('.seek-row .time')?.textContent`);
+check("zone plays (elapsed advances)", z1 !== z2, `${z1} -> ${z2}`);
+
+check("no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
 console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);
 ws.close();
 process.exit(failures ? 1 : 0);
