@@ -3,32 +3,28 @@
 Plan for rewriting the embedded web app (`crates/musicata-server/static/`) as a
 Svelte + TypeScript app, built with Vite and embedded into the server binary.
 
-## Status
+## Status — migration complete (cutover done)
 
-**The Svelte app at `/v2` + `/v2/admin` is at functional parity with the old app except the
-metadata editor panel**, all CDP-verified against a scanned testdata library. The old vanilla
-app still serves `/` + `/admin` (untouched). Done: admin (all 6 panels), player shell +
-playback hot path, album/artist/track browsing + nav, queue drawer, search, favorites,
-playlists + smart playlists, browse filters, internet radio, zones/output switching.
+**The Svelte app now serves `/` and `/admin`.** `static/`, the `include_str!` handlers, and
+the old `run.mjs`/`flows.mjs`/`instrument.mjs` suite are deleted. Full functional parity with
+the old app, all CDP-verified against a scanned testdata library: admin (all 6 panels),
+player shell + playback hot path, album/artist/track browsing + nav, queue drawer, search,
+favorites, playlists + smart playlists, browse filters, internet radio, zones/output
+switching, and the track metadata editor.
 
-**Remaining to fully complete the migration:**
-1. **Metadata editor panel** — the only missing feature. Brings the full `Track` +
-   metadata-observation graph as generated ts-rs types (the component that consumes
-   `observed_metadata`): canonical metadata, artwork review, MusicBrainz candidates.
-2. **Redesign the lag/flow smoke harness for the Svelte app.** `tests/ui/instrument.mjs`
-   wraps the *old app's global functions* (`updateFooterFromState`, `markActiveTrack`,
-   `applyProgressTick`, `driveBrowserAudio`) to count hot-path work — none of which exist in
-   the Svelte app. The hot-path assertion must be rebuilt around a MutationObserver (assert a
-   progress tick mutates only the elapsed/seek nodes, not now-title/queue) or app-exposed test
-   counters; `flows.mjs` selectors (`#play-pause`, `#segmented`, `#browse-grid`, `#back-btn`,
-   `.link-artist`…) must map to the new DOM. This is the regression gate and must pass before
-   cutover.
-3. **Cutover (Phase 5).** Flip `/v2`→`/` and `/v2/admin`→`/admin`, remove the `include_str!`
-   handlers + `static/`, retire the CLAUDE.md "no build step" convention.
-4. **PWA (Phase 4).** `vite-plugin-pwa` service worker (replaces the hand-versioned `sw.js`).
+The regression gate was rebuilt for the Svelte architecture (`scripts/v2-smoke.sh` +
+`tests/ui/v2-flows.mjs`, run by the pre-commit hook via `scripts/ui-smoke.sh`): a
+MutationObserver asserts a progress tick moves only the elapsed/seek text, never the
+now-title — the hot path, now proven structurally rather than by counting global-function
+calls.
 
-Cutover is deliberately gated on (1) and (2): replacing the live app demands feature parity
-*and* the hot-path regression suite, not a rushed flip.
+**Optional follow-ups (not blocking):**
+- **PWA** — `vite-plugin-pwa` service worker (the old hand-versioned `sw.js` is gone; the app
+  works without offline caching until this lands).
+- **ts-rs for the metadata-observation graph** — the review panel's shapes are currently
+  hand-typed; generate them like the rest for end-to-end type safety.
+- Broaden `v2-flows.mjs` toward the old suite's coverage (zone flows, radio playback, the
+  scale-phase `--no-scan` pass).
 
 - **Phase 0 (toolchain) — done.** `web/` (Svelte 5 + TS + Vite, two entries) builds via
   `build.rs`, embeds through `rust-embed`, served at `/v2` + `/v2/admin`. Headless-verified

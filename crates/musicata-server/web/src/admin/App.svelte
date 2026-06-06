@@ -16,7 +16,7 @@
       <p>Administration</p>
     </div>
   </div>
-  <a class="ghost-button" href="/v2">← Back to player</a>
+  <a class="ghost-button" href="/">← Back to player</a>
 </header>
 
 <main class="admin-grid">

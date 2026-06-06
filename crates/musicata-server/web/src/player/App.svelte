@@ -186,7 +186,7 @@
         <option value={`zone:${z.id}`}>Zone · {z.name}</option>
       {/each}
     </select>
-    <a class="ghost-button" href="/v2/admin">Admin</a>
+    <a class="ghost-button" href="/admin">Admin</a>
   </header>
 
   <main class="player-main">

@@ -1472,17 +1472,10 @@ fn app(
 ) -> Router {
     Router::new()
         .merge(subsonic::routes())
-        .route("/", get(index))
-        .route("/admin", get(admin_page))
-        .route("/admin.js", get(admin_js))
-        .route("/app.js", get(app_js))
-        .route("/styles.css", get(styles_css))
-        .route("/manifest.webmanifest", get(manifest))
-        .route("/icon.svg", get(app_icon))
-        .route("/sw.js", get(service_worker))
-        // Svelte app under migration (parallel paths; cutover flips these to / and /admin).
-        .route("/v2", get(svelte_player))
-        .route("/v2/admin", get(svelte_admin))
+        // The embedded Svelte app (built from web/ by build.rs). Hashed bundles under
+        // /assets/* are immutable; the HTML entries are no-cache.
+        .route("/", get(svelte_player))
+        .route("/admin", get(svelte_admin))
         .route("/assets/{*path}", get(svelte_asset))
         .route("/api/health", get(health))
         .route("/api/library/summary", get(library_summary))
@@ -1668,83 +1661,6 @@ async fn svelte_asset(Path(path): Path<String>) -> Response {
     web_asset(
         &format!("assets/{path}"),
         "public, max-age=31536000, immutable",
-    )
-}
-
-async fn index() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "text/html; charset=utf-8"),
-            (CACHE_CONTROL, APP_SHELL_CACHE),
-        ],
-        include_str!("../static/index.html"),
-    )
-}
-
-async fn admin_page() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "text/html; charset=utf-8"),
-            (CACHE_CONTROL, APP_SHELL_CACHE),
-        ],
-        include_str!("../static/admin.html"),
-    )
-}
-
-async fn admin_js() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "application/javascript; charset=utf-8"),
-            (CACHE_CONTROL, APP_SHELL_CACHE),
-        ],
-        include_str!("../static/admin.js"),
-    )
-}
-
-async fn app_js() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "application/javascript; charset=utf-8"),
-            (CACHE_CONTROL, APP_SHELL_CACHE),
-        ],
-        include_str!("../static/app.js"),
-    )
-}
-
-async fn styles_css() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "text/css; charset=utf-8"),
-            (CACHE_CONTROL, APP_SHELL_CACHE),
-        ],
-        include_str!("../static/styles.css"),
-    )
-}
-
-async fn manifest() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "application/manifest+json; charset=utf-8")],
-        include_str!("../static/manifest.webmanifest"),
-    )
-}
-
-async fn app_icon() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
-            (CACHE_CONTROL, "public, max-age=86400"),
-        ],
-        include_str!("../static/icon.svg"),
-    )
-}
-
-async fn service_worker() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "application/javascript; charset=utf-8"),
-            (CACHE_CONTROL, APP_SHELL_CACHE),
-        ],
-        include_str!("../static/sw.js"),
     )
 }
 
