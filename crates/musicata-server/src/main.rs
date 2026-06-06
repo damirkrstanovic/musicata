@@ -643,6 +643,23 @@ fn spawn_library_scan(state: &AppState, label: &str) {
 /// Background library task: scan once right away (so a fresh database is populated
 /// and an existing one refreshed), then re-scan on the interval unless incremental
 /// rescanning is disabled. Never blocks serving.
+/// A scan rewrites albums/artists to folder-derived rows, clearing their acquired
+/// `artwork_url` and resetting grouping to folder-derived. Republish acquired album/artist
+/// covers and re-apply enrichment + user merges *immediately* after the scan — otherwise
+/// they're only restored at the end of the cycle, after the slow fingerprint/MusicBrainz
+/// passes, so for minutes each cycle artists/albums would show no artwork.
+async fn restore_after_scan(database: &Database) {
+    if let Err(error) = database.reapply_canonical_grouping().await {
+        tracing::warn!(%error, "reapply canonical grouping failed");
+    }
+    if let Err(error) = database.reapply_acquired_artwork().await {
+        tracing::warn!(%error, "reapply acquired album artwork failed");
+    }
+    if let Err(error) = database.reapply_acquired_artist_artwork().await {
+        tracing::warn!(%error, "reapply acquired artist artwork failed");
+    }
+}
+
 async fn library_scan_loop(
     database: Database,
     providers: Arc<RwLock<ProviderRegistry>>,
@@ -667,6 +684,7 @@ async fn library_scan_loop(
         true,
     )
     .await;
+    restore_after_scan(&database).await;
     // Fingerprint untagged tracks first (resolves MBIDs), then enrich their metadata
     // from MusicBrainz, then fill covers (which can now reach the id-exact providers).
     fingerprint_pass(&database, &providers, &activity).await;
@@ -696,6 +714,7 @@ async fn library_scan_loop(
             true,
         )
         .await;
+        restore_after_scan(&database).await;
         fingerprint_pass(&database, &providers, &activity).await;
         musicbrainz_search_pass(&database, &activity).await;
         musicbrainz_enrich_pass(&database, &activity).await;
