@@ -16,9 +16,13 @@ Svelte + TypeScript app, built with Vite and embedded into the server binary.
   sender, mediaSession glue, and a `Footer`/`SeekBar`. `PlaybackState`/`QueueItem`/
   `PlaybackStatus`/`RepeatMode` generated via ts-rs. Verified over CDP against a freshly
   scanned testdata library: clicking play starts a track and the elapsed advances
-  (0:01→0:04). A temporary "Play an album" affordance drives it until the library views land.
-  Next: library grid, album/artist detail, track lists (full `Track` type), queue drawer,
-  search, metadata panel — then run the smoke suite's lag assertions against `/v2`.
+  (0:01→0:04). Phase 3b (browsing views) done: album grid + artists grid (infinite scroll via
+  a `use:onVisible` action), album/artist detail heroes, a `TrackList` that plays the list at
+  the clicked index, and a History-synced nav stack (tabs + Back). `Track` is a structural
+  `TrackRow` (display + playback fields); the full `Track` + metadata graph is generated when
+  the metadata panel lands. CDP-verified: grid → detail → play (elapsed advances) → Back.
+  Next: queue drawer, search, browse filters, playlists, metadata panel — then run the smoke
+  suite's lag assertions against `/v2`.
 - **Phase 2 (admin page) — done.** `/v2/admin` is a full Svelte port: Sources, Artwork &
   Settings, Players & Zones, Merged artists, Identification, Activity (live WS). Reuses the
   promise-based `Modal`, the typed `api` client, and the existing `styles.css`. Server admin

@@ -2,17 +2,25 @@
   import { onMount, onDestroy } from "svelte";
   import { api } from "../lib/api";
   import { player } from "../lib/player.svelte";
+  import { nav } from "../lib/nav.svelte";
   import { connectPlayer, type PlayerSocket, type ProgressTick } from "../lib/playerWs";
   import { BrowserAudio } from "../lib/audio";
+  import { setAudio } from "../lib/playback";
   import { sendCommand } from "../lib/commands";
   import { setMediaMetadata, setMediaPosition, setMediaHandlers } from "../lib/media";
   import type { PlaybackState } from "../types/PlaybackState";
   import Footer from "./Footer.svelte";
+  import LibraryGrid from "./LibraryGrid.svelte";
+  import ArtistsGrid from "./ArtistsGrid.svelte";
+  import AlbumDetail from "./AlbumDetail.svelte";
+  import ArtistDetail from "./ArtistDetail.svelte";
 
   let audioEl: HTMLAudioElement;
   let audio: BrowserAudio | null = null;
   let ws: PlayerSocket | null = null;
-  let starting = $state(false);
+
+  // A value (not a getter call) so TS narrows `route` in each branch below.
+  const route = $derived(nav.current);
 
   // Hot path: a tick moves only elapsed/duration (+ the OS scrubber).
   function applyTick(tick: ProgressTick) {
@@ -21,8 +29,6 @@
     setMediaPosition(player.elapsed, player.duration);
   }
 
-  // Full snapshot: replace playback, reconcile the <audio> element, refresh OS metadata only
-  // when the track or status actually changed.
   function applyState(next: PlaybackState) {
     const trackChanged =
       (player.playback?.now_playing?.track_id ?? null) !== (next.now_playing?.track_id ?? null);
@@ -39,6 +45,7 @@
 
   onMount(async () => {
     audio = new BrowserAudio(audioEl);
+    setAudio(audio);
     audio.onProgress((msg) => ws?.send(msg));
     audio.onEnded(() => ws?.send({ type: "ended" }));
     audio.start();
@@ -65,41 +72,43 @@
     ws?.close();
     audio?.stop();
   });
-
-  // Temporary Phase-3a affordance: claim audio output and play the first album, so the
-  // playback hot path actually runs. Replaced by real library views in the next sub-phase.
-  async function playSomething() {
-    if (!player.activeId) return;
-    starting = true;
-    try {
-      const album = (await api.albums({ limit: 1 })).items[0];
-      if (!album) return;
-      const { tracks } = await api.albumTracks(album.id);
-      if (!tracks.length) return;
-      audio?.claim();
-      audio?.primePlay(tracks[0].stream_url); // in-gesture, satisfies autoplay
-      await sendCommand(player.activeId, {
-        command: "play_tracks",
-        track_ids: tracks.map((t) => t.id),
-        start_index: 0,
-      });
-    } finally {
-      starting = false;
-    }
-  }
 </script>
+
+<svelte:window onpopstate={() => nav.pop()} />
 
 <div class="player-shell">
   <header class="app-bar">
-    <h1>Musicata</h1>
-    <div class="app-bar-actions">
-      <button class="primary-button" disabled={starting} onclick={playSomething}>Play an album</button>
-      <a class="ghost-button" href="/v2/admin">Admin</a>
-    </div>
+    {#if nav.canGoBack}
+      <button class="ghost-button" type="button" onclick={() => nav.pop()}>← Back</button>
+    {/if}
+    <nav class="app-tabs">
+      <button
+        class="tab"
+        class:active={route.name === "library"}
+        type="button"
+        onclick={() => nav.root({ name: "library" })}>Albums</button
+      >
+      <button
+        class="tab"
+        class:active={route.name === "artists"}
+        type="button"
+        onclick={() => nav.root({ name: "artists" })}>Artists</button
+      >
+    </nav>
+    <a class="ghost-button" href="/v2/admin">Admin</a>
   </header>
-  <p class="admin-hint" style="padding: 0 1rem">
-    Player shell (Phase 3a) — footer + playback hot path. Library views land next.
-  </p>
+
+  <main class="player-main">
+    {#if route.name === "library"}
+      <LibraryGrid />
+    {:else if route.name === "artists"}
+      <ArtistsGrid />
+    {:else if route.name === "album"}
+      <AlbumDetail id={route.id} />
+    {:else if route.name === "artist"}
+      <ArtistDetail id={route.id} />
+    {/if}
+  </main>
 
   <Footer />
   <audio bind:this={audioEl} preload="none" hidden></audio>

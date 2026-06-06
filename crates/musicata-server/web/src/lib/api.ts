@@ -52,13 +52,32 @@ export interface UnidentifiedArtist {
   track_count: number;
 }
 
-/** The subset of a track needed to start playback. A structural view of the server's `Track`
- *  (generated in full when the track-list views land), so no deep metadata graph yet. */
-export interface PlayableTrack {
+/** The display + playback fields of the server's `Track` — a structural view, so the deep
+ *  metadata-observation graph isn't generated until the metadata panel (which consumes it). */
+export interface TrackRow {
   id: string;
-  stream_url: string;
   title: string;
+  artist_id: string;
   artist_name: string;
+  album_id: string;
+  album_title: string;
+  year: number | null;
+  track_number: number | null;
+  disc_number: number | null;
+  duration_seconds: number | null;
+  stream_url: string;
+}
+
+export interface AlbumDetail {
+  album: Album;
+  artist: Artist | null;
+  tracks: TrackRow[];
+}
+
+export interface ArtistDetail {
+  artist: Artist;
+  albums: Album[];
+  tracks: TrackRow[];
 }
 
 export type { SourceView, AppSettings, ArtistAliasGroup, Activity, Player, Zone };
@@ -142,8 +161,8 @@ export const api = {
   settings: () => getJson<AppSettings>("/api/settings"),
   saveSettings: (body: AppSettings) => sendJson("/api/settings", "PATCH", body),
 
-  albumTracks: (id: string) =>
-    getJson<{ tracks: PlayableTrack[] }>(`/api/albums/${encodeURIComponent(id)}`),
+  albumDetail: (id: string) => getJson<AlbumDetail>(`/api/albums/${encodeURIComponent(id)}`),
+  artistDetail: (id: string) => getJson<ArtistDetail>(`/api/artists/${encodeURIComponent(id)}`),
 
   // Players & zones
   players: () => getJson<Player[]>("/api/players"),
