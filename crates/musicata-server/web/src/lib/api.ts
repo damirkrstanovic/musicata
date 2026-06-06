@@ -145,6 +145,17 @@ export interface BrowseIndex {
   folders: BrowseFacet[];
 }
 
+export interface ExportInfo {
+  name: string;
+  size_bytes: number;
+  created_at_unix_seconds: number;
+}
+export interface ExportStatus {
+  running: boolean;
+  latest: ExportInfo | null;
+  error: string | null;
+}
+
 /** Album/track list filters (browse facets), layered onto the paging params. */
 export type BrowseParams = ListParams & {
   genre?: string;
@@ -282,6 +293,23 @@ export const api = {
   mergeArtists: (body: MergeArtistsRequest) => sendJson("/api/artists/merge", "POST", body),
   unmergeArtist: (key: string) =>
     sendJson(`/api/artists/aliases/${encodeURIComponent(key)}`, "DELETE"),
+
+  // Library export / import (migration)
+  exportStatus: () => getJson<ExportStatus>("/api/library/export"),
+  startExport: () => sendJson<ExportStatus>("/api/library/export", "POST"),
+  importLibrary: async (file: File) => {
+    const response = await fetch("/api/library/import", { method: "POST", body: file });
+    if (!response.ok) {
+      let detail = `${response.status}`;
+      try {
+        detail = ((await response.json()) as { error?: { message?: string } }).error?.message ?? detail;
+      } catch {
+        // keep status
+      }
+      throw new ApiError(response.status, detail);
+    }
+    return (await response.json()) as { restart_required: boolean };
+  },
 
   // Activity & identification
   activity: () => getJson<Activity[]>("/api/activity"),

@@ -1940,6 +1940,18 @@ impl Database {
 
     /// How much of the library has been identified (resolved a MusicBrainz recording id,
     /// via embedded tags or fingerprint/search), plus the fingerprint status breakdown.
+    /// Write a consistent, compacted snapshot of the whole database to `dest` (a fresh
+    /// SQLite file) for library export. `VACUUM INTO` captures a stable view even while
+    /// writes continue, so it's safe on the live database. `dest` must not already exist.
+    pub async fn snapshot_to(&self, dest: &Path) -> Result<()> {
+        // VACUUM INTO takes a string literal, not a bound parameter; escape any quotes.
+        let escaped = dest.to_string_lossy().replace('\'', "''");
+        sqlx::query(&format!("VACUUM INTO '{escaped}'"))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn identification_stats(&self) -> Result<IdentificationStats> {
         let identified = track_identified_clause("t.id");
         Ok(IdentificationStats {

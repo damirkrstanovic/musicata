@@ -1,5 +1,6 @@
 mod activity;
 mod artwork;
+mod backup;
 mod artwork_providers;
 mod fingerprint;
 mod mpd;
@@ -18,15 +19,15 @@ use crate::providers::{ProviderHandle, ProviderRegistry};
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::Request,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{
         HeaderMap, StatusCode,
         header::{
-            ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
-            IF_NONE_MATCH, RANGE,
+            ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
+            CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE,
         },
     },
     middleware::{self, Next},
@@ -85,6 +86,10 @@ struct AppState {
     // Read only by network-backed providers (SMB) today; local disk serves directly.
     #[cfg_attr(not(feature = "provider-smb"), allow(dead_code))]
     artwork_cache: Arc<artwork::ArtworkCache>,
+    // Library export/import (migration).
+    db_path: PathBuf,
+    artwork_dir: PathBuf,
+    export_status: Arc<std::sync::Mutex<backup::ExportStatus>>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +126,14 @@ async fn main() -> Result<()> {
     init_logging();
 
     let config = Config::from_args()?;
+    // Apply a staged library import (from /api/library/import) before opening the DB — safe
+    // because nothing has it open yet.
+    let artwork_dir = config
+        .database
+        .parent()
+        .map(|parent| parent.join("artwork"))
+        .unwrap_or_else(|| PathBuf::from("artwork"));
+    backup::apply_staged_import(&config.database, &artwork_dir);
     let database = Database::connect(&config.database)
         .await
         .with_context(|| format!("failed to open database {}", config.database.display()))?;
@@ -252,6 +265,7 @@ async fn main() -> Result<()> {
             rescan_lock,
             subsonic_auth,
             artwork_cache,
+            config.database.clone(),
         ),
     )
     .await
@@ -1488,7 +1502,12 @@ fn app(
     rescan_lock: Arc<Mutex<()>>,
     subsonic_auth: subsonic::SubsonicAuth,
     artwork_cache: Arc<artwork::ArtworkCache>,
+    db_path: PathBuf,
 ) -> Router {
+    let artwork_dir = db_path
+        .parent()
+        .map(|parent| parent.join("artwork"))
+        .unwrap_or_else(|| PathBuf::from("artwork"));
     Router::new()
         .merge(subsonic::routes())
         // The embedded Svelte app (built from web/ by build.rs). Hashed bundles under
@@ -1499,6 +1518,16 @@ fn app(
         .route("/api/health", get(health))
         .route("/api/library/summary", get(library_summary))
         .route("/api/library/rescan", post(rescan_library))
+        .route(
+            "/api/library/export",
+            get(library_export_status).post(start_library_export),
+        )
+        .route("/api/library/export/download", get(download_library_export))
+        .route(
+            "/api/library/import",
+            // Large uploads (a full library export); lift the default 2 MB body cap.
+            post(import_library).layer(DefaultBodyLimit::disable()),
+        )
         .route(
             "/api/metadata/write-back",
             get(metadata_write_back_policy).post(reject_metadata_write_back),
@@ -1618,6 +1647,9 @@ fn app(
             next_playback_session: Arc::new(AtomicU64::new(1)),
             subsonic: subsonic_auth,
             artwork_cache,
+            db_path,
+            artwork_dir,
+            export_status: Arc::new(std::sync::Mutex::new(backup::ExportStatus::default())),
         })
 }
 
@@ -1832,6 +1864,134 @@ async fn rescan_library(
         modified: changes.modified,
         summary,
     }))
+}
+
+// --- Library export / import (migration). See crate::backup. ---
+
+fn exports_dir(db_path: &std::path::Path) -> PathBuf {
+    db_path
+        .parent()
+        .map(|parent| parent.join("exports"))
+        .unwrap_or_else(|| PathBuf::from("exports"))
+}
+
+async fn library_export_status(State(state): State<AppState>) -> Json<backup::ExportStatus> {
+    Json(state.export_status.lock().expect("export status").clone())
+}
+
+/// Kick off a background export (DB snapshot + artwork → one zip). Idempotent while running.
+async fn start_library_export(State(state): State<AppState>) -> Json<backup::ExportStatus> {
+    {
+        let mut status = state.export_status.lock().expect("export status");
+        if status.running {
+            return Json(status.clone());
+        }
+        status.running = true;
+        status.error = None;
+    }
+    let database = state.database.clone();
+    let db_path = state.db_path.clone();
+    let artwork_dir = state.artwork_dir.clone();
+    let activity = state.activity.clone();
+    let export_status = state.export_status.clone();
+    tokio::spawn(async move {
+        let task = activity.start("export", "Preparing library export…");
+        let result = run_export(&database, &db_path, &artwork_dir).await;
+        let mut status = export_status.lock().expect("export status");
+        status.running = false;
+        match result {
+            Ok(info) => {
+                status.latest = Some(info);
+                activity.finish(task, true, Some("Library export ready to download".to_string()));
+            }
+            Err(error) => {
+                activity.finish(task, false, Some(format!("Export failed: {error}")));
+                status.error = Some(error);
+            }
+        }
+    });
+    Json(state.export_status.lock().expect("export status").clone())
+}
+
+async fn run_export(
+    database: &Database,
+    db_path: &std::path::Path,
+    artwork_dir: &std::path::Path,
+) -> Result<backup::ExportInfo, String> {
+    let dir = exports_dir(db_path);
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let snapshot = dir.join(".snapshot.db");
+    let _ = std::fs::remove_file(&snapshot);
+    database
+        .snapshot_to(&snapshot)
+        .await
+        .map_err(|error| format!("database snapshot: {error}"))?;
+
+    let created_at = now_unix_seconds();
+    let name = format!("musicata-export-{created_at}.zip");
+    let dest = dir.join(&name);
+    let (snap, art, out) = (snapshot.clone(), artwork_dir.to_path_buf(), dest.clone());
+    tokio::task::spawn_blocking(move || backup::create_archive(&snap, &art, &out))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    let _ = std::fs::remove_file(&snapshot);
+
+    // Keep only the newest export so the disk doesn't fill with snapshots.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path != dest && path.extension().is_some_and(|ext| ext == "zip") {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    let size_bytes = std::fs::metadata(&dest).map(|meta| meta.len()).unwrap_or(0);
+    Ok(backup::ExportInfo {
+        name,
+        size_bytes,
+        created_at_unix_seconds: created_at,
+    })
+}
+
+async fn download_library_export(State(state): State<AppState>) -> Response {
+    let latest = state.export_status.lock().expect("export status").latest.clone();
+    let Some(info) = latest else {
+        return AppError::not_found("no export available yet").into_response();
+    };
+    let path = exports_dir(&state.db_path).join(&info.name);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            [
+                (CONTENT_TYPE, "application/zip".to_string()),
+                (
+                    CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", info.name),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => AppError::not_found("export file is missing; re-run the export").into_response(),
+    }
+}
+
+/// Accept an uploaded export zip (raw body) and stage it; it's applied at the next startup.
+async fn import_library(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if body.is_empty() {
+        return Err(AppError::bad_request("empty upload"));
+    }
+    let db_import = backup::staged_db(&state.db_path);
+    let artwork_import = backup::staged_artwork(&state.artwork_dir);
+    let bytes = body.to_vec();
+    tokio::task::spawn_blocking(move || backup::extract_import(&bytes, &db_import, &artwork_import))
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    Ok(Json(json!({ "restart_required": true })))
 }
 
 /// Common pagination/sorting query parameters for list endpoints.
@@ -7445,6 +7605,7 @@ mod tests {
                     password: Some("p".to_string()),
                 },
                 std::sync::Arc::new(crate::artwork::ArtworkCache::new(self.root.join("artwork"))),
+                self.root.join("musicata.db"),
             )
         }
 

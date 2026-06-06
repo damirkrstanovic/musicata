@@ -43,6 +43,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 rust-embed = { version = "8", features = ["mime-guess"] }
 # Only pulled in under the `ts` feature (type generation); MIT/Apache-2.0.
 ts-rs = { version = "10", optional = true }
+# Library export/import archive (DB snapshot + artwork). Deflate only; MIT (AGPL-compatible).
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tower.workspace = true

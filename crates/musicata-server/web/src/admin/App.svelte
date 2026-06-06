@@ -2,6 +2,7 @@
   import Modal from "../lib/Modal.svelte";
   import StatusDashboard from "./StatusDashboard.svelte";
   import SourcesPanel from "./SourcesPanel.svelte";
+  import ImportExportPanel from "./ImportExportPanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import PlayersZonesPanel from "./PlayersZonesPanel.svelte";
   import MergedArtistsPanel from "./MergedArtistsPanel.svelte";
@@ -23,6 +24,7 @@
 
   <h2 class="admin-group-title">Library &amp; sources</h2>
   <SourcesPanel />
+  <ImportExportPanel />
 
   <h2 class="admin-group-title">Identification &amp; artwork</h2>
   <SettingsPanel />
