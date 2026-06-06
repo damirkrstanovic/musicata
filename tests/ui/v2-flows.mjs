@@ -65,7 +65,7 @@ check("queue drawer lists tracks", (await js(`document.querySelectorAll('.queue-
 await clickText(".queue-head button", "Close");
 
 // --- Browse filter narrows the grid ---
-await clickText(".tab", "Albums");
+await clickText(".seg", "Albums");
 await sleep(500);
 const all = await js(`document.querySelectorAll('.album-card').length`);
 await js(`(()=>{const s=document.querySelector('.browse-filters select'); if(s&&s.options.length>1){s.value=s.options[1].value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
@@ -80,10 +80,8 @@ await sleep(900);
 check("search renders sections", (await js(`document.querySelectorAll('.section-title').length`)) > 0);
 await js(`(()=>{const el=document.querySelector('.search input'); el.value=''; el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
 
-// --- Smart playlist opens + lists tracks ---
-await clickText(".tab", "Playlists");
-await sleep(600);
-await js(`[...document.querySelectorAll('.admin-row .admin-row-main')].find(b=>/never played/i.test(b.textContent))?.click()`);
+// --- Smart playlist (sidebar) opens + lists tracks ---
+await js(`[...document.querySelectorAll('.library-panel .nav-link')].find(b=>/never played/i.test(b.textContent))?.click()`);
 await sleep(900);
 check("smart playlist opens + lists tracks", (await js(`document.querySelectorAll('.track-list .track').length`)) > 0);
 

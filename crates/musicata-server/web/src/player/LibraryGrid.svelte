@@ -6,7 +6,6 @@
   import { nav } from "../lib/nav.svelte";
   import { browse } from "../lib/browse.svelte";
   import AlbumCard from "./AlbumCard.svelte";
-  import BrowseFilters from "./BrowseFilters.svelte";
 
   const PAGE = 60;
   let albums = $state<Album[]>([]);
@@ -56,7 +55,6 @@
   });
 </script>
 
-<BrowseFilters />
 <div class="browse-grid">
   {#each albums as album (album.id)}
     <AlbumCard {album} onopen={() => nav.push({ name: "album", id: album.id, title: album.title })} />

@@ -8,8 +8,7 @@
 </script>
 
 {#if metadata.trackId}
-  <div class="scrim" role="presentation" onclick={() => metadata.close()}></div>
-  <section class="queue-drawer metadata-drawer" aria-label="Track metadata">
+  <section class="metadata-panel metadata-drawer" aria-label="Track metadata">
     <header class="queue-head">
       <strong>Metadata</strong>
       <div class="queue-head-actions">

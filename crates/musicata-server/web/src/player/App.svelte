@@ -8,12 +8,12 @@
   import { setAudio } from "../lib/playback";
   import { sendCommand } from "../lib/commands";
   import { setMediaMetadata, setMediaPosition, setMediaHandlers } from "../lib/media";
-  import { search } from "../lib/search.svelte";
   import { favorites } from "../lib/favorites.svelte";
   import type { PlaybackState } from "../types/PlaybackState";
   import type { Player } from "../types/Player";
   import type { Zone } from "../types/Zone";
   import Modal from "../lib/Modal.svelte";
+  import Sidebar from "./Sidebar.svelte";
   import Footer from "./Footer.svelte";
   import LibraryGrid from "./LibraryGrid.svelte";
   import ArtistsGrid from "./ArtistsGrid.svelte";
@@ -23,10 +23,8 @@
   import QueueDrawer from "./QueueDrawer.svelte";
   import MetadataPanel from "./MetadataPanel.svelte";
   import FavoritesView from "./FavoritesView.svelte";
-  import PlaylistsIndex from "./PlaylistsIndex.svelte";
   import PlaylistView from "./PlaylistView.svelte";
   import SmartPlaylistView from "./SmartPlaylistView.svelte";
-  import RadioView from "./RadioView.svelte";
 
   let audioEl: HTMLAudioElement;
   let audio: BrowserAudio | null = null;
@@ -34,6 +32,23 @@
 
   // A value (not a getter call) so TS narrows `route` in each branch below.
   const route = $derived(nav.current);
+
+  // Center-panel title for the current route.
+  const title = $derived(
+    route.name === "library"
+      ? "Albums"
+      : route.name === "artists"
+        ? "Artists"
+        : route.name === "favorites"
+          ? "Favorites"
+          : route.name === "search"
+            ? "Search"
+            : route.name === "album"
+              ? route.title
+              : route.name === "artist" || route.name === "playlist" || route.name === "smart"
+                ? route.label
+                : "Musicata",
+  );
 
   // Hot path: a tick moves only elapsed/duration (+ the OS scrubber).
   function applyTick(tick: ProgressTick) {
@@ -115,91 +130,47 @@
     ws?.close();
     audio?.stop();
   });
-
-  // Debounce search input; switch to/from the search view as the box gains/loses text.
-  let searchTimer: ReturnType<typeof setTimeout> | undefined;
-  function onSearchInput(value: string) {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => {
-      search.query = value;
-      if (value.trim()) {
-        if (nav.current.name !== "search") nav.root({ name: "search" });
-      } else if (nav.current.name === "search") {
-        nav.root({ name: "library" });
-      }
-    }, 220);
-  }
 </script>
 
 <svelte:window onpopstate={() => nav.pop()} />
 
-<div class="player-shell">
-  <header class="app-bar">
-    {#if nav.canGoBack}
-      <button class="ghost-button" type="button" onclick={() => nav.pop()}>← Back</button>
-    {/if}
-    <nav class="app-tabs">
-      <button
-        class="tab"
-        class:active={route.name === "library"}
-        type="button"
-        onclick={() => nav.root({ name: "library" })}>Albums</button
-      >
-      <button
-        class="tab"
-        class:active={route.name === "artists"}
-        type="button"
-        onclick={() => nav.root({ name: "artists" })}>Artists</button
-      >
-      <button
-        class="tab"
-        class:active={route.name === "favorites"}
-        type="button"
-        onclick={() => nav.root({ name: "favorites" })}>Favorites</button
-      >
-      <button
-        class="tab"
-        class:active={route.name === "playlists"}
-        type="button"
-        onclick={() => nav.root({ name: "playlists" })}>Playlists</button
-      >
-      <button
-        class="tab"
-        class:active={route.name === "radio"}
-        type="button"
-        onclick={() => nav.root({ name: "radio" })}>Radio</button
-      >
-    </nav>
-    <label class="search">
-      <input type="search" autocomplete="off" placeholder="Search" oninput={(e) => onSearchInput(e.currentTarget.value)} />
-    </label>
-    <select
-      class="target-select"
-      aria-label="Output"
-      value={`${player.activeKind}:${player.activeId}`}
-      onchange={(e) => onTargetChange(e.currentTarget.value)}
-    >
-      {#each players as p (p.id)}
-        <option value={`player:${p.id}`}>{p.name}</option>
-      {/each}
-      {#each zones as z (z.id)}
-        <option value={`zone:${z.id}`}>Zone · {z.name}</option>
-      {/each}
-    </select>
-    <a class="ghost-button" href="/admin">Admin</a>
-  </header>
+<main class="shell">
+  <Sidebar />
 
-  <main class="player-main">
+  <section class="content">
+    <header class="content-header">
+      {#if nav.canGoBack}
+        <button class="back-btn" type="button" onclick={() => nav.pop()}>‹ Back</button>
+      {/if}
+      <div class="content-title">
+        <p class="eyebrow">Library</p>
+        <h2>{title}</h2>
+      </div>
+      <div class="content-controls">
+        <div class="segmented" role="tablist" aria-label="Browse">
+          <button
+            class="seg"
+            class:is-active={route.name === "library"}
+            type="button"
+            onclick={() => nav.root({ name: "library" })}>Albums</button
+          >
+          <button
+            class="seg"
+            class:is-active={route.name === "artists"}
+            type="button"
+            onclick={() => nav.root({ name: "artists" })}>Artists</button
+          >
+        </div>
+        <a class="ghost-button" href="/admin">Admin</a>
+      </div>
+    </header>
+
     {#if route.name === "library"}
       <LibraryGrid />
     {:else if route.name === "artists"}
       <ArtistsGrid />
     {:else if route.name === "favorites"}
       <FavoritesView />
-    {:else if route.name === "playlists"}
-      <PlaylistsIndex />
-    {:else if route.name === "radio"}
-      <RadioView />
     {:else if route.name === "search"}
       <SearchResults />
     {:else if route.name === "album"}
@@ -211,11 +182,33 @@
     {:else if route.name === "smart"}
       <SmartPlaylistView id={route.id} />
     {/if}
-  </main>
+  </section>
 
-  <Footer />
-  <QueueDrawer />
-  <MetadataPanel />
-  <Modal />
-  <audio bind:this={audioEl} preload="none" hidden></audio>
-</div>
+  <aside class="right-rail">
+    <div class="rail-header">
+      <div class="player-switch">
+        <select
+          class="player-switch-btn"
+          aria-label="Output"
+          value={`${player.activeKind}:${player.activeId}`}
+          onchange={(e) => onTargetChange(e.currentTarget.value)}
+        >
+          {#each players as p (p.id)}
+            <option value={`player:${p.id}`}>{p.name}</option>
+          {/each}
+          {#each zones as z (z.id)}
+            <option value={`zone:${z.id}`}>Zone · {z.name}</option>
+          {/each}
+        </select>
+      </div>
+    </div>
+    <div class="rail-top">
+      <MetadataPanel />
+      <QueueDrawer />
+    </div>
+    <Footer />
+  </aside>
+</main>
+
+<Modal />
+<audio bind:this={audioEl} preload="none" hidden></audio>

@@ -9,7 +9,6 @@
 </script>
 
 {#if player.queueOpen}
-  <div class="scrim" role="presentation" onclick={close}></div>
   <section class="queue-drawer" aria-label="Play queue">
     <header class="queue-head">
       <strong>Queue</strong>
