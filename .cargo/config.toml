@@ -1,0 +1,9 @@
+# Build for the x86-64-v3 microarchitecture level (AVX2 + FMA + BMI1/2).
+# This vectorizes the hot fingerprint path — symphonia's audio decode and
+# chromaprint's FFT — which is otherwise scalar on a generic x86-64 baseline.
+#
+# Portability: v3 covers essentially every x86 CPU from ~2015 on (Intel Haswell+,
+# AMD Excavator+). If you ship binaries to older/low-end hardware (pre-AVX2 Atom/
+# Celeron), drop this. For a build tuned to *this* machine only, use "native".
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
