@@ -50,6 +50,16 @@ Other docs: `docs/plugins.md` (Roon research + provider plan), `docs/api.md` (na
 - **Network is never on a request's hot path**: bind the web port before scanning;
   connect/scan in the background with timeouts; surface progress/errors via the
   activity log + WebSocket, not blocking calls or polling.
+- **Don't couple fundamentally different operations.** Each long-running background job
+  (source discovery/scan, fingerprint identification, MusicBrainz enrichment, artwork
+  fetch) is its **own task draining its own DB-backed queue at its own pace** — they
+  coordinate *only* through the database, never by running in lockstep in one loop. A
+  slow step (e.g. an SMB rescan) must never stall an unrelated one (e.g. identification).
+  Each worker loops: do available work → if it did work, loop again (drain the backlog);
+  else sleep a short idle poll. Group jobs into one task only when they share an external
+  rate limit (e.g. the two MusicBrainz passes). See `*_loop` fns in `main.rs`. The
+  trade-off — eventual consistency instead of strict ordering between jobs — is the point;
+  keep it simple, don't re-entangle them for ordering.
 - **Static assets are served `no-cache`** and embedded via `include_str!`; bump the
   `CACHE` version in `static/sw.js` whenever a static asset changes.
 - AGPL-3.0; check a new dependency's license before adding it.
