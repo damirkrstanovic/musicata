@@ -33,6 +33,10 @@ pub const ACOUSTID_CLIENT_KEY: &str = "Ez6XS6V6Z3";
 /// `fpcalc -length 120`); decoding the whole track would be wasteful.
 const FINGERPRINT_SECONDS: u32 = 120;
 const ACOUSTID_TIMEOUT: Duration = Duration::from_secs(15);
+/// AcoustID asks for no more than 3 requests/second. We space request *starts* a hair
+/// above 1/3 s (≈2.94 req/s) so several concurrent workers stay within budget while still
+/// saturating it — rather than serializing at 1/(interval + latency).
+const ACOUSTID_MIN_INTERVAL: Duration = Duration::from_millis(340);
 
 /// Compute the Chromaprint fingerprint (AcoustID's base64 form) for an audio file's
 /// bytes, plus its duration in whole seconds. Decodes up to [`FINGERPRINT_SECONDS`].
@@ -154,8 +158,8 @@ pub struct AcoustIdClient {
     base_url: String,
     client_key: String,
     agent: ureq::Agent,
-    /// AcoustID asks for no more than 3 requests/second.
-    last_request: Mutex<Option<Instant>>,
+    /// Earliest instant the next request may *start* (see [`ACOUSTID_MIN_INTERVAL`]).
+    next_slot: Mutex<Option<Instant>>,
 }
 
 impl AcoustIdClient {
@@ -177,7 +181,7 @@ impl AcoustIdClient {
             base_url: base_url.into(),
             client_key: client_key.into(),
             agent,
-            last_request: Mutex::new(None),
+            next_slot: Mutex::new(None),
         }
     }
 
@@ -185,8 +189,30 @@ impl AcoustIdClient {
         !self.client_key.is_empty()
     }
 
-    /// Look up the MusicBrainz ids for a fingerprint + duration. `Ok(None)` = no key,
-    /// no match, or a transport error treated as "not found" by the caller.
+    /// Block until this thread's turn under the ~3 req/s budget, reserving the next slot.
+    /// The lock is held only to claim a start time; the caller's network round-trip runs
+    /// unlocked, so several requests can be in flight at once while their *starts* stay
+    /// spaced ≥ [`ACOUSTID_MIN_INTERVAL`] apart across all threads.
+    fn reserve_slot(&self) {
+        let start = {
+            let mut slot = self.next_slot.lock().expect("acoustid limiter poisoned");
+            let now = Instant::now();
+            let start = match *slot {
+                Some(next) if next > now => next,
+                _ => now,
+            };
+            *slot = Some(start + ACOUSTID_MIN_INTERVAL);
+            start
+        };
+        let now = Instant::now();
+        if start > now {
+            std::thread::sleep(start - now);
+        }
+    }
+
+    /// Look up the MusicBrainz ids for a fingerprint + duration. Three outcomes the caller
+    /// must keep distinct: `Ok(Some)` matched, `Ok(None)` no key / genuinely no match (safe
+    /// to negative-cache), `Err` transient (HTTP/transport/rate-limit) — retry, don't cache.
     pub fn lookup(
         &self,
         fingerprint: &str,
@@ -195,15 +221,9 @@ impl AcoustIdClient {
         if !self.is_configured() {
             return Ok(None);
         }
-        // Throttle to <= 3 req/s, holding the lock across the request to serialize.
-        let mut last = self.last_request.lock().expect("acoustid limiter poisoned");
-        if let Some(previous) = *last {
-            let min_gap = Duration::from_millis(350);
-            let elapsed = previous.elapsed();
-            if elapsed < min_gap {
-                std::thread::sleep(min_gap - elapsed);
-            }
-        }
+        // Wait for our slot under the ~3 req/s budget; the request itself runs unlocked so
+        // concurrent workers overlap their round-trips instead of serializing.
+        self.reserve_slot();
         let url = format!("{}/v2/lookup", self.base_url);
         let value = self
             .agent
@@ -225,7 +245,6 @@ impl AcoustIdClient {
             })?
             .into_json::<Value>()
             .map_err(|error| error.to_string())?;
-        *last = Some(Instant::now());
         Ok(parse_acoustid(&value))
     }
 }
@@ -335,6 +354,22 @@ mod tests {
         assert_eq!(m.recording_mbid.as_deref(), Some("rec-mbid"));
         assert_eq!(m.release_group_mbid.as_deref(), Some("rg-mbid"));
         assert_eq!(m.release_mbid.as_deref(), Some("rel-mbid"));
+    }
+
+    #[test]
+    fn reserve_slot_spaces_request_starts() {
+        // First slot is immediate; each later one waits ~ACOUSTID_MIN_INTERVAL, so three
+        // back-to-back reservations take at least two intervals — keeping us within 3 req/s.
+        let client = AcoustIdClient::new("key");
+        let start = Instant::now();
+        client.reserve_slot();
+        client.reserve_slot();
+        client.reserve_slot();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= ACOUSTID_MIN_INTERVAL * 2,
+            "3 request starts should span >= 2 intervals, got {elapsed:?}"
+        );
     }
 
     #[test]

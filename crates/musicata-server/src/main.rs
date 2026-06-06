@@ -738,8 +738,9 @@ async fn fingerprint_loop(
 ) {
     let _ = ready.wait_for(|&r| r).await;
     loop {
-        let processed = fingerprint_pass(&database, &providers, &activity).await;
-        if processed == 0 {
+        let durable = fingerprint_pass(&database, &providers, &activity).await;
+        if durable == 0 {
+            // Empty queue, or every track failed transiently (AcoustID down) — back off.
             tokio::time::sleep(BACKGROUND_IDLE_POLL).await;
         }
     }
@@ -1219,8 +1220,9 @@ fn acoustid_lookup_duration(real_seconds: Option<f64>, window_seconds: u32) -> u
 /// id-exact artwork providers. Gated by a Settings toggle; no-ops without an AcoustID
 /// key. Mirrors `artwork_fill_pass` (rate-limited, capped, negative cache, activity).
 ///
-/// Returns the number of tracks processed this pass, so the caller can keep draining the
-/// queue back-to-back while there's work and idle when there isn't.
+/// Returns how many tracks got a *durable* verdict this pass (resolved or genuine
+/// not-found). Transient failures don't count — so when AcoustID is unreachable the caller
+/// sees 0 and backs off instead of hot-looping over the same tracks.
 async fn fingerprint_pass(
     database: &Database,
     providers: &Arc<RwLock<ProviderRegistry>>,
@@ -1256,11 +1258,15 @@ async fn fingerprint_pass(
     let task = activity.start("fingerprint", format!("Identifying tracks (0/{total})"));
 
     // Process the batch with bounded concurrency: decoding is CPU-heavy, so let several
-    // tracks decode across cores at once. The AcoustID lookups still serialize through the
-    // client's shared rate limiter (~3/s), so this just keeps decode off the critical path
-    // instead of stacking it on top of the rate limit.
+    // tracks decode across cores at once, and the AcoustID lookups overlap their round-trips
+    // up to the client's shared ~3/s start-rate limiter — so the batch runs at the budget,
+    // not at 1/(interval + latency).
     let semaphore = Arc::new(tokio::sync::Semaphore::new(FINGERPRINT_CONCURRENCY));
     let resolved = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Tracks given a durable verdict (resolved or genuine not-found). Transient failures
+    // (network/HTTP/rate-limit, or an unreadable file) are NOT counted and NOT cached, so
+    // the loop retries them next pass instead of suppressing them for a week.
+    let durable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut workers = tokio::task::JoinSet::new();
 
@@ -1275,6 +1281,7 @@ async fn fingerprint_pass(
         let client = client.clone();
         let activity = activity.clone();
         let resolved = resolved.clone();
+        let durable = durable.clone();
         let done = done.clone();
         workers.spawn(async move {
             let _permit = permit;
@@ -1288,20 +1295,29 @@ async fn fingerprint_pass(
             let real_duration = target.duration_seconds;
             let lookup_client = client.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                let (fingerprint, window_duration) =
-                    fingerprint::compute_fingerprint(&audio, &extension).ok()?;
-                lookup_client
+                let Ok((fingerprint, window_duration)) =
+                    fingerprint::compute_fingerprint(&audio, &extension)
+                else {
+                    // Undecodable file → won't change on retry; negative-cache it.
+                    return FingerprintOutcome::NoMatch;
+                };
+                match lookup_client
                     .lookup(&fingerprint, acoustid_lookup_duration(real_duration, window_duration))
-                    .ok()
-                    .flatten()
+                {
+                    Ok(Some(found)) => FingerprintOutcome::Resolved(found),
+                    Ok(None) => FingerprintOutcome::NoMatch,
+                    Err(error) => {
+                        tracing::debug!(%error, "acoustid lookup failed (transient, will retry)");
+                        FingerprintOutcome::Transient
+                    }
+                }
             })
             .await
-            .ok()
-            .flatten();
+            .unwrap_or(FingerprintOutcome::Transient); // task panic → retry, don't cache.
 
             let now = now_unix_seconds();
             match outcome {
-                Some(found) => {
+                FingerprintOutcome::Resolved(found) => {
                     let _ = database
                         .upsert_track_fingerprint(
                             &target.track_id,
@@ -1313,12 +1329,16 @@ async fn fingerprint_pass(
                         )
                         .await;
                     resolved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    durable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                None => {
+                FingerprintOutcome::NoMatch => {
                     let _ = database
                         .upsert_track_fingerprint(&target.track_id, "not_found", None, None, None, now)
                         .await;
+                    durable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Transient: leave it untouched so the next pass tries again.
+                FingerprintOutcome::Transient => {}
             }
             let count = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             activity.update(task, format!("Identifying tracks ({count}/{total})"));
@@ -1326,6 +1346,7 @@ async fn fingerprint_pass(
     }
     while workers.join_next().await.is_some() {}
     let resolved = resolved.load(std::sync::atomic::Ordering::Relaxed);
+    let durable = durable.load(std::sync::atomic::Ordering::Relaxed);
 
     if resolved > 0 {
         activity.finish(
@@ -1336,7 +1357,18 @@ async fn fingerprint_pass(
     } else {
         activity.remove(task);
     }
-    total
+    durable
+}
+
+/// How `fingerprint_pass` classified one track — kept distinct so transient failures aren't
+/// negative-cached like a genuine no-match.
+enum FingerprintOutcome {
+    /// AcoustID matched: store the resolved MusicBrainz ids.
+    Resolved(fingerprint::AcoustIdMatch),
+    /// Looked up cleanly with nothing back, or the file won't decode — safe to negative-cache.
+    NoMatch,
+    /// Network/HTTP/rate-limit error or a worker panic — retry next pass, don't cache.
+    Transient,
 }
 
 /// Read a track's audio bytes from its provider — SMB over the wire, else local disk.
