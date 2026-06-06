@@ -1,0 +1,198 @@
+# Frontend migration: vanilla JS → Svelte
+
+Plan for rewriting the embedded web app (`crates/musicata-server/static/`) as a
+Svelte + TypeScript app, built with Vite and embedded into the server binary.
+
+**Decisions (locked):**
+- **Svelte 5 (runes) + TypeScript**, plain Svelte + **Vite** (no SvelteKit — we serve a
+  static SPA from axum, no SSR/Node runtime).
+- **Build integration: `build.rs` auto-builds.** `cargo build` invokes the Vite build and
+  embeds the output, so assets never go stale. Node+npm become a build-time dependency.
+- **Shared types:** generate TypeScript from the Rust API DTOs so client calls are checked
+  against the server at compile time.
+- **Big-bang cutover:** both pages rewritten on this branch, `static/` deleted in one
+  switch. Sequenced internally (admin slightly ahead) to de-risk, but a single merge.
+
+**The non-negotiable:** the playback hot path. `scripts/ui-smoke.sh` (66 checks) asserts
+footer latency, no audio restarts, and **no full-state broadcast or DOM sweep on position
+ticks**. This is the acceptance gate for every phase touching the player.
+
+---
+
+## Why this shape
+
+- **No SvelteKit.** SvelteKit's value is SSR + filesystem routing + a Node server adapter.
+  We have none of those needs: assets are static and embedded, and axum is the server.
+  Plain Svelte + Vite gives the compiler and component model without the meta-framework.
+- **Two Vite entry points**, mirroring today's two pages: `/` (player) and `/admin`. Each
+  emits its own HTML + hashed JS/CSS bundle. No client router needed; the player keeps its
+  in-page view + History-API back-stack, now expressed as components + a store.
+- **Svelte 5 runes** give fine-grained, signal-based reactivity with no VDOM — structurally
+  the same surgical DOM updates the player already does by hand, which is exactly what lets
+  us preserve the position-tick optimization (see Hot path below).
+- **Keep `styles.css` as-is** (3,080 lines) imported once per entry. CSS is orthogonal to
+  the JS rewrite; rewriting it concurrently multiplies risk for no functional gain.
+  Componentize/scope CSS later as a separate effort if desired.
+
+---
+
+## Toolchain & embedding
+
+New layout (current `static/` stays until cutover):
+
+```
+crates/musicata-server/
+  web/                      # the Vite + Svelte project
+    package.json
+    vite.config.ts          # two inputs (player, admin); vite-plugin-pwa
+    tsconfig.json
+    index.html              # player entry  -> /
+    admin.html              # admin entry   -> /admin
+    src/
+      lib/                  # api client, ws, stores, shared components, utils
+      player/               # player components
+      admin/                # admin components
+      types/generated.ts    # Rust → TS DTOs (generated; checked in or built)
+      styles.css            # moved from static/, imported by each entry
+    dist/                   # Vite output (hashed bundles + manifest); git-ignored
+  build.rs                  # runs the Vite build, exposes dist/ to the crate
+  src/...
+```
+
+**`build.rs`:**
+1. `cargo:rerun-if-changed=web/src`, `web/package.json`, `web/vite.config.ts`,
+   `web/index.html`, `web/admin.html` — rebuild only when the FE changes.
+2. Run `npm ci` (when `node_modules` is missing) then `npm run build` in `web/`.
+3. Fail the build loudly if Node/npm is absent **unless** `MUSICATA_SKIP_WEB_BUILD=1` is
+   set, in which case fall back to a pre-existing `dist/` (escape hatch for offline/CI/
+   Node-less environments). Emit a clear warning when falling back.
+4. Pass `dist/`'s path to the crate via `cargo:rustc-env` (or rely on a fixed relative
+   path) for the embed step.
+
+**Embedding & serving:** replace the per-file `include_str!` handlers and the manual
+`sw.js` cache bump with **`rust-embed`** (MIT) over `web/dist/`:
+- Hashed asset bundles (`*.[hash].js/.css`) → served `Cache-Control: immutable, max-age=1y`.
+- `index.html` / `admin.html` → served `no-cache` (so a new deploy is picked up; they
+  reference the new hashed bundles).
+- Content types from the file extension; a single embedded-dir handler replaces the eight
+  hand-written asset routes in `main.rs`.
+- Debug builds can use rust-embed's "read from disk" mode for fast iteration (no rebuild to
+  see a CSS tweak), release builds embed.
+
+**Service worker / PWA:** use **`vite-plugin-pwa`** to generate the SW + precache manifest
+with automatic content-hash cache-busting. This *removes* the hand-versioned `CACHE`
+constant in `sw.js` — a current maintenance footgun — while preserving offline behavior.
+
+---
+
+## Shared types (Rust → TS)
+
+Audit finding: the API is mixed — ~49 `#[derive(Serialize)]` response structs (e.g.
+`LibrarySummary`, `Player`, `PlaybackSessionResponse`, `RescanResponse`, page envelopes)
+but ~95 ad-hoc `json!({...})` response sites.
+
+Plan:
+- Add **`ts-rs`** (MIT) `#[derive(TS)]` to the response/DTO structs; a `cargo test` exports
+  them to `web/src/types/generated.ts`. These cover the typed half for free.
+- For the ad-hoc `json!` responses: **prefer promoting the hot ones to real structs**
+  (better server hygiene anyway), and hand-write TS types for the long tail. Track which
+  endpoints are typed vs hand-modeled.
+- A single typed `api()` client in `web/src/lib/api.ts` wraps `fetch` with the generated
+  types, so every call site is checked. This is the main payoff justifying the toolchain.
+
+---
+
+## State & the playback hot path (must-preserve)
+
+Today: a global `state` object; the per-player WebSocket sends a lightweight
+`type:"progress"` message ~1×/s that `applyProgressTick` (`app.js:3231`) routes to update
+*only* the elapsed/seek readout, early-returning before the full-state path so the track
+list is never swept (`markActiveTrack`). Manual memoization (`state.lastTrackKey`,
+`lastStatus`, `lastShuffle`) guards the per-second cost.
+
+In Svelte 5:
+- A **`playerStore`** (`$state` runes) holds what `state` holds today.
+- **Position is its own signal** (`elapsed`, `duration`). The footer's seek + elapsed text
+  bind to it; Svelte updates exactly those nodes on a tick — same surgical update as today,
+  but the memoization band-aids disappear (reactivity skips unchanged work automatically).
+- The track-list "active" highlight **derives** from an `activeTrackId` signal, recomputed
+  only when it changes — never on a position tick.
+- WebSocket handling moves to `web/src/lib/ws.ts` (per-player socket, reconnect/backoff,
+  `progress` vs full-state routing) — a direct port of the current logic.
+- **Validation:** port the footer + store + WS *first*, then run `scripts/ui-smoke.sh` and
+  confirm the lag assertions stay green before building anything else on the player.
+
+---
+
+## Component inventory
+
+**Shared (`web/src/lib/`):** `api.ts` (typed client), `ws.ts`, `stores` (player, library,
+ui), `Modal.svelte` (promise-based dialog, ports `admin.js` `openModal`),
+`infiniteScroll` (Svelte action wrapping the current IntersectionObserver helper),
+`format.ts` (formatTime/escape).
+
+**Player (`web/src/player/`):** `App.svelte` (shell + nav stack), `NavTabs`, `Footer`
+(transport), `SeekBar`, `LibraryGrid` + `AlbumCard`/`ArtistCard`, `AlbumDetail`,
+`ArtistDetail`, `TrackList` + `TrackRow`, `QueueDrawer` + `QueueRow`, `SearchBar`,
+`BrowseFilters`, `PlaylistView`/`SmartPlaylistView`, `AddToPlaylistPopover`,
+`MetadataPanel` (+ `CanonicalMetadata`, `ArtworkReview`, `MusicBrainzCandidates`).
+
+**Admin (`web/src/admin/`):** `App.svelte`, `SettingsSection`, `SourcesPanel`,
+`PlayersPanel`, `ZonesPanel`, `ActivityFeed` (WS), `MergeArtistsModal`.
+
+This also fixes today's duplication (`buildAlbumCard`/`buildArtistCard`, the near-identical
+`openAlbum`/`openArtist`/`openSmartPlaylistView`) by sharing real components.
+
+---
+
+## Phases (single branch, single cutover)
+
+**Phase 0 — Toolchain scaffold.** Create `web/` (Vite + Svelte 5 + TS), two entries
+rendering placeholders, `build.rs` + `rust-embed` wiring, axum serving the embedded `dist/`
+at `/` and `/admin`. Gate: `cargo build` produces a binary that serves the Svelte shell;
+smoke suite *loads* (even if flows fail). Proves the pipeline before any logic is ported.
+
+**Phase 1 — Shared types + api client.** `ts-rs` export test; typed `api()`; audit/triage
+the `json!` endpoints. Gate: generated types compile; a couple of real calls typecheck.
+
+**Phase 2 — Admin page.** Smaller, no playback hot path — shakes out Modal/store/api/WS
+patterns. Gate: admin smoke flows (sources, players, zones, activity feed) green.
+
+**Phase 3 — Player.** Order: shell + `playerStore` + `ws.ts` + Footer/SeekBar **first**
+(run smoke, confirm lag assertions), then library/album/artist/track views, then
+queue/search/browse, then playlists, then metadata panel. Gate: full player smoke green at
+each sub-step; never let the lag checks regress.
+
+**Phase 4 — PWA + cleanup.** `vite-plugin-pwa` service worker; delete `static/`, the
+per-file asset handlers, and the manual `sw.js` cache bump.
+
+**Phase 5 — Cutover & docs.** Full `scripts/ui-smoke.sh` + manual QA on a real library.
+Rewrite the **CLAUDE.md** frontend conventions (the "vanilla HTML/CSS/JS, **no build
+step**" and "bump `CACHE` in `sw.js`" lines are now false), update `docs/style-guide.md`,
+and document the `web/` build in "Build / test / run".
+
+---
+
+## Risks & mitigations
+
+| Risk | Mitigation |
+|---|---|
+| Position-tick latency regresses | Port Footer/store/WS first; run smoke each step; keep position as its own signal. |
+| Node becomes a hard build dep | `MUSICATA_SKIP_WEB_BUILD=1` + prebuilt `dist/` fallback for CI/offline. |
+| `json!` endpoints aren't typed | Promote hot ones to structs; hand-write TS for the tail; track coverage. |
+| Bundle bloat | Measure gzipped output vs today's ~140 KB JS; Svelte output should be ≤ that. Fail loud if not. |
+| Smoke suite drives real assets | Unchanged — it runs the built binary, which now embeds the Vite bundle. |
+| CSS rewrite scope creep | Keep `styles.css` global and as-is for the migration; componentize later. |
+
+**Licenses (AGPL-compatible, all permissive):** Svelte (MIT), Vite (MIT), `rust-embed`
+(MIT), `ts-rs` (MIT), `vite-plugin-pwa` (MIT). Verify each at add time per project policy.
+
+---
+
+## Convention changes this lands
+
+- `static/` (vanilla, no build step) → `web/` (Svelte + Vite, built by `build.rs`).
+- `include_str!` per file → `rust-embed` over `dist/`.
+- Manual `sw.js` `CACHE` bump → `vite-plugin-pwa`-generated, content-hashed.
+- CLAUDE.md "no build step" convention is retired; `cargo build` now needs Node+npm
+  (or `MUSICATA_SKIP_WEB_BUILD=1` with a prebuilt `dist/`).
