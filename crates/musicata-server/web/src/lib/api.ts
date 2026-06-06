@@ -80,6 +80,13 @@ export interface ArtistDetail {
   tracks: TrackRow[];
 }
 
+export interface SearchResults {
+  query: string;
+  artists: Artist[];
+  albums: Album[];
+  tracks: TrackRow[];
+}
+
 export type { SourceView, AppSettings, ArtistAliasGroup, Activity, Player, Zone };
 
 export interface CreateSourceRequest {
@@ -111,12 +118,13 @@ export class ApiError extends Error {
 async function getJson<T>(
   path: string,
   params?: Record<string, string | number | undefined>,
+  signal?: AbortSignal,
 ): Promise<T> {
   const url = new URL(path, location.origin);
   for (const [key, value] of Object.entries(params ?? {})) {
     if (value !== undefined) url.searchParams.set(key, String(value));
   }
-  const response = await fetch(url, { headers: { accept: "application/json" } });
+  const response = await fetch(url, { headers: { accept: "application/json" }, signal });
   if (!response.ok) throw new ApiError(response.status, `GET ${path} → ${response.status}`);
   return (await response.json()) as T;
 }
@@ -163,6 +171,7 @@ export const api = {
 
   albumDetail: (id: string) => getJson<AlbumDetail>(`/api/albums/${encodeURIComponent(id)}`),
   artistDetail: (id: string) => getJson<ArtistDetail>(`/api/artists/${encodeURIComponent(id)}`),
+  search: (q: string, signal?: AbortSignal) => getJson<SearchResults>("/api/search", { q }, signal),
 
   // Players & zones
   players: () => getJson<Player[]>("/api/players"),

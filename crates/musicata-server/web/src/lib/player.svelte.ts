@@ -15,6 +15,7 @@ class Player {
   elapsed = $state(0);
   duration = $state(0);
   seekDragging = $state(false);
+  queueOpen = $state(false);
 
   get status(): PlaybackStatus {
     return this.playback?.status ?? "stopped";

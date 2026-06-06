@@ -21,8 +21,12 @@ Svelte + TypeScript app, built with Vite and embedded into the server binary.
   the clicked index, and a History-synced nav stack (tabs + Back). `Track` is a structural
   `TrackRow` (display + playback fields); the full `Track` + metadata graph is generated when
   the metadata panel lands. CDP-verified: grid → detail → play (elapsed advances) → Back.
-  Next: queue drawer, search, browse filters, playlists, metadata panel — then run the smoke
-  suite's lag assertions against `/v2`.
+  Phase 3c (queue + search) done: a queue drawer reading `PlaybackState.queue` (jump/reorder/
+  remove/clear via commands, current-track highlight) and a debounced, AbortController-guarded
+  search over `/api/search`. CDP-verified: 8-item queue, reorder reflected after the
+  round-trip; search "dar" → artists/albums/tracks, 16 cards.
+  Next: browse filters, playlists/favorites, metadata panel — then run the smoke suite's lag
+  assertions against `/v2`.
 - **Phase 2 (admin page) — done.** `/v2/admin` is a full Svelte port: Sources, Artwork &
   Settings, Players & Zones, Merged artists, Identification, Activity (live WS). Reuses the
   promise-based `Modal`, the typed `api` client, and the existing `styles.css`. Server admin

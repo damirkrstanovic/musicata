@@ -76,5 +76,14 @@
       onchange={(e) =>
         send({ command: "set_volume", volume: Number((e.currentTarget as HTMLInputElement).value) })}
     />
+    <button
+      class="queue-btn"
+      type="button"
+      title="Queue"
+      aria-pressed={player.queueOpen}
+      onclick={() => (player.queueOpen = !player.queueOpen)}
+    >
+      <span class="queue-glyph">≣</span><span class="queue-count">{player.queue.length}</span>
+    </button>
   </div>
 </footer>

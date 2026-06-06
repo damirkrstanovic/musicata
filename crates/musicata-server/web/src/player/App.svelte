@@ -8,12 +8,15 @@
   import { setAudio } from "../lib/playback";
   import { sendCommand } from "../lib/commands";
   import { setMediaMetadata, setMediaPosition, setMediaHandlers } from "../lib/media";
+  import { search } from "../lib/search.svelte";
   import type { PlaybackState } from "../types/PlaybackState";
   import Footer from "./Footer.svelte";
   import LibraryGrid from "./LibraryGrid.svelte";
   import ArtistsGrid from "./ArtistsGrid.svelte";
   import AlbumDetail from "./AlbumDetail.svelte";
   import ArtistDetail from "./ArtistDetail.svelte";
+  import SearchResults from "./SearchResults.svelte";
+  import QueueDrawer from "./QueueDrawer.svelte";
 
   let audioEl: HTMLAudioElement;
   let audio: BrowserAudio | null = null;
@@ -72,6 +75,20 @@
     ws?.close();
     audio?.stop();
   });
+
+  // Debounce search input; switch to/from the search view as the box gains/loses text.
+  let searchTimer: ReturnType<typeof setTimeout> | undefined;
+  function onSearchInput(value: string) {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      search.query = value;
+      if (value.trim()) {
+        if (nav.current.name !== "search") nav.root({ name: "search" });
+      } else if (nav.current.name === "search") {
+        nav.root({ name: "library" });
+      }
+    }, 220);
+  }
 </script>
 
 <svelte:window onpopstate={() => nav.pop()} />
@@ -95,6 +112,9 @@
         onclick={() => nav.root({ name: "artists" })}>Artists</button
       >
     </nav>
+    <label class="search">
+      <input type="search" autocomplete="off" placeholder="Search" oninput={(e) => onSearchInput(e.currentTarget.value)} />
+    </label>
     <a class="ghost-button" href="/v2/admin">Admin</a>
   </header>
 
@@ -103,6 +123,8 @@
       <LibraryGrid />
     {:else if route.name === "artists"}
       <ArtistsGrid />
+    {:else if route.name === "search"}
+      <SearchResults />
     {:else if route.name === "album"}
       <AlbumDetail id={route.id} />
     {:else if route.name === "artist"}
@@ -111,5 +133,6 @@
   </main>
 
   <Footer />
+  <QueueDrawer />
   <audio bind:this={audioEl} preload="none" hidden></audio>
 </div>

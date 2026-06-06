@@ -3,6 +3,7 @@
 export type Route =
   | { name: "library" }
   | { name: "artists" }
+  | { name: "search" }
   | { name: "album"; id: string; title: string }
   | { name: "artist"; id: string; label: string };
 
