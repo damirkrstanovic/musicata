@@ -52,6 +52,15 @@ export interface UnidentifiedArtist {
   track_count: number;
 }
 
+/** The subset of a track needed to start playback. A structural view of the server's `Track`
+ *  (generated in full when the track-list views land), so no deep metadata graph yet. */
+export interface PlayableTrack {
+  id: string;
+  stream_url: string;
+  title: string;
+  artist_name: string;
+}
+
 export type { SourceView, AppSettings, ArtistAliasGroup, Activity, Player, Zone };
 
 export interface CreateSourceRequest {
@@ -133,8 +142,13 @@ export const api = {
   settings: () => getJson<AppSettings>("/api/settings"),
   saveSettings: (body: AppSettings) => sendJson("/api/settings", "PATCH", body),
 
+  albumTracks: (id: string) =>
+    getJson<{ tracks: PlayableTrack[] }>(`/api/albums/${encodeURIComponent(id)}`),
+
   // Players & zones
   players: () => getJson<Player[]>("/api/players"),
+  playerCommand: (id: string, command: unknown) =>
+    sendJson(`/api/players/${encodeURIComponent(id)}/commands`, "POST", command),
   createPlayer: (body: { kind: "mpd"; address: string; name?: string }) =>
     sendJson("/api/players", "POST", body),
   updatePlayer: (id: string, body: { name?: string; zone_id?: string | null }) =>

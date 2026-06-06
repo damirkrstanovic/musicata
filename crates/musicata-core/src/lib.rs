@@ -527,6 +527,7 @@ pub struct BrowseYearFacet {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum PlaybackStatus {
     #[default]
@@ -536,6 +537,7 @@ pub enum PlaybackStatus {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum RepeatMode {
     #[default]
@@ -581,6 +583,7 @@ pub struct Zone {
 /// What a controller knows about a track queued on a player. `stream_url` is what
 /// the player actually fetches; `track_id` links back to the library when known.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct QueueItem {
     pub track_id: Option<String>,
     pub title: String,
@@ -591,6 +594,7 @@ pub struct QueueItem {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct PlaybackState {
     pub status: PlaybackStatus,
     pub now_playing: Option<QueueItem>,

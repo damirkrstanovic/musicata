@@ -8,6 +8,17 @@ Svelte + TypeScript app, built with Vite and embedded into the server binary.
 - **Phase 0 (toolchain) — done.** `web/` (Svelte 5 + TS + Vite, two entries) builds via
   `build.rs`, embeds through `rust-embed`, served at `/v2` + `/v2/admin`. Headless-verified
   the Svelte app mounts. Old app at `/` untouched.
+- **Phase 3 (player) — in progress.** Phase 3a (shell + playback hot path) done: a runes
+  `player` store whose `elapsed`/`duration` are their own signals (the hot path — a progress
+  tick mutates only those, so the footer time/seek move while now-playing/queue, which derive
+  from `playback`, don't), a reconnecting per-player WebSocket routing `progress` ticks vs
+  full `PlaybackState`, a `BrowserAudio` service (drive/report/ended), typed `PlayerCommand`
+  sender, mediaSession glue, and a `Footer`/`SeekBar`. `PlaybackState`/`QueueItem`/
+  `PlaybackStatus`/`RepeatMode` generated via ts-rs. Verified over CDP against a freshly
+  scanned testdata library: clicking play starts a track and the elapsed advances
+  (0:01→0:04). A temporary "Play an album" affordance drives it until the library views land.
+  Next: library grid, album/artist detail, track lists (full `Track` type), queue drawer,
+  search, metadata panel — then run the smoke suite's lag assertions against `/v2`.
 - **Phase 2 (admin page) — done.** `/v2/admin` is a full Svelte port: Sources, Artwork &
   Settings, Players & Zones, Merged artists, Identification, Activity (live WS). Reuses the
   promise-based `Modal`, the typed `api` client, and the existing `styles.css`. Server admin
