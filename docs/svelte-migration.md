@@ -5,6 +5,31 @@ Svelte + TypeScript app, built with Vite and embedded into the server binary.
 
 ## Status
 
+**The Svelte app at `/v2` + `/v2/admin` is at functional parity with the old app except the
+metadata editor panel**, all CDP-verified against a scanned testdata library. The old vanilla
+app still serves `/` + `/admin` (untouched). Done: admin (all 6 panels), player shell +
+playback hot path, album/artist/track browsing + nav, queue drawer, search, favorites,
+playlists + smart playlists, browse filters, internet radio, zones/output switching.
+
+**Remaining to fully complete the migration:**
+1. **Metadata editor panel** — the only missing feature. Brings the full `Track` +
+   metadata-observation graph as generated ts-rs types (the component that consumes
+   `observed_metadata`): canonical metadata, artwork review, MusicBrainz candidates.
+2. **Redesign the lag/flow smoke harness for the Svelte app.** `tests/ui/instrument.mjs`
+   wraps the *old app's global functions* (`updateFooterFromState`, `markActiveTrack`,
+   `applyProgressTick`, `driveBrowserAudio`) to count hot-path work — none of which exist in
+   the Svelte app. The hot-path assertion must be rebuilt around a MutationObserver (assert a
+   progress tick mutates only the elapsed/seek nodes, not now-title/queue) or app-exposed test
+   counters; `flows.mjs` selectors (`#play-pause`, `#segmented`, `#browse-grid`, `#back-btn`,
+   `.link-artist`…) must map to the new DOM. This is the regression gate and must pass before
+   cutover.
+3. **Cutover (Phase 5).** Flip `/v2`→`/` and `/v2/admin`→`/admin`, remove the `include_str!`
+   handlers + `static/`, retire the CLAUDE.md "no build step" convention.
+4. **PWA (Phase 4).** `vite-plugin-pwa` service worker (replaces the hand-versioned `sw.js`).
+
+Cutover is deliberately gated on (1) and (2): replacing the live app demands feature parity
+*and* the hot-path regression suite, not a rushed flip.
+
 - **Phase 0 (toolchain) — done.** `web/` (Svelte 5 + TS + Vite, two entries) builds via
   `build.rs`, embeds through `rust-embed`, served at `/v2` + `/v2/admin`. Headless-verified
   the Svelte app mounts. Old app at `/` untouched.
