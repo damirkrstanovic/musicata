@@ -19,7 +19,8 @@ export type PlayerCommand =
   | { command: "enqueue"; track_ids: string[] }
   | { command: "play_queue_index"; index: number }
   | { command: "remove_queue_item"; index: number }
-  | { command: "move_queue_item"; from: number; to: number };
+  | { command: "move_queue_item"; from: number; to: number }
+  | { command: "play_stream"; url: string; title: string };
 
 export async function sendCommand(playerId: string | null, command: PlayerCommand): Promise<void> {
   if (!playerId) return;

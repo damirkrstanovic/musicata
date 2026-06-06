@@ -23,3 +23,11 @@ export async function playTracks(tracks: TrackRow[], startIndex = 0): Promise<vo
     start_index: startIndex,
   });
 }
+
+/** Play an internet-radio stream on the active player. Call from a click handler. */
+export async function playStream(url: string, title: string): Promise<void> {
+  if (!player.activeId) return;
+  audio?.claim();
+  audio?.primePlay(url);
+  await sendCommand(player.activeId, { command: "play_stream", url, title });
+}

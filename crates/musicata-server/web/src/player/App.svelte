@@ -23,6 +23,7 @@
   import PlaylistsIndex from "./PlaylistsIndex.svelte";
   import PlaylistView from "./PlaylistView.svelte";
   import SmartPlaylistView from "./SmartPlaylistView.svelte";
+  import RadioView from "./RadioView.svelte";
 
   let audioEl: HTMLAudioElement;
   let audio: BrowserAudio | null = null;
@@ -130,6 +131,12 @@
         type="button"
         onclick={() => nav.root({ name: "playlists" })}>Playlists</button
       >
+      <button
+        class="tab"
+        class:active={route.name === "radio"}
+        type="button"
+        onclick={() => nav.root({ name: "radio" })}>Radio</button
+      >
     </nav>
     <label class="search">
       <input type="search" autocomplete="off" placeholder="Search" oninput={(e) => onSearchInput(e.currentTarget.value)} />
@@ -146,6 +153,8 @@
       <FavoritesView />
     {:else if route.name === "playlists"}
       <PlaylistsIndex />
+    {:else if route.name === "radio"}
+      <RadioView />
     {:else if route.name === "search"}
       <SearchResults />
     {:else if route.name === "album"}
