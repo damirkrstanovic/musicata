@@ -1,11 +1,10 @@
 <script lang="ts">
   import Modal from "../lib/Modal.svelte";
+  import StatusDashboard from "./StatusDashboard.svelte";
   import SourcesPanel from "./SourcesPanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import PlayersZonesPanel from "./PlayersZonesPanel.svelte";
   import MergedArtistsPanel from "./MergedArtistsPanel.svelte";
-  import IdentificationPanel from "./IdentificationPanel.svelte";
-  import ActivityPanel from "./ActivityPanel.svelte";
 </script>
 
 <header class="admin-bar">
@@ -20,12 +19,32 @@
 </header>
 
 <main class="admin-grid">
+  <StatusDashboard />
+
+  <h2 class="admin-group-title">Library &amp; sources</h2>
   <SourcesPanel />
+
+  <h2 class="admin-group-title">Identification &amp; artwork</h2>
   <SettingsPanel />
+
+  <h2 class="admin-group-title">Playback</h2>
   <PlayersZonesPanel />
+
+  <h2 class="admin-group-title">Curation</h2>
   <MergedArtistsPanel />
-  <IdentificationPanel />
-  <ActivityPanel />
+
+  <Modal />
 </main>
 
-<Modal />
+<style>
+  .admin-group-title {
+    grid-column: 1 / -1;
+    margin: 1.4rem 0 0;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    font-size: 0.8rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    opacity: 0.65;
+  }
+</style>

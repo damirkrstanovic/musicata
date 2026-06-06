@@ -2460,6 +2460,18 @@ async fn identification_stats_route(
             "resolved": stats.fingerprint_resolved,
             "not_found": stats.fingerprint_not_found,
             "searched": stats.fingerprint_searched,
+        },
+        // Enrichment lags identification: enriched of the identified tracks, the rest queued.
+        "enrichment": {
+            "enriched": stats.tracks_enriched,
+            "identified": stats.tracks_identified,
+            "queued": (stats.tracks_identified - stats.tracks_enriched).max(0),
+        },
+        "artwork": {
+            "album_covers": stats.album_covers,
+            "albums_total": stats.albums_total,
+            "artist_images": stats.artist_images,
+            "artists_total": stats.artists_total,
         }
     })))
 }

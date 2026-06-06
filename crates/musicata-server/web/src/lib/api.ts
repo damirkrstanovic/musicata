@@ -49,6 +49,8 @@ export interface IdentificationStats {
   processed: number;
   queued: number;
   fingerprint: { resolved: number; not_found: number; searched: number };
+  enrichment: { enriched: number; identified: number; queued: number };
+  artwork: { album_covers: number; albums_total: number; artist_images: number; artists_total: number };
 }
 
 export interface UnidentifiedAlbum {

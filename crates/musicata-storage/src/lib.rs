@@ -1975,6 +1975,17 @@ impl Database {
                     "SELECT COUNT(*) FROM track_fingerprint WHERE status = 'search_not_found'",
                 )
                 .await?,
+            tracks_enriched: self
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM track_musicbrainz_metadata WHERE status = 'resolved'",
+                )
+                .await?,
+            album_covers: self
+                .scalar_i64("SELECT COUNT(*) FROM albums WHERE artwork_url IS NOT NULL")
+                .await?,
+            artist_images: self
+                .scalar_i64("SELECT COUNT(*) FROM artists WHERE artwork_url IS NOT NULL")
+                .await?,
         })
     }
 
@@ -3318,6 +3329,11 @@ pub struct IdentificationStats {
     pub fingerprint_resolved: i64,
     pub fingerprint_not_found: i64,
     pub fingerprint_searched: i64,
+    /// Identified tracks whose full MusicBrainz metadata has been fetched + applied.
+    pub tracks_enriched: i64,
+    /// Albums / artists that have an acquired cover image.
+    pub album_covers: i64,
+    pub artist_images: i64,
 }
 
 /// SQL boolean: whether the track referenced by `track_id_expr` (e.g. `"t.id"`) carries a
