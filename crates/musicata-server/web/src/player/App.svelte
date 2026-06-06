@@ -21,6 +21,7 @@
   import ArtistDetail from "./ArtistDetail.svelte";
   import SearchResults from "./SearchResults.svelte";
   import QueueDrawer from "./QueueDrawer.svelte";
+  import MetadataPanel from "./MetadataPanel.svelte";
   import FavoritesView from "./FavoritesView.svelte";
   import PlaylistsIndex from "./PlaylistsIndex.svelte";
   import PlaylistView from "./PlaylistView.svelte";
@@ -214,6 +215,7 @@
 
   <Footer />
   <QueueDrawer />
+  <MetadataPanel />
   <Modal />
   <audio bind:this={audioEl} preload="none" hidden></audio>
 </div>

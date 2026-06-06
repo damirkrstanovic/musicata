@@ -140,6 +140,56 @@ export type BrowseParams = ListParams & {
   composer?: string;
 };
 
+// --- Track metadata review (the editor panel). Hand-typed against the server structs;
+// ts-rs generation of the metadata-observation graph is a follow-up. ---
+
+export type MetadataApprovalState = "observed" | "approved" | "rejected";
+
+export type MetadataFieldValue =
+  | { kind: "text"; value: string }
+  | { kind: "number"; value: number }
+  | { kind: "text_list"; value: string[] }
+  | { kind: "count"; value: number };
+
+export interface MetadataFieldObservation {
+  source: string;
+  field_name: string;
+  value: MetadataFieldValue;
+  confidence: number;
+  observed_at_unix_seconds: number;
+  approval_state: MetadataApprovalState;
+}
+
+export interface MetadataObservationReview {
+  source: string;
+  confidence: number;
+  observed_at_unix_seconds: number;
+  approval_state: MetadataApprovalState;
+  fields: MetadataFieldObservation[];
+}
+
+export interface TrackCanonicalMetadata {
+  title: string;
+  artist_name: string;
+  album_title: string;
+  year: number | null;
+  track_number: number | null;
+}
+
+export interface TrackMetadataReview {
+  track_id: string;
+  canonical: TrackCanonicalMetadata;
+  observations: MetadataObservationReview[];
+}
+
+export interface MetadataFieldUpdate {
+  source: string;
+  observed_at_unix_seconds: number;
+  field_name: string;
+  value: MetadataFieldValue;
+  approval_state: MetadataApprovalState;
+}
+
 export type { SourceView, AppSettings, ArtistAliasGroup, Activity, Player, Zone };
 
 export interface CreateSourceRequest {
@@ -243,6 +293,10 @@ export const api = {
 
   albumDetail: (id: string) => getJson<AlbumDetail>(`/api/albums/${encodeURIComponent(id)}`),
   artistDetail: (id: string) => getJson<ArtistDetail>(`/api/artists/${encodeURIComponent(id)}`),
+  metadataReview: (trackId: string) =>
+    getJson<TrackMetadataReview>(`/api/tracks/${encodeURIComponent(trackId)}/metadata/review`),
+  updateMetadataField: (trackId: string, update: MetadataFieldUpdate) =>
+    sendJson(`/api/tracks/${encodeURIComponent(trackId)}/metadata/review/fields`, "PATCH", update),
   search: (q: string, signal?: AbortSignal) => getJson<SearchResults>("/api/search", { q }, signal),
 
   // Players & zones

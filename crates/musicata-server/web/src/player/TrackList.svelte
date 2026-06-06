@@ -5,6 +5,7 @@
   import { player } from "../lib/player.svelte";
   import { nav } from "../lib/nav.svelte";
   import { favorites } from "../lib/favorites.svelte";
+  import { metadata } from "../lib/metadata.svelte";
 
   // Clicking a row plays the whole list starting there (matches the old player).
   let { tracks }: { tracks: TrackRow[] } = $props();
@@ -46,6 +47,12 @@
           title="Favorite"
           aria-pressed={favorites.has(track.id)}
           onclick={() => favorites.toggleTrack(track.id)}>{favorites.has(track.id) ? "♥" : "♡"}</button
+        >
+        <button
+          class="icon-button track-meta"
+          type="button"
+          title="Edit metadata"
+          onclick={() => metadata.open(track.id)}>⋯</button
         >
       </span>
     </div>
