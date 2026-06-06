@@ -5,6 +5,7 @@
   import { onVisible } from "../lib/dom";
   import { nav } from "../lib/nav.svelte";
   import { browse } from "../lib/browse.svelte";
+  import { search } from "../lib/search.svelte";
   import AlbumCard from "./AlbumCard.svelte";
 
   const PAGE = 60;
@@ -12,24 +13,32 @@
   let done = $state(false);
   let offset = 0;
   let loading = false;
-  let token = 0; // bumped on filter change so stale responses are dropped
+  let token = 0; // bumped on filter/search change so stale responses are dropped
 
   async function loadMore() {
     if (done || loading) return;
     loading = true;
     const mine = token;
     try {
-      const page = await api.albums({
-        limit: PAGE,
-        offset,
-        genre: browse.genre || undefined,
-        year: browse.year ?? undefined,
-        composer: browse.composer || undefined,
-      });
-      if (mine !== token) return; // filter changed mid-flight
-      albums = [...albums, ...page.items];
-      offset += page.items.length;
-      if (page.items.length < PAGE) done = true;
+      const q = search.query.trim();
+      if (q) {
+        const results = await api.search(q);
+        if (mine !== token) return;
+        albums = results.albums;
+        done = true;
+      } else {
+        const page = await api.albums({
+          limit: PAGE,
+          offset,
+          genre: browse.genre || undefined,
+          year: browse.year ?? undefined,
+          composer: browse.composer || undefined,
+        });
+        if (mine !== token) return; // filter changed mid-flight
+        albums = [...albums, ...page.items];
+        offset += page.items.length;
+        if (page.items.length < PAGE) done = true;
+      }
     } catch {
       done = true;
     } finally {
@@ -37,10 +46,11 @@
     }
   }
 
-  // Reset and reload whenever the filter changes (also the initial load). The reset +
-  // loadMore is untracked so its reads of `done`/`loading` don't become effect deps (which
-  // would re-trigger the effect when loadMore flips `done`, looping the grid back to empty).
+  // Reset and reload whenever the search query or filter changes (also the initial load).
+  // The reset + loadMore is untracked so its reads of `done`/`loading` don't become effect
+  // deps (which would re-trigger the effect when loadMore flips `done`).
   $effect(() => {
+    void search.query;
     void browse.genre;
     void browse.year;
     void browse.composer;

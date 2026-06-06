@@ -24,17 +24,12 @@
   }
   load();
 
+  // Search is a live filter on the current Tracks/Albums/Artists segment (not a separate
+  // view), so it persists when you switch segments. The grid views react to search.query.
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
   function onSearch(value: string) {
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => {
-      search.query = value;
-      if (value.trim()) {
-        if (nav.current.name !== "search") nav.root({ name: "search" });
-      } else if (nav.current.name === "search") {
-        nav.root({ name: "tracks" });
-      }
-    }, 220);
+    searchTimer = setTimeout(() => (search.query = value), 220);
   }
 
   async function newPlaylist() {

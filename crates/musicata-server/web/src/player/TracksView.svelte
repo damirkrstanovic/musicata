@@ -3,6 +3,7 @@
   import { api, type TrackRow } from "../lib/api";
   import { onVisible } from "../lib/dom";
   import { browse } from "../lib/browse.svelte";
+  import { search } from "../lib/search.svelte";
   import TrackList from "./TrackList.svelte";
 
   const PAGE = 100;
@@ -17,17 +18,26 @@
     loading = true;
     const mine = token;
     try {
-      const page = await api.tracks({
-        limit: PAGE,
-        offset,
-        genre: browse.genre || undefined,
-        year: browse.year ?? undefined,
-        composer: browse.composer || undefined,
-      });
-      if (mine !== token) return;
-      tracks = [...tracks, ...page.items];
-      offset += page.items.length;
-      if (page.items.length < PAGE) done = true;
+      const q = search.query.trim();
+      if (q) {
+        // Search mode: a single page of matching tracks (no infinite scroll).
+        const results = await api.search(q);
+        if (mine !== token) return;
+        tracks = results.tracks;
+        done = true;
+      } else {
+        const page = await api.tracks({
+          limit: PAGE,
+          offset,
+          genre: browse.genre || undefined,
+          year: browse.year ?? undefined,
+          composer: browse.composer || undefined,
+        });
+        if (mine !== token) return;
+        tracks = [...tracks, ...page.items];
+        offset += page.items.length;
+        if (page.items.length < PAGE) done = true;
+      }
     } catch {
       done = true;
     } finally {
@@ -35,8 +45,10 @@
     }
   }
 
-  // Reset + reload on filter change (untracked so loadMore's `done` read isn't a dep).
+  // Reset + reload when the search query or browse filter changes (untracked so loadMore's
+  // `done` read isn't a dep).
   $effect(() => {
+    void search.query;
     void browse.genre;
     void browse.year;
     void browse.composer;

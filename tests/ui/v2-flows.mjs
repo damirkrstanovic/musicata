@@ -73,11 +73,20 @@ const filtered = await js(`document.querySelectorAll('.album-card').length`);
 check("browse filter changes the grid", filtered > 0 && filtered <= all, `all=${all} filtered=${filtered}`);
 await clickText("button", "Clear");
 
-// --- Search ---
+// --- Search is a per-segment filter that persists across segment switches ---
+await clickText(".seg", "Albums");
+await sleep(400);
 await js(`(()=>{const el=document.querySelector('.search input'); el.value='dar'; el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
 await sleep(900);
-check("search renders sections", (await js(`document.querySelectorAll('.section-title').length`)) > 0);
+const titleOnAlbums = await js(`document.querySelector('.content-title h2')?.textContent`);
+await clickText(".seg", "Artists");
+await sleep(900);
+const titleOnArtists = await js(`document.querySelector('.content-title h2')?.textContent`);
+check("search shows on the segment", /search/i.test(titleOnAlbums || ""), `title=${titleOnAlbums}`);
+check("search persists across segment switch", /search/i.test(titleOnArtists || ""), `title=${titleOnArtists}`);
+// clear search before the next flows
 await js(`(()=>{const el=document.querySelector('.search input'); el.value=''; el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+await sleep(400);
 
 // --- Smart playlist (sidebar) opens + lists tracks ---
 await js(`[...document.querySelectorAll('.library-panel .nav-link')].find(b=>/never played/i.test(b.textContent))?.click()`);

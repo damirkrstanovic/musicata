@@ -31,12 +31,22 @@
           <button
             type="button"
             class="track-link"
+            disabled={!track.artist_id}
             onclick={(e) => {
               e.stopPropagation();
               nav.push({ name: "artist", id: track.artist_id, label: track.artist_name });
             }}>{track.artist_name}</button
           >
         </span>
+        <button
+          type="button"
+          class="track-link track-album-cell"
+          disabled={!track.album_id}
+          onclick={(e) => {
+            e.stopPropagation();
+            nav.push({ name: "album", id: track.album_id, title: track.album_title });
+          }}>{track.album_title}</button
+        >
       </div>
       <span class="track-stat">{track.duration_seconds ? formatTime(track.duration_seconds) : ""}</span>
       <span class="track-actions">

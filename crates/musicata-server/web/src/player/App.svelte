@@ -9,6 +9,7 @@
   import { sendCommand } from "../lib/commands";
   import { setMediaMetadata, setMediaPosition, setMediaHandlers } from "../lib/media";
   import { favorites } from "../lib/favorites.svelte";
+  import { search } from "../lib/search.svelte";
   import type { PlaybackState } from "../types/PlaybackState";
   import type { Player } from "../types/Player";
   import type { Zone } from "../types/Zone";
@@ -20,7 +21,6 @@
   import ArtistsGrid from "./ArtistsGrid.svelte";
   import AlbumDetail from "./AlbumDetail.svelte";
   import ArtistDetail from "./ArtistDetail.svelte";
-  import SearchResults from "./SearchResults.svelte";
   import QueueDrawer from "./QueueDrawer.svelte";
   import MetadataPanel from "./MetadataPanel.svelte";
   import FavoritesView from "./FavoritesView.svelte";
@@ -35,22 +35,25 @@
   const route = $derived(nav.current);
 
   // Center-panel title for the current route.
+  const isSegment = $derived(
+    route.name === "tracks" || route.name === "library" || route.name === "artists",
+  );
   const title = $derived(
-    route.name === "tracks"
-      ? "Tracks"
-      : route.name === "library"
-        ? "Albums"
-        : route.name === "artists"
-        ? "Artists"
-        : route.name === "favorites"
-          ? "Favorites"
-          : route.name === "search"
-            ? "Search"
-            : route.name === "album"
-              ? route.title
-              : route.name === "artist" || route.name === "playlist" || route.name === "smart"
-                ? route.label
-                : "Musicata",
+    search.query.trim() && isSegment
+      ? `Search: ${search.query.trim()}`
+      : route.name === "tracks"
+        ? "Tracks"
+        : route.name === "library"
+          ? "Albums"
+          : route.name === "artists"
+            ? "Artists"
+            : route.name === "favorites"
+              ? "Favorites"
+              : route.name === "album"
+                ? route.title
+                : route.name === "artist" || route.name === "playlist" || route.name === "smart"
+                  ? route.label
+                  : "Musicata",
   );
 
   // Hot path: a tick moves only elapsed/duration (+ the OS scrubber).
@@ -182,8 +185,6 @@
       <ArtistsGrid />
     {:else if route.name === "favorites"}
       <FavoritesView />
-    {:else if route.name === "search"}
-      <SearchResults />
     {:else if route.name === "album"}
       <AlbumDetail id={route.id} />
     {:else if route.name === "artist"}
