@@ -7,8 +7,19 @@ import type { QueueItem } from "../types/QueueItem";
 import type { PlaybackStatus } from "../types/PlaybackStatus";
 import type { RepeatMode } from "../types/RepeatMode";
 
+export type TargetKind = "player" | "zone";
+export interface Target {
+  kind: TargetKind;
+  id: string;
+}
+
 class Player {
   activeId = $state<string | null>(null);
+  activeKind = $state<TargetKind>("player");
+  /** The browser player's id, and the zone it belongs to (if any) — the targets this tab
+   *  outputs audio for. */
+  browserId = $state<string | null>(null);
+  browserZoneId = $state<string | null>(null);
   playback = $state<PlaybackState | null>(null);
 
   // Hot-path signals — see the note above.
@@ -16,6 +27,16 @@ class Player {
   duration = $state(0);
   seekDragging = $state(false);
   queueOpen = $state(false);
+
+  get target(): Target | null {
+    return this.activeId ? { kind: this.activeKind, id: this.activeId } : null;
+  }
+  /** True when this tab is the audio output: the active target is the browser player, or a
+   *  zone that contains it. */
+  get isBrowserOutput(): boolean {
+    if (this.activeKind === "player") return this.activeId === this.browserId;
+    return this.activeId !== null && this.activeId === this.browserZoneId;
+  }
 
   get status(): PlaybackStatus {
     return this.playback?.status ?? "stopped";

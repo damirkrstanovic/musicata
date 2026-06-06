@@ -28,7 +28,7 @@
       const seconds = Number((e.currentTarget as HTMLInputElement).value);
       player.seekDragging = false;
       player.elapsed = seconds;
-      sendCommand(player.activeId, { command: "seek", position_seconds: seconds });
+      sendCommand(player.target, { command: "seek", position_seconds: seconds });
     }}
   />
   <span class="time">{formatTime(player.duration)}</span>

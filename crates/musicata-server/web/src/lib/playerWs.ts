@@ -16,6 +16,7 @@ export interface PlayerSocket {
 }
 
 export function connectPlayer(
+  kind: "player" | "zone",
   id: string,
   handlers: { onState: (s: PlaybackState) => void; onProgress: (t: ProgressTick) => void },
 ): PlayerSocket {
@@ -26,7 +27,7 @@ export function connectPlayer(
   const connect = () => {
     if (closed) return;
     const scheme = location.protocol === "https:" ? "wss" : "ws";
-    socket = new WebSocket(`${scheme}://${location.host}/api/players/${encodeURIComponent(id)}/ws`);
+    socket = new WebSocket(`${scheme}://${location.host}/api/${kind}s/${encodeURIComponent(id)}/ws`);
     socket.onmessage = (event) => {
       let msg: { type?: string };
       try {

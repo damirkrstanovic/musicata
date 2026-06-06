@@ -1,8 +1,8 @@
 // Typed mirror of the server's `PlayerCommand` enum (musicata-core), sent to
 // POST /api/players/{id}/commands. Hand-typed: it's a tagged enum the client only ever
 // *sends*, so a struct-derived type would add no checking the literals don't already give.
-import { api } from "./api";
 import type { RepeatMode } from "../types/RepeatMode";
+import type { Target } from "./player.svelte";
 
 export type PlayerCommand =
   | { command: "play" }
@@ -22,10 +22,14 @@ export type PlayerCommand =
   | { command: "move_queue_item"; from: number; to: number }
   | { command: "play_stream"; url: string; title: string };
 
-export async function sendCommand(playerId: string | null, command: PlayerCommand): Promise<void> {
-  if (!playerId) return;
+export async function sendCommand(target: Target | null, command: PlayerCommand): Promise<void> {
+  if (!target) return;
   try {
-    await api.playerCommand(playerId, command);
+    const response = await fetch(
+      `/api/${target.kind}s/${encodeURIComponent(target.id)}/commands`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(command) },
+    );
+    if (!response.ok) throw new Error(`command → ${response.status}`);
   } catch (error) {
     console.error("player command failed", command, error);
   }

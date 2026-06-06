@@ -13,21 +13,27 @@ export function setAudio(instance: BrowserAudio): void {
 
 /** Play `tracks` on the active player, starting at `startIndex`. Call from a click handler. */
 export async function playTracks(tracks: TrackRow[], startIndex = 0): Promise<void> {
-  if (!player.activeId || !tracks.length) return;
-  const start = tracks[startIndex] ?? tracks[0];
-  audio?.claim();
-  audio?.primePlay(start.stream_url);
-  await sendCommand(player.activeId, {
+  if (!player.target || !tracks.length) return;
+  // Only prime local audio when this tab is the output (browser target); MPD/zone targets
+  // play on their own device.
+  if (player.isBrowserOutput) {
+    const start = tracks[startIndex] ?? tracks[0];
+    audio?.claim();
+    audio?.primePlay(start.stream_url);
+  }
+  await sendCommand(player.target, {
     command: "play_tracks",
     track_ids: tracks.map((t) => t.id),
     start_index: startIndex,
   });
 }
 
-/** Play an internet-radio stream on the active player. Call from a click handler. */
+/** Play an internet-radio stream on the active target. Call from a click handler. */
 export async function playStream(url: string, title: string): Promise<void> {
-  if (!player.activeId) return;
-  audio?.claim();
-  audio?.primePlay(url);
-  await sendCommand(player.activeId, { command: "play_stream", url, title });
+  if (!player.target) return;
+  if (player.isBrowserOutput) {
+    audio?.claim();
+    audio?.primePlay(url);
+  }
+  await sendCommand(player.target, { command: "play_stream", url, title });
 }

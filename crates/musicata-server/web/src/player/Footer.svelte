@@ -7,7 +7,7 @@
   const REPEAT_NEXT: Record<RepeatMode, RepeatMode> = { off: "all", all: "one", one: "off" };
 
   function send(command: PlayerCommand) {
-    sendCommand(player.activeId, command);
+    sendCommand(player.target, command);
   }
 
   // Now-playing text reads `player.nowPlaying` (i.e. `player.playback`), which a progress

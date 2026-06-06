@@ -11,6 +11,8 @@
   import { search } from "../lib/search.svelte";
   import { favorites } from "../lib/favorites.svelte";
   import type { PlaybackState } from "../types/PlaybackState";
+  import type { Player } from "../types/Player";
+  import type { Zone } from "../types/Zone";
   import Modal from "../lib/Modal.svelte";
   import Footer from "./Footer.svelte";
   import LibraryGrid from "./LibraryGrid.svelte";
@@ -48,7 +50,7 @@
       player.elapsed = next.elapsed_seconds ?? 0;
       player.duration = next.duration_seconds ?? 0;
     }
-    audio?.drive(next);
+    if (player.isBrowserOutput) audio?.drive(next);
     if (trackChanged || statusChanged) setMediaMetadata(next.now_playing, next.status);
     setMediaPosition(player.elapsed, player.duration);
   }
@@ -61,23 +63,52 @@
     audio.start();
 
     setMediaHandlers({
-      play: () => sendCommand(player.activeId, { command: "play" }),
-      pause: () => sendCommand(player.activeId, { command: "pause" }),
-      previoustrack: () => sendCommand(player.activeId, { command: "previous" }),
-      nexttrack: () => sendCommand(player.activeId, { command: "next" }),
+      play: () => sendCommand(player.target, { command: "play" }),
+      pause: () => sendCommand(player.target, { command: "pause" }),
+      previoustrack: () => sendCommand(player.target, { command: "previous" }),
+      nexttrack: () => sendCommand(player.target, { command: "next" }),
       seekto: (d) => {
         if (d.seekTime != null)
-          sendCommand(player.activeId, { command: "seek", position_seconds: d.seekTime });
+          sendCommand(player.target, { command: "seek", position_seconds: d.seekTime });
       },
     });
 
     favorites.load();
-    const players = await api.players();
+    await loadTargets();
     const browser = players.find((p) => p.kind === "browser") ?? players[0];
-    if (!browser) return;
-    player.activeId = browser.id;
-    ws = connectPlayer(browser.id, { onState: applyState, onProgress: applyTick });
+    if (browser) connect("player", browser.id);
   });
+
+  // Players + zones for the output switcher.
+  let players = $state<Player[]>([]);
+  let zones = $state<Zone[]>([]);
+  async function loadTargets() {
+    try {
+      const [ps, zs] = await Promise.all([api.players(), api.zones()]);
+      players = ps;
+      zones = zs;
+      const browser = ps.find((p) => p.kind === "browser");
+      player.browserId = browser?.id ?? null;
+      player.browserZoneId = browser?.zone_id ?? null;
+    } catch {
+      // keep previous
+    }
+  }
+
+  function connect(kind: "player" | "zone", id: string) {
+    ws?.close();
+    player.activeKind = kind;
+    player.activeId = id;
+    player.playback = null;
+    player.elapsed = 0;
+    player.duration = 0;
+    ws = connectPlayer(kind, id, { onState: applyState, onProgress: applyTick });
+  }
+
+  function onTargetChange(value: string) {
+    const [kind, id] = value.split(":") as ["player" | "zone", string];
+    connect(kind, id);
+  }
 
   onDestroy(() => {
     ws?.close();
@@ -141,6 +172,19 @@
     <label class="search">
       <input type="search" autocomplete="off" placeholder="Search" oninput={(e) => onSearchInput(e.currentTarget.value)} />
     </label>
+    <select
+      class="target-select"
+      aria-label="Output"
+      value={`${player.activeKind}:${player.activeId}`}
+      onchange={(e) => onTargetChange(e.currentTarget.value)}
+    >
+      {#each players as p (p.id)}
+        <option value={`player:${p.id}`}>{p.name}</option>
+      {/each}
+      {#each zones as z (z.id)}
+        <option value={`zone:${z.id}`}>Zone · {z.name}</option>
+      {/each}
+    </select>
     <a class="ghost-button" href="/v2/admin">Admin</a>
   </header>
 

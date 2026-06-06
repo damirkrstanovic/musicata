@@ -14,7 +14,7 @@
     <header class="queue-head">
       <strong>Queue</strong>
       <div class="queue-head-actions">
-        <button class="ghost-button" type="button" onclick={() => sendCommand(player.activeId, { command: "clear" })}>
+        <button class="ghost-button" type="button" onclick={() => sendCommand(player.target, { command: "clear" })}>
           Clear
         </button>
         <button class="ghost-button" type="button" onclick={close}>Close</button>
@@ -34,7 +34,7 @@
             <button
               class="q-main"
               type="button"
-              onclick={() => sendCommand(player.activeId, { command: "play_queue_index", index })}
+              onclick={() => sendCommand(player.target, { command: "play_queue_index", index })}
             >
               <span class="q-title">{item.title || "Unknown"}</span>
               <span class="q-sub">{[item.artist, item.album].filter(Boolean).join(" · ")}</span>
@@ -45,7 +45,7 @@
                 type="button"
                 title="Move up"
                 disabled={index === 0}
-                onclick={() => sendCommand(player.activeId, { command: "move_queue_item", from: index, to: index - 1 })}
+                onclick={() => sendCommand(player.target, { command: "move_queue_item", from: index, to: index - 1 })}
                 >↑</button
               >
               <button
@@ -53,14 +53,14 @@
                 type="button"
                 title="Move down"
                 disabled={index === player.queue.length - 1}
-                onclick={() => sendCommand(player.activeId, { command: "move_queue_item", from: index, to: index + 1 })}
+                onclick={() => sendCommand(player.target, { command: "move_queue_item", from: index, to: index + 1 })}
                 >↓</button
               >
               <button
                 class="icon-button"
                 type="button"
                 title="Remove"
-                onclick={() => sendCommand(player.activeId, { command: "remove_queue_item", index })}>×</button
+                onclick={() => sendCommand(player.target, { command: "remove_queue_item", index })}>×</button
               >
             </span>
           </div>
