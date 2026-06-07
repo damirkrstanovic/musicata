@@ -458,6 +458,13 @@ Tasks:
   in the web app, opening the same master track view as a user playlist. More facets
   (genre/year smart lists, never-played-by-decade) are easy follow-ups.
 - Add metadata-based recommendations by genre, year, artist, album artist, composer, and MusicBrainz IDs.
+- **Continuous play (autoplay / endless radio)** — when the queue nears empty, append *similar*
+  tracks so music never stops (Spotify "Autoplay" / "Song Radio"). Design: **`docs/continuous-play.md`**.
+  Rides on the "Similar & Radio" slice (`docs/recommendations.md`): LB Labs `similar-recordings`
+  (MBID→local) + a Jellyfin-style local fallback, a **sliding seed** (re-seed from recent plays,
+  the trick that keeps it endless and non-looping), dedup/recency/skip/per-artist filters, and a
+  `< 5`-upcoming refill hooked into `track_ended`/the MPD poll loop. Two affordances: an Autoplay
+  toggle + a "Start radio from this" action. Build the similarity slice first.
 - Add optional ListenBrainz scrobbling and recommendation import.
 - Design an optional `musicata-ml` service for future audio embeddings, genre/mood inference, and similarity search.
 
