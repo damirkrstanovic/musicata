@@ -2,6 +2,7 @@
 // the server. The server then broadcasts ~1/s `type:"progress"` ticks to all sockets, which
 // feed the hot path. Only one tab outputs at a time (claimed via localStorage).
 import type { PlaybackState } from "../types/PlaybackState";
+import type { EqProfile } from "./dsp";
 
 export interface ProgressReport {
   type: "progress";
@@ -16,10 +17,43 @@ export class BrowserAudio {
   private onEnd?: () => void;
   private timer?: ReturnType<typeof setInterval>;
 
+  // Web Audio graph. Built once during a play gesture (claim()) so the AudioContext starts
+  // running, then all browser audio flows through it:
+  //   source -> preamp -> [EQ biquads] -> destination
+  //                                    \-> splitter -> analyserL/R   (taps for the VU meter)
+  // EQ changes update the biquad chain live; the analysers feed `levels()` for the meter.
+  private ctx?: AudioContext;
+  private srcNode?: MediaElementAudioSourceNode;
+  private preamp?: GainNode;
+  private eqBands: BiquadFilterNode[] = [];
+  private splitter?: ChannelSplitterNode;
+  private analyserL?: AnalyserNode;
+  private analyserR?: AnalyserNode;
+  private bufL?: Float32Array<ArrayBuffer>;
+  private bufR?: Float32Array<ArrayBuffer>;
+  private profile: EqProfile | null = null;
+  private graphFailed = false;
+
   constructor(el: HTMLAudioElement) {
     this.el = el;
     el.addEventListener("ended", () => this.onEnd?.());
     el.addEventListener("loadedmetadata", () => this.report());
+    // Web Audio unlock: build + resume the graph on the first user gesture *anywhere*, so EQ
+    // and metering engage no matter how playback is first triggered (footer Play, a track row,
+    // media keys) and regardless of the browser's autoplay policy. createMediaElementSource can
+    // only ever run inside a gesture once; doing it here guarantees that.
+    const unlock = () => {
+      this.ensureGraph();
+      this.ctx?.resume().catch(() => {});
+      if (this.ctx?.state === "running" || this.graphFailed) {
+        for (const ev of ["pointerdown", "keydown", "click"] as const) {
+          document.removeEventListener(ev, unlock, true);
+        }
+      }
+    };
+    for (const ev of ["pointerdown", "keydown", "click"] as const) {
+      document.addEventListener(ev, unlock, true);
+    }
   }
 
   /** Mark this tab as the audio output. Must be called from a user gesture so play() works. */
@@ -30,9 +64,110 @@ export class BrowserAudio {
     } catch {
       // private mode — fine
     }
+    this.ensureGraph(); // build the graph in this gesture so the context starts running
+    this.ctx?.resume().catch(() => {});
   }
   get isClaimed(): boolean {
     return this.claimed;
+  }
+
+  /** Set (or clear, with `null`) the active EQ profile and apply it live. */
+  setEq(profile: EqProfile | null): void {
+    this.profile = profile;
+    this.ensureGraph();
+    if (this.ctx) {
+      this.rebuildChain();
+      this.ctx.resume().catch(() => {});
+    }
+  }
+
+  /** Instantaneous RMS level (0..~1, linear) per channel, or null if metering is unavailable. */
+  levels(): { l: number; r: number } | null {
+    if (!this.analyserL || !this.analyserR || !this.bufL || !this.bufR) return null;
+    this.analyserL.getFloatTimeDomainData(this.bufL);
+    this.analyserR.getFloatTimeDomainData(this.bufR);
+    return { l: rms(this.bufL), r: rms(this.bufR) };
+  }
+
+  private ensureGraph(): void {
+    if (this.ctx || this.graphFailed) return;
+    const Ctor =
+      window.AudioContext ??
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!Ctor) {
+      this.graphFailed = true;
+      return;
+    }
+    try {
+      const ctx = new Ctor();
+      this.ctx = ctx;
+      this.srcNode = ctx.createMediaElementSource(this.el);
+      this.preamp = ctx.createGain();
+      this.splitter = ctx.createChannelSplitter(2);
+      this.analyserL = ctx.createAnalyser();
+      this.analyserR = ctx.createAnalyser();
+      this.analyserL.fftSize = 1024;
+      this.analyserR.fftSize = 1024;
+      this.analyserL.smoothingTimeConstant = 0;
+      this.analyserR.smoothingTimeConstant = 0;
+      this.bufL = new Float32Array(new ArrayBuffer(this.analyserL.fftSize * 4));
+      this.bufR = new Float32Array(new ArrayBuffer(this.analyserR.fftSize * 4));
+      this.rebuildChain();
+    } catch {
+      this.graphFailed = true; // already tapped, or Web Audio unavailable
+      // If the element was already tapped before the failure, route it straight to output so
+      // playback isn't lost (we just go without EQ/metering).
+      try {
+        this.srcNode?.connect(this.ctx!.destination);
+      } catch {
+        // nothing tapped — native path is intact
+      }
+    }
+  }
+
+  /** (Re)build source -> preamp -> [bands] -> destination, with a post-EQ stereo tap to the
+   *  analysers. Safe to call on a running context; used for both initial build and EQ edits. */
+  private rebuildChain(): void {
+    const { ctx, srcNode: src, preamp, splitter, analyserL: aL, analyserR: aR } = this;
+    if (!ctx || !src || !preamp || !splitter || !aL || !aR) return;
+    try {
+      src.disconnect();
+    } catch {
+      // not connected yet
+    }
+    try {
+      preamp.disconnect();
+    } catch {
+      // ignore
+    }
+    for (const b of this.eqBands) {
+      try {
+        b.disconnect();
+      } catch {
+        // ignore
+      }
+    }
+    this.eqBands = [];
+    const p = this.profile;
+    preamp.gain.value = p ? 10 ** (p.preampDb / 20) : 1;
+    src.connect(preamp);
+    let prev: AudioNode = preamp;
+    if (p) {
+      for (const band of p.bands) {
+        const f = ctx.createBiquadFilter();
+        f.type = band.type;
+        f.frequency.value = band.freq;
+        f.Q.value = band.q;
+        f.gain.value = band.gain;
+        prev.connect(f);
+        prev = f;
+        this.eqBands.push(f);
+      }
+    }
+    prev.connect(ctx.destination);
+    prev.connect(splitter);
+    splitter.connect(aL, 0);
+    splitter.connect(aR, 1);
   }
 
   onProgress(cb: (msg: ProgressReport) => void): void {
@@ -44,7 +179,11 @@ export class BrowserAudio {
 
   start(): void {
     this.timer = setInterval(() => {
-      if (this.claimed && !this.el.paused) this.report();
+      if (this.claimed && !this.el.paused) {
+        this.report();
+        // Safety net: re-resume the EQ graph if a gesture-less enable left it suspended.
+        if (this.ctx?.state === "suspended") this.ctx.resume().catch(() => {});
+      }
     }, 1000);
   }
   stop(): void {
@@ -58,6 +197,7 @@ export class BrowserAudio {
   /** Start a stream right now. Call inside a user gesture so the browser's autoplay policy
    *  lets it play; `drive()` then keeps it in sync once the server's state arrives. */
   primePlay(streamUrl: string): void {
+    this.ctx?.resume().catch(() => {});
     if (!this.el.src.endsWith(streamUrl)) this.el.src = streamUrl;
     this.el.play().catch(() => {
       // gesture not honored / will retry via drive()
@@ -83,6 +223,7 @@ export class BrowserAudio {
       // Apply an external seek (a >2s jump), ignoring echoes of our own reported position.
       const elapsed = playback.elapsed_seconds ?? 0;
       if (Math.abs(this.el.currentTime - elapsed) > 2) this.el.currentTime = elapsed;
+      this.ctx?.resume().catch(() => {});
       this.el.play().catch(() => {
         // autoplay policy: needs a user gesture
       });
@@ -90,4 +231,10 @@ export class BrowserAudio {
       this.el.pause();
     }
   }
+}
+
+function rms(buf: Float32Array): number {
+  let sum = 0;
+  for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+  return Math.sqrt(sum / buf.length);
 }

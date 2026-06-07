@@ -1,5 +1,7 @@
 <script lang="ts">
   import { player } from "../lib/player.svelte";
+  import { dsp } from "../lib/dsp.svelte";
+  import { meter } from "../lib/meter.svelte";
   import { sendCommand, type PlayerCommand } from "../lib/commands";
   import type { RepeatMode } from "../types/RepeatMode";
   import SeekBar from "./SeekBar.svelte";
@@ -76,6 +78,26 @@
       onchange={(e) =>
         send({ command: "set_volume", volume: Number((e.currentTarget as HTMLInputElement).value) })}
     />
+    <button
+      class="eq-btn"
+      class:active={meter.open}
+      type="button"
+      title="VU meter"
+      aria-pressed={meter.open}
+      onclick={() => meter.toggle()}
+    >
+      ▮▮
+    </button>
+    <button
+      class="eq-btn"
+      class:active={dsp.enabled}
+      type="button"
+      title="Equalizer"
+      aria-pressed={dsp.panelOpen}
+      onclick={() => (dsp.panelOpen = !dsp.panelOpen)}
+    >
+      EQ
+    </button>
     <button
       class="queue-btn"
       type="button"

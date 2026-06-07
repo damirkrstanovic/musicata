@@ -11,6 +11,11 @@ export function setAudio(instance: BrowserAudio): void {
   audio = instance;
 }
 
+/** The active browser audio driver (for the VU meter to read output levels). */
+export function getAudio(): BrowserAudio | null {
+  return audio;
+}
+
 /** Play `tracks` on the active player, starting at `startIndex`. Call from a click handler. */
 export async function playTracks(tracks: TrackRow[], startIndex = 0): Promise<void> {
   if (!player.target || !tracks.length) return;

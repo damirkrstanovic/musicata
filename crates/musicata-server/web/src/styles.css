@@ -3079,3 +3079,254 @@ body.admin {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+
+/* Equalizer (DSP) — footer button mirrors .queue-btn; drawer mirrors .queue-drawer. */
+.eq-btn {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #1d2026;
+  color: var(--text);
+  padding: 7px 11px;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+}
+.eq-btn:hover,
+.eq-btn[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+.eq-btn.active {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.eq-drawer {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  padding: 0 0 16px;
+  background: #14171b;
+  animation: queue-rise 0.2s ease;
+}
+.eq-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 22px;
+  border-bottom: 1px solid var(--line);
+}
+.eq-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 22px;
+  cursor: pointer;
+}
+.eq-note {
+  margin: 0;
+  padding: 0 22px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.eq-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 22px;
+}
+.eq-field > span {
+  font-size: 0.72rem;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.eq-field select {
+  background: #1d2026;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+}
+.eq-curve-wrap {
+  padding: 0 22px;
+}
+.eq-curve {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #14181f;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.eq-grid-0 {
+  stroke: rgba(233, 242, 255, 0.22);
+  stroke-width: 1;
+}
+.eq-grid {
+  stroke: rgba(233, 242, 255, 0.08);
+  stroke-width: 1;
+}
+.eq-grid-label {
+  fill: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  text-anchor: middle;
+}
+.eq-grid-db {
+  text-anchor: end;
+}
+.eq-curve-line {
+  fill: none;
+  stroke: var(--accent-strong, #e8c87a);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 0 2px rgba(232, 200, 122, 0.5));
+}
+
+.eq-bands {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 22px;
+}
+.eq-band-head {
+  font-size: 0.74rem;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+.eq-band {
+  display: grid;
+  grid-template-columns: 2.2rem 1fr auto auto;
+  gap: 8px;
+  align-items: baseline;
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--text);
+}
+.eq-b-type { color: var(--accent-strong); }
+.eq-b-gain { font-variant-numeric: tabular-nums; }
+.eq-b-q { color: var(--muted); }
+.eq-import {
+  border-top: 1px solid var(--line);
+  padding: 12px 22px 0;
+}
+.eq-import summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.eq-import .eq-note { padding: 0; margin: 8px 0; }
+.eq-name,
+.eq-text {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 8px;
+  background: #1d2026;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+}
+.eq-text {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  resize: vertical;
+}
+.eq-error {
+  margin: 0 0 8px;
+  color: #e06c6c;
+  font-size: 0.78rem;
+}
+
+/* VU meter — McIntosh-style blue meters. Overlay mirrors .queue-drawer. */
+.vu-drawer {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+  background: #0c0e12;
+  animation: queue-rise 0.2s ease;
+}
+.vu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 22px;
+  border-bottom: 1px solid var(--line);
+}
+.vu-meters {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 4px 18px 0;
+}
+.vu-face {
+  margin: 0;
+  border-radius: 12px;
+  box-shadow: 0 0 0 1px #05112b, 0 6px 22px rgba(20, 72, 143, 0.35);
+}
+.vu-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.vu-arc {
+  fill: none;
+  stroke: rgba(233, 242, 255, 0.65);
+  stroke-width: 1.4;
+}
+.vu-red {
+  fill: none;
+  stroke: #ff5a4d;
+  stroke-width: 3.2;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 2px rgba(255, 90, 77, 0.7));
+}
+.vu-tick {
+  stroke: rgba(233, 242, 255, 0.8);
+  stroke-width: 1.3;
+}
+.vu-label {
+  fill: rgba(233, 242, 255, 0.85);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-anchor: middle;
+  dominant-baseline: middle;
+}
+.vu-vu {
+  fill: rgba(233, 242, 255, 0.9);
+  font-family: var(--font-display, serif);
+  font-size: 15px;
+  font-style: italic;
+  letter-spacing: 1px;
+  text-anchor: middle;
+}
+.vu-ch {
+  fill: rgba(233, 242, 255, 0.7);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-anchor: middle;
+}
+.vu-needle {
+  stroke: #fdf5e3;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+.vu-pivot {
+  fill: #fdf5e3;
+}
+.vu-note {
+  margin: 0;
+  padding: 0 22px 16px;
+  color: var(--muted);
+  font-size: 0.74rem;
+}

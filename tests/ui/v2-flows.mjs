@@ -145,6 +145,36 @@ await sleep(900);
 check("metadata panel opens", await js(`!!document.querySelector('.metadata-drawer')`));
 await clickText(".queue-head button", "Close");
 
+// Equalizer: opening the panel + applying a preset must render bands and NOT disturb the
+// now-playing track (the Web Audio routing must not restart/reload playback).
+const eqTitleBefore = await js(`document.querySelector('#now-title')?.textContent`);
+await js(`[...document.querySelectorAll('.eq-btn')].find(b=>/equalizer/i.test(b.title))?.click()`);
+await sleep(400);
+check("eq panel opens", await js(`!!document.querySelector('.eq-drawer')`));
+await js(`(()=>{const s=document.querySelector('.eq-field select'); if(s){s.value='demo-bass'; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
+await sleep(500);
+check("eq preset applies bands", (await js(`document.querySelectorAll('.eq-band').length`)) > 0);
+check("eq response curve renders", await js(`!!document.querySelector('.eq-curve-line')?.getAttribute('d')`));
+// The biquad nodes are actually built and applied to the live graph (this is what regressed:
+// a short-circuited effect left the profile unapplied even though the DOM showed bands).
+check("eq biquads applied to graph", (await js(`window.__audio?.eqBands?.length ?? 0`)) > 0);
+check("eq graph processes audio (level>0)", (await js(`(()=>{const l=window.__audio?.levels(); return l? l.l+l.r : 0;})()`)) > 0);
+check(
+  "eq does not disturb now-playing",
+  eqTitleBefore === (await js(`document.querySelector('#now-title')?.textContent`)),
+  `${eqTitleBefore}`,
+);
+await js(`(()=>{const s=document.querySelector('.eq-field select'); if(s){s.value=''; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
+await clickText(".eq-head button", "Close");
+await sleep(300);
+
+// VU meter: opening it renders the two (L/R) McIntosh-style meters.
+await js(`[...document.querySelectorAll('.eq-btn')].find(b=>/vu/i.test(b.title))?.click()`);
+await sleep(400);
+check("vu meter opens with L/R meters", (await js(`document.querySelectorAll('.vu-svg').length`)) >= 2);
+await clickText(".vu-head button", "Close");
+await sleep(300);
+
 // Radio: the station shows in the sidebar; playing it sets now-playing.
 check("radio station listed", await js(`[...document.querySelectorAll('.library-panel .nav-link')].some(b=>/smoke fm/i.test(b.textContent))`));
 await js(`[...document.querySelectorAll('.library-panel .nav-link')].find(b=>/smoke fm/i.test(b.textContent))?.click()`);

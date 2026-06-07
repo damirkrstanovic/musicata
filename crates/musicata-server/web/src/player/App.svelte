@@ -10,6 +10,7 @@
   import { setMediaMetadata, setMediaPosition, setMediaHandlers } from "../lib/media";
   import { favorites } from "../lib/favorites.svelte";
   import { search } from "../lib/search.svelte";
+  import { dsp } from "../lib/dsp.svelte";
   import type { PlaybackState } from "../types/PlaybackState";
   import type { Player } from "../types/Player";
   import type { Zone } from "../types/Zone";
@@ -22,6 +23,8 @@
   import AlbumDetail from "./AlbumDetail.svelte";
   import ArtistDetail from "./ArtistDetail.svelte";
   import QueueDrawer from "./QueueDrawer.svelte";
+  import EqPanel from "./EqPanel.svelte";
+  import VuMeter from "./VuMeter.svelte";
   import MetadataPanel from "./MetadataPanel.svelte";
   import FavoritesView from "./FavoritesView.svelte";
   import PlaylistView from "./PlaylistView.svelte";
@@ -77,9 +80,20 @@
     setMediaPosition(player.elapsed, player.duration);
   }
 
+  // Push the active EQ profile into the Web Audio graph whenever it changes. IMPORTANT: read
+  // the reactive dsp state into `profile` FIRST. If we inlined it as `audio?.setEq(dsp...)`,
+  // the optional chain would short-circuit argument evaluation while `audio` is still null on
+  // the first run, so the effect would track no dependencies and never re-run.
+  $effect(() => {
+    const profile = dsp.enabled ? dsp.active : null;
+    audio?.setEq(profile);
+  });
+
   onMount(async () => {
     audio = new BrowserAudio(audioEl);
     setAudio(audio);
+    (window as unknown as { __audio?: unknown }).__audio = audio; // debug hook
+    audio.setEq(dsp.enabled ? dsp.active : null); // apply persisted profile on load
     audio.onProgress((msg) => ws?.send(msg));
     audio.onEnded(() => ws?.send({ type: "ended" }));
     audio.start();
@@ -217,6 +231,8 @@
     <div class="rail-top">
       <MetadataPanel />
       <QueueDrawer />
+      <EqPanel />
+      <VuMeter />
     </div>
     <Footer />
   </aside>
