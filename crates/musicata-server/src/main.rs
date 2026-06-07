@@ -5,6 +5,7 @@ mod artwork_providers;
 mod fingerprint;
 mod loudness;
 mod mpd;
+mod recommendations;
 mod musicbrainz;
 mod players;
 mod providers;
@@ -78,6 +79,7 @@ struct AppState {
     players: Arc<PlayerManager>,
     musicbrainz: MusicBrainzClient,
     radio_browser: radiobrowser::RadioBrowserClient,
+    listenbrainz: Arc<recommendations::ListenBrainzClient>,
     activity: Arc<activity::ActivityLog>,
     rescan_lock: Arc<Mutex<()>>,
     most_played_cache: Arc<Mutex<Option<MostPlayedCache>>>,
@@ -255,6 +257,12 @@ async fn main() -> Result<()> {
                 database.clone(),
                 providers.clone(),
                 activity.clone(),
+                ready_rx.clone(),
+            ));
+            tokio::spawn(autoplay_loop(
+                players.clone(),
+                database.clone(),
+                Arc::new(recommendations::ListenBrainzClient::new()),
                 ready_rx.clone(),
             ));
         }
@@ -851,6 +859,92 @@ async fn loudness_loop(
             tokio::time::sleep(BACKGROUND_IDLE_POLL).await;
         }
     }
+}
+
+/// Whether continuous play / autoplay is on (default off — it's an opt-in "keep going").
+const SETTING_AUTOPLAY: &str = "autoplay";
+const AUTOPLAY_POLL: Duration = Duration::from_secs(6);
+/// Refill when fewer than this many tracks remain after the current one (Music Assistant's
+/// "Don't Stop The Music" uses the same threshold).
+const AUTOPLAY_MIN_UPCOMING: usize = 5;
+const AUTOPLAY_BATCH: usize = 10;
+
+/// **Continuous play** — when autoplay is on and a playing queue nears its end, append similar
+/// tracks so the music keeps going. Its own decoupled loop (polls, never on a request path);
+/// the seed slides with playback (current track), so it walks the similarity graph rather than
+/// looping. Covers the browser player and every zone.
+async fn autoplay_loop(
+    players: Arc<players::PlayerManager>,
+    database: Database,
+    listenbrainz: Arc<recommendations::ListenBrainzClient>,
+    mut ready: tokio::sync::watch::Receiver<bool>,
+) {
+    let _ = ready.wait_for(|&r| r).await;
+    loop {
+        tokio::time::sleep(AUTOPLAY_POLL).await;
+        let on = database.get_setting(SETTING_AUTOPLAY).await.ok().flatten().as_deref() == Some("true");
+        if !on {
+            continue;
+        }
+        if let Some(handle) = players.get(players::BROWSER_PLAYER_ID).await {
+            if let Ok(state) = handle.state(&database).await {
+                if let Some(ids) = autoplay_candidates(&database, &listenbrainz, &state).await {
+                    let _ = handle
+                        .execute(
+                            PlayerCommand::Enqueue { track_ids: ids },
+                            &database,
+                            players.public_base_url(),
+                        )
+                        .await;
+                }
+            }
+        }
+        if let Ok(zones) = players.zones().await {
+            for zone in zones {
+                if let Ok(state) = players.zone_state(&zone.id).await {
+                    if let Some(ids) = autoplay_candidates(&database, &listenbrainz, &state).await {
+                        let _ = players
+                            .command_zone(&zone.id, PlayerCommand::Enqueue { track_ids: ids })
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Track ids to append if a playing queue is near its end, else `None`. Seed = the current
+/// track; excludes everything already queued. Skips repeat-all (that loops by design).
+async fn autoplay_candidates(
+    database: &Database,
+    listenbrainz: &Arc<recommendations::ListenBrainzClient>,
+    state: &musicata_core::PlaybackState,
+) -> Option<Vec<String>> {
+    use musicata_core::{PlaybackStatus, RepeatMode};
+    if !matches!(state.status, PlaybackStatus::Playing) || !matches!(state.repeat, RepeatMode::Off) {
+        return None;
+    }
+    let position = state.queue_position?;
+    let upcoming = state.queue.len().saturating_sub(position + 1);
+    if upcoming >= AUTOPLAY_MIN_UPCOMING {
+        return None;
+    }
+    let seed = state.queue.get(position)?.track_id.clone()?;
+    let exclude: std::collections::HashSet<String> = state
+        .queue
+        .iter()
+        .filter_map(|item| item.track_id.clone())
+        .collect();
+    let ids = recommendations::similar_track_ids(
+        database,
+        listenbrainz,
+        &seed,
+        &exclude,
+        AUTOPLAY_BATCH,
+        now_unix_seconds(),
+    )
+    .await;
+    (!ids.is_empty()).then_some(ids)
 }
 
 /// Tracks analyzed per pass — a granularity knob; the loop drains the backlog back-to-back.
@@ -1911,6 +2005,8 @@ fn app(
             get(track_musicbrainz_candidates),
         )
         .route("/api/tracks/{id}/stream", get(stream_track))
+        .route("/api/tracks/{id}/radio", get(track_radio))
+        .route("/api/autoplay", get(get_autoplay).put(set_autoplay))
         .fallback(fallback)
         .layer(middleware::from_fn(log_request))
         .with_state(AppState {
@@ -1919,6 +2015,7 @@ fn app(
             players,
             musicbrainz: MusicBrainzClient::default(),
             radio_browser: radiobrowser::RadioBrowserClient::default(),
+            listenbrainz: Arc::new(recommendations::ListenBrainzClient::new()),
             activity,
             rescan_lock,
             most_played_cache: Arc::new(Mutex::new(None)),
@@ -2454,6 +2551,68 @@ async fn player_state(
         .ok_or_else(|| AppError::not_found(format!("unknown player: {id}")))?;
     let playback = player.state(&state.database).await.map_err(db_error)?;
     Ok(Json(playback))
+}
+
+#[derive(Debug, Deserialize)]
+struct RadioQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct RadioResponse {
+    track_ids: Vec<String>,
+}
+
+/// Seed a "radio" from a track: the seed followed by similar tracks (cached ListenBrainz
+/// similar-recordings resolved to local, then local content fallback). The web plays these;
+/// continuous play keeps it going.
+async fn track_radio(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<RadioQuery>,
+) -> Result<Json<RadioResponse>, AppError> {
+    if state.database.track(&id).await.map_err(db_error)?.is_none() {
+        return Err(AppError::not_found(format!("unknown track: {id}")));
+    }
+    let limit = query.limit.unwrap_or(25).clamp(1, 100);
+    let similar = recommendations::similar_track_ids(
+        &state.database,
+        &state.listenbrainz,
+        &id,
+        &std::collections::HashSet::new(),
+        limit,
+        now_unix_seconds(),
+    )
+    .await;
+    let mut track_ids = Vec::with_capacity(similar.len() + 1);
+    track_ids.push(id);
+    track_ids.extend(similar);
+    Ok(Json(RadioResponse { track_ids }))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AutoplayState {
+    enabled: bool,
+}
+
+/// Continuous play / autoplay toggle (global). When on, the autoplay loop keeps a playing
+/// queue topped up with similar tracks.
+async fn get_autoplay(State(state): State<AppState>) -> Json<AutoplayState> {
+    let enabled =
+        state.database.get_setting(SETTING_AUTOPLAY).await.ok().flatten().as_deref() == Some("true");
+    Json(AutoplayState { enabled })
+}
+
+async fn set_autoplay(
+    State(state): State<AppState>,
+    Json(body): Json<AutoplayState>,
+) -> Result<Json<AutoplayState>, AppError> {
+    state
+        .database
+        .set_setting(SETTING_AUTOPLAY, if body.enabled { "true" } else { "false" })
+        .await
+        .map_err(db_error)?;
+    Ok(Json(body))
 }
 
 async fn player_command(

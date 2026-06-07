@@ -101,16 +101,22 @@ Coverage: **browser ✓, zone ✓** (both via `track_ended`); **MPD ✓** with t
 
 ## Build order (value per effort)
 
-1. **Land the "Similar & Radio" slice first** (`docs/recommendations.md`): `similarity_cache`
-   v26, `ListenBrainzLabsProvider`, `LocalSimilarityProvider`, MBID→local matcher. Continuous
-   play is a thin layer on it; without it there's nothing to chain. *Highest leverage.*
-2. **"Start radio from this" action** — explicit seed → similar-recordings → resolve →
-   weighted sample → set the queue. Proves candidate quality end-to-end with a controllable
-   entry point.
-3. **Autoplay toggle + `< 5` refill** reusing #2's engine, with sliding-seed re-seeding. The
-   headline "don't stop the music" feature — small once #1–#2 exist.
-4. **Variety/recency/skip filters** (artist cap, recency window from `listens`, skip penalty).
-   Big perceived-quality jump for little code — pure SQL over existing tables.
+1. **[DONE] Similarity engine** — `similarity_cache` (migration v27); `recommendations.rs`
+   with the **ListenBrainz Labs** `similar-recordings` client (rate-limited, cached, parser
+   unit-tested) and the **local content fallback** (`similar_local_track_ids`: genre/artist
+   overlap, Jellyfin weights — always available, no network); the MBID→local matcher
+   (`track_recording_mbid` + `tracks_for_recording_mbids`) and recency dedup
+   (`recently_played_track_ids`). The `similar_track_ids` service chains them first-hit-wins.
+   *(The ListenBrainz live path is wired + parser-tested but not yet verified against the real
+   API — needs tracks with recording MBIDs + network; the local fallback is what tests exercise.)*
+2. **[DONE] "Start radio from this"** — `GET /api/tracks/{id}/radio` (seed + similar) + a footer
+   `((•))` button; `playTrackIds`/`startRadio` in the web player.
+3. **[DONE] Autoplay + `< 5` refill** — a decoupled `autoplay_loop` (global `autoplay` setting,
+   `GET/PUT /api/autoplay`, an "Autoplay" toggle in the queue drawer) that tops up a playing
+   queue (browser + zones) with similar tracks when fewer than 5 remain, sliding the seed to the
+   current track and excluding what's queued + recently played.
+4. **Next — variety filters**: per-artist cap (≤2–3 / never two in a row) and a skip-penalty
+   cooldown (`event_kind='skipped'`). Recency is done; these are the remaining quality wins.
 
 Deferred: personal LB collaborative-filter recs (`/1/cf/recommendation/...` — *experimental*,
 needs opt-in LB scrobbling, recommendations.md Slice 3); Last.fm provider (user key);

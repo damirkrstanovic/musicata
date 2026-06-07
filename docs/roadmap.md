@@ -458,13 +458,14 @@ Tasks:
   in the web app, opening the same master track view as a user playlist. More facets
   (genre/year smart lists, never-played-by-decade) are easy follow-ups.
 - Add metadata-based recommendations by genre, year, artist, album artist, composer, and MusicBrainz IDs.
-- **Continuous play (autoplay / endless radio)** — when the queue nears empty, append *similar*
-  tracks so music never stops (Spotify "Autoplay" / "Song Radio"). Design: **`docs/continuous-play.md`**.
-  Rides on the "Similar & Radio" slice (`docs/recommendations.md`): LB Labs `similar-recordings`
-  (MBID→local) + a Jellyfin-style local fallback, a **sliding seed** (re-seed from recent plays,
-  the trick that keeps it endless and non-looping), dedup/recency/skip/per-artist filters, and a
-  `< 5`-upcoming refill hooked into `track_ended`/the MPD poll loop. Two affordances: an Autoplay
-  toggle + a "Start radio from this" action. Build the similarity slice first.
+- **[DONE] Similar & Radio + Continuous play (autoplay).** Designs: `docs/recommendations.md`,
+  `docs/continuous-play.md`. Shipped: a `similarity_cache` (v27) + `recommendations.rs`
+  (ListenBrainz Labs `similar-recordings`, cached + parser-tested; a local genre/artist fallback;
+  MBID→local matcher; recency dedup); **"Start radio from this"** (`/api/tracks/{id}/radio` + a
+  footer button); and a decoupled **`autoplay_loop`** (global `autoplay` setting + queue-drawer
+  toggle) that tops up a playing queue (browser + zones) with similar tracks when < 5 remain,
+  sliding the seed to the current track. *Remaining:* verify the ListenBrainz live path against
+  the real API; per-artist cap + skip-penalty variety filters; weighted-by-score sampling.
 - Add optional ListenBrainz scrobbling and recommendation import.
 - Design an optional `musicata-ml` service for future audio embeddings, genre/mood inference, and similarity search.
 

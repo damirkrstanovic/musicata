@@ -11,6 +11,7 @@
   import { favorites } from "../lib/favorites.svelte";
   import { search } from "../lib/search.svelte";
   import { dsp } from "../lib/dsp.svelte";
+  import { autoplay } from "../lib/autoplay.svelte";
   import type { PlaybackState } from "../types/PlaybackState";
   import type { Player } from "../types/Player";
   import type { Zone } from "../types/Zone";
@@ -121,6 +122,7 @@
     });
 
     favorites.load();
+    autoplay.load();
     await loadTargets();
     const browser = players.find((p) => p.kind === "browser") ?? players[0];
     if (browser) connect("player", browser.id);

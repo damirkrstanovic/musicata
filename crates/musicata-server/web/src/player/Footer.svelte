@@ -2,6 +2,7 @@
   import { player } from "../lib/player.svelte";
   import { dsp } from "../lib/dsp.svelte";
   import { meter } from "../lib/meter.svelte";
+  import { startRadio } from "../lib/playback";
   import { sendCommand, type PlayerCommand } from "../lib/commands";
   import type { RepeatMode } from "../types/RepeatMode";
   import SeekBar from "./SeekBar.svelte";
@@ -78,6 +79,18 @@
       onchange={(e) =>
         send({ command: "set_volume", volume: Number((e.currentTarget as HTMLInputElement).value) })}
     />
+    <button
+      class="eq-btn radio-btn"
+      type="button"
+      title="Start radio from this track"
+      disabled={!player.nowPlaying?.track_id}
+      onclick={() => {
+        const id = player.nowPlaying?.track_id;
+        if (id) startRadio(id);
+      }}
+    >
+      ((•))
+    </button>
     <button
       class="eq-btn"
       class:active={meter.open}

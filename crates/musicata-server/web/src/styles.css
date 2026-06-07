@@ -3102,6 +3102,29 @@ body.admin {
   border-color: var(--accent);
   color: var(--accent-strong);
 }
+.eq-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+  border-color: var(--line);
+  color: var(--text);
+}
+.radio-btn {
+  font-size: 0.74rem;
+  letter-spacing: 0;
+}
+
+/* Autoplay toggle in the queue-drawer header. */
+.autoplay-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+.autoplay-toggle input:checked + span {
+  color: var(--accent-strong);
+}
 
 .eq-drawer {
   position: absolute;

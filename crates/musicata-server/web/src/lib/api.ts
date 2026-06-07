@@ -267,6 +267,14 @@ export const api = {
   settings: () => getJson<AppSettings>("/api/settings"),
   saveSettings: (body: AppSettings) => sendJson("/api/settings", "PATCH", body),
 
+  // Recommendations: radio (seed + similar tracks) + continuous-play toggle.
+  trackRadio: (id: string, limit = 25) =>
+    getJson<{ track_ids: string[] }>(`/api/tracks/${encodeURIComponent(id)}/radio`, {
+      limit: String(limit),
+    }),
+  autoplay: () => getJson<{ enabled: boolean }>("/api/autoplay"),
+  setAutoplay: (enabled: boolean) => sendJson("/api/autoplay", "PUT", { enabled }),
+
   albumDetail: (id: string) => getJson<AlbumDetail>(`/api/albums/${encodeURIComponent(id)}`),
   artistDetail: (id: string) => getJson<ArtistDetail>(`/api/artists/${encodeURIComponent(id)}`),
   metadataReview: (trackId: string) =>

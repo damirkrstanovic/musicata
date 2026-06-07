@@ -1,5 +1,6 @@
 <script lang="ts">
   import { player } from "../lib/player.svelte";
+  import { autoplay } from "../lib/autoplay.svelte";
   import { sendCommand } from "../lib/commands";
   import { initial } from "../lib/dom";
 
@@ -13,6 +14,14 @@
     <header class="queue-head">
       <strong>Queue</strong>
       <div class="queue-head-actions">
+        <label class="autoplay-toggle" title="Keep playing similar tracks when the queue ends">
+          <input
+            type="checkbox"
+            checked={autoplay.enabled}
+            onchange={() => autoplay.toggle()}
+          />
+          <span>Autoplay</span>
+        </label>
         <button class="ghost-button" type="button" onclick={() => sendCommand(player.target, { command: "clear" })}>
           Clear
         </button>

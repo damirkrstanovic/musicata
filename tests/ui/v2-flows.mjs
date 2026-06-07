@@ -183,6 +183,19 @@ check("vu meter opens with L/R meters", (await js(`document.querySelectorAll('.v
 await clickText(".vu-head button", "Close");
 await sleep(300);
 
+// Recommendations: "Start radio from this" returns the seed + similar tracks (the local
+// content fallback always yields the seed; ListenBrainz adds more when MBIDs + network exist).
+const npId = (await api("/api/players/browser-local/state"))?.now_playing?.track_id;
+if (npId) {
+  const radio = await api(`/api/tracks/${npId}/radio?limit=10`);
+  check("radio endpoint returns tracks", (radio?.track_ids?.length ?? 0) >= 1, JSON.stringify(radio));
+}
+check("radio button present in footer", await js(`!!document.querySelector('.radio-btn')`));
+// Continuous-play (autoplay) toggle persists through the API.
+await api("/api/autoplay", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true }) });
+check("autoplay toggle persists", (await api("/api/autoplay"))?.enabled === true);
+await api("/api/autoplay", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) });
+
 // Radio: the station shows in the sidebar; playing it sets now-playing.
 check("radio station listed", await js(`[...document.querySelectorAll('.library-panel .nav-link')].some(b=>/smoke fm/i.test(b.textContent))`));
 await js(`[...document.querySelectorAll('.library-panel .nav-link')].find(b=>/smoke fm/i.test(b.textContent))?.click()`);

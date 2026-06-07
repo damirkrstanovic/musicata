@@ -277,6 +277,13 @@ impl Database {
             set_user_version(&self.pool, 26).await?;
         }
 
+        if version < 27 {
+            for statement in MIGRATION_027_SIMILARITY_CACHE {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 27).await?;
+        }
+
         Ok(())
     }
 
@@ -1983,6 +1990,149 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    // ---- Recommendations (similar / radio / continuous play) -------------------
+
+    /// Cached similarity payload for a seed MBID: (payload_json, fetched_at). `entity_kind` is
+    /// e.g. "recording". An empty-array payload is a `not_found` marker.
+    pub async fn get_similarity_cache(
+        &self,
+        entity_kind: &str,
+        seed_mbid: &str,
+    ) -> Result<Option<(String, i64)>> {
+        let row = sqlx::query(
+            "SELECT payload_json, fetched_at_unix_seconds FROM similarity_cache
+             WHERE entity_kind = ?1 AND seed_mbid = ?2",
+        )
+        .bind(entity_kind)
+        .bind(seed_mbid)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => Ok(Some((
+                row.try_get("payload_json")?,
+                row.try_get("fetched_at_unix_seconds")?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn set_similarity_cache(
+        &self,
+        entity_kind: &str,
+        seed_mbid: &str,
+        payload_json: &str,
+        now_unix_seconds: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO similarity_cache (entity_kind, seed_mbid, payload_json, fetched_at_unix_seconds)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(entity_kind, seed_mbid) DO UPDATE SET
+                payload_json = ?3, fetched_at_unix_seconds = ?4",
+        )
+        .bind(entity_kind)
+        .bind(seed_mbid)
+        .bind(payload_json)
+        .bind(now_unix_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A track's MusicBrainz recording id, from its tags or its AcoustID fingerprint. Used to
+    /// seed ListenBrainz similar-recordings.
+    pub async fn track_recording_mbid(&self, track_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT COALESCE(
+                (SELECT o.musicbrainz_recording_id FROM track_metadata_observations o
+                   WHERE o.track_id = ?1 AND o.musicbrainz_recording_id IS NOT NULL LIMIT 1),
+                (SELECT f.musicbrainz_recording_id FROM track_fingerprint f
+                   WHERE f.track_id = ?1 AND f.musicbrainz_recording_id IS NOT NULL LIMIT 1)
+             ) AS mbid",
+        )
+        .bind(track_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|row| row.try_get::<Option<String>, _>("mbid").ok().flatten()))
+    }
+
+    /// Resolve external recording MBIDs to local track ids (first local track per MBID, in the
+    /// input order). The lingua franca for turning ListenBrainz results into playable tracks.
+    pub async fn tracks_for_recording_mbids(&self, mbids: &[String]) -> Result<Vec<String>> {
+        if mbids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SQLite VALUES preserve order; map each input MBID to its first matching local track.
+        let values = (1..=mbids.len())
+            .map(|i| format!("(?{i})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let query = format!(
+            "WITH seeds(mbid) AS (VALUES {values})
+             SELECT s.mbid AS mbid,
+                    (SELECT t.id FROM tracks t
+                     JOIN track_metadata_observations o ON o.track_id = t.id
+                     WHERE o.musicbrainz_recording_id = s.mbid LIMIT 1) AS track_id
+             FROM seeds s",
+        );
+        let mut q = sqlx::query(&query);
+        for mbid in mbids {
+            q = q.bind(mbid);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.try_get::<Option<String>, _>("track_id").ok().flatten())
+            .collect())
+    }
+
+    /// Track ids played (event_kind='played') at or after `since_unix` — the recency-exclusion
+    /// set for continuous play (don't re-queue something just heard).
+    pub async fn recently_played_track_ids(&self, since_unix_seconds: i64) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT track_id FROM listens
+             WHERE listened_at_unix_seconds >= ?1 AND event_kind = 'played'",
+        )
+        .bind(since_unix_seconds)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|row| Ok(row.try_get("track_id")?)).collect()
+    }
+
+    /// Local content similarity fallback (no network): tracks sharing a genre with the seed or
+    /// by the same artist, Jellyfin-style weighted (genre 10, same-artist 30), seed excluded.
+    pub async fn similar_local_track_ids(
+        &self,
+        seed_track_id: &str,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "WITH seed_genres(g) AS (
+                 SELECT DISTINCT json_each.value
+                 FROM track_metadata_observations o, json_each(o.genres)
+                 WHERE o.track_id = ?1
+             ),
+             seed AS (SELECT artist_id FROM tracks WHERE id = ?1)
+             SELECT t.id AS id,
+                 (SELECT COUNT(DISTINCT json_each.value)
+                  FROM track_metadata_observations o2, json_each(o2.genres)
+                  WHERE o2.track_id = t.id AND json_each.value IN (SELECT g FROM seed_genres)) * 10
+                 + (CASE WHEN t.artist_id = (SELECT artist_id FROM seed) THEN 30 ELSE 0 END) AS score
+             FROM tracks t
+             WHERE t.id != ?1
+               AND ( t.artist_id = (SELECT artist_id FROM seed)
+                     OR EXISTS (SELECT 1 FROM track_metadata_observations o2, json_each(o2.genres)
+                                WHERE o2.track_id = t.id
+                                  AND json_each.value IN (SELECT g FROM seed_genres)) )
+             ORDER BY score DESC, RANDOM()
+             LIMIT ?2",
+        )
+        .bind(seed_track_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|row| Ok(row.try_get("id")?)).collect()
     }
 
     /// Drop `not_found` fingerprint markers so those tracks are re-fingerprinted on the
@@ -4368,6 +4518,17 @@ const MIGRATION_026_TRACK_LOUDNESS: &[&str] = &["CREATE TABLE IF NOT EXISTS trac
         integrated_lufs REAL,
         true_peak_dbtp REAL,
         analyzed_at_unix_seconds INTEGER NOT NULL
+    )"];
+
+// Cached external similarity results (ListenBrainz Labs), keyed by seed MBID. `payload_json`
+// is a scored MBID list (an empty array is a `not_found` marker). Lets recommendations resolve
+// off the cache instead of the network on the request/refill path.
+const MIGRATION_027_SIMILARITY_CACHE: &[&str] = &["CREATE TABLE IF NOT EXISTS similarity_cache (
+        entity_kind TEXT NOT NULL,
+        seed_mbid TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        fetched_at_unix_seconds INTEGER NOT NULL,
+        PRIMARY KEY (entity_kind, seed_mbid)
     )"];
 
 // MusicBrainz metadata fetched for a track via its (fingerprinted) recording MBID —
