@@ -647,7 +647,14 @@ Tasks:
   authenticating to a password-protected/TLS MPD) is scoped under Milestone 5's "MPD
   authentication + secure transport" item.
 - Research and prototype Squeezelite/LMS bridge behavior.
-- Research Snapcast for synchronized transport.
+- [x] **Research Snapcast for synchronized transport.** Done — see **`docs/snapcast.md`**.
+  Verdict: the right tool for reliable + sample-accurate network playback to non-browser
+  endpoints (and the cleanest path to real zone sync). Use the real **snapserver** (managed
+  subprocess), feed it server-decoded PCM via a **FIFO**, control via **JSON-RPC**; don't
+  reimplement the protocol. **Key cost:** it forces a *new* server-side **decode→PCM→FIFO**
+  stage (Musicata has always let endpoints fetch+decode per-track URLs) — which also becomes
+  the home for the server-side DSP tier (`docs/dsp.md`). Cargo-feature-gated, "requires
+  snapserver," like the SMB source.
 - Later evaluate AirPlay, Chromecast, UPnP/DLNA, and MPD integrations.
 
 Done when:
@@ -655,23 +662,50 @@ Done when:
 - At least one non-browser endpoint can be controlled from the server.
 - Browser and endpoint players share the same queue/zone command model.
 
-## Milestone 11: DSP Preparation
+## Milestone 11: DSP — EQ, room & headphone correction
 
-Goal: reserve the right architecture without shipping DSP too early.
+Goal: let an ordinary user improve how their music sounds — headphone correction with zero
+effort, room correction if they'll measure — without becoming an audio operator.
 
-Tasks:
+Research + full design + the phased, file-grounded plan: **`docs/dsp.md`** (prior art on
+Roon/Dirac/AutoEq/CamillaDSP, the profile model, the filter capability matrix). Read it
+before starting. **Decisions: browser-first, three tiers; correction is per *output*, not
+global** — a server-stored `DspProfile` (PEQ + optional room IR) plus a client-stored
+`OutputPreset` (sink + profile + remembered volume). We *apply* filters; we don't measure
+(REW/DRC + a calibrated mic do that). The **home-office two-output case** (active speakers +
+headphones, one-tap switch, each with its own correction + volume) is the driving example.
 
-- Define a per-zone audio pipeline model.
-- Add configuration placeholders for headroom, volume leveling, EQ, convolution, and sample-rate conversion.
-- Add a parametric EQ stage (per-band frequency/gain/Q biquad filters) to the
-  per-zone pipeline, with a UI for editing bands. (CamillaDSP already implements
-  parametric EQ, so this likely rides on the CamillaDSP integration below.)
-- Research CamillaDSP integration.
+Tasks (browser-first; see `docs/dsp.md` for per-phase detail + the files touched):
+
+- [ ] **Phase 0–1 — profile model + browser DSP core.** `DspProfile` types
+  (musicata-core) + JSON-in-settings storage + `/api/dsp/*`; a `/admin` profiles panel; the
+  Web Audio graph in `BrowserAudio` (`MediaElementSource → preamp → biquads → master →
+  destination`) with `applyProfile`/`setBypass`. Hot-path-safe (no DOM, no element reload).
+- [ ] **Phase 2 — output presets + speakers/headphones switcher (the home-office MVP).** A
+  client `audioDevices` store (presets in `localStorage`, `enumerateDevices`); a footer
+  🔊/🎧 toggle that swaps profile + sink (`AudioContext.setSinkId`) + remembered per-output
+  volume (a safety feature). Document the setSinkId support/fallback.
+- [ ] **Phase 3 — AutoEq headphone profiles.** Bundle a curated AutoEq preset set (MIT) +
+  model picker + a `ParametricEQ.txt` importer → instant zero-mic headphone correction.
+- [ ] **Phase 4 — room correction in the browser.** `ConvolverNode` + user WAV impulse
+  response (`normalize=false`), same graph; stereo only.
+- [ ] **Phase 5 — CamillaDSP subprocess (the DAC tier).** Managed subprocess (control via
+  `PatchConfig` over WebSocket), ALSA-loopback routing for MPD→DAC, the *same* profile
+  compiled to CamillaDSP YAML; multichannel + crossovers. Cargo-feature-gated, "require
+  installed," like the SMB source.
+- [ ] **Phase 6 — polish.** Volume Leveling (R128 via `ebur128`, constant-gain, Track/Album);
+  a Roon-style signal-path badge over the WebSocket; phone-app filter export
+  (GraphicEQ.txt / IR WAV for JamesDSP / Wavelet).
+
+Explicitly out of scope: a measurement suite (no sweep/RTA/mic capture), and any Dirac
+ingestion (its filters are locked to its own processor — non-exportable).
 
 Done when:
 
-- Playback design can route decoded audio through a future DSP stage.
-- No MVP feature depends on DSP being implemented.
+- A user can pick their headphone model and immediately hear corrected sound in the browser
+  player, on any platform.
+- The same correction profile applies on the CamillaDSP/DAC path.
+- The playback hot path is untouched (a progress tick never disturbs the now-playing title).
 
 ## Milestone 12: Packaging, Security, And Operations
 
