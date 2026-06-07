@@ -1,107 +1,168 @@
 # Repository Guidelines
 
+Musicata is a local-first music server + web controller. Rust workspace, milestone-driven
+(see `docs/roadmap.md`). **This is the single source of truth for human and AI contributors;
+`CLAUDE.md` includes this file.**
+
+## Prior art — read before solving a hard problem
+
+**`docs/prior-art.md`** captures how Roon, Jellyfin, Navidrome, beets, Picard, Music
+Assistant and Mopidy solve the problems we keep hitting (provider/plugin ecosystem,
+incremental library scanning, OpenSubsonic compatibility, SMB access, background-work UX,
+metadata sourcing & conflict resolution, discography completeness, artwork, artist identity)
+and what Musicata adopted, with code pointers. When you work in one of those areas, read the
+relevant section first rather than re-deriving the design — and append to it when you learn
+something new from another project. Reference checkouts live next to this repo
+(`../jellyfin`, `../navidrome`, `../snapcast`, `../immich`).
+
+Per-feature designs: `docs/dsp.md` (EQ / room & headphone correction), `docs/loudness.md`
+(EBU R128 volume leveling), `docs/recommendations.md` (ListenBrainz similar & radio),
+`docs/continuous-play.md` (autoplay), `docs/snapcast.md` (synchronized network transport).
+Other docs: `docs/plugins.md`, `docs/api.md` (native + OpenSubsonic), `docs/style-guide.md`
+(web UI conventions), `docs/metadata.md`.
+
 ## Project Structure & Module Organization
 
-This repository is a Rust workspace for Musicata, an open source music server/controller prototype. Keep source organized by crate and keep provider-neutral logic out of server-specific code.
+Rust workspace; keep provider-neutral logic out of server-specific code.
 
-- `crates/musicata-core/` contains domain types, provider traits, and local library scanning.
-- `crates/musicata-server/` contains the HTTP API, static web controller, and playback streaming routes.
-- `crates/musicata-server/static/` contains the current PWA-style web assets.
-- `docs/` contains research and requirements.
-- `testdata/` contains sample music used by scanner tests and manual flow testing.
+- `crates/musicata-core` — domain types + the scanner. Pure, sync, dependency-light
+  (lofty/serde/sha2); **no tokio**. `MusicProvider`, `SourceFs` VFS, incremental scan,
+  `merge_libraries`.
+- `crates/musicata-storage` — SQLite via sqlx. Migrations by `PRAGMA user_version`. One
+  library cache + separate per-feature tables (players, player/zone queues, playlists,
+  favorites, radio, sources, activities, listens, fingerprints, loudness, …).
+- `crates/musicata-server` — axum 0.8 (+ws): the providers/registry, players, the
+  OpenSubsonic surface, and the embedded web app. Wire types are generated from the Rust
+  structs by ts-rs (`scripts/gen-web-types.sh`).
+- `crates/musicata-server/web/` — the web app: **Svelte 5 + TypeScript + Vite**, built by
+  `build.rs` and embedded via `rust-embed` from `web/dist/`. Two pages: `/` player, `/admin`.
+- `docs/` — research, requirements, roadmap, and per-feature designs. `testdata/` is a real
+  fixture library used by scanner tests and the UI smoke suite.
 
 Avoid adding source files at the repository root unless they are standard project entry points.
 
 ## Build, Test, and Development Commands
 
-Use Cargo from the repository root:
+```
+cargo build                         # default features (incl. SMB source); runs the Vite web build
+cargo build --no-default-features   # minimal: drop the SMB `smb` dep
+cargo test                          # all crates (SMB tests run by default)
+cargo run -p musicata-server -- --library <dir> --addr 127.0.0.1:3030
+```
 
-- `cargo run -p musicata-server` starts the prototype server at `127.0.0.1:3030` and scans `testdata`.
-- `cargo run -p musicata-server -- --library /path/to/music --addr 127.0.0.1:3031` runs against another library or port.
-- `cargo run -p musicata-server -- --config musicata.example.conf` runs with a config file; environment overrides use `MUSICATA_LIBRARY`, `MUSICATA_DATABASE`, `MUSICATA_ADDR`, `MUSICATA_RESCAN`, and `MUSICATA_INCREMENTAL_RESCAN`.
-- `cargo run -p musicata-server -- --scan-once` runs the incremental scan/update path and exits without binding a server port.
-- `cargo test --offline` runs all unit tests without fetching dependencies.
-- `cargo fmt --all` formats the workspace.
-- `cargo check --offline` verifies the workspace quickly.
+- **Node + npm are build dependencies** — `build.rs` runs the Vite build on every `cargo
+  build`. Set `MUSICATA_SKIP_WEB_BUILD=1` with a prebuilt `web/dist/` to skip (offline /
+  Rust-only iteration).
+- Flags/env are **bootstrap-only** (where the DB/library live, the bind address), not feature
+  toggles: `--config`, `MUSICATA_LIBRARY`, `MUSICATA_DATABASE`, `MUSICATA_ADDR`,
+  `MUSICATA_RESCAN`, `MUSICATA_INCREMENTAL_RESCAN`. `--scan-once` runs the incremental scan and
+  exits without binding a port.
+- Regenerate the Rust→TS wire types with `scripts/gen-web-types.sh` after changing a
+  `#[derive(ts_rs::TS)]` struct.
+- **Before testing against a *running* server, `cargo build`** — `cargo test` only builds the
+  test harness (not the `target/debug/musicata-server` binary) and does **not** build `web/`.
+- In `web/`: `npm run check` (svelte-check) for the frontend typecheck.
 
-The current server uses Axum, Tokio, Serde, and `tracing`. In restricted environments with a read-only global Cargo registry, use a writable `CARGO_HOME`.
+## Conventions (hard-won)
 
-## Coding Style & Naming Conventions
+- **Configuration lives in the product, not in flags/env/config files.** Musicata is for an
+  ordinary user, not an operator editing YAML. User-facing settings (enable artwork fetching,
+  an API key, a music source, a player) are **persisted in the DB and edited in the web UI**
+  (the `/admin` Settings page) — live, no restart. CLI flags / env vars exist only for
+  *bootstrap* and test harnesses. When adding a feature, add a setting + UI, not a `--flag`.
+- **Enum dispatch, not `dyn`**, for `ProviderHandle` / `PlayerHandle` — async methods stay
+  object-safe; a new backend is one variant + match arms, cargo-feature-gated.
+- **Capabilities are advertised** (`ProviderCapabilities`) and callers skip what a source
+  can't do.
+- **Incremental scans**: reuse parsed metadata for files with unchanged size+mtime; read tags
+  only for new/changed files; watch the local FS, fall back to a periodic pass for network
+  sources. (See prior-art §2.)
+- **Network is never on a request's hot path**: bind the web port before scanning;
+  connect/scan in the background with timeouts; surface progress/errors via the activity log +
+  WebSocket, not blocking calls or polling.
+- **The web app is built by `build.rs`** (Vite) and embedded via `rust-embed` from `web/dist/`.
+  Hashed `/assets/*` bundles are served immutable; the HTML entries `no-cache`. Edit components
+  in `web/src/`; run `npm run check`.
+- **Don't couple fundamentally different operations.** Each long-running background job (source
+  discovery/scan, fingerprint identification, MusicBrainz enrichment, artwork fetch, loudness
+  analysis) is its **own task draining its own DB-backed queue at its own pace** — they
+  coordinate *only* through the database, never in lockstep in one loop. A slow step (an SMB
+  rescan) must never stall an unrelated one (identification). Each worker loops: do available
+  work → if it did work, loop again (drain the backlog); else sleep a short idle poll. Group
+  jobs into one task only when they share an external rate limit (e.g. the two MusicBrainz
+  passes). See `*_loop` fns in `main.rs`. The trade-off — eventual consistency instead of
+  strict ordering — is the point; don't re-entangle them for ordering.
+- AGPL-3.0; check a new dependency's license before adding it.
 
-Use Rust 2024 edition and standard `rustfmt` output. Keep modules small, explicit, and aligned with the architecture: providers belong in core, transport concerns belong in server. Use `snake_case` for functions/modules, `PascalCase` for types and traits, and `SCREAMING_SNAKE_CASE` only for true constants.
+## Coding Style & Naming
 
-For web assets, use plain `kebab-case` filenames and keep JavaScript as progressive controller glue until the Rust web stack is introduced.
+Rust 2024 edition and standard `rustfmt` output. Keep modules small, explicit, and aligned
+with the architecture: provider-neutral logic in core, persistence in storage, transport
+concerns in server. Use `snake_case` for functions/modules, `PascalCase` for types and traits,
+and `SCREAMING_SNAKE_CASE` only for true constants. `cargo fmt` reformats multi-line edits —
+re-read a region you just edited before editing it again.
+
+Frontend (Svelte 5 + TypeScript in `web/src/`): `PascalCase.svelte` for components,
+`kebab-case` for other assets; follow `docs/style-guide.md` for UI conventions.
 
 ## Testing Guidelines
 
-Prefer unit tests beside the Rust code they cover. Scanner tests currently use `testdata/`, so keep that sample library stable enough for deterministic counts and searches. Do not require private credentials or network access in default tests.
+Prefer unit tests beside the Rust code they cover. Scanner tests use `testdata/`, so keep that
+sample library stable enough for deterministic counts and searches. Do not require private
+credentials or network access in default tests. Each feature should cover expected behavior
+and at least one failure or edge case. Run `cargo test` before handing off changes.
 
-Each feature should cover expected behavior and at least one failure or edge case when applicable. Run `cargo test --offline` before handing off changes.
+The **UI smoke suite** — `scripts/ui-smoke.sh` (→ `scripts/v2-smoke.sh` + `tests/ui/v2-flows.mjs`)
+— drives the Svelte app over CDP (headless Chromium at
+`~/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome`) and asserts user flows *and* the
+playback hot path: via a MutationObserver, a progress tick must move only the elapsed/seek
+text, never the now-title. `cargo test` covers the server only and does **not** build `web/`,
+so run the smoke suite after any UI change. Rust-level hot-path guards live in `players.rs`
+tests.
 
 ## Commit & Pull Request Guidelines
 
-No usable Git history is available in this workspace, so there is no existing commit convention to preserve. Use short, imperative commit subjects, for example `Add playback queue model`. Conventional Commit prefixes such as `feat:`, `fix:`, and `docs:` are acceptable if adopted consistently.
+Branch for feature work; commit/push **only when asked**. Use short, imperative commit
+subjects, e.g. `Add playback queue model`; Conventional-Commit prefixes (`feat:`, `fix:`,
+`docs:`) are acceptable if used consistently. End commit messages with the co-author trailer:
 
-Pull requests should include a concise summary, verification commands, linked issues when relevant, and screenshots or recordings for UI changes.
+```
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+```
+
+Pull requests should include a concise summary, verification commands, linked issues when
+relevant, and screenshots or recordings for UI changes. The `pre-commit` hook runs `cargo
+test` + the UI smoke suite — keep them green.
 
 ## Agent-Specific Instructions
 
-Keep generated changes scoped to the requested task. Do not collapse provider-neutral domain logic into local-disk or browser-specific code. Preserve the Rust-first direction and keep dependency additions tied to roadmap milestones.
+Keep generated changes scoped to the requested task. Do not collapse provider-neutral domain
+logic into local-disk or browser-specific code. Preserve the Rust-first direction and keep
+dependency additions tied to roadmap milestones.
 
-Coding Principles
-1. Think Before Coding
+### Coding Principles
 
-Don't assume. Don't hide confusion. Surface tradeoffs.
+**1. Think Before Coding** — Don't assume. Don't hide confusion. Surface tradeoffs. State
+assumptions explicitly; if uncertain, ask. If multiple interpretations exist, present them —
+don't pick silently. If a simpler approach exists, say so. If something is unclear, stop, name
+what's confusing, and ask.
 
-    State your assumptions explicitly. If uncertain, ask.
-    If multiple interpretations exist, present them - don't pick silently.
-    If a simpler approach exists, say so. Push back when warranted.
-    If something is unclear, stop. Name what's confusing. Ask.
+**2. Simplicity First** — Minimum code that solves the problem; nothing speculative. No
+features beyond what was asked, no abstractions for single-use code, no unrequested
+"flexibility," no error handling for impossible scenarios. If you write 200 lines and it could
+be 50, rewrite it. Ask: "Would a senior engineer say this is overcomplicated?"
 
-2. Simplicity First
+**3. Surgical Changes** — Touch only what you must. Don't "improve" adjacent code, comments, or
+formatting; don't refactor what isn't broken; match existing style even if you'd do it
+differently. If you notice unrelated dead code, mention it — don't delete it. Remove
+imports/variables/functions that *your* changes made unused; don't remove pre-existing dead
+code unless asked. Every changed line should trace directly to the request.
 
-Minimum code that solves the problem. Nothing speculative.
+**4. Goal-Driven Execution** — Define success criteria; loop until verified. Turn tasks into
+verifiable goals ("Add validation" → "Write tests for invalid inputs, then make them pass").
+For multi-step tasks, state a brief plan with a verify check per step. Strong success criteria
+let you loop independently.
 
-    No features beyond what was asked.
-    No abstractions for single-use code.
-    No "flexibility" or "configurability" that wasn't requested.
-    No error handling for impossible scenarios.
-    If you write 200 lines and it could be 50, rewrite it.
-
-Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
-3. Surgical Changes
-
-Touch only what you must. Clean up only your own mess.
-
-When editing existing code:
-
-    Don't "improve" adjacent code, comments, or formatting.
-    Don't refactor things that aren't broken.
-    Match existing style, even if you'd do it differently.
-    If you notice unrelated dead code, mention it - don't delete it.
-
-When your changes create orphans:
-
-    Remove imports/variables/functions that YOUR changes made unused.
-    Don't remove pre-existing dead code unless asked.
-
-The test: every changed line should trace directly to the user's request.
-4. Goal-Driven Execution
-
-Define success criteria. Loop until verified.
-
-Transform tasks into verifiable goals:
-
-    "Add validation" → "Write tests for invalid inputs, then make them pass"
-    "Fix the bug" → "Write a test that reproduces it, then make it pass"
-    "Refactor X" → "Ensure tests pass before and after"
-
-For multi-step tasks, state a brief plan:
-
-    [Step] → verify: [check]
-    [Step] → verify: [check]
-    [Step] → verify: [check]
-
-Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
-
-These principles are working if: fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+These principles are working if: fewer unnecessary changes in diffs, fewer rewrites due to
+overcomplication, and clarifying questions come before implementation rather than after
+mistakes.
