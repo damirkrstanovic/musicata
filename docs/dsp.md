@@ -341,8 +341,13 @@ CamillaDSP endpoint instead of a browser device — same profile model, multicha
 
 ### Phase 6 — polish
 
-Volume Leveling (R128 at scan time via `ebur128`; constant-gain Track/Album), a Roon-style
-**signal-path badge** over the WebSocket, phone-app filter **export** (GraphicEQ.txt / IR WAV).
+**Volume Leveling** (EBU R128, constant-gain Track/Album) — full design in
+**`docs/loudness.md`**. The killer feature for continuous play + even multiroom; analyze LUFS
++ true-peak once at scan time (`ebur128`), apply a per-track gain at playback. **Critical
+coordination:** the leveling gain and this EQ chain's **preamp** sum for clipping — run the
+−1 dBTP clip check on the *combined* `leveling_dB + preamp_dB`, or they double-clip. Plus a
+Roon-style **signal-path badge** over the WebSocket, and phone-app filter **export**
+(GraphicEQ.txt / IR WAV).
 
 ### Files touched (Phases 0–2, the home-office MVP)
 
