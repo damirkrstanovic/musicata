@@ -20,17 +20,28 @@ use musicata_storage::Database;
 /// upstream and may need refreshing — check labs.api.listenbrainz.org if results dry up.
 pub const LB_SIMILAR_ALGORITHM: &str =
     "session_based_days_7500_session_300_contribution_5_threshold_15_limit_50_skip_30_top_n_listeners_1000";
+/// similar-artists uses a *different* algorithm enum than similar-recordings (no
+/// `top_n_listeners`). Artist similarity has far better coverage, so it's the primary source.
+pub const LB_ARTISTS_ALGORITHM: &str =
+    "session_based_days_9000_session_300_contribution_5_threshold_15_limit_50_skip_30";
 const LB_TIMEOUT: Duration = Duration::from_secs(15);
 /// ListenBrainz rate-limits via response headers; space request starts ~1/s to stay polite.
 const LB_MIN_INTERVAL: Duration = Duration::from_millis(1100);
 /// Re-query a seed's similar recordings at most this often.
 const CACHE_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
-/// Recency-exclusion window for continuous play: don't re-queue something heard this recently.
-const RECENCY_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+/// Recency-exclusion window for continuous play (autoplay only): don't re-queue something heard
+/// this recently. Explicit radio passes `None` so a station isn't shrunk by what you've played.
+pub const RECENCY_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScoredMbid {
     pub mbid: String,
+    pub score: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScoredArtist {
+    pub name: String,
     pub score: f64,
 }
 
@@ -109,6 +120,51 @@ impl ListenBrainzClient {
             .map_err(|error| error.to_string())?;
         Ok(parse_similar_recordings(&value))
     }
+
+    /// Similar artists for an artist MBID, highest score first. The radio workhorse — better
+    /// coverage than similar-recordings.
+    pub fn similar_artists(&self, artist_mbid: &str) -> Result<Vec<ScoredArtist>, String> {
+        self.reserve_slot();
+        let url = format!("{}/similar-artists/json", self.base_url);
+        let value = self
+            .agent
+            .get(&url)
+            .query("artist_mbids", artist_mbid)
+            .query("algorithm", LB_ARTISTS_ALGORITHM)
+            .call()
+            .map_err(|error| match error {
+                ureq::Error::Status(status, response) => {
+                    let body = response.into_string().unwrap_or_else(|_| "<no body>".to_string());
+                    format!("ListenBrainz HTTP {status}: {body}")
+                }
+                ureq::Error::Transport(error) => error.to_string(),
+            })?
+            .into_json::<Value>()
+            .map_err(|error| error.to_string())?;
+        Ok(parse_similar_artists(&value))
+    }
+}
+
+/// Parse a similar-artists response (a flat array of `{name, artist_mbid, score}`) into names.
+fn parse_similar_artists(value: &Value) -> Vec<ScoredArtist> {
+    let arr = value
+        .as_array()
+        .cloned()
+        .or_else(|| value.get("data").and_then(|d| d.as_array()).cloned())
+        .unwrap_or_default();
+    let items = if arr.len() == 1 && arr[0].is_array() {
+        arr[0].as_array().cloned().unwrap_or_default()
+    } else {
+        arr
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let name = item.get("name")?.as_str()?.to_string();
+            let score = item.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+            Some(ScoredArtist { name, score })
+        })
+        .collect()
 }
 
 /// Parse a ListenBrainz Labs similar-recordings response into scored MBIDs. Tolerant of the
@@ -166,36 +222,116 @@ async fn cached_similar_recordings(
     }
 }
 
-/// Up to `limit` local track ids similar to `seed_track_id`: cached ListenBrainz similar
-/// recordings resolved to local tracks, topped up with local content similarity, excluding the
-/// seed, the `exclude` set, and anything played recently.
+/// Cached similar artists for a seed artist MBID (same cache/fetch shape as recordings).
+async fn cached_similar_artists(
+    database: &Database,
+    client: &Arc<ListenBrainzClient>,
+    artist_mbid: &str,
+    now_unix: i64,
+) -> Vec<ScoredArtist> {
+    if let Ok(Some((json, fetched))) = database.get_similarity_cache("artist", artist_mbid).await {
+        if now_unix - fetched < CACHE_TTL_SECONDS {
+            return serde_json::from_str(&json).unwrap_or_default();
+        }
+    }
+    let client = client.clone();
+    let mbid = artist_mbid.to_string();
+    match tokio::task::spawn_blocking(move || client.similar_artists(&mbid)).await {
+        Ok(Ok(artists)) => {
+            if let Ok(json) = serde_json::to_string(&artists) {
+                let _ = database.set_similarity_cache("artist", artist_mbid, &json, now_unix).await;
+            }
+            artists
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// How many tracks any one artist may contribute to a radio batch (variety cap).
+const PER_ARTIST: usize = 2;
+
+/// The seed's MusicBrainz artist id: from the track's tags, else resolved from the artist
+/// NAME via a cached MusicBrainz search. This is what makes radio work for libraries whose
+/// files carry no MBIDs (the common case) — without it, ListenBrainz can't be seeded at all.
+async fn seed_artist_mbid(
+    database: &Database,
+    mb: &crate::musicbrainz::MusicBrainzClient,
+    seed_track_id: &str,
+    now_unix: i64,
+) -> Option<String> {
+    if let Ok(Some(mbid)) = database.track_artist_mbid(seed_track_id).await {
+        return Some(mbid);
+    }
+    let artist_name = database.track(seed_track_id).await.ok().flatten()?.artist_name;
+    let key = artist_name.trim().to_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+    if let Ok(Some((cached, fetched))) = database.get_similarity_cache("artist_name", &key).await {
+        if now_unix - fetched < CACHE_TTL_SECONDS {
+            return (!cached.is_empty()).then_some(cached);
+        }
+    }
+    let mb = mb.clone();
+    let name = artist_name.clone();
+    let mbid = match tokio::task::spawn_blocking(move || mb.search_artist_mbid(&name)).await {
+        Ok(Ok(mbid)) => mbid,
+        _ => return None, // transient: don't cache a failure
+    };
+    let _ = database
+        .set_similarity_cache("artist_name", &key, mbid.as_deref().unwrap_or(""), now_unix)
+        .await;
+    mbid
+}
+
+/// Up to `limit` local track ids to play after `seed_track_id`, highest-relevance first:
+/// **(1)** ListenBrainz **similar-artists** of the seed's artist → those artists' local tracks
+/// (the radio workhorse, round-robin so no artist dominates); **(2)** ListenBrainz
+/// similar-recordings (a bonus — sparse coverage); **(3)** local genre/artist content
+/// similarity. Excludes the seed and the `exclude` set; `recency_window_secs` (autoplay only)
+/// additionally excludes recently-played tracks.
 pub async fn similar_track_ids(
     database: &Database,
     client: &Arc<ListenBrainzClient>,
+    mb: &crate::musicbrainz::MusicBrainzClient,
     seed_track_id: &str,
     exclude: &HashSet<String>,
     limit: usize,
     now_unix: i64,
+    recency_window_secs: Option<i64>,
 ) -> Vec<String> {
     let mut seen = exclude.clone();
     seen.insert(seed_track_id.to_string());
-    if let Ok(recent) = database.recently_played_track_ids(now_unix - RECENCY_WINDOW_SECONDS).await {
-        seen.extend(recent);
+    if let Some(window) = recency_window_secs {
+        if let Ok(recent) = database.recently_played_track_ids(now_unix - window).await {
+            seen.extend(recent);
+        }
     }
 
     let mut out: Vec<String> = Vec::new();
 
-    // 1. External similarity (ListenBrainz, cached) resolved to local tracks.
-    if let Ok(Some(mbid)) = database.track_recording_mbid(seed_track_id).await {
-        let scored = cached_similar_recordings(database, client, &mbid, now_unix).await;
-        if !scored.is_empty() {
-            let mbids: Vec<String> = scored.into_iter().map(|s| s.mbid).collect();
-            if let Ok(local) = database.tracks_for_recording_mbids(&mbids).await {
-                for id in local {
-                    if seen.insert(id.clone()) {
-                        out.push(id);
-                        if out.len() >= limit {
-                            return out;
+    // 1. Similar artists (best coverage) → their local tracks, round-robin (variety).
+    if let Some(artist_mbid) = seed_artist_mbid(database, mb, seed_track_id, now_unix).await {
+        let artists = cached_similar_artists(database, client, &artist_mbid, now_unix).await;
+        if !artists.is_empty() {
+            let names: Vec<String> = artists.iter().take(40).map(|a| a.name.clone()).collect();
+            if let Ok(pairs) = database.tracks_for_artist_names(&names).await {
+                let mut by_artist: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for (name, track_id) in pairs {
+                    by_artist.entry(name).or_default().push(track_id);
+                }
+                'rounds: for round in 0..PER_ARTIST {
+                    for artist in &artists {
+                        if let Some(track) =
+                            by_artist.get(&artist.name.to_lowercase()).and_then(|t| t.get(round))
+                        {
+                            if seen.insert(track.clone()) {
+                                out.push(track.clone());
+                                if out.len() >= limit {
+                                    break 'rounds;
+                                }
+                            }
                         }
                     }
                 }
@@ -203,7 +339,27 @@ pub async fn similar_track_ids(
         }
     }
 
-    // 2. Local content fallback to fill the rest (always available, no network).
+    // 2. Similar recordings (bonus — often empty for a given recording MBID).
+    if out.len() < limit {
+        if let Ok(Some(mbid)) = database.track_recording_mbid(seed_track_id).await {
+            let scored = cached_similar_recordings(database, client, &mbid, now_unix).await;
+            if !scored.is_empty() {
+                let mbids: Vec<String> = scored.into_iter().map(|s| s.mbid).collect();
+                if let Ok(local) = database.tracks_for_recording_mbids(&mbids).await {
+                    for id in local {
+                        if seen.insert(id.clone()) {
+                            out.push(id);
+                            if out.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Local content fallback (always available, no network).
     if out.len() < limit {
         let want = ((limit - out.len()) * 4).max(limit) as i64;
         if let Ok(local) = database.similar_local_track_ids(seed_track_id, want).await {
@@ -262,5 +418,18 @@ mod tests {
     fn empty_response_is_empty() {
         assert!(parse_similar_recordings(&serde_json::json!([])).is_empty());
         assert!(parse_similar_recordings(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn parses_similar_artists() {
+        // The real similar-artists shape (a flat array of {name, artist_mbid, score}).
+        let value = serde_json::json!([
+            { "name": "Nile Rodgers", "artist_mbid": "c6d571dd", "score": 10614 },
+            { "name": "Gorillaz", "artist_mbid": "e21857d5", "score": 8663 }
+        ]);
+        let parsed = parse_similar_artists(&value);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], ScoredArtist { name: "Nile Rodgers".into(), score: 10614.0 });
+        assert_eq!(parsed[1].name, "Gorillaz");
     }
 }

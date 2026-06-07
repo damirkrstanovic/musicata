@@ -2087,6 +2087,44 @@ impl Database {
             .collect())
     }
 
+    /// A track's MusicBrainz artist id (from tags). Seeds ListenBrainz similar-artists, which
+    /// has far better coverage than similar-recordings.
+    pub async fn track_artist_mbid(&self, track_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT o.musicbrainz_artist_id AS mbid FROM track_metadata_observations o
+             WHERE o.track_id = ?1 AND o.musicbrainz_artist_id IS NOT NULL LIMIT 1",
+        )
+        .bind(track_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|row| row.try_get::<Option<String>, _>("mbid").ok().flatten()))
+    }
+
+    /// Local tracks for a set of artist names (case-insensitive), as `(lowercased name, track
+    /// id)` pairs in random per-artist order. Used to turn ListenBrainz similar-artists into a
+    /// playable "artists like this" radio; the caller groups by name to cap tracks per artist.
+    pub async fn tracks_for_artist_names(&self, names: &[String]) -> Result<Vec<(String, String)>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lowered: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+        let placeholders = (1..=lowered.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT lower(t.artist_name) AS aname, t.id AS id
+             FROM tracks t
+             WHERE lower(t.artist_name) IN ({placeholders})
+             ORDER BY RANDOM()",
+        );
+        let mut q = sqlx::query(&query);
+        for name in &lowered {
+            q = q.bind(name);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("aname")?, row.try_get("id")?)))
+            .collect()
+    }
+
     /// Track ids played (event_kind='played') at or after `since_unix` — the recency-exclusion
     /// set for continuous play (don't re-queue something just heard).
     pub async fn recently_played_track_ids(&self, since_unix_seconds: i64) -> Result<Vec<String>> {

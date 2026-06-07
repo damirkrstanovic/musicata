@@ -264,6 +264,25 @@ impl MusicBrainzClient {
         }))
     }
 
+    /// The MusicBrainz artist id for an artist name (top search hit), so ListenBrainz
+    /// similar-artists can be used even when a library's tags carry no MBIDs. `Ok(None)` = no
+    /// hit; `Err` = transport (caller retries). Synchronous — run on `spawn_blocking`.
+    pub fn search_artist_mbid(&self, name: &str) -> Result<Option<String>, String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let query = format!("artist:\"{}\"", trimmed.replace('"', " "));
+        let value = self.fetch_search(MusicBrainzSearchEntityType::Artist, &query, 1)?;
+        Ok(value
+            .get("artists")
+            .and_then(Value::as_array)
+            .and_then(|artists| artists.first())
+            .and_then(|artist| artist.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string))
+    }
+
     fn fetch_search(
         &self,
         entity_type: MusicBrainzSearchEntityType,
@@ -516,6 +535,7 @@ pub struct CoverArtArchiveIssue {
 pub enum MusicBrainzSearchEntityType {
     Recording,
     Release,
+    Artist,
 }
 
 impl MusicBrainzSearchEntityType {
@@ -523,6 +543,7 @@ impl MusicBrainzSearchEntityType {
         match self {
             Self::Recording => "recording",
             Self::Release => "release",
+            Self::Artist => "artist",
         }
     }
 }

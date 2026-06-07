@@ -115,8 +115,22 @@ Coverage: **browser ✓, zone ✓** (both via `track_ended`); **MPD ✓** with t
    `GET/PUT /api/autoplay`, an "Autoplay" toggle in the queue drawer) that tops up a playing
    queue (browser + zones) with similar tracks when fewer than 5 remain, sliding the seed to the
    current track and excluding what's queued + recently played.
-4. **Next — variety filters**: per-artist cap (≤2–3 / never two in a row) and a skip-penalty
-   cooldown (`event_kind='skipped'`). Recency is done; these are the remaining quality wins.
+4. **[DONE] Per-artist cap** (≤2 per batch, round-robin so no artist dominates). **Next:** a
+   skip-penalty cooldown (`event_kind='skipped'`).
+
+### Fixes after testing on a real (MBID-less) library
+
+Testing against an 11k-track library surfaced that **its tags carry zero MusicBrainz IDs**, so
+the ListenBrainz path never triggered and radio fell to the local genre/artist fallback —
+"weird"/sparse picks (an artist's own tracks only). Fixed:
+
+- **Primary source is now LB `similar-artists`** (vastly better coverage than `similar-recordings`,
+  which is empty for most recordings — verified live) — and it uses its *own* algorithm enum.
+- **Seed artist MBID is resolved from the artist *name* via a cached MusicBrainz search** when
+  tags lack it, so radio works for MBID-less libraries (the common case). Verified: an "AIR"
+  seed now yields AIR + DJ Shadow + Amon Tobin + Daft Punk + Massive Attack.
+- **Explicit radio no longer applies the recency filter** (only autoplay does) — that was
+  shrinking a station, and collapsing sparse seeds to a single track, as plays accumulated.
 
 Deferred: personal LB collaborative-filter recs (`/1/cf/recommendation/...` — *experimental*,
 needs opt-in LB scrobbling, recommendations.md Slice 3); Last.fm provider (user key);

@@ -879,6 +879,7 @@ async fn autoplay_loop(
     listenbrainz: Arc<recommendations::ListenBrainzClient>,
     mut ready: tokio::sync::watch::Receiver<bool>,
 ) {
+    let musicbrainz = MusicBrainzClient::default();
     let _ = ready.wait_for(|&r| r).await;
     loop {
         tokio::time::sleep(AUTOPLAY_POLL).await;
@@ -888,7 +889,7 @@ async fn autoplay_loop(
         }
         if let Some(handle) = players.get(players::BROWSER_PLAYER_ID).await {
             if let Ok(state) = handle.state(&database).await {
-                if let Some(ids) = autoplay_candidates(&database, &listenbrainz, &state).await {
+                if let Some(ids) = autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await {
                     let _ = handle
                         .execute(
                             PlayerCommand::Enqueue { track_ids: ids },
@@ -902,7 +903,7 @@ async fn autoplay_loop(
         if let Ok(zones) = players.zones().await {
             for zone in zones {
                 if let Ok(state) = players.zone_state(&zone.id).await {
-                    if let Some(ids) = autoplay_candidates(&database, &listenbrainz, &state).await {
+                    if let Some(ids) = autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await {
                         let _ = players
                             .command_zone(&zone.id, PlayerCommand::Enqueue { track_ids: ids })
                             .await;
@@ -918,6 +919,7 @@ async fn autoplay_loop(
 async fn autoplay_candidates(
     database: &Database,
     listenbrainz: &Arc<recommendations::ListenBrainzClient>,
+    musicbrainz: &MusicBrainzClient,
     state: &musicata_core::PlaybackState,
 ) -> Option<Vec<String>> {
     use musicata_core::{PlaybackStatus, RepeatMode};
@@ -938,10 +940,12 @@ async fn autoplay_candidates(
     let ids = recommendations::similar_track_ids(
         database,
         listenbrainz,
+        musicbrainz,
         &seed,
         &exclude,
         AUTOPLAY_BATCH,
         now_unix_seconds(),
+        Some(recommendations::RECENCY_WINDOW_SECONDS), // autoplay: don't repeat recent plays
     )
     .await;
     (!ids.is_empty()).then_some(ids)
@@ -2578,10 +2582,12 @@ async fn track_radio(
     let similar = recommendations::similar_track_ids(
         &state.database,
         &state.listenbrainz,
+        &state.musicbrainz,
         &id,
         &std::collections::HashSet::new(),
         limit,
         now_unix_seconds(),
+        None, // explicit radio: don't shrink the station by recently-played tracks
     )
     .await;
     let mut track_ids = Vec::with_capacity(similar.len() + 1);
