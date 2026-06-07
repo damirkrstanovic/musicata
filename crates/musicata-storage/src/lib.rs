@@ -270,6 +270,13 @@ impl Database {
             set_user_version(&self.pool, 25).await?;
         }
 
+        if version < 26 {
+            for statement in MIGRATION_026_TRACK_LOUDNESS {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 26).await?;
+        }
+
         Ok(())
     }
 
@@ -1884,6 +1891,100 @@ impl Database {
         Ok(())
     }
 
+    /// Tracks with no EBU R128 loudness analysis yet — candidates for the loudness pass.
+    /// Reuses [`TrackFingerprintTarget`] (it carries exactly what's needed to read + decode
+    /// the file). Anti-joins `track_loudness`, so once analyzed a track is never re-queued.
+    pub async fn tracks_missing_loudness(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<TrackFingerprintTarget>> {
+        let rows = sqlx::query(
+            "SELECT t.id, t.title, t.artist_name, t.extension, t.provider_id,
+                    t.provider_item_id, t.path, t.duration_seconds
+             FROM tracks t
+             LEFT JOIN track_loudness l ON l.track_id = t.id
+             WHERE l.track_id IS NULL
+             ORDER BY t.artist_name, t.title
+             LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(TrackFingerprintTarget {
+                    track_id: row.try_get("id")?,
+                    title: row.try_get("title")?,
+                    artist_name: row.try_get("artist_name")?,
+                    extension: row.try_get("extension")?,
+                    provider_id: row.try_get("provider_id")?,
+                    provider_item_id: row.try_get("provider_item_id")?,
+                    path: row.try_get("path")?,
+                    duration_seconds: row.try_get("duration_seconds")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Store a track's measured loudness (integrated LUFS + true-peak dBTP). A NULL `lufs`
+    /// marks a track analyzed but un-measurable (e.g. silent / undecodable) so it isn't retried.
+    pub async fn upsert_track_loudness(
+        &self,
+        track_id: &str,
+        integrated_lufs: Option<f64>,
+        true_peak_dbtp: Option<f64>,
+        now_unix_seconds: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO track_loudness
+                (track_id, integrated_lufs, true_peak_dbtp, analyzed_at_unix_seconds)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(track_id) DO UPDATE SET
+                integrated_lufs = ?2, true_peak_dbtp = ?3, analyzed_at_unix_seconds = ?4",
+        )
+        .bind(track_id)
+        .bind(integrated_lufs)
+        .bind(true_peak_dbtp)
+        .bind(now_unix_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A track's measured (integrated LUFS, true-peak dBTP), if analyzed and measurable.
+    /// Feeds the per-track playback leveling gain.
+    pub async fn track_loudness(&self, track_id: &str) -> Result<Option<(f64, f64)>> {
+        let row = sqlx::query(
+            "SELECT integrated_lufs, true_peak_dbtp FROM track_loudness
+             WHERE track_id = ?1 AND integrated_lufs IS NOT NULL",
+        )
+        .bind(track_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => {
+                let lufs: f64 = row.try_get("integrated_lufs")?;
+                let peak: Option<f64> = row.try_get("true_peak_dbtp")?;
+                Ok(Some((lufs, peak.unwrap_or(0.0))))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Re-attach per-track loudness to queue items loaded from the persisted snapshot (the
+    /// queue tables don't store it). Keeps a restored queue's volume leveling working.
+    async fn fill_queue_loudness(&self, items: &mut [QueueItem]) -> Result<()> {
+        for item in items.iter_mut() {
+            if let Some(id) = item.track_id.clone() {
+                if let Some((lufs, peak)) = self.track_loudness(&id).await? {
+                    item.integrated_loudness_lufs = Some(lufs);
+                    item.true_peak_dbtp = Some(peak);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Drop `not_found` fingerprint markers so those tracks are re-fingerprinted on the
     /// next pass (instead of waiting out the retry window). Used once after a fix that
     /// changes the lookup (e.g. reporting the real track duration to AcoustID). Returns
@@ -2418,7 +2519,7 @@ impl Database {
         .bind(player_id)
         .fetch_all(&self.pool)
         .await?;
-        let items = item_rows
+        let mut items = item_rows
             .iter()
             .map(|row| {
                 Ok(QueueItem {
@@ -2428,9 +2529,11 @@ impl Database {
                     album: row.try_get("album")?,
                     stream_url: row.try_get("stream_url")?,
                     artwork_url: row.try_get("artwork_url")?,
+                    ..Default::default()
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        self.fill_queue_loudness(&mut items).await?;
         Ok(Some(PlayerQueueSnapshot { playback, items }))
     }
 
@@ -2556,7 +2659,7 @@ impl Database {
         .bind(zone_id)
         .fetch_all(&self.pool)
         .await?;
-        let items = item_rows
+        let mut items = item_rows
             .iter()
             .map(|row| {
                 Ok(QueueItem {
@@ -2566,9 +2669,11 @@ impl Database {
                     album: row.try_get("album")?,
                     stream_url: row.try_get("stream_url")?,
                     artwork_url: row.try_get("artwork_url")?,
+                    ..Default::default()
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        self.fill_queue_loudness(&mut items).await?;
         Ok(Some(PlayerQueueSnapshot { playback, items }))
     }
 
@@ -4255,6 +4360,16 @@ const MIGRATION_021_TRACK_FINGERPRINT: &[&str] = &["CREATE TABLE IF NOT EXISTS t
         fingerprinted_at_unix_seconds INTEGER NOT NULL
     )"];
 
+// Per-track EBU R128 loudness, in its own table (like track_fingerprint) so it survives a
+// rescan that rewrites the tracks table. `integrated_lufs` is the whole-track loudness;
+// `true_peak_dbtp` is the max oversampled peak — both feed the playback leveling gain.
+const MIGRATION_026_TRACK_LOUDNESS: &[&str] = &["CREATE TABLE IF NOT EXISTS track_loudness (
+        track_id TEXT PRIMARY KEY,
+        integrated_lufs REAL,
+        true_peak_dbtp REAL,
+        analyzed_at_unix_seconds INTEGER NOT NULL
+    )"];
+
 // MusicBrainz metadata fetched for a track via its (fingerprinted) recording MBID —
 // real title/artist/album/track-number, applied to the canonical library so an untagged
 // track stops showing folder-derived junk. Like track_fingerprint / acquired_album_artwork,
@@ -5650,6 +5765,7 @@ mod tests {
                 album: "Album".to_string(),
                 stream_url: "/api/tracks/track_1/stream".to_string(),
                 artwork_url: Some("/api/albums/a/cover".to_string()),
+                ..Default::default()
             },
             QueueItem {
                 track_id: None,
@@ -5658,6 +5774,7 @@ mod tests {
                 album: String::new(),
                 stream_url: "http://radio.example/stream".to_string(),
                 artwork_url: None,
+                ..Default::default()
             },
         ];
         let playback = super::PlayerPlayback {
@@ -5742,6 +5859,7 @@ mod tests {
                 album: "Album".to_string(),
                 stream_url: "/api/tracks/track_1/stream".to_string(),
                 artwork_url: Some("/api/albums/a/cover".to_string()),
+                ..Default::default()
             },
             QueueItem {
                 track_id: Some("track_2".to_string()),
@@ -5750,6 +5868,7 @@ mod tests {
                 album: "Album".to_string(),
                 stream_url: "/api/tracks/track_2/stream".to_string(),
                 artwork_url: None,
+                ..Default::default()
             },
         ];
         let playback = super::PlayerPlayback {
@@ -6219,6 +6338,54 @@ mod tests {
                 .len(),
             1
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn track_loudness_lifecycle() {
+        let db_path = temp_db_path("track-loudness");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = fixture_library();
+        database.save_library(&mut library).await.expect("save");
+
+        // A fresh track has no loudness yet — it's a candidate for analysis.
+        let missing = database.tracks_missing_loudness(10).await.expect("missing");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].track_id, "track_1");
+        assert!(database.track_loudness("track_1").await.expect("read").is_none());
+
+        // Record a measurement; it reads back and the track is no longer queued.
+        database
+            .upsert_track_loudness("track_1", Some(-16.5), Some(-1.2), 1_800_000_000)
+            .await
+            .expect("upsert");
+        assert_eq!(
+            database.track_loudness("track_1").await.expect("read"),
+            Some((-16.5, -1.2))
+        );
+        assert!(database.tracks_missing_loudness(10).await.expect("missing").is_empty());
+
+        // A NULL marker (un-measurable track) still suppresses re-analysis but reads as None.
+        database
+            .upsert_track_loudness("track_1", None, None, 1_900_000_000)
+            .await
+            .expect("upsert null");
+        assert!(database.track_loudness("track_1").await.expect("read").is_none());
+        assert!(database.tracks_missing_loudness(10).await.expect("missing").is_empty());
+
+        // A loaded queue gets its loudness re-attached from the table.
+        database
+            .upsert_track_loudness("track_1", Some(-12.0), Some(-0.5), 2_000_000_000)
+            .await
+            .expect("re-measure");
+        let mut items = vec![musicata_core::QueueItem {
+            track_id: Some("track_1".to_string()),
+            ..Default::default()
+        }];
+        database.fill_queue_loudness(&mut items).await.expect("fill");
+        assert_eq!(items[0].integrated_loudness_lufs, Some(-12.0));
+        assert_eq!(items[0].true_peak_dbtp, Some(-0.5));
 
         let _ = std::fs::remove_file(db_path);
     }

@@ -4,6 +4,11 @@
 import type { PlaybackState } from "../types/PlaybackState";
 import type { EqProfile } from "./dsp";
 
+// Volume-leveling target (LUFS) and the true-peak ceiling (dBTP) the combined gain must not
+// exceed. −14 LUFS is the streaming/Roon convention.
+const LEVELING_TARGET_LUFS = -14;
+const TRUE_PEAK_CEILING_DBTP = -1;
+
 export interface ProgressReport {
   type: "progress";
   elapsed_seconds: number;
@@ -33,6 +38,14 @@ export class BrowserAudio {
   private bufR?: Float32Array<ArrayBuffer>;
   private profile: EqProfile | null = null;
   private graphFailed = false;
+
+  // Volume leveling (EBU R128). `levelingGain` sits at the end of the chain; its gain is set
+  // per track from the now-playing item's LUFS, combined with the EQ preamp for clip safety.
+  private levelingGain?: GainNode;
+  private eqPreampDb = 0;
+  private levelingEnabled = false;
+  private trackLufs: number | null = null;
+  private trackTruePeak: number | null = null;
 
   constructor(el: HTMLAudioElement) {
     this.el = el;
@@ -112,6 +125,7 @@ export class BrowserAudio {
       this.analyserR.smoothingTimeConstant = 0;
       this.bufL = new Float32Array(new ArrayBuffer(this.analyserL.fftSize * 4));
       this.bufR = new Float32Array(new ArrayBuffer(this.analyserR.fftSize * 4));
+      this.levelingGain = ctx.createGain();
       this.rebuildChain();
     } catch {
       this.graphFailed = true; // already tapped, or Web Audio unavailable
@@ -128,27 +142,19 @@ export class BrowserAudio {
   /** (Re)build source -> preamp -> [bands] -> destination, with a post-EQ stereo tap to the
    *  analysers. Safe to call on a running context; used for both initial build and EQ edits. */
   private rebuildChain(): void {
-    const { ctx, srcNode: src, preamp, splitter, analyserL: aL, analyserR: aR } = this;
-    if (!ctx || !src || !preamp || !splitter || !aL || !aR) return;
-    try {
-      src.disconnect();
-    } catch {
-      // not connected yet
-    }
-    try {
-      preamp.disconnect();
-    } catch {
-      // ignore
-    }
-    for (const b of this.eqBands) {
+    const { ctx, srcNode: src, preamp, levelingGain: lvl, splitter, analyserL: aL, analyserR: aR } =
+      this;
+    if (!ctx || !src || !preamp || !lvl || !splitter || !aL || !aR) return;
+    for (const n of [src, preamp, lvl, ...this.eqBands]) {
       try {
-        b.disconnect();
+        n.disconnect();
       } catch {
-        // ignore
+        // not connected yet
       }
     }
     this.eqBands = [];
     const p = this.profile;
+    this.eqPreampDb = p ? p.preampDb : 0;
     preamp.gain.value = p ? 10 ** (p.preampDb / 20) : 1;
     src.connect(preamp);
     let prev: AudioNode = preamp;
@@ -164,10 +170,42 @@ export class BrowserAudio {
         this.eqBands.push(f);
       }
     }
-    prev.connect(ctx.destination);
-    prev.connect(splitter);
+    // Leveling is the last stage; the analyser tap is post-leveling so the VU shows output.
+    prev.connect(lvl);
+    lvl.connect(ctx.destination);
+    lvl.connect(splitter);
     splitter.connect(aL, 0);
     splitter.connect(aR, 1);
+    this.applyLeveling();
+  }
+
+  /** Enable/disable per-track volume leveling (the apply side; analysis is server-side). */
+  setLeveling(enabled: boolean): void {
+    this.levelingEnabled = enabled;
+    this.applyLeveling();
+  }
+
+  /** The now-playing track's measured loudness (LUFS) + true-peak (dBTP), or nulls if unknown. */
+  setTrackLoudness(lufs: number | null, truePeak: number | null): void {
+    this.trackLufs = lufs;
+    this.trackTruePeak = truePeak;
+    this.applyLeveling();
+  }
+
+  /** Compute the leveling gain (target − track LUFS), then attenuate it so the *combined* gain
+   *  with the EQ preamp keeps true-peak ≤ the ceiling — the two gains sum, so they must be
+   *  clip-checked together or they double-clip. */
+  private applyLeveling(): void {
+    if (!this.levelingGain) return;
+    let db = 0;
+    if (this.levelingEnabled && this.trackLufs != null && Number.isFinite(this.trackLufs)) {
+      db = LEVELING_TARGET_LUFS - this.trackLufs;
+      if (this.trackTruePeak != null) {
+        const maxLeveling = TRUE_PEAK_CEILING_DBTP - this.trackTruePeak - this.eqPreampDb;
+        if (db > maxLeveling) db = maxLeveling;
+      }
+    }
+    this.levelingGain.gain.value = 10 ** (db / 20);
   }
 
   onProgress(cb: (msg: ProgressReport) => void): void {

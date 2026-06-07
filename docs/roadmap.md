@@ -700,12 +700,14 @@ Tasks (browser-first; see `docs/dsp.md` for per-phase detail + the files touched
   `PatchConfig` over WebSocket), ALSA-loopback routing for MPD→DAC, the *same* profile
   compiled to CamillaDSP YAML; multichannel + crossovers. Cargo-feature-gated, "require
   installed," like the SMB source.
-- [ ] **Phase 6 — polish.** **Volume Leveling** (EBU R128, constant-gain, Track/Album/Auto) —
-  design in **`docs/loudness.md`**; analyze LUFS + true-peak at scan time (`ebur128`), apply a
-  per-track gain at playback, with the clip check on the gain *combined* with the EQ preamp.
-  The key dependency for smooth **continuous play** + even **multiroom** loudness. Plus a
-  Roon-style signal-path badge over the WebSocket; phone-app filter export (GraphicEQ.txt /
-  IR WAV for JamesDSP / Wavelet).
+- **Phase 6 — Volume Leveling (Track mode): DONE.** EBU R128 analysis at scan time
+  (`ebur128`, `track_loudness` table v26, `loudness_loop`), a per-track browser leveling gain
+  with the clip check combined with the EQ preamp; Off/Track toggle. Design + remaining work
+  (Album/Auto, tag bootstrap, server-side apply for Snapcast, an `/admin` analysis toggle) in
+  **`docs/loudness.md`**. The key dependency for smooth **continuous play** + even **multiroom**.
+- [ ] **Phase 6 (cont.) — polish.** A Roon-style signal-path badge over the WebSocket;
+  phone-app filter export (GraphicEQ.txt / IR WAV for JamesDSP / Wavelet); Volume Leveling
+  Album/Auto modes.
 
 Explicitly out of scope: a measurement suite (no sweep/RTA/mic capture), and any Dirac
 ingestion (its filters are locked to its own processor — non-exportable).

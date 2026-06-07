@@ -265,6 +265,7 @@ fn queue_item(pairs: &[(String, String)]) -> QueueItem {
         stream_url: uri,
         // Filled in from the library during enrichment; MPD has no artwork URL.
         artwork_url: None,
+        ..Default::default()
     }
 }
 

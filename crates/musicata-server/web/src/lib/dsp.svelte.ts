@@ -11,6 +11,7 @@ interface Persisted {
   enabled: boolean;
   activeId: string | null;
   custom: EqProfile[];
+  leveling?: boolean;
 }
 
 class Dsp {
@@ -19,6 +20,8 @@ class Dsp {
   /** User-imported presets (built-ins live in `dsp.ts`). */
   custom = $state<EqProfile[]>([]);
   panelOpen = $state(false);
+  /** Volume leveling (EBU R128 normalization across tracks). */
+  leveling = $state(false);
 
   constructor() {
     try {
@@ -28,6 +31,7 @@ class Dsp {
         this.enabled = !!p.enabled;
         this.activeId = p.activeId ?? null;
         this.custom = Array.isArray(p.custom) ? p.custom : [];
+        this.leveling = !!p.leveling;
       }
     } catch {
       // private mode / corrupt — start empty
@@ -46,6 +50,10 @@ class Dsp {
 
   setEnabled(v: boolean): void {
     this.enabled = v;
+    this.save();
+  }
+  setLeveling(v: boolean): void {
+    this.leveling = v;
     this.save();
   }
   setActive(id: string | null): void {
@@ -71,7 +79,12 @@ class Dsp {
 
   private save(): void {
     try {
-      const data: Persisted = { enabled: this.enabled, activeId: this.activeId, custom: this.custom };
+      const data: Persisted = {
+        enabled: this.enabled,
+        activeId: this.activeId,
+        custom: this.custom,
+        leveling: this.leveling,
+      };
       localStorage.setItem(LS_KEY, JSON.stringify(data));
     } catch {
       // private mode — fine

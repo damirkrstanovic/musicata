@@ -1751,6 +1751,7 @@ async fn apply_to_queue_state(
                 album: String::new(),
                 stream_url: url,
                 artwork_url: None,
+                ..Default::default()
             }];
             state.position = Some(0);
             state.status = PlaybackStatus::Playing;
@@ -1786,6 +1787,7 @@ async fn resolve_queue_items(database: &Database, track_ids: &[String]) -> Resul
     for id in track_ids {
         if let Some(track) = database.track(id).await? {
             let artwork_url = database.album_artwork_url(&track.album_id).await?;
+            let loudness = database.track_loudness(&track.id).await?;
             items.push(QueueItem {
                 track_id: Some(track.id),
                 title: track.title,
@@ -1793,6 +1795,8 @@ async fn resolve_queue_items(database: &Database, track_ids: &[String]) -> Resul
                 album: track.album_title,
                 stream_url: track.stream_url,
                 artwork_url,
+                integrated_loudness_lufs: loudness.map(|(lufs, _)| lufs),
+                true_peak_dbtp: loudness.map(|(_, peak)| peak),
             });
         }
     }

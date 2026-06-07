@@ -35,6 +35,8 @@ futures = { version = "0.3", optional = true }
 rusty-chromaprint = "0.3.0"
 base64 = "0.22.1"
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "alac", "isomp4", "ogg", "vorbis", "flac", "pcm", "wav"] }
+# EBU R128 loudness analysis (volume leveling). Pure-Rust port of libebur128, MIT-licensed.
+ebur128 = "0.1"
 # Cover-art thumbnail resizing (`?size=`). Minimal codec set — only the formats we
 # decode for covers — to keep the build lean. MIT/Apache-2.0 (AGPL-compatible).
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }

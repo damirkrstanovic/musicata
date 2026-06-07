@@ -3,6 +3,7 @@ mod artwork;
 mod backup;
 mod artwork_providers;
 mod fingerprint;
+mod loudness;
 mod mpd;
 mod musicbrainz;
 mod players;
@@ -248,6 +249,12 @@ async fn main() -> Result<()> {
                 database.clone(),
                 activity.clone(),
                 artwork_cache.clone(),
+                ready_rx.clone(),
+            ));
+            tokio::spawn(loudness_loop(
+                database.clone(),
+                providers.clone(),
+                activity.clone(),
                 ready_rx.clone(),
             ));
         }
@@ -827,6 +834,111 @@ async fn artwork_loop(
     }
 }
 
+/// **Loudness** — measures each track's EBU R128 integrated loudness + true-peak so the player
+/// can level volume across tracks. Drains its own queue (analyze-once, cached in
+/// `track_loudness`) at its own pace, independently of scanning/fingerprinting. CPU-bound
+/// (a full decode per track), so it idles when there's nothing new.
+async fn loudness_loop(
+    database: Database,
+    providers: Arc<RwLock<ProviderRegistry>>,
+    activity: Arc<activity::ActivityLog>,
+    mut ready: tokio::sync::watch::Receiver<bool>,
+) {
+    let _ = ready.wait_for(|&r| r).await;
+    loop {
+        let did = loudness_pass(&database, &providers, &activity).await;
+        if did == 0 {
+            tokio::time::sleep(BACKGROUND_IDLE_POLL).await;
+        }
+    }
+}
+
+/// Tracks analyzed per pass — a granularity knob; the loop drains the backlog back-to-back.
+const LOUDNESS_BATCH: i64 = 200;
+/// Concurrent decodes. Loudness analysis is pure-CPU (decode + R128), so a few across cores.
+const LOUDNESS_CONCURRENCY: usize = 4;
+
+/// Analyze a batch of un-measured tracks. Returns how many were given a durable verdict
+/// (measured, or marked un-measurable) so the loop knows whether to keep draining or idle.
+async fn loudness_pass(
+    database: &Database,
+    providers: &Arc<RwLock<ProviderRegistry>>,
+    activity: &Arc<activity::ActivityLog>,
+) -> usize {
+    if !setting_enabled(database, SETTING_LOUDNESS).await {
+        return 0;
+    }
+    let targets = match database.tracks_missing_loudness(LOUDNESS_BATCH).await {
+        Ok(targets) => targets,
+        Err(error) => {
+            tracing::warn!(%error, "loudness: failed to list tracks");
+            return 0;
+        }
+    };
+    if targets.is_empty() {
+        return 0;
+    }
+
+    let total = targets.len();
+    let task = activity.start("loudness", format!("Analyzing loudness (0/{total})"));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(LOUDNESS_CONCURRENCY));
+    let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let durable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut workers = tokio::task::JoinSet::new();
+
+    for target in targets {
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("loudness semaphore");
+        let database = database.clone();
+        let providers = providers.clone();
+        let activity = activity.clone();
+        let done = done.clone();
+        let durable = durable.clone();
+        workers.spawn(async move {
+            let _permit = permit;
+            // An unreadable file is skipped (not marked), so a transient failure is retried.
+            let Ok(audio) = read_track_source_file(&providers, &target).await else {
+                done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            };
+            let extension = target.extension.clone();
+            let result =
+                tokio::task::spawn_blocking(move || loudness::analyze_loudness(&audio, &extension))
+                    .await
+                    .unwrap_or_else(|_| Err("analysis task panicked".to_string()));
+            let now = now_unix_seconds();
+            match result {
+                Ok((lufs, true_peak)) => {
+                    let _ = database
+                        .upsert_track_loudness(&target.track_id, Some(lufs), Some(true_peak), now)
+                        .await;
+                }
+                Err(error) => {
+                    // Undecodable / un-measurable → mark analyzed (NULL) so it isn't retried.
+                    tracing::debug!(track = %target.track_id, %error, "loudness analysis failed");
+                    let _ = database
+                        .upsert_track_loudness(&target.track_id, None, None, now)
+                        .await;
+                }
+            }
+            durable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let count = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            activity.update(task, format!("Analyzing loudness ({count}/{total})"));
+        });
+    }
+    while workers.join_next().await.is_some() {}
+    let durable = durable.load(std::sync::atomic::Ordering::Relaxed);
+    if durable > 0 {
+        activity.finish(task, true, Some(format!("Analyzed loudness for {durable} tracks")));
+    } else {
+        activity.remove(task);
+    }
+    durable
+}
+
 /// Snapshot/static path (`--no-incremental-rescan`): a single ordered fill — scan, then
 /// fingerprint → MusicBrainz → grouping → artwork once each — then stop. Ordering matters
 /// here because there's no second pass to converge on; the live path gets convergence from
@@ -863,6 +975,9 @@ const SETTING_ARTWORK_FETCH: &str = "artwork_fetch";
 const SETTING_FANART_TV_KEY: &str = "fanart_tv_key";
 const SETTING_FINGERPRINT: &str = "fingerprint_enabled";
 const SETTING_MB_ENRICH: &str = "musicbrainz_enrich_enabled";
+/// Gates the scan-time EBU R128 loudness analysis pass (default on). The *apply* side (whether
+/// to actually level playback) is a client-side toggle in the browser player.
+const SETTING_LOUDNESS: &str = "loudness_analysis_enabled";
 
 /// Read a default-on boolean setting (toggling it in the UI takes effect next pass).
 async fn setting_enabled(database: &Database, key: &str) -> bool {

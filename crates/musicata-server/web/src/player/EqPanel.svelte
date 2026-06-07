@@ -62,6 +62,21 @@
     <label class="eq-toggle">
       <input
         type="checkbox"
+        checked={dsp.leveling}
+        onchange={(e) => dsp.setLeveling((e.currentTarget as HTMLInputElement).checked)}
+      />
+      <span>Volume leveling</span>
+    </label>
+    <p class="eq-note">
+      Normalizes loudness across tracks (EBU R128) so quiet and loud songs play at the same
+      level — great for shuffle and radio.
+    </p>
+
+    <div class="eq-divider"></div>
+
+    <label class="eq-toggle">
+      <input
+        type="checkbox"
         checked={dsp.enabled}
         onchange={(e) => dsp.setEnabled((e.currentTarget as HTMLInputElement).checked)}
       />

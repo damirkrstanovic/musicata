@@ -151,6 +151,14 @@ const eqTitleBefore = await js(`document.querySelector('#now-title')?.textConten
 await js(`[...document.querySelectorAll('.eq-btn')].find(b=>/equalizer/i.test(b.title))?.click()`);
 await sleep(400);
 check("eq panel opens", await js(`!!document.querySelector('.eq-drawer')`));
+// Volume leveling: a quiet track (-20 LUFS, -10 dBTP) is boosted toward the -14 target when
+// leveling is on (the leveling gain goes above 1.0). The toggle is the first .eq-toggle.
+await js(`window.__audio?.setTrackLoudness(-20, -10)`);
+await js(`[...document.querySelectorAll('.eq-toggle input')][0]?.click()`);
+await sleep(200);
+check("volume leveling boosts a quiet track", (await js(`window.__audio?.levelingGain?.gain?.value ?? 0`)) > 1.5);
+await js(`[...document.querySelectorAll('.eq-toggle input')][0]?.click()`);
+await js(`window.__audio?.setTrackLoudness(null, null)`);
 await js(`(()=>{const s=document.querySelector('.eq-field select'); if(s){s.value='demo-bass'; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
 await sleep(500);
 check("eq preset applies bands", (await js(`document.querySelectorAll('.eq-band').length`)) > 0);

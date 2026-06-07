@@ -118,14 +118,22 @@ on a playback hot path. Reuses Musicata's existing **symphonia** decode
 
 ## Build order
 
-1. **Storage + `loudness_loop` + ebur128** — measure & cache LUFS + true-peak (+ album
-   aggregate). Nothing audible yet; the data exists. (Migration v26, new worker.)
-2. **Browser Track-mode leveling** — the leveling GainNode with the **combined-gain clip
-   check**, the −14 setting, Off/Track. *This is the killer feature for continuous play* — ship
-   it as soon as data exists.
-3. **Album mode + Auto.**
+1. **[DONE] Storage + `loudness_loop` + ebur128** — `track_loudness` table (migration v26,
+   separate so it survives rescans), a `loudness.rs` full-track decode → `ebur128`
+   (integrated LUFS + true-peak dBTP), and a `loudness_loop` background worker draining
+   `tracks_missing_loudness` (gated by `loudness_analysis_enabled`, default on). LUFS/peak
+   ride to the browser on `QueueItem` (filled in `resolve_queue_items` + re-attached on queue
+   load via `fill_queue_loudness`).
+2. **[DONE] Browser Track-mode leveling** — a leveling `GainNode` at the end of the Web Audio
+   chain (`lib/audio.ts`), gain = `−14 − trackLUFS` with the **combined-gain clip check**
+   against the EQ preamp (`maxLeveling = −1 − truePeak − eqPreampDb`). Off/Track toggle in the
+   EQ panel (`dsp.leveling`, persisted). Verified by a ui-smoke check (a −20 LUFS track boosts
+   above unity) + storage/`ebur128` unit tests.
+3. **Album mode + Auto.** (Next — needs per-album LUFS aggregation + boundary detection.)
 4. **Tag bootstrap** (RG/R128 with reference correction) — fills in before scans complete.
 5. **Server-side apply in the Snapcast decode loop** — when that tier lands; identical math.
+6. **`/admin` toggle** for the analysis pass + a configurable target (currently default-on /
+   −14 fixed).
 
 ## Verification
 

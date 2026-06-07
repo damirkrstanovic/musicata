@@ -4,4 +4,9 @@
  * What a controller knows about a track queued on a player. `stream_url` is what
  * the player actually fetches; `track_id` links back to the library when known.
  */
-export type QueueItem = { track_id: string | null, title: string, artist: string, album: string, stream_url: string, artwork_url: string | null, };
+export type QueueItem = { track_id: string | null, title: string, artist: string, album: string, stream_url: string, artwork_url: string | null, 
+/**
+ * EBU R128 integrated loudness (LUFS) + true-peak (dBTP), when analyzed. The browser
+ * player uses these to apply per-track volume leveling (see web `lib/audio.ts`).
+ */
+integrated_loudness_lufs: number | null, true_peak_dbtp: number | null, };

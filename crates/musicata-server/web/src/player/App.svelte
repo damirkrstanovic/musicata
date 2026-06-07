@@ -76,6 +76,10 @@
       player.duration = next.duration_seconds ?? 0;
     }
     if (player.isBrowserOutput) audio?.drive(next);
+    if (trackChanged) {
+      const np = next.now_playing;
+      audio?.setTrackLoudness(np?.integrated_loudness_lufs ?? null, np?.true_peak_dbtp ?? null);
+    }
     if (trackChanged || statusChanged) setMediaMetadata(next.now_playing, next.status);
     setMediaPosition(player.elapsed, player.duration);
   }
@@ -89,11 +93,18 @@
     audio?.setEq(profile);
   });
 
+  // Volume leveling toggle → graph (read the reactive dep first; see the note above).
+  $effect(() => {
+    const leveling = dsp.leveling;
+    audio?.setLeveling(leveling);
+  });
+
   onMount(async () => {
     audio = new BrowserAudio(audioEl);
     setAudio(audio);
     (window as unknown as { __audio?: unknown }).__audio = audio; // debug hook
     audio.setEq(dsp.enabled ? dsp.active : null); // apply persisted profile on load
+    audio.setLeveling(dsp.leveling);
     audio.onProgress((msg) => ws?.send(msg));
     audio.onEnded(() => ws?.send({ type: "ended" }));
     audio.start();

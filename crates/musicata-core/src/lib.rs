@@ -586,7 +586,7 @@ pub struct Zone {
 
 /// What a controller knows about a track queued on a player. `stream_url` is what
 /// the player actually fetches; `track_id` links back to the library when known.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct QueueItem {
     pub track_id: Option<String>,
@@ -595,6 +595,10 @@ pub struct QueueItem {
     pub album: String,
     pub stream_url: String,
     pub artwork_url: Option<String>,
+    /// EBU R128 integrated loudness (LUFS) + true-peak (dBTP), when analyzed. The browser
+    /// player uses these to apply per-track volume leveling (see web `lib/audio.ts`).
+    pub integrated_loudness_lufs: Option<f64>,
+    pub true_peak_dbtp: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
