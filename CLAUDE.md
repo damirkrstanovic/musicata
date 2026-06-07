@@ -55,6 +55,16 @@ Other docs: `docs/plugins.md` (Roon research + provider plan), `docs/api.md` (na
   `web/dist/`. Hashed `/assets/*` bundles are served immutable; the HTML entries
   `no-cache`. `cargo build` therefore needs Node+npm (or `MUSICATA_SKIP_WEB_BUILD=1` with a
   prebuilt `web/dist/`). Edit components in `web/src/`; run `npm run check` (svelte-check).
+- **Don't couple fundamentally different operations.** Each long-running background job
+  (source discovery/scan, fingerprint identification, MusicBrainz enrichment, artwork
+  fetch) is its **own task draining its own DB-backed queue at its own pace** — they
+  coordinate *only* through the database, never by running in lockstep in one loop. A
+  slow step (e.g. an SMB rescan) must never stall an unrelated one (e.g. identification).
+  Each worker loops: do available work → if it did work, loop again (drain the backlog);
+  else sleep a short idle poll. Group jobs into one task only when they share an external
+  rate limit (e.g. the two MusicBrainz passes). See `*_loop` fns in `main.rs`. The
+  trade-off — eventual consistency instead of strict ordering between jobs — is the point;
+  keep it simple, don't re-entangle them for ordering.
 - AGPL-3.0; check a new dependency's license before adding it.
 
 ## Build / test / run

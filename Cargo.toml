@@ -6,6 +6,13 @@ members = [
 ]
 resolver = "2"
 
+# Release builds get cross-crate inlining + maximal vectorization. The fingerprint
+# path (symphonia decode + chromaprint FFT) is the main beneficiary.
+# target-cpu (SIMD width) is set in .cargo/config.toml.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.package]
 edition = "2024"
 license = "AGPL-3.0-or-later"

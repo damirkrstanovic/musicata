@@ -209,15 +209,48 @@ async fn main() -> Result<()> {
     // no watcher) — for a snapshot DB or the UI smoke suite running on the real library.
     // After each scan, missing covers are auto-filled if enabled in the app's settings.
     if !config.no_scan {
-        tokio::spawn(library_scan_loop(
-            database.clone(),
-            providers.clone(),
-            rescan_lock.clone(),
-            activity.clone(),
-            LIBRARY_RESCAN_INTERVAL,
-            !config.no_incremental_rescan,
-            artwork_cache.clone(),
-        ));
+        if config.no_incremental_rescan {
+            // Snapshot/static serve (smoke suite, frozen DB): one ordered fill, then stop.
+            tokio::spawn(initial_library_fill(
+                database.clone(),
+                providers.clone(),
+                rescan_lock.clone(),
+                activity.clone(),
+                artwork_cache.clone(),
+            ));
+        } else {
+            // Live: each long-running operation is its own task, coordinating *only* through
+            // the database. Discovery finds tracks; the fingerprint / MusicBrainz / artwork
+            // workers each drain their own DB-backed queue at their own pace. No pass blocks
+            // another — a slow SMB rescan no longer freezes identification. `ready` is just a
+            // one-shot startup gate so workers don't race the one-time id migrations.
+            let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(library_discovery_loop(
+                database.clone(),
+                providers.clone(),
+                rescan_lock.clone(),
+                activity.clone(),
+                LIBRARY_RESCAN_INTERVAL,
+                ready_tx,
+            ));
+            tokio::spawn(fingerprint_loop(
+                database.clone(),
+                providers.clone(),
+                activity.clone(),
+                ready_rx.clone(),
+            ));
+            tokio::spawn(musicbrainz_loop(
+                database.clone(),
+                activity.clone(),
+                ready_rx.clone(),
+            ));
+            tokio::spawn(artwork_loop(
+                database.clone(),
+                activity.clone(),
+                artwork_cache.clone(),
+                ready_rx.clone(),
+            ));
+        }
     }
 
     // Persist the activity log (debounced) so its history survives a restart.
@@ -279,6 +312,11 @@ async fn main() -> Result<()> {
 // so a pass is cheap; but the directory walk still costs round-trips on a network
 // share, so we don't run it as tightly as a local-only scan would allow.
 const LIBRARY_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a background worker (fingerprint/MusicBrainz/artwork) sleeps after finding its
+/// queue empty before polling again. Short, because polling is a single cheap indexed query;
+/// while there *is* work the worker loops back-to-back without sleeping.
+const BACKGROUND_IDLE_POLL: Duration = Duration::from_secs(20);
 
 /// Listening history is kept for this long; older listens are pruned.
 const LISTEN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -654,14 +692,11 @@ fn spawn_library_scan(state: &AppState, label: &str) {
     });
 }
 
-/// Background library task: scan once right away (so a fresh database is populated
-/// and an existing one refreshed), then re-scan on the interval unless incremental
-/// rescanning is disabled. Never blocks serving.
 /// A scan rewrites albums/artists to folder-derived rows, clearing their acquired
 /// `artwork_url` and resetting grouping to folder-derived. Republish acquired album/artist
 /// covers and re-apply enrichment + user merges *immediately* after the scan — otherwise
-/// they're only restored at the end of the cycle, after the slow fingerprint/MusicBrainz
-/// passes, so for minutes each cycle artists/albums would show no artwork.
+/// they're only restored once the separate artwork/MusicBrainz workers next drain their
+/// queues, so for minutes after each rescan artists/albums would show no artwork.
 async fn restore_after_scan(database: &Database) {
     if let Err(error) = database.reapply_canonical_grouping().await {
         tracing::warn!(%error, "reapply canonical grouping failed");
@@ -674,21 +709,31 @@ async fn restore_after_scan(database: &Database) {
     }
 }
 
-async fn library_scan_loop(
+/// One-time startup migrations: re-derive ids if the identity scheme changed (moving
+/// favorites/artwork onto the new ids) and fix up the fingerprint-lookup table. Both are
+/// guarded (run at most once ever) and must complete before any worker touches tracks, so
+/// a worker never writes rows keyed on ids the migration is about to rename.
+async fn run_startup_migrations(database: &Database) {
+    migrate_identity(database).await;
+    migrate_fingerprint_lookup(database).await;
+}
+
+/// **Discovery** — the only task that scans sources. Scans once right away (populating a
+/// fresh DB / refreshing an existing one), then re-scans on the interval. Owns the one-time
+/// migrations and signals `ready` once they're done so the workers can start. Pure
+/// discovery: it resolves no metadata and fetches no artwork — those are separate tasks. It
+/// does republish already-acquired artwork + re-group right after each scan so covers don't
+/// vanish for minutes while the workers catch up.
+async fn library_discovery_loop(
     database: Database,
     providers: Arc<RwLock<ProviderRegistry>>,
     rescan_lock: Arc<Mutex<()>>,
     activity: Arc<activity::ActivityLog>,
     interval: Duration,
-    incremental: bool,
-    artwork_cache: Arc<artwork::ArtworkCache>,
+    ready: tokio::sync::watch::Sender<bool>,
 ) {
-    // Re-derive ids if the identity scheme changed (normalization rollout), moving
-    // favorites/artwork onto the new ids. Runs here (in the background loop, before the
-    // first scan saves) so it never delays the server binding; it's a one-time pass
-    // (guarded by identity_version) and serializes ahead of the scan below.
-    migrate_identity(&database).await;
-    migrate_fingerprint_lookup(&database).await;
+    run_startup_migrations(&database).await;
+    let _ = ready.send(true); // migrations done — workers may start.
     scan_and_persist(
         &database,
         &providers,
@@ -699,22 +744,6 @@ async fn library_scan_loop(
     )
     .await;
     restore_after_scan(&database).await;
-    // Fingerprint untagged tracks first (resolves MBIDs), then enrich their metadata
-    // from MusicBrainz, then fill covers (which can now reach the id-exact providers).
-    fingerprint_pass(&database, &providers, &activity).await;
-    musicbrainz_search_pass(&database, &activity).await;
-    musicbrainz_enrich_pass(&database, &activity).await;
-    // Re-apply resolved enrichment AND user artist-merges over the folder-derived grouping
-    // the scan just reset — unconditionally (so merges apply even with enrichment off),
-    // before artwork fetching so covers key on the final grouping.
-    if let Err(error) = database.reapply_canonical_grouping().await {
-        tracing::warn!(%error, "reapply canonical grouping failed");
-    }
-    artwork_fill_pass(&database, &activity, &artwork_cache).await;
-    artist_artwork_fill_pass(&database, &activity, &artwork_cache).await;
-    if !incremental {
-        return;
-    }
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await; // Consume the immediate tick; we just scanned.
     loop {
@@ -729,15 +758,104 @@ async fn library_scan_loop(
         )
         .await;
         restore_after_scan(&database).await;
-        fingerprint_pass(&database, &providers, &activity).await;
-        musicbrainz_search_pass(&database, &activity).await;
-        musicbrainz_enrich_pass(&database, &activity).await;
+    }
+}
+
+/// **Identification** — drains the unfingerprinted-track queue independently of scanning.
+/// Each `fingerprint_pass` does a batch; while batches keep finding work we loop straight
+/// back (draining the whole backlog as fast as the AcoustID limiter allows), and only idle
+/// when the queue is empty. New tracks from a later scan are picked up on the next poll.
+async fn fingerprint_loop(
+    database: Database,
+    providers: Arc<RwLock<ProviderRegistry>>,
+    activity: Arc<activity::ActivityLog>,
+    mut ready: tokio::sync::watch::Receiver<bool>,
+) {
+    let _ = ready.wait_for(|&r| r).await;
+    loop {
+        let durable = fingerprint_pass(&database, &providers, &activity).await;
+        if durable == 0 {
+            // Empty queue, or every track failed transiently (AcoustID down) — back off.
+            tokio::time::sleep(BACKGROUND_IDLE_POLL).await;
+        }
+    }
+}
+
+/// **MusicBrainz** — text-search fallback + metadata enrichment. Both share MusicBrainz's
+/// 1 req/s limit, so they live in one task (separate tasks would contend on that limit).
+/// Drains search+enrich, then re-applies resolved enrichment over the folder-derived
+/// grouping a rescan resets, then idles.
+async fn musicbrainz_loop(
+    database: Database,
+    activity: Arc<activity::ActivityLog>,
+    mut ready: tokio::sync::watch::Receiver<bool>,
+) {
+    let _ = ready.wait_for(|&r| r).await;
+    loop {
+        let mut did = false;
+        did |= musicbrainz_search_pass(&database, &activity).await;
+        did |= musicbrainz_enrich_pass(&database, &activity).await;
+        if did {
+            continue; // more queue to drain before re-grouping / idling.
+        }
+        // Queue drained: re-apply resolved enrichment AND user artist-merges over the
+        // grouping a rescan reset (unconditional, so merges apply even with enrichment off).
         if let Err(error) = database.reapply_canonical_grouping().await {
             tracing::warn!(%error, "reapply canonical grouping failed");
         }
-        artwork_fill_pass(&database, &activity, &artwork_cache).await;
-        artist_artwork_fill_pass(&database, &activity, &artwork_cache).await;
+        tokio::time::sleep(BACKGROUND_IDLE_POLL).await;
     }
+}
+
+/// **Artwork** — fills missing album + artist covers, independently of everything else.
+/// Each pass first restores already-acquired covers (a rescan rewrites those tables), then
+/// fetches for the still-missing ones. Drains, then idles.
+async fn artwork_loop(
+    database: Database,
+    activity: Arc<activity::ActivityLog>,
+    artwork_cache: Arc<artwork::ArtworkCache>,
+    mut ready: tokio::sync::watch::Receiver<bool>,
+) {
+    let _ = ready.wait_for(|&r| r).await;
+    loop {
+        let mut did = false;
+        did |= artwork_fill_pass(&database, &activity, &artwork_cache).await;
+        did |= artist_artwork_fill_pass(&database, &activity, &artwork_cache).await;
+        if !did {
+            tokio::time::sleep(BACKGROUND_IDLE_POLL).await;
+        }
+    }
+}
+
+/// Snapshot/static path (`--no-incremental-rescan`): a single ordered fill — scan, then
+/// fingerprint → MusicBrainz → grouping → artwork once each — then stop. Ordering matters
+/// here because there's no second pass to converge on; the live path gets convergence from
+/// its independent loops instead.
+async fn initial_library_fill(
+    database: Database,
+    providers: Arc<RwLock<ProviderRegistry>>,
+    rescan_lock: Arc<Mutex<()>>,
+    activity: Arc<activity::ActivityLog>,
+    artwork_cache: Arc<artwork::ArtworkCache>,
+) {
+    run_startup_migrations(&database).await;
+    scan_and_persist(
+        &database,
+        &providers,
+        &rescan_lock,
+        &activity,
+        "Initial library scan",
+        true,
+    )
+    .await;
+    fingerprint_pass(&database, &providers, &activity).await;
+    musicbrainz_search_pass(&database, &activity).await;
+    musicbrainz_enrich_pass(&database, &activity).await;
+    if let Err(error) = database.reapply_canonical_grouping().await {
+        tracing::warn!(%error, "reapply canonical grouping failed");
+    }
+    artwork_fill_pass(&database, &activity, &artwork_cache).await;
+    artist_artwork_fill_pass(&database, &activity, &artwork_cache).await;
 }
 
 /// Setting keys edited in the web UI (see `crate::Database::get_setting`).
@@ -867,11 +985,12 @@ const ARTWORK_FILL_BATCH: usize = 100;
 /// `artwork_url`), then fetch for the still-coverless albums (rate-limited by the
 /// providers, capped per pass, with a negative cache so misses aren't re-queried every
 /// rescan). Reports progress on the same activity feed as the scan.
+/// Returns whether it had albums to fetch for, so the caller can drain vs idle.
 async fn artwork_fill_pass(
     database: &Database,
     activity: &Arc<activity::ActivityLog>,
     artwork_cache: &Arc<artwork::ArtworkCache>,
-) {
+) -> bool {
     // Always restore already-acquired covers' artwork_url after the rescan's album
     // rewrite (DB-only) — even if *fetching* is off, existing covers should still show.
     if let Err(error) = database.reapply_acquired_artwork().await {
@@ -880,7 +999,7 @@ async fn artwork_fill_pass(
 
     // Fetching new covers is a user setting (web UI), not a flag — read it live.
     if !artwork_fetch_enabled(database).await {
-        return;
+        return false;
     }
     let fanart_tv_key = database
         .get_setting(SETTING_FANART_TV_KEY)
@@ -892,7 +1011,7 @@ async fn artwork_fill_pass(
         fanart_tv_key,
     ));
     if registry.is_empty() {
-        return;
+        return false;
     }
 
     let retry_before = now_unix_seconds() - ARTWORK_RETRY_SECS;
@@ -900,11 +1019,11 @@ async fn artwork_fill_pass(
         Ok(targets) => targets,
         Err(error) => {
             tracing::warn!(%error, "artwork: failed to list albums missing artwork");
-            return;
+            return false;
         }
     };
     if targets.is_empty() {
-        return;
+        return false;
     }
 
     let batch: Vec<_> = targets.into_iter().take(ARTWORK_FILL_BATCH).collect();
@@ -998,6 +1117,7 @@ async fn artwork_fill_pass(
         // Nothing found this pass — don't leave a noisy entry in the activity log.
         activity.remove(task);
     }
+    true
 }
 
 /// After a scan, fetch missing **artist** images. Name-based (the library carries no
@@ -1005,16 +1125,17 @@ async fn artwork_fill_pass(
 /// re-apply already-acquired images first (the rescan wiped the artists table), then —
 /// if fetching is enabled — fetch for the still-imageless artists, rate-limited and
 /// batched, with a `not_found` negative cache.
+/// Returns whether it had artists to fetch for, so the caller can drain vs idle.
 async fn artist_artwork_fill_pass(
     database: &Database,
     activity: &Arc<activity::ActivityLog>,
     artwork_cache: &Arc<artwork::ArtworkCache>,
-) {
+) -> bool {
     if let Err(error) = database.reapply_acquired_artist_artwork().await {
         tracing::warn!(%error, "artist artwork: failed to re-apply acquired images");
     }
     if !artwork_fetch_enabled(database).await {
-        return;
+        return false;
     }
     let registry = Arc::new(artwork_providers::ArtworkProviderRegistry::new(vec![
         Box::new(artwork_providers::DeezerProvider::new()),
@@ -1025,11 +1146,11 @@ async fn artist_artwork_fill_pass(
         Ok(targets) => targets,
         Err(error) => {
             tracing::warn!(%error, "artist artwork: failed to list artists missing images");
-            return;
+            return false;
         }
     };
     if targets.is_empty() {
-        return;
+        return false;
     }
 
     let batch: Vec<_> = targets.into_iter().take(ARTWORK_FILL_BATCH).collect();
@@ -1104,15 +1225,15 @@ async fn artist_artwork_fill_pass(
     } else {
         activity.remove(task);
     }
+    true
 }
 
-/// Retry window for a track AcoustID couldn't identify, so the rescan doesn't
-/// re-fingerprint it every pass.
+/// Retry window for a track AcoustID couldn't identify, so we don't re-fingerprint it
+/// every pass.
 const FINGERPRINT_RETRY_SECS: i64 = 7 * 24 * 60 * 60;
-/// Tracks fingerprinted per pass. The AcoustID lookup is rate-limited (~3/s), so a pass of
-/// N takes ~N/3 s regardless; a big batch keeps the pass running back-to-back (the rescan
-/// tick is consumed while it works) so a large library is identified in ~1 hour rather than
-/// dribbling out 100 at a time.
+/// Tracks fingerprinted per pass. Just a query/activity granularity now — `fingerprint_loop`
+/// calls the pass back-to-back until the queue is empty, so the whole backlog drains in one
+/// continuous run (bounded only by the ~3/s AcoustID limiter), not one batch per scan.
 const FINGERPRINT_BATCH: i64 = 400;
 /// How many tracks decode concurrently. Decoding is CPU-bound; this keeps it off the
 /// AcoustID-lookup critical path (lookups still serialize through the shared rate limiter).
@@ -1133,17 +1254,21 @@ fn acoustid_lookup_duration(real_seconds: Option<f64>, window_seconds: u32) -> u
 /// and store the resolved MusicBrainz ids, so `album_musicbrainz_ids` can feed the
 /// id-exact artwork providers. Gated by a Settings toggle; no-ops without an AcoustID
 /// key. Mirrors `artwork_fill_pass` (rate-limited, capped, negative cache, activity).
+///
+/// Returns how many tracks got a *durable* verdict this pass (resolved or genuine
+/// not-found). Transient failures don't count — so when AcoustID is unreachable the caller
+/// sees 0 and backs off instead of hot-looping over the same tracks.
 async fn fingerprint_pass(
     database: &Database,
     providers: &Arc<RwLock<ProviderRegistry>>,
     activity: &Arc<activity::ActivityLog>,
-) {
+) -> usize {
     if !setting_enabled(database, SETTING_FINGERPRINT).await {
-        return;
+        return 0;
     }
     // Until the project compiles in its AcoustID application key, the feature no-ops.
     if fingerprint::ACOUSTID_CLIENT_KEY.is_empty() {
-        return;
+        return 0;
     }
 
     let retry_before = now_unix_seconds() - FINGERPRINT_RETRY_SECS;
@@ -1154,11 +1279,11 @@ async fn fingerprint_pass(
         Ok(targets) => targets,
         Err(error) => {
             tracing::warn!(%error, "fingerprint: failed to list untagged tracks");
-            return;
+            return 0;
         }
     };
     if targets.is_empty() {
-        return;
+        return 0;
     }
 
     let client = Arc::new(fingerprint::AcoustIdClient::new(
@@ -1168,11 +1293,15 @@ async fn fingerprint_pass(
     let task = activity.start("fingerprint", format!("Identifying tracks (0/{total})"));
 
     // Process the batch with bounded concurrency: decoding is CPU-heavy, so let several
-    // tracks decode across cores at once. The AcoustID lookups still serialize through the
-    // client's shared rate limiter (~3/s), so this just keeps decode off the critical path
-    // instead of stacking it on top of the rate limit.
+    // tracks decode across cores at once, and the AcoustID lookups overlap their round-trips
+    // up to the client's shared ~3/s start-rate limiter — so the batch runs at the budget,
+    // not at 1/(interval + latency).
     let semaphore = Arc::new(tokio::sync::Semaphore::new(FINGERPRINT_CONCURRENCY));
     let resolved = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Tracks given a durable verdict (resolved or genuine not-found). Transient failures
+    // (network/HTTP/rate-limit, or an unreadable file) are NOT counted and NOT cached, so
+    // the loop retries them next pass instead of suppressing them for a week.
+    let durable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut workers = tokio::task::JoinSet::new();
 
@@ -1187,6 +1316,7 @@ async fn fingerprint_pass(
         let client = client.clone();
         let activity = activity.clone();
         let resolved = resolved.clone();
+        let durable = durable.clone();
         let done = done.clone();
         workers.spawn(async move {
             let _permit = permit;
@@ -1200,20 +1330,29 @@ async fn fingerprint_pass(
             let real_duration = target.duration_seconds;
             let lookup_client = client.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                let (fingerprint, window_duration) =
-                    fingerprint::compute_fingerprint(&audio, &extension).ok()?;
-                lookup_client
+                let Ok((fingerprint, window_duration)) =
+                    fingerprint::compute_fingerprint(&audio, &extension)
+                else {
+                    // Undecodable file → won't change on retry; negative-cache it.
+                    return FingerprintOutcome::NoMatch;
+                };
+                match lookup_client
                     .lookup(&fingerprint, acoustid_lookup_duration(real_duration, window_duration))
-                    .ok()
-                    .flatten()
+                {
+                    Ok(Some(found)) => FingerprintOutcome::Resolved(found),
+                    Ok(None) => FingerprintOutcome::NoMatch,
+                    Err(error) => {
+                        tracing::debug!(%error, "acoustid lookup failed (transient, will retry)");
+                        FingerprintOutcome::Transient
+                    }
+                }
             })
             .await
-            .ok()
-            .flatten();
+            .unwrap_or(FingerprintOutcome::Transient); // task panic → retry, don't cache.
 
             let now = now_unix_seconds();
             match outcome {
-                Some(found) => {
+                FingerprintOutcome::Resolved(found) => {
                     let _ = database
                         .upsert_track_fingerprint(
                             &target.track_id,
@@ -1225,12 +1364,16 @@ async fn fingerprint_pass(
                         )
                         .await;
                     resolved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    durable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                None => {
+                FingerprintOutcome::NoMatch => {
                     let _ = database
                         .upsert_track_fingerprint(&target.track_id, "not_found", None, None, None, now)
                         .await;
+                    durable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Transient: leave it untouched so the next pass tries again.
+                FingerprintOutcome::Transient => {}
             }
             let count = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             activity.update(task, format!("Identifying tracks ({count}/{total})"));
@@ -1238,6 +1381,7 @@ async fn fingerprint_pass(
     }
     while workers.join_next().await.is_some() {}
     let resolved = resolved.load(std::sync::atomic::Ordering::Relaxed);
+    let durable = durable.load(std::sync::atomic::Ordering::Relaxed);
 
     if resolved > 0 {
         activity.finish(
@@ -1248,6 +1392,18 @@ async fn fingerprint_pass(
     } else {
         activity.remove(task);
     }
+    durable
+}
+
+/// How `fingerprint_pass` classified one track — kept distinct so transient failures aren't
+/// negative-cached like a genuine no-match.
+enum FingerprintOutcome {
+    /// AcoustID matched: store the resolved MusicBrainz ids.
+    Resolved(fingerprint::AcoustIdMatch),
+    /// Looked up cleanly with nothing back, or the file won't decode — safe to negative-cache.
+    NoMatch,
+    /// Network/HTTP/rate-limit error or a worker panic — retry next pass, don't cache.
+    Transient,
 }
 
 /// Read a track's audio bytes from its provider — SMB over the wire, else local disk.
@@ -1292,19 +1448,23 @@ const MB_SEARCH_MIN_SCORE: u64 = 92;
 /// match the track is marked `resolved` (so enrichment + id-exact artwork pick it up);
 /// otherwise `search_not_found` (terminal, so it isn't re-searched). Gated by the same
 /// MusicBrainz toggle; runs after fingerprinting, before enrichment.
-async fn musicbrainz_search_pass(database: &Database, activity: &Arc<activity::ActivityLog>) {
+/// Returns whether it had targets, so the caller can keep draining vs idle.
+async fn musicbrainz_search_pass(
+    database: &Database,
+    activity: &Arc<activity::ActivityLog>,
+) -> bool {
     if !setting_enabled(database, SETTING_MB_ENRICH).await {
-        return;
+        return false;
     }
     let targets = match database.tracks_for_musicbrainz_search(MB_SEARCH_BATCH).await {
         Ok(targets) => targets,
         Err(error) => {
             tracing::warn!(%error, "musicbrainz search: failed to list targets");
-            return;
+            return false;
         }
     };
     if targets.is_empty() {
-        return;
+        return false;
     }
     let client = Arc::new(MusicBrainzClient::default());
     let total = targets.len();
@@ -1374,6 +1534,7 @@ async fn musicbrainz_search_pass(database: &Database, activity: &Arc<activity::A
     } else {
         activity.remove(task);
     }
+    true
 }
 
 /// Accept a text-search match only when it's high-scoring AND its artist + title loosely
@@ -1400,11 +1561,15 @@ fn loose_text_match(left: &str, right: &str) -> bool {
 /// and apply it to the canonical library (so an untagged track stops showing folder-derived
 /// junk). DB-only; never overwrites embedded tags (enforced in `reapply_canonical_grouping`).
 /// Gated by a Settings toggle. Mirrors `fingerprint_pass` (capped, paced, negative cache,
-/// activity). Always re-applies resolved enrichment so a fresh scan's folder grouping is
-/// corrected even when no new track is fetched.
-async fn musicbrainz_enrich_pass(database: &Database, activity: &Arc<activity::ActivityLog>) {
+/// activity). Returns whether it had targets; when it has none, `musicbrainz_loop` does the
+/// `reapply_canonical_grouping` that re-applies resolved enrichment over a rescan's reset
+/// grouping, so that correction still happens with no new track to fetch.
+async fn musicbrainz_enrich_pass(
+    database: &Database,
+    activity: &Arc<activity::ActivityLog>,
+) -> bool {
     if !setting_enabled(database, SETTING_MB_ENRICH).await {
-        return;
+        return false;
     }
 
     let retry_before = now_unix_seconds() - MB_ENRICH_RETRY_SECS;
@@ -1415,13 +1580,11 @@ async fn musicbrainz_enrich_pass(database: &Database, activity: &Arc<activity::A
         Ok(targets) => targets,
         Err(error) => {
             tracing::warn!(%error, "musicbrainz enrich: failed to list targets");
-            return;
+            return false;
         }
     };
     if targets.is_empty() {
-        // No new work; the unconditional reapply in the scan loop re-applies resolved
-        // enrichment (and aliases) after the rescan reset grouping to folder-derived.
-        return;
+        return false;
     }
 
     let client = Arc::new(MusicBrainzClient::default());
@@ -1492,6 +1655,7 @@ async fn musicbrainz_enrich_pass(database: &Database, activity: &Arc<activity::A
     } else {
         activity.remove(task);
     }
+    true
 }
 
 fn app(
