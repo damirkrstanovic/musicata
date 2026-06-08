@@ -151,7 +151,14 @@
     player.playback = null;
     player.elapsed = 0;
     player.duration = 0;
-    ws = connectPlayer(kind, id, { onState: applyState, onProgress: applyTick });
+    ws = connectPlayer(kind, id, {
+      onState: applyState,
+      onProgress: applyTick,
+      onDisconnect: () => {
+        // Server went away — don't let buffered audio keep playing on this tab.
+        if (player.isBrowserOutput) audio?.pause();
+      },
+    });
   }
 
   function onTargetChange(value: string) {

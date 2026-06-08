@@ -18,7 +18,11 @@ export interface PlayerSocket {
 export function connectPlayer(
   kind: "player" | "zone",
   id: string,
-  handlers: { onState: (s: PlaybackState) => void; onProgress: (t: ProgressTick) => void },
+  handlers: {
+    onState: (s: PlaybackState) => void;
+    onProgress: (t: ProgressTick) => void;
+    onDisconnect?: () => void;
+  },
 ): PlayerSocket {
   let socket: WebSocket | null = null;
   let closed = false;
@@ -39,7 +43,12 @@ export function connectPlayer(
       else handlers.onState(msg as unknown as PlaybackState);
     };
     socket.onclose = () => {
-      if (!closed) timer = setTimeout(connect, 2000);
+      // Unexpected close = the server went away. Tell the app so it can stop local output
+      // (a deliberate teardown/target-switch sets `closed` first and skips this).
+      if (!closed) {
+        handlers.onDisconnect?.();
+        timer = setTimeout(connect, 2000);
+      }
     };
     socket.onerror = () => {
       try {

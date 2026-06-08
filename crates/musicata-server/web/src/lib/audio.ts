@@ -228,6 +228,12 @@ export class BrowserAudio {
     if (this.timer) clearInterval(this.timer);
   }
 
+  /** Pause output immediately. Used when the server connection drops so already-buffered audio
+   *  doesn't keep playing on after the server is gone. */
+  pause(): void {
+    this.el.pause();
+  }
+
   setVolume(volume: number): void {
     this.el.volume = Math.min(1, Math.max(0, volume / 100));
   }

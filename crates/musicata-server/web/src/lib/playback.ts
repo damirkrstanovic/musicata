@@ -49,7 +49,16 @@ export async function startRadio(seedTrackId: string): Promise<void> {
   // Claim output inside the gesture before the await, so autoplay policy lets it play.
   if (player.isBrowserOutput) audio?.claim();
   const res = await api.trackRadio(seedTrackId, 25);
-  if (res?.track_ids?.length) await playTrackIds(res.track_ids);
+  const ids = res?.track_ids ?? [];
+  if (!ids.length) return;
+  // If the seed is the track already playing, keep it going and just queue the station after
+  // it — no restart, no interruption. (The radio list includes the seed at index 0.)
+  if (player.nowPlaying?.track_id === seedTrackId && player.status !== "stopped") {
+    const rest = ids.filter((id) => id !== seedTrackId);
+    if (rest.length) await sendCommand(player.target, { command: "enqueue", track_ids: rest });
+    return;
+  }
+  await playTrackIds(ids);
 }
 
 /** Play an internet-radio stream on the active target. Call from a click handler. */

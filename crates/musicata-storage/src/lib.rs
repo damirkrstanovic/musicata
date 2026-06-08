@@ -2068,12 +2068,25 @@ impl Database {
             .map(|i| format!("(?{i})"))
             .collect::<Vec<_>>()
             .join(",");
+        // A local track's recording MBID can live in any of three places: file tags
+        // (observations), AcoustID fingerprinting, or MusicBrainz enrichment. Match against all
+        // three so LB results resolve even for libraries whose tags carry no MBIDs.
         let query = format!(
-            "WITH seeds(mbid) AS (VALUES {values})
+            "WITH seeds(mbid) AS (VALUES {values}),
+                  recording_ids(track_id, mbid) AS (
+                      SELECT track_id, musicbrainz_recording_id FROM track_metadata_observations
+                        WHERE musicbrainz_recording_id IS NOT NULL
+                      UNION
+                      SELECT track_id, musicbrainz_recording_id FROM track_fingerprint
+                        WHERE musicbrainz_recording_id IS NOT NULL
+                      UNION
+                      SELECT track_id, musicbrainz_recording_id FROM track_musicbrainz_metadata
+                        WHERE musicbrainz_recording_id IS NOT NULL
+                  )
              SELECT s.mbid AS mbid,
-                    (SELECT t.id FROM tracks t
-                     JOIN track_metadata_observations o ON o.track_id = t.id
-                     WHERE o.musicbrainz_recording_id = s.mbid LIMIT 1) AS track_id
+                    (SELECT r.track_id FROM recording_ids r
+                     JOIN tracks t ON t.id = r.track_id
+                     WHERE r.mbid = s.mbid LIMIT 1) AS track_id
              FROM seeds s",
         );
         let mut q = sqlx::query(&query);
@@ -2087,12 +2100,18 @@ impl Database {
             .collect())
     }
 
-    /// A track's MusicBrainz artist id (from tags). Seeds ListenBrainz similar-artists, which
-    /// has far better coverage than similar-recordings.
+    /// A track's MusicBrainz artist id. Seeds ListenBrainz similar-artists, which has far better
+    /// coverage than similar-recordings. Prefers file tags, falling back to MusicBrainz
+    /// enrichment (`track_musicbrainz_metadata`) — the common case for libraries whose tags carry
+    /// no MBIDs but which fingerprinting/enrichment has since identified.
     pub async fn track_artist_mbid(&self, track_id: &str) -> Result<Option<String>> {
         let row = sqlx::query(
-            "SELECT o.musicbrainz_artist_id AS mbid FROM track_metadata_observations o
-             WHERE o.track_id = ?1 AND o.musicbrainz_artist_id IS NOT NULL LIMIT 1",
+            "SELECT COALESCE(
+                (SELECT o.musicbrainz_artist_id FROM track_metadata_observations o
+                   WHERE o.track_id = ?1 AND o.musicbrainz_artist_id IS NOT NULL LIMIT 1),
+                (SELECT m.musicbrainz_artist_id FROM track_musicbrainz_metadata m
+                   WHERE m.track_id = ?1 AND m.musicbrainz_artist_id IS NOT NULL LIMIT 1)
+             ) AS mbid",
         )
         .bind(track_id)
         .fetch_optional(&self.pool)

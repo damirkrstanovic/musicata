@@ -191,6 +191,25 @@ if (npId) {
   check("radio endpoint returns tracks", (radio?.track_ids?.length ?? 0) >= 1, JSON.stringify(radio));
 }
 check("radio button present in footer", await js(`!!document.querySelector('.radio-btn')`));
+// Radio from the now-playing track must CONTINUE it (enqueue the station after it), not restart
+// it from 0. The bug: startRadio called play_tracks with the seed at index 0, resetting elapsed.
+const beforeRadio = await api("/api/players/browser-local/state");
+const seedId = beforeRadio?.now_playing?.track_id;
+const e0 = beforeRadio?.elapsed_seconds ?? 0;
+const q0 = beforeRadio?.queue?.length ?? 0;
+await js(`document.querySelector('.radio-btn')?.click()`);
+await sleep(2000);
+const afterRadio = await api("/api/players/browser-local/state");
+check(
+  "radio continues the seed (no restart)",
+  !!seedId && afterRadio?.now_playing?.track_id === seedId && (afterRadio?.elapsed_seconds ?? 0) >= e0,
+  `seed=${seedId} e0=${e0} -> np=${afterRadio?.now_playing?.track_id} e1=${afterRadio?.elapsed_seconds}`,
+);
+check(
+  "radio enqueues a station after the seed",
+  (afterRadio?.queue?.length ?? 0) >= q0,
+  `queue ${q0} -> ${afterRadio?.queue?.length}`,
+);
 // Continuous-play (autoplay) toggle persists through the API.
 await api("/api/autoplay", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true }) });
 check("autoplay toggle persists", (await api("/api/autoplay"))?.enabled === true);
