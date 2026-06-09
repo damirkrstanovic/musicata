@@ -5,6 +5,7 @@
   import ImportExportPanel from "./ImportExportPanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import PlayersZonesPanel from "./PlayersZonesPanel.svelte";
+  import SnapcastPanel from "./SnapcastPanel.svelte";
   import MergedArtistsPanel from "./MergedArtistsPanel.svelte";
 </script>
 
@@ -31,6 +32,7 @@
 
   <h2 class="admin-group-title">Playback</h2>
   <PlayersZonesPanel />
+  <SnapcastPanel />
 
   <h2 class="admin-group-title">Curation</h2>
   <MergedArtistsPanel />

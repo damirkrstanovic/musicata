@@ -15,6 +15,10 @@ provider-smb = ["dep:smb", "dep:futures"]
 # Generate TypeScript types for the web client from the server's response structs (the
 # admin DTOs). Off by default; see scripts/gen-web-types.sh.
 ts = ["dep:ts-rs", "musicata-core/ts"]
+# Synchronized multi-room playback via Snapcast: decode the zone/player queue to PCM
+# server-side and feed a managed `snapserver` over a FIFO, controlled by JSON-RPC.
+# Requires the `snapserver`/`snapclient` binaries installed; see crate::snapcast.
+snapcast = ["dep:rubato", "dep:libc"]
 
 [dependencies]
 anyhow.workspace = true
@@ -45,6 +49,14 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 rust-embed = { version = "8", features = ["mime-guess"] }
 # Only pulled in under the `ts` feature (type generation); MIT/Apache-2.0.
 ts-rs = { version = "10", optional = true }
+# Sample-rate conversion for the Snapcast decode path (the library is mixed
+# 44.1/48/96 kHz; snapserver runs at one fixed rate). Pulled in under `snapcast`;
+# MIT (AGPL-compatible).
+rubato = { version = "3", optional = true }
+# Used by the `snapcast` feature only: PR_SET_PDEATHSIG so a managed snapserver dies with us
+# even on SIGKILL (prevents an orphan that would fight a restarted instance for the FIFO).
+# MIT/Apache-2.0 (AGPL-compatible).
+libc = { version = "0.2", optional = true }
 # Library export/import archive (DB snapshot + artwork). Deflate only; MIT (AGPL-compatible).
 zip = { version = "2", default-features = false, features = ["deflate"] }
 

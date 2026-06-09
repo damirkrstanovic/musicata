@@ -29,6 +29,9 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
 
 use crate::mpd::{MpdConnection, MpdStatus};
+use crate::providers::ProviderRegistry;
+#[cfg(feature = "snapcast")]
+use crate::snapcast::{DecodedTrack, SnapcastManager, WriterEvent, WriterMsg};
 
 /// Stable id of the always-present local browser player.
 pub const BROWSER_PLAYER_ID: &str = "browser-local";
@@ -66,6 +69,8 @@ impl Drop for PlayerEntry {
 pub enum PlayerHandle {
     Mpd(Arc<MpdPlayer>),
     Browser(Arc<BrowserPlayer>),
+    #[cfg(feature = "snapcast")]
+    Snapcast(Arc<SnapcastPlayer>),
 }
 
 impl PlayerHandle {
@@ -73,6 +78,8 @@ impl PlayerHandle {
         match self {
             PlayerHandle::Mpd(player) => player.is_online(),
             PlayerHandle::Browser(player) => player.is_online(),
+            #[cfg(feature = "snapcast")]
+            PlayerHandle::Snapcast(player) => player.is_online(),
         }
     }
 
@@ -80,6 +87,8 @@ impl PlayerHandle {
         match self {
             PlayerHandle::Mpd(player) => player.subscribe(),
             PlayerHandle::Browser(player) => player.subscribe(),
+            #[cfg(feature = "snapcast")]
+            PlayerHandle::Snapcast(player) => player.subscribe(),
         }
     }
 
@@ -91,6 +100,8 @@ impl PlayerHandle {
         match self {
             PlayerHandle::Mpd(_) => None,
             PlayerHandle::Browser(player) => Some(player.subscribe_progress()),
+            #[cfg(feature = "snapcast")]
+            PlayerHandle::Snapcast(player) => Some(player.subscribe_progress()),
         }
     }
 
@@ -98,6 +109,8 @@ impl PlayerHandle {
         match self {
             PlayerHandle::Mpd(player) => player.state(database).await,
             PlayerHandle::Browser(player) => Ok(player.snapshot().await),
+            #[cfg(feature = "snapcast")]
+            PlayerHandle::Snapcast(player) => Ok(player.snapshot().await),
         }
     }
 
@@ -110,6 +123,8 @@ impl PlayerHandle {
         match self {
             PlayerHandle::Mpd(player) => player.execute(command, database, base_url).await,
             PlayerHandle::Browser(player) => player.execute(command, database).await,
+            #[cfg(feature = "snapcast")]
+            PlayerHandle::Snapcast(player) => player.execute(command, database, base_url).await,
         }
     }
 }
@@ -354,22 +369,40 @@ impl Drop for ZoneEntry {
     }
 }
 
+/// Stable id of the always-present Snapcast multi-room player (created when the feature is
+/// enabled in settings, like the browser player).
+#[cfg(feature = "snapcast")]
+pub const SNAPCAST_PLAYER_ID: &str = "snapcast-local";
+
 /// Registry of registered players and zones, backed by the database.
 pub struct PlayerManager {
     database: Database,
     public_base_url: String,
+    /// Needed by the Snapcast player to read library audio for server-side decode.
+    #[cfg_attr(not(feature = "snapcast"), allow(dead_code))]
+    providers: Arc<RwLock<ProviderRegistry>>,
     players: RwLock<BTreeMap<String, PlayerEntry>>,
     zones: RwLock<BTreeMap<String, ZoneEntry>>,
+    /// The managed snapserver + FIFO, present once Snapcast is enabled in settings.
+    #[cfg(feature = "snapcast")]
+    snapcast: RwLock<Option<Arc<SnapcastManager>>>,
 }
 
 impl PlayerManager {
     /// Build the manager and bring up a runtime entry for every persisted player.
-    pub async fn load(database: Database, public_base_url: String) -> Result<Arc<Self>> {
+    pub async fn load(
+        database: Database,
+        public_base_url: String,
+        providers: Arc<RwLock<ProviderRegistry>>,
+    ) -> Result<Arc<Self>> {
         let manager = Arc::new(Self {
             database,
             public_base_url,
+            providers,
             players: RwLock::new(BTreeMap::new()),
             zones: RwLock::new(BTreeMap::new()),
+            #[cfg(feature = "snapcast")]
+            snapcast: RwLock::new(None),
         });
         // The local browser player always exists.
         if manager
@@ -427,6 +460,40 @@ impl PlayerManager {
         &self.public_base_url
     }
 
+    /// Activate the Snapcast subsystem: store the managed snapserver, ensure the
+    /// always-present `snapcast-local` player exists, and bring it up. Idempotent.
+    #[cfg(feature = "snapcast")]
+    pub async fn enable_snapcast(&self, manager: Arc<SnapcastManager>) -> Result<()> {
+        *self.snapcast.write().await = Some(manager);
+        if self
+            .database
+            .player_record(SNAPCAST_PLAYER_ID)
+            .await?
+            .is_none()
+        {
+            self.database
+                .upsert_player(&PlayerRecord {
+                    id: SNAPCAST_PLAYER_ID.to_string(),
+                    kind: "snapcast".to_string(),
+                    address: "local".to_string(),
+                    name: "Multi-room (Snapcast)".to_string(),
+                    zone_id: None,
+                })
+                .await?;
+        }
+        if !self.players.read().await.contains_key(SNAPCAST_PLAYER_ID) {
+            let record = self.require_record(SNAPCAST_PLAYER_ID).await?;
+            self.bring_up(&record).await;
+        }
+        Ok(())
+    }
+
+    /// The managed snapserver, once enabled — used by the control/admin layer.
+    #[cfg(feature = "snapcast")]
+    pub async fn snapcast_manager(&self) -> Option<Arc<SnapcastManager>> {
+        self.snapcast.read().await.clone()
+    }
+
     /// Bring up the runtime entry for a persisted player record.
     async fn bring_up(&self, record: &PlayerRecord) {
         let (handle, task, poll) = match record.kind.as_str() {
@@ -436,6 +503,24 @@ impl PlayerManager {
                 // server restart, not just a page refresh.
                 player.restore().await;
                 (PlayerHandle::Browser(player), None, None)
+            }
+            #[cfg(feature = "snapcast")]
+            "snapcast" => {
+                // Only brought up once the managed snapserver is running (set by
+                // `enable_snapcast`); without it there's no FIFO to write to.
+                let Some(manager) = self.snapcast.read().await.clone() else {
+                    tracing::warn!(player = %record.id, "snapcast player skipped: subsystem not enabled");
+                    return;
+                };
+                let player = SnapcastPlayer::new(
+                    record.id.clone(),
+                    self.database.clone(),
+                    self.providers.clone(),
+                    manager,
+                );
+                player.restore().await;
+                let task = player.clone().spawn_control_task();
+                (PlayerHandle::Snapcast(player), Some(task), None)
             }
             _ => {
                 let player = Arc::new(MpdPlayer::new(
@@ -1603,10 +1688,17 @@ impl ZonePlayer {
         public_base_url: &str,
     ) {
         for member in members {
-            // Browser members are driven by the zone broadcast; only MPD members
-            // need an out-of-band command. (Forwarding to the single browser player
-            // would give it a second, competing queue.)
-            if !matches!(member, PlayerHandle::Mpd(_)) {
+            // Browser members are driven by the zone broadcast; server-decoded members
+            // (MPD, Snapcast) need an out-of-band command to mirror the zone queue.
+            // (Forwarding to the single browser player would give it a second, competing
+            // queue.)
+            let driven = match member {
+                PlayerHandle::Mpd(_) => true,
+                #[cfg(feature = "snapcast")]
+                PlayerHandle::Snapcast(_) => true,
+                _ => false,
+            };
+            if !driven {
                 continue;
             }
             if let Err(error) = member
@@ -1850,6 +1942,462 @@ fn reindex_after_move(pos: usize, from: usize, to: usize) -> usize {
     }
 }
 
+/// The queue index to play *after* `position`, honoring repeat — used to preload the next
+/// track for gapless Snapcast output. `None` means "stop after this one".
+#[cfg(feature = "snapcast")]
+fn next_index(position: Option<usize>, len: usize, repeat: RepeatMode) -> Option<usize> {
+    let pos = position?;
+    if len == 0 {
+        return None;
+    }
+    match repeat {
+        RepeatMode::One => Some(pos),
+        RepeatMode::All => Some((pos + 1) % len),
+        RepeatMode::Off => {
+            let next = pos + 1;
+            (next < len).then_some(next)
+        }
+    }
+}
+
+/// A Snapcast-backed player. Like [`MpdPlayer`] its queue is server-owned (persisted to the
+/// `player_queue` tables, reconciled command-by-command), but instead of speaking a protocol
+/// to an external player it **decodes the queue to PCM server-side** and streams it into the
+/// FIFO a managed `snapserver` reads — so every assigned snapclient plays it sample-accurate
+/// in sync. The decode loop *is* the playback cursor: play/pause/seek/skip reposition it. See
+/// `crate::snapcast` and `docs/snapcast.md`.
+#[cfg(feature = "snapcast")]
+pub struct SnapcastPlayer {
+    id: String,
+    database: Database,
+    providers: Arc<RwLock<ProviderRegistry>>,
+    /// Kept so the snapserver + FIFO outlive the player; also the control handle home.
+    #[allow(dead_code)]
+    manager: Arc<SnapcastManager>,
+    sample_rate: u32,
+    state: Mutex<QueueState>,
+    state_tx: broadcast::Sender<PlaybackState>,
+    progress_tx: broadcast::Sender<ProgressTick>,
+    last_progress_persist: AtomicI64,
+    /// Commands to the FIFO writer thread (std channel: the thread blocks on it while idle).
+    writer_tx: std::sync::mpsc::Sender<WriterMsg>,
+    /// Writer→player events (advance/drain). Taken once by the control task.
+    events_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<WriterEvent>>>,
+    /// What the writer currently has loaded, so reconcile avoids re-decoding.
+    loaded: Mutex<LoadedTrack>,
+}
+
+/// What the writer thread is currently rendering / has preloaded.
+#[cfg(feature = "snapcast")]
+#[derive(Default)]
+struct LoadedTrack {
+    track_id: Option<String>,
+    position: Option<usize>,
+    next_track_id: Option<String>,
+}
+
+#[cfg(feature = "snapcast")]
+impl SnapcastPlayer {
+    /// Build the player and spawn its FIFO writer thread (which blocks opening the FIFO
+    /// until snapserver is reading). Call [`restore`](Self::restore) then
+    /// [`spawn_control_task`](Self::spawn_control_task) to bring it fully up.
+    fn new(
+        id: String,
+        database: Database,
+        providers: Arc<RwLock<ProviderRegistry>>,
+        manager: Arc<SnapcastManager>,
+    ) -> Arc<Self> {
+        let (state_tx, _) = broadcast::channel(32);
+        let (progress_tx, _) = broadcast::channel(32);
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sample_rate = manager.sample_rate();
+        let fifo = manager.fifo_path();
+        std::thread::Builder::new()
+            .name(format!("snapcast-writer-{id}"))
+            .spawn(move || crate::snapcast::run_writer(fifo, writer_rx, events_tx))
+            .expect("spawn snapcast writer thread");
+        Arc::new(Self {
+            id,
+            database,
+            providers,
+            manager,
+            sample_rate,
+            state: Mutex::new(QueueState::default()),
+            state_tx,
+            progress_tx,
+            last_progress_persist: AtomicI64::new(0),
+            writer_tx,
+            events_rx: std::sync::Mutex::new(Some(events_rx)),
+            loaded: Mutex::new(LoadedTrack::default()),
+        })
+    }
+
+    pub fn is_online(&self) -> bool {
+        true
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<PlaybackState> {
+        self.state_tx.subscribe()
+    }
+
+    pub fn subscribe_progress(&self) -> broadcast::Receiver<ProgressTick> {
+        self.progress_tx.subscribe()
+    }
+
+    pub async fn snapshot(&self) -> PlaybackState {
+        let state = self.state.lock().await;
+        PlaybackState {
+            status: state.status,
+            now_playing: state
+                .position
+                .and_then(|index| state.queue.get(index).cloned()),
+            elapsed_seconds: state.elapsed_seconds,
+            duration_seconds: state.duration_seconds,
+            volume: state.volume,
+            repeat: state.repeat,
+            shuffle: state.shuffle,
+            queue: state.queue.clone(),
+            queue_position: state.position,
+        }
+    }
+
+    async fn broadcast(&self) {
+        let _ = self.state_tx.send(self.snapshot().await);
+    }
+
+    /// Reload the queue persisted before the last shutdown (restored paused — no audio is
+    /// rendering at startup), exactly like the browser and zone players.
+    async fn restore(&self) {
+        let snapshot = match self.database.load_player_queue(&self.id).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(player = %self.id, %error, "snapcast: failed to load persisted queue");
+                return;
+            }
+        };
+        let mut state = self.state.lock().await;
+        let playback = snapshot.playback;
+        state.queue = snapshot.items;
+        state.position = playback.position.filter(|&index| index < state.queue.len());
+        state.status = match playback.status {
+            PlaybackStatus::Playing => PlaybackStatus::Paused,
+            other if state.position.is_none() => match other {
+                PlaybackStatus::Paused => PlaybackStatus::Stopped,
+                other => other,
+            },
+            other => other,
+        };
+        state.elapsed_seconds = playback.elapsed_seconds;
+        state.duration_seconds = None;
+        state.volume = playback.volume;
+        state.repeat = playback.repeat;
+        state.shuffle = playback.shuffle;
+    }
+
+    async fn persist(&self, persist: QueuePersist) {
+        let result = match &persist {
+            QueuePersist::Playback(playback) => {
+                self.database.save_player_playback(&self.id, playback).await
+            }
+            QueuePersist::Queue(playback, items) => {
+                self.database
+                    .save_player_queue(&self.id, playback, items)
+                    .await
+            }
+        };
+        if let Err(error) = result {
+            tracing::warn!(player = %self.id, %error, "snapcast: failed to persist queue");
+        }
+    }
+
+    async fn persist_playback(&self) {
+        let playback = self.state.lock().await.playback();
+        self.persist(QueuePersist::Playback(playback)).await;
+    }
+
+    pub async fn execute(
+        &self,
+        command: PlayerCommand,
+        database: &Database,
+        _base_url: &str,
+    ) -> Result<()> {
+        let mutates_queue = command_mutates_queue(&command);
+        let persist = {
+            let mut state = self.state.lock().await;
+            apply_to_queue_state(&mut state, command.clone(), database).await?;
+            let playback = state.playback();
+            if mutates_queue {
+                QueuePersist::Queue(playback, state.queue.clone())
+            } else {
+                QueuePersist::Playback(playback)
+            }
+        };
+        self.broadcast().await;
+        self.persist(persist).await;
+        self.reconcile(&command).await;
+        Ok(())
+    }
+
+    /// Drive the FIFO writer to match the queue state after a command: pause/stop, resume,
+    /// seek, or decode+load a new current track (and preload the next for gapless output).
+    async fn reconcile(&self, command: &PlayerCommand) {
+        if let PlayerCommand::SetVolume { volume } = command {
+            let _ = self.writer_tx.send(WriterMsg::SetVolume(*volume));
+        }
+        let (status, position, item, elapsed, next_item) = {
+            let state = self.state.lock().await;
+            let position = state.position;
+            let item = position.and_then(|index| state.queue.get(index).cloned());
+            let elapsed = state.elapsed_seconds.unwrap_or(0.0);
+            let next = next_index(position, state.queue.len(), state.repeat)
+                .and_then(|index| state.queue.get(index).cloned());
+            (state.status, position, item, elapsed, next)
+        };
+
+        match status {
+            PlaybackStatus::Stopped => {
+                let _ = self.writer_tx.send(WriterMsg::Stop);
+                *self.loaded.lock().await = LoadedTrack::default();
+                return;
+            }
+            PlaybackStatus::Paused => {
+                let _ = self.writer_tx.send(WriterMsg::SetPlaying(false));
+                return;
+            }
+            PlaybackStatus::Playing => {}
+        }
+
+        let Some(item) = item else {
+            let _ = self.writer_tx.send(WriterMsg::Stop);
+            *self.loaded.lock().await = LoadedTrack::default();
+            return;
+        };
+        let Some(track_id) = item.track_id.clone() else {
+            // Snapcast decodes library files; it can't play a bare remote stream URL.
+            tracing::warn!(player = %self.id, "snapcast: skipping non-library stream item");
+            let _ = self.writer_tx.send(WriterMsg::SetPlaying(false));
+            return;
+        };
+
+        let same = {
+            let loaded = self.loaded.lock().await;
+            loaded.track_id.as_deref() == Some(track_id.as_str()) && loaded.position == position
+        };
+        let is_seek = matches!(command, PlayerCommand::Seek { .. });
+        if same {
+            if is_seek {
+                let frame = (elapsed * self.sample_rate as f64) as usize;
+                let _ = self.writer_tx.send(WriterMsg::Seek { frame });
+            }
+            let _ = self.writer_tx.send(WriterMsg::SetPlaying(true));
+            self.preload(next_item).await;
+            return;
+        }
+
+        // A different track is now current — decode and load it.
+        let decoded = match self.decode(&track_id).await {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                tracing::warn!(player = %self.id, track = %track_id, %error, "snapcast: decode failed");
+                return;
+            }
+        };
+        let duration = decoded.frames() as f64 / self.sample_rate as f64;
+        let gain = leveling_gain(&item);
+        let frame = (elapsed * self.sample_rate as f64) as usize;
+        let _ = self.writer_tx.send(WriterMsg::Load {
+            track: decoded,
+            start_frame: frame,
+            gain,
+        });
+        let _ = self.writer_tx.send(WriterMsg::SetPlaying(true));
+        {
+            let mut loaded = self.loaded.lock().await;
+            loaded.track_id = Some(track_id);
+            loaded.position = position;
+            loaded.next_track_id = None;
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.duration_seconds = Some(duration);
+        }
+        self.broadcast().await;
+        self.preload(next_item).await;
+    }
+
+    /// Decode the next queue item and hand it to the writer for gapless continuation —
+    /// unless it is already preloaded (so this is cheap to call on every command).
+    async fn preload(&self, next_item: Option<QueueItem>) {
+        let next_track_id = next_item.as_ref().and_then(|item| item.track_id.clone());
+        {
+            let mut loaded = self.loaded.lock().await;
+            if loaded.next_track_id == next_track_id {
+                return;
+            }
+            loaded.next_track_id = next_track_id.clone();
+        }
+        let (Some(track_id), Some(item)) = (next_track_id, next_item) else {
+            return;
+        };
+        match self.decode(&track_id).await {
+            Ok(decoded) => {
+                let _ = self.writer_tx.send(WriterMsg::Preload {
+                    track: decoded,
+                    gain: leveling_gain(&item),
+                });
+            }
+            Err(error) => {
+                tracing::debug!(player = %self.id, track = %track_id, %error, "snapcast: preload decode failed");
+            }
+        }
+    }
+
+    async fn decode(&self, track_id: &str) -> Result<Arc<DecodedTrack>, String> {
+        crate::snapcast::decode_queue_item(
+            &self.database,
+            &self.providers,
+            track_id,
+            self.sample_rate,
+        )
+        .await
+        .map(Arc::new)
+    }
+
+    /// Spawn the control task: it advances the queue on writer drain/advance events and
+    /// ticks the elapsed position while playing. Returns its handle (aborted on drop).
+    fn spawn_control_task(self: Arc<Self>) -> JoinHandle<()> {
+        let mut events = self
+            .events_rx
+            .lock()
+            .expect("events lock")
+            .take()
+            .expect("control task spawned once");
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    event = events.recv() => match event {
+                        Some(WriterEvent::Advanced) => self.on_advanced().await,
+                        Some(WriterEvent::Drained) => self.on_drained().await,
+                        None => break,
+                    },
+                    _ = ticker.tick() => self.on_tick().await,
+                }
+            }
+        })
+    }
+
+    /// The writer rolled gaplessly into the preloaded next track — advance our cursor.
+    async fn on_advanced(&self) {
+        let (new_position, new_track_id, next_item) = {
+            let mut state = self.state.lock().await;
+            let new_position = next_index(state.position, state.queue.len(), state.repeat);
+            state.position = new_position;
+            state.elapsed_seconds = Some(0.0);
+            state.duration_seconds = None;
+            let new_track_id = new_position
+                .and_then(|index| state.queue.get(index))
+                .and_then(|item| item.track_id.clone());
+            let next = next_index(new_position, state.queue.len(), state.repeat)
+                .and_then(|index| state.queue.get(index).cloned());
+            (new_position, new_track_id, next)
+        };
+        {
+            let mut loaded = self.loaded.lock().await;
+            loaded.position = new_position;
+            loaded.track_id = new_track_id.clone();
+            loaded.next_track_id = None;
+        }
+        // Best-effort: set the seek-bar duration for the new current track.
+        if let Some(track_id) = &new_track_id {
+            if let Ok(Some(track)) = self.database.track(track_id).await {
+                let mut state = self.state.lock().await;
+                state.duration_seconds = track.duration_seconds;
+            }
+        }
+        self.broadcast().await;
+        self.persist_playback().await;
+        self.preload(next_item).await;
+    }
+
+    /// The queue drained with nothing preloaded — stop.
+    async fn on_drained(&self) {
+        {
+            let mut state = self.state.lock().await;
+            state.status = PlaybackStatus::Stopped;
+            state.elapsed_seconds = Some(0.0);
+        }
+        *self.loaded.lock().await = LoadedTrack::default();
+        self.broadcast().await;
+        self.persist_playback().await;
+    }
+
+    /// Advance the displayed elapsed position once per second while playing, mirroring the
+    /// MPD position poll (the audio truth is snapserver's; this is the seek bar + the
+    /// listen recorder's view).
+    async fn on_tick(&self) {
+        let (elapsed, duration, playback) = {
+            let mut state = self.state.lock().await;
+            if state.status != PlaybackStatus::Playing {
+                return;
+            }
+            let mut elapsed = state.elapsed_seconds.unwrap_or(0.0) + 1.0;
+            if let Some(duration) = state.duration_seconds {
+                if elapsed > duration {
+                    elapsed = duration;
+                }
+            }
+            state.elapsed_seconds = Some(elapsed);
+            (elapsed, state.duration_seconds, state.playback())
+        };
+        let _ = self.progress_tx.send(ProgressTick {
+            elapsed_seconds: elapsed,
+            duration_seconds: duration,
+        });
+        let now = now_unix();
+        let last = self.last_progress_persist.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= PROGRESS_PERSIST_SECS
+            && self
+                .last_progress_persist
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.persist(QueuePersist::Playback(playback)).await;
+        }
+    }
+}
+
+#[cfg(feature = "snapcast")]
+impl Drop for SnapcastPlayer {
+    fn drop(&mut self) {
+        // Stop the writer thread (best-effort; it may be blocked writing the FIFO).
+        let _ = self.writer_tx.send(WriterMsg::Shutdown);
+    }
+}
+
+/// Per-track linear gain for EBU R128 volume leveling on the Snapcast path — the
+/// server-side equivalent of the browser's Track-mode leveling (see `docs/loudness.md`).
+/// Targets −18 LUFS, clamped so the result never exceeds 0 dBFS true peak, and bounded to
+/// ±12 dB. `1.0` (unchanged) when the track has no measured loudness.
+#[cfg(feature = "snapcast")]
+fn leveling_gain(item: &QueueItem) -> f32 {
+    const TARGET_LUFS: f64 = -18.0;
+    const MAX_GAIN_DB: f64 = 12.0;
+    let Some(loudness) = item.integrated_loudness_lufs else {
+        return 1.0;
+    };
+    let mut gain_db = TARGET_LUFS - loudness;
+    // Don't push true peak above 0 dBFS (clip guard), mirroring the browser leveling.
+    if let Some(peak) = item.true_peak_dbtp {
+        gain_db = gain_db.min(-peak);
+    }
+    gain_db = gain_db.clamp(-MAX_GAIN_DB, MAX_GAIN_DB);
+    10f64.powf(gain_db / 20.0) as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1859,12 +2407,7 @@ mod tests {
     // ---- ListenTracker (the completion-rule state machine) ----
 
     /// A Playing tick for `id` at `elapsed`, duration `dur`.
-    fn tick(
-        tracker: &mut ListenTracker,
-        id: &str,
-        elapsed: f64,
-        dur: Option<f64>,
-    ) -> ListenAction {
+    fn tick(tracker: &mut ListenTracker, id: &str, elapsed: f64, dur: Option<f64>) -> ListenAction {
         tracker.observe(PlaybackStatus::Playing, Some(id), Some(elapsed), dur)
     }
 
@@ -1955,7 +2498,10 @@ mod tests {
     #[test]
     fn pause_resume_does_not_finalize_or_double_count() {
         let mut t = ListenTracker::default();
-        assert_eq!(tick(&mut t, "a", 95.0, D180), ListenAction::RecordListen("a".into()));
+        assert_eq!(
+            tick(&mut t, "a", 95.0, D180),
+            ListenAction::RecordListen("a".into())
+        );
         // Pause holds; resume continues; neither records anything.
         assert_eq!(
             t.observe(PlaybackStatus::Paused, Some("a"), Some(95.0), D180),
@@ -1982,7 +2528,10 @@ mod tests {
     #[test]
     fn stop_after_a_listen_is_not_a_skip() {
         let mut t = ListenTracker::default();
-        assert_eq!(tick(&mut t, "a", 95.0, D180), ListenAction::RecordListen("a".into()));
+        assert_eq!(
+            tick(&mut t, "a", 95.0, D180),
+            ListenAction::RecordListen("a".into())
+        );
         assert_eq!(
             t.observe(PlaybackStatus::Stopped, None, None, None),
             ListenAction::None
@@ -2129,9 +2678,13 @@ mod tests {
         let mut library = library_with_tracks(5); // each track is 180s -> threshold 90s
         database.save_library(&mut library).await.expect("save");
 
-        let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
-            .await
-            .expect("manager");
+        let manager = PlayerManager::load(
+            database.clone(),
+            "http://localhost".to_string(),
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+        )
+        .await
+        .expect("manager");
         let browser = manager
             .get(BROWSER_PLAYER_ID)
             .await
@@ -2170,9 +2723,13 @@ mod tests {
         let mut library = library_with_tracks(2);
         database.save_library(&mut library).await.expect("save");
 
-        let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
-            .await
-            .expect("manager");
+        let manager = PlayerManager::load(
+            database.clone(),
+            "http://localhost".to_string(),
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+        )
+        .await
+        .expect("manager");
         let browser = manager.get(BROWSER_PLAYER_ID).await.expect("browser");
         let PlayerHandle::Browser(player) = &browser else {
             panic!("browser handle");
@@ -2313,9 +2870,13 @@ mod tests {
         database.save_library(&mut library).await.expect("save");
 
         {
-            let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
-                .await
-                .expect("manager");
+            let manager = PlayerManager::load(
+                database.clone(),
+                "http://localhost".to_string(),
+                Arc::new(RwLock::new(ProviderRegistry::new())),
+            )
+            .await
+            .expect("manager");
             let browser = manager.get(BROWSER_PLAYER_ID).await.expect("browser");
             browser
                 .execute(
@@ -2350,9 +2911,13 @@ mod tests {
         }
 
         // Fresh manager over the same database = a server restart.
-        let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
-            .await
-            .expect("reload manager");
+        let manager = PlayerManager::load(
+            database.clone(),
+            "http://localhost".to_string(),
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+        )
+        .await
+        .expect("reload manager");
         let browser = manager.get(BROWSER_PLAYER_ID).await.expect("browser");
         let state = browser.state(&database).await.expect("state");
 
@@ -2453,9 +3018,13 @@ mod tests {
         database.save_library(&mut library).await.expect("save");
 
         let zone_id = {
-            let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
-                .await
-                .expect("manager");
+            let manager = PlayerManager::load(
+                database.clone(),
+                "http://localhost".to_string(),
+                Arc::new(RwLock::new(ProviderRegistry::new())),
+            )
+            .await
+            .expect("manager");
             let zone = manager.create_zone("Living Room").await.expect("zone");
             manager
                 .command_zone(
@@ -2480,9 +3049,13 @@ mod tests {
         };
 
         // Fresh manager over the same database = a server restart.
-        let manager = PlayerManager::load(database.clone(), "http://localhost".to_string())
-            .await
-            .expect("reload manager");
+        let manager = PlayerManager::load(
+            database.clone(),
+            "http://localhost".to_string(),
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+        )
+        .await
+        .expect("reload manager");
         let state = manager.zone_state(&zone_id).await.expect("state");
 
         assert_eq!(state.queue.len(), 3, "queue restored");
@@ -2637,5 +3210,43 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(db_path);
+    }
+
+    // ---- Snapcast helpers (pure) ----
+
+    #[cfg(feature = "snapcast")]
+    #[test]
+    fn next_index_honors_repeat_mode() {
+        // Off: advance, then stop at the end.
+        assert_eq!(next_index(Some(0), 3, RepeatMode::Off), Some(1));
+        assert_eq!(next_index(Some(2), 3, RepeatMode::Off), None);
+        // All: wrap around.
+        assert_eq!(next_index(Some(2), 3, RepeatMode::All), Some(0));
+        // One: repeat the same track.
+        assert_eq!(next_index(Some(1), 3, RepeatMode::One), Some(1));
+        // No position / empty queue: nothing to play next.
+        assert_eq!(next_index(None, 3, RepeatMode::All), None);
+        assert_eq!(next_index(Some(0), 0, RepeatMode::All), None);
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[test]
+    fn leveling_gain_targets_minus_18_and_guards_clipping() {
+        let item = |lufs: Option<f64>, peak: Option<f64>| QueueItem {
+            integrated_loudness_lufs: lufs,
+            true_peak_dbtp: peak,
+            ..Default::default()
+        };
+        // No measurement → unity gain.
+        assert_eq!(leveling_gain(&item(None, None)), 1.0);
+        // Quiet track (-30 LUFS) wants +12 dB; capped at the +12 dB ceiling, peak allows it.
+        let quiet = leveling_gain(&item(Some(-30.0), Some(-20.0)));
+        assert!((quiet - 10f32.powf(12.0 / 20.0)).abs() < 1e-3);
+        // Loud track (-12 LUFS) → cut toward -18 (≈ -6 dB).
+        let loud = leveling_gain(&item(Some(-12.0), Some(-1.0)));
+        assert!(loud < 1.0 && loud > 0.0);
+        // A high true peak clamps the gain so output never exceeds 0 dBFS (here +0.5 dB room).
+        let near_clip = leveling_gain(&item(Some(-30.0), Some(-0.5)));
+        assert!((near_clip - 10f32.powf(0.5 / 20.0)).abs() < 1e-3);
     }
 }

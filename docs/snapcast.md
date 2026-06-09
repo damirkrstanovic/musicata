@@ -155,27 +155,154 @@ both Snapcast transport and the server-side DSP tier.
 
 ---
 
-## Phased plan (sketch — not committed)
+## Implementation status — DONE (Phases 0–4), tested against snapserver 0.35
 
-1. **Spike the decode→FIFO stage.** symphonia decode of the current queue → resample to
-   48 kHz → write a FIFO, paced to real time, gapless. Verify with a hand-run snapserver +
-   one snapclient. (The hard, novel part — do it first, in isolation.)
-2. **`SnapcastPlayer`/zone variant.** Wire the decode loop to a zone's `QueueState`; translate
-   play/pause/seek/next into decoder repositioning; persist + register like MPD.
-3. **JSON-RPC control client.** Discover groups/clients; map zone membership + per-output
-   volume to `Group.SetClients` / `Client.SetVolume`; subscribe to notifications for live
-   state. snapserver lifecycle management (managed subprocess or external).
-4. **`/admin` + settings.** Configure the snapserver endpoint, expose discovered
-   clients as assignable zone outputs. Per "configuration lives in the product."
-5. **Server-side DSP hook (optional, ties to `docs/dsp.md`).** Apply the zone's DSP profile in
-   the decode path before the FIFO.
+Built and verified end-to-end with the real `snapserver`/`snapclient` 0.35:
+
+- **Phase 0** `crate::snapcast::decode` — symphonia full-length decode → stereo downmix →
+  `rubato` FFT resample to 48 kHz → interleaved `i16`. Unit-tested.
+- **Phase 0** `crate::snapcast::writer` — a dedicated OS thread streaming PCM into the FIFO,
+  **self-paced to real time** (see hard-won note below).
+- **Phase 1** `players.rs::SnapcastPlayer` (+ `PlayerHandle::Snapcast`) — server-owned queue,
+  the decode loop is the playback cursor; gapless preload; registered/persisted like MPD as
+  the always-present `snapcast-local` ("Multi-room (Snapcast)") player; drivable as a zone
+  member via `drive_members`.
+- **Phase 2** `crate::snapcast::{server,control}` — managed `snapserver` subprocess + FIFO
+  lifecycle (one "Musicata" pipe stream); JSON-RPC client (enumerate clients, per-room volume,
+  point groups at our stream).
+- **Phase 3** `/api/snapcast/*` + `SnapcastPanel.svelte` — enable toggle + connected-room list
+  with per-room volume, under `/admin` → Playback (configuration lives in the product).
+- **Phase 4** `players.rs::leveling_gain` — per-track EBU R128 leveling applied in the writer
+  (the server-side equivalent of the browser Track-mode gain), plus a live master volume.
+
+**Verification.** Decode/resample unit tests + `next_index`/`leveling_gain` tests. Live: two
+`snapclient`s capturing the stream were **100 % sample-identical at a sub-millisecond offset**
+(0–3 frames = capture-process start jitter), proving synchronized multi-room. Transport
+(play/pause/seek/next, elapsed) verified through the player command API.
+
+### Hard-won notes (real bugs found while testing — don't regress these)
+
+1. **The writer must self-pace to real time.** snapserver never backpressures our pipe writes
+   here — it reads the pipe at real time and relays to each snapclient (which buffers ~1 s) —
+   so a writer with no pacing spins a CPU and races the queue forward. `writer.rs` keeps a
+   playout clock at most `PACING_LEAD` (1 s) ahead of now and sleeps: it bursts up front to
+   prime the client buffer, then feeds at real time, and the lead doubles as the runaway cap
+   when no client is connected.
+2. **Feed in snapserver-sized chunks.** snapserver reads its pipe in small chunks paced to real
+   time (its `chunk_ms`, default 20 ms). Writing coarse chunks (the first cut used 85 ms) makes
+   the pipe sawtooth; matching ~20 ms (`CHUNK_FRAMES = 960`) keeps its input smooth and makes
+   seek/skip/pause react within a chunk.
+3. **Manage snapserver with `std::process`, not `tokio::process`.** An unwaited
+   `tokio::process::Child` makes the runtime's SIGCHLD reaper busy-loop (≈300 % CPU at idle,
+   observed). snapserver is a fire-and-forget long-lived child we never await output from, so
+   `server.rs` spawns it with `std::process` and kills+reaps it explicitly on shutdown/drop.
+4. **Tie the snapserver child to our lifetime with `PR_SET_PDEATHSIG`.** If Musicata dies
+   *without* running Drop (crash/SIGKILL), the managed snapserver would orphan — and a
+   restarted instance starting a *second* snapserver against the same FIFO means **two readers
+   splitting the byte stream**, so both get a corrupt, gappy feed. `server.rs` sets
+   `PR_SET_PDEATHSIG(SIGKILL)` via `pre_exec` so the kernel kills snapserver when we die.
+   (This was the actual cause of "gappy audio" in testing — accumulated orphan snapservers all
+   draining one FIFO; verified fixed by killing Musicata with `-9` and watching snapserver exit.)
+
+(Also: in **debug** builds rubato's FFT resample of a multi-minute track takes several seconds,
+so the first `play` is slow and `execute` blocks on it; release is < 1 s. A future refinement
+is to decode off the command's response path.)
+
+### How it was verified
+
+An audio-truth harness generated tracks as distinct pure tones (and a noise track), at mixed
+44.1/48 kHz to exercise the resampler, then captured the live `snapclient` stream and
+**FFT-detected the playing frequency** to confirm the *audible* track matched the API state
+(not just the state). 24 checks pass: play, correct pitch on resampled tracks, pause→silence,
+next/prev/index, gapless auto-advance (no silence at the boundary), repeat one/off, enqueue,
+clear, master-volume scaling, and two snapclients **100 % sample-identical at < 1 ms offset**.
+Plus: 80 rapid mixed commands with no hang/deadlock, JSON-RPC per-room volume round-trip, and
+~0 CPU at idle and during playback.
+
+## Committed phased plan (multi-room synchronized playback)
+
+This is the committed build order for milestone 10's "in-sync playback across two or more
+zones." It is file-grounded against today's code; each phase is independently shippable and
+the order is by **risk** (the novel decode stage first). The whole subsystem is gated behind a
+new `snapcast` **cargo feature** and "requires snapserver installed," exactly like the `smb`
+source.
+
+**The sync question is settled:** we do **not** build clock-sync / drift-correction ourselves —
+Snapcast's engine (above) provides it. The only *new* "advanced processing" we own is the
+**server-side decode→PCM→FIFO** stage; Snapcast does the rest. So Phase 0 is the real work.
+
+**New dependency:** `rubato` (MIT — license-compatible per AGPL convention) for sample-rate
+conversion, feature-gated under `snapcast`. `symphonia` is already a dep (used by
+`fingerprint.rs` + loudness), so decoding reuses an in-tree pattern.
+
+### Phase 0 — Spike the decode→FIFO stage *(the hard, novel part — in isolation)*
+
+The one thing Musicata has never done: decode audio to PCM server-side and feed a continuous
+stream. Build it standalone before touching the player model.
+
+- New module `crates/musicata-server/src/snapcast/decode.rs`. Reuse the
+  `fingerprint.rs:decode_samples` pattern (symphonia probe → decoder loop →
+  `SampleBuffer` interleaved) but **full-length and streaming** (don't cap at 120 s, don't
+  buffer the whole track) — emit interleaved PCM at the declared zone format (48 kHz / 16-bit /
+  stereo = 4 B/frame).
+- **Resample** each track to the fixed zone rate with `rubato` (library is mixed 44.1/48/96).
+- **Pace to real time + gapless:** write `chunk_ms` (~20 ms ≈ 3840 B) per tick; concatenate
+  the next queue track with no intervening silence. Rely on the FIFO write blocking when no
+  client drains it, plus a pacing sleep to bound buffering.
+- **Verify (manual):** hand-run `snapserver` with
+  `source = pipe:///run/musicata/snapfifo?name=Musicata&sampleformat=48000:16:2&codec=flac`
+  + one `snapclient`; decode a `testdata/` track into the FIFO; confirm audio plays.
+
+### Phase 1 — `Snapcast` player/zone variant
+
+- Add `Snapcast(Arc<SnapcastPlayer>)` to the `PlayerHandle` enum (`players.rs:66`) + match arms
+  in `is_online`/`subscribe`/`state`/`execute`.
+- `SnapcastPlayer` owns the Phase-0 decode loop bound to a zone's canonical `QueueState`
+  (`players.rs:1462`/`ZonePlayer`). **The decode loop is the playback cursor** — play/pause/
+  seek/next reposition the decoder (analogous to how `ZonePlayer::execute` /`drive_members`
+  reconcile members today, but here we own the samples).
+- Register/persist like MPD: a `"snapcast"` kind arm in `PlayerHandlers::bring_up`
+  (`players.rs:431`) spawns the decode task (mirroring MPD's task/poll handles); persisted in
+  the existing `players` table.
+- **Done when:** an MPD-less zone with a Snapcast output produces real synchronized audio —
+  closing the deferred "no audio sample-sync" gap for Snapcast zones.
+
+### Phase 2 — JSON-RPC control client + snapserver lifecycle
+
+- New `crates/musicata-server/src/snapcast/control.rs`: a small JSON-RPC client over TCP 1705
+  (newline-delimited) or WS 1780. Calls: `Server.GetStatus`, `Group.SetStream`,
+  `Group.SetClients`, `Client.SetVolume`/`Client.SetLatency`. Subscribe to
+  `Client.OnConnect/OnDisconnect/OnVolumeChanged`, `Group.OnStreamChanged`, `Server.OnUpdate`
+  to keep state live.
+- **snapserver lifecycle:** manage it as a subprocess via `tokio::process::Command` (Musicata
+  manages **no** subprocess today — genuinely new; mirrors the planned CamillaDSP management in
+  `docs/dsp.md`), owning FIFO creation (`mode=read`). External/already-running snapserver also
+  supported.
+- Map zone membership + per-output volume onto `Group.SetClients` / `Client.SetVolume`.
+- **Decoupling:** each active Snapcast zone is its **own decode task draining its own queue at
+  its own pace** — coordinating only through the DB — per the "decouple background operations"
+  convention (the `*_loop` fns in `main.rs`).
+
+### Phase 3 — `/admin` + settings *(configuration lives in the product)*
+
+- Per the project convention (settings in the DB + web UI, **not** flags): a `/admin` panel to
+  configure the snapserver endpoint and expose discovered snapclients as assignable zone
+  outputs, edited live. No `--flag`.
+
+### Phase 4 — Server-side DSP / loudness hook *(optional; ties `docs/dsp.md` + `docs/loudness.md`)*
+
+- Apply the zone's DSP profile + EBU R128 leveling gain in the decode path **before** the FIFO.
+  This is the already-noted "server-side apply for Snapcast" loudness item and the shared
+  server-side PCM stage DSP Tier 2 wants — corrected, synchronized multi-room from one pipeline.
 
 ### Verification
 
 A loopback integration test: spawn snapserver (FIFO source) + a snapclient writing to a file
 sink; have Musicata decode a `testdata/` track into the FIFO; assert the client receives audio
 and `Server.GetStatus` reflects the stream playing. Plus unit tests for the decode/resample/
-gapless concatenation and the JSON-RPC client (against recorded responses).
+gapless concatenation and the JSON-RPC client (against recorded responses). `cargo test`
+default features must stay green with `snapcast` off; gated tests require an installed
+snapserver and run under the feature.
 
 ---
 

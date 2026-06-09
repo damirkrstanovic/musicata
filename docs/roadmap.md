@@ -663,6 +663,18 @@ Tasks:
   stage (Musicata has always let endpoints fetch+decode per-track URLs) — which also becomes
   the home for the server-side DSP tier (`docs/dsp.md`). Cargo-feature-gated, "requires
   snapserver," like the SMB source.
+- [x] **Multi-room synchronized playback (Snapcast) — DONE; see `docs/snapcast.md`.** Sync is
+  solved by Snapcast's engine; the new work we own is the server-side decode→PCM→FIFO stage.
+  Shipped all phases: **0** `crate::snapcast::{decode,writer}` (symphonia → `rubato` resample to
+  48 kHz → FIFO, real-time self-paced, gapless); **1** `PlayerHandle::Snapcast` /
+  `SnapcastPlayer` (decode loop is the playback cursor over a server-owned queue; the
+  always-present `snapcast-local` player, drivable as a zone member); **2** managed `snapserver`
+  subprocess + FIFO + JSON-RPC control client; **3** `/api/snapcast/*` + an `/admin`
+  Multi-room panel (enable + per-room volume); **4** per-track R128 leveling in the writer.
+  `snapcast` cargo feature; `rubato` (MIT) dep. Verified two snapclients 100 %
+  sample-identical (sub-ms offset). MVP scope: one synced stream to N rooms (independent
+  per-room streams are a future extension). **Note:** the loudness analysis loop can spin on
+  certain malformed tracks — a *pre-existing* issue surfaced during testing, tracked separately.
 - Later evaluate AirPlay, Chromecast, UPnP/DLNA, and MPD integrations.
 
 Done when:

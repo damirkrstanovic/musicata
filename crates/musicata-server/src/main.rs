@@ -1,19 +1,21 @@
 mod activity;
 mod artwork;
-mod backup;
 mod artwork_providers;
+mod backup;
 mod fingerprint;
 mod loudness;
 mod mpd;
-mod recommendations;
 mod musicbrainz;
 mod players;
 mod providers;
 mod radiobrowser;
+mod recommendations;
 #[cfg(feature = "provider-smb")]
 mod scan_concurrency;
 #[cfg(feature = "provider-smb")]
 mod smb;
+#[cfg(feature = "snapcast")]
+mod snapcast;
 mod subsonic;
 
 use crate::players::{BrowserPlayer, PlayerHandle, PlayerManager, ProgressTick, ZonePlayer};
@@ -179,7 +181,7 @@ async fn main() -> Result<()> {
         .public_url
         .clone()
         .unwrap_or_else(|| format!("http://{}", config.addr));
-    let players = PlayerManager::load(database.clone(), public_url).await?;
+    let players = PlayerManager::load(database.clone(), public_url, providers.clone()).await?;
     // Seed any players given on the command line / config (idempotent).
     for addr in &config.mpd_addrs {
         if let Err(error) = players
@@ -188,6 +190,13 @@ async fn main() -> Result<()> {
         {
             tracing::warn!(%addr, %error, "failed to register configured MPD player");
         }
+    }
+    // Bring up the Snapcast multi-room subsystem if enabled in settings (managed
+    // snapserver + the always-present "Multi-room (Snapcast)" player). Failures are
+    // logged, never fatal — the rest of the server runs without it.
+    #[cfg(feature = "snapcast")]
+    if let Err(error) = maybe_enable_snapcast(&database, &players).await {
+        tracing::warn!(%error, "snapcast: failed to start; multi-room disabled");
     }
 
     let listener = tokio::net::TcpListener::bind(config.addr)
@@ -883,13 +892,21 @@ async fn autoplay_loop(
     let _ = ready.wait_for(|&r| r).await;
     loop {
         tokio::time::sleep(AUTOPLAY_POLL).await;
-        let on = database.get_setting(SETTING_AUTOPLAY).await.ok().flatten().as_deref() == Some("true");
+        let on = database
+            .get_setting(SETTING_AUTOPLAY)
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true");
         if !on {
             continue;
         }
         if let Some(handle) = players.get(players::BROWSER_PLAYER_ID).await {
             if let Ok(state) = handle.state(&database).await {
-                if let Some(ids) = autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await {
+                if let Some(ids) =
+                    autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await
+                {
                     let _ = handle
                         .execute(
                             PlayerCommand::Enqueue { track_ids: ids },
@@ -903,7 +920,9 @@ async fn autoplay_loop(
         if let Ok(zones) = players.zones().await {
             for zone in zones {
                 if let Ok(state) = players.zone_state(&zone.id).await {
-                    if let Some(ids) = autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await {
+                    if let Some(ids) =
+                        autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await
+                    {
                         let _ = players
                             .command_zone(&zone.id, PlayerCommand::Enqueue { track_ids: ids })
                             .await;
@@ -923,7 +942,8 @@ async fn autoplay_candidates(
     state: &musicata_core::PlaybackState,
 ) -> Option<Vec<String>> {
     use musicata_core::{PlaybackStatus, RepeatMode};
-    if !matches!(state.status, PlaybackStatus::Playing) || !matches!(state.repeat, RepeatMode::Off) {
+    if !matches!(state.status, PlaybackStatus::Playing) || !matches!(state.repeat, RepeatMode::Off)
+    {
         return None;
     }
     let position = state.queue_position?;
@@ -1030,7 +1050,11 @@ async fn loudness_pass(
     while workers.join_next().await.is_some() {}
     let durable = durable.load(std::sync::atomic::Ordering::Relaxed);
     if durable > 0 {
-        activity.finish(task, true, Some(format!("Analyzed loudness for {durable} tracks")));
+        activity.finish(
+            task,
+            true,
+            Some(format!("Analyzed loudness for {durable} tracks")),
+        );
     } else {
         activity.remove(task);
     }
@@ -1167,7 +1191,10 @@ async fn migrate_fingerprint_lookup(database: &Database) {
     }
     match database.clear_not_found_fingerprints().await {
         Ok(cleared) if cleared > 0 => {
-            tracing::info!(cleared, "fingerprint: cleared stale not_found markers for re-lookup")
+            tracing::info!(
+                cleared,
+                "fingerprint: cleared stale not_found markers for re-lookup"
+            )
         }
         Ok(_) => {}
         Err(error) => {
@@ -1374,7 +1401,11 @@ async fn artist_artwork_fill_pass(
     for (index, target) in batch.into_iter().enumerate() {
         activity.update(
             task,
-            format!("Finding artist images ({}/{total}): {}", index + 1, target.name),
+            format!(
+                "Finding artist images ({}/{total}): {}",
+                index + 1,
+                target.name
+            ),
         );
         let query = artwork_providers::ArtistArtworkQuery {
             name: target.name.clone(),
@@ -1549,9 +1580,10 @@ async fn fingerprint_pass(
                     // Undecodable file → won't change on retry; negative-cache it.
                     return FingerprintOutcome::NoMatch;
                 };
-                match lookup_client
-                    .lookup(&fingerprint, acoustid_lookup_duration(real_duration, window_duration))
-                {
+                match lookup_client.lookup(
+                    &fingerprint,
+                    acoustid_lookup_duration(real_duration, window_duration),
+                ) {
                     Ok(Some(found)) => FingerprintOutcome::Resolved(found),
                     Ok(None) => FingerprintOutcome::NoMatch,
                     Err(error) => {
@@ -1581,7 +1613,14 @@ async fn fingerprint_pass(
                 }
                 FingerprintOutcome::NoMatch => {
                     let _ = database
-                        .upsert_track_fingerprint(&target.track_id, "not_found", None, None, None, now)
+                        .upsert_track_fingerprint(
+                            &target.track_id,
+                            "not_found",
+                            None,
+                            None,
+                            None,
+                            now,
+                        )
                         .await;
                     durable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1617,6 +1656,70 @@ enum FingerprintOutcome {
     NoMatch,
     /// Network/HTTP/rate-limit error or a worker panic — retry next pass, don't cache.
     Transient,
+}
+
+/// Start the Snapcast multi-room subsystem when enabled in settings: read its settings from
+/// the DB, launch the managed snapserver + FIFO, and bring up the multi-room player.
+#[cfg(feature = "snapcast")]
+async fn maybe_enable_snapcast(
+    database: &musicata_storage::Database,
+    players: &Arc<PlayerManager>,
+) -> anyhow::Result<()> {
+    let settings = snapcast_settings_from_db(database).await?;
+    if !settings.enabled {
+        return Ok(());
+    }
+    let manager = Arc::new(snapcast::SnapcastManager::start(settings).await?);
+    players.enable_snapcast(manager).await?;
+    tracing::info!("snapcast: multi-room enabled");
+    Ok(())
+}
+
+/// Build [`snapcast::SnapcastSettings`] from the persisted `snapcast.*` settings keys,
+/// falling back to defaults for anything unset (config lives in the product, not in flags).
+#[cfg(feature = "snapcast")]
+async fn snapcast_settings_from_db(
+    database: &musicata_storage::Database,
+) -> anyhow::Result<snapcast::SnapcastSettings> {
+    let mut settings = snapcast::SnapcastSettings::default();
+    let get = |key: &'static str| database.get_setting(key);
+    if let Some(value) = get("snapcast.enabled").await? {
+        settings.enabled = value == "true";
+    }
+    if let Some(value) = get("snapcast.manage_server").await? {
+        settings.manage_server = value == "true";
+    }
+    if let Some(value) = get("snapcast.server_binary").await? {
+        if !value.is_empty() {
+            settings.server_binary = value;
+        }
+    }
+    if let Some(value) = get("snapcast.fifo_path").await? {
+        if !value.is_empty() {
+            settings.fifo_path = value.into();
+        }
+    }
+    if let Some(value) = get("snapcast.sample_rate").await? {
+        if let Ok(rate) = value.parse() {
+            settings.sample_rate = rate;
+        }
+    }
+    if let Some(value) = get("snapcast.control_host").await? {
+        if !value.is_empty() {
+            settings.control_host = value;
+        }
+    }
+    if let Some(value) = get("snapcast.control_port").await? {
+        if let Ok(port) = value.parse() {
+            settings.control_port = port;
+        }
+    }
+    if let Some(value) = get("snapcast.http_port").await? {
+        if let Ok(port) = value.parse() {
+            settings.http_port = port;
+        }
+    }
+    Ok(settings)
 }
 
 /// Read a track's audio bytes from its provider — SMB over the wire, else local disk.
@@ -1669,7 +1772,10 @@ async fn musicbrainz_search_pass(
     if !setting_enabled(database, SETTING_MB_ENRICH).await {
         return false;
     }
-    let targets = match database.tracks_for_musicbrainz_search(MB_SEARCH_BATCH).await {
+    let targets = match database
+        .tracks_for_musicbrainz_search(MB_SEARCH_BATCH)
+        .await
+    {
         Ok(targets) => targets,
         Err(error) => {
             tracing::warn!(%error, "musicbrainz search: failed to list targets");
@@ -1690,7 +1796,11 @@ async fn musicbrainz_search_pass(
         }
         activity.update(
             task,
-            format!("Searching MusicBrainz ({}/{total}): {}", index + 1, target.title),
+            format!(
+                "Searching MusicBrainz ({}/{total}): {}",
+                index + 1,
+                target.title
+            ),
         );
         let client = client.clone();
         let (title, artist, album, year) = (
@@ -1973,6 +2083,7 @@ fn app(
         .route("/api/activity", get(list_activity))
         .route("/api/activity/ws", get(activity_ws))
         .route("/api/settings", get(get_settings).patch(update_settings))
+        .merge(snapcast_routes())
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
             get(album_musicbrainz_candidates),
@@ -2282,7 +2393,11 @@ async fn start_library_export(State(state): State<AppState>) -> Json<backup::Exp
         match result {
             Ok(info) => {
                 status.latest = Some(info);
-                activity.finish(task, true, Some("Library export ready to download".to_string()));
+                activity.finish(
+                    task,
+                    true,
+                    Some("Library export ready to download".to_string()),
+                );
             }
             Err(error) => {
                 activity.finish(task, false, Some(format!("Export failed: {error}")));
@@ -2335,7 +2450,12 @@ async fn run_export(
 }
 
 async fn download_library_export(State(state): State<AppState>) -> Response {
-    let latest = state.export_status.lock().expect("export status").latest.clone();
+    let latest = state
+        .export_status
+        .lock()
+        .expect("export status")
+        .latest
+        .clone();
     let Some(info) = latest else {
         return AppError::not_found("no export available yet").into_response();
     };
@@ -2367,10 +2487,12 @@ async fn import_library(
     let db_import = backup::staged_db(&state.db_path);
     let artwork_import = backup::staged_artwork(&state.artwork_dir);
     let bytes = body.to_vec();
-    tokio::task::spawn_blocking(move || backup::extract_import(&bytes, &db_import, &artwork_import))
-        .await
-        .map_err(|error| AppError::internal(error.to_string()))?
-        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        backup::extract_import(&bytes, &db_import, &artwork_import)
+    })
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?
+    .map_err(|error| AppError::bad_request(error.to_string()))?;
     Ok(Json(json!({ "restart_required": true })))
 }
 
@@ -2604,8 +2726,14 @@ struct AutoplayState {
 /// Continuous play / autoplay toggle (global). When on, the autoplay loop keeps a playing
 /// queue topped up with similar tracks.
 async fn get_autoplay(State(state): State<AppState>) -> Json<AutoplayState> {
-    let enabled =
-        state.database.get_setting(SETTING_AUTOPLAY).await.ok().flatten().as_deref() == Some("true");
+    let enabled = state
+        .database
+        .get_setting(SETTING_AUTOPLAY)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
     Json(AutoplayState { enabled })
 }
 
@@ -2615,7 +2743,10 @@ async fn set_autoplay(
 ) -> Result<Json<AutoplayState>, AppError> {
     state
         .database
-        .set_setting(SETTING_AUTOPLAY, if body.enabled { "true" } else { "false" })
+        .set_setting(
+            SETTING_AUTOPLAY,
+            if body.enabled { "true" } else { "false" },
+        )
         .await
         .map_err(db_error)?;
     Ok(Json(body))
@@ -3337,7 +3468,10 @@ async fn smart_playlist_detail(
             .into_iter()
             .map(|(track, _)| track)
             .collect(),
-        "never-played" => db.never_played(SMART_PLAYLIST_LIMIT).await.map_err(db_error)?,
+        "never-played" => db
+            .never_played(SMART_PLAYLIST_LIMIT)
+            .await
+            .map_err(db_error)?,
         "forgotten-favorites" => db
             .forgotten_favorites(SMART_PLAYLIST_LIMIT, since)
             .await
@@ -3780,6 +3914,124 @@ async fn update_settings(
             .map_err(db_error)?;
     }
     get_settings(State(state)).await
+}
+
+// ---- Snapcast multi-room control (configuration lives in the product) ----
+
+/// Snapcast routes, gated by the `snapcast` feature (empty router when built without it, so
+/// the route table is identical shape either way).
+#[cfg(feature = "snapcast")]
+fn snapcast_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/snapcast/status",
+            get(snapcast_status).patch(snapcast_update),
+        )
+        .route(
+            "/api/snapcast/clients/{id}/volume",
+            post(snapcast_set_volume),
+        )
+}
+
+#[cfg(not(feature = "snapcast"))]
+fn snapcast_routes() -> Router<AppState> {
+    Router::new()
+}
+
+/// Whether the Snapcast subsystem is enabled in settings (default off).
+#[cfg(feature = "snapcast")]
+async fn snapcast_enabled_setting(database: &Database) -> bool {
+    database
+        .get_setting("snapcast.enabled")
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
+}
+
+#[cfg(feature = "snapcast")]
+#[derive(Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+struct SnapcastStatus {
+    /// Persisted enable flag (a disable takes full effect on restart).
+    enabled: bool,
+    /// Whether the managed snapserver + player are actually running this session.
+    running: bool,
+    /// Connected snapclients (rooms), each a synchronized output.
+    clients: Vec<snapcast::SnapClient>,
+}
+
+#[cfg(feature = "snapcast")]
+async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastStatus>, AppError> {
+    let enabled = snapcast_enabled_setting(&state.database).await;
+    let manager = state.players.snapcast_manager().await;
+    let mut clients = Vec::new();
+    if let Some(manager) = &manager {
+        let control = snapcast::SnapControl::new(manager.control_addr());
+        // Point any group at our stream so every connected client hears the audio.
+        let _ = control.assign_all_to_stream(snapcast::STREAM_NAME).await;
+        clients = control.clients().await.unwrap_or_default();
+    }
+    Ok(Json(SnapcastStatus {
+        enabled,
+        running: manager.is_some(),
+        clients,
+    }))
+}
+
+#[cfg(feature = "snapcast")]
+#[derive(Debug, Deserialize)]
+struct SnapcastSettingsUpdate {
+    enabled: bool,
+}
+
+#[cfg(feature = "snapcast")]
+async fn snapcast_update(
+    State(state): State<AppState>,
+    Json(update): Json<SnapcastSettingsUpdate>,
+) -> Result<Json<SnapcastStatus>, AppError> {
+    state
+        .database
+        .set_setting(
+            "snapcast.enabled",
+            if update.enabled { "true" } else { "false" },
+        )
+        .await
+        .map_err(db_error)?;
+    // Start the subsystem immediately when enabled; a disable persists and takes effect on
+    // restart (we don't tear down a live snapserver mid-session).
+    if update.enabled && state.players.snapcast_manager().await.is_none() {
+        maybe_enable_snapcast(&state.database, &state.players)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?;
+    }
+    snapcast_status(State(state)).await
+}
+
+#[cfg(feature = "snapcast")]
+#[derive(Debug, Deserialize)]
+struct SnapVolumeUpdate {
+    percent: u8,
+}
+
+#[cfg(feature = "snapcast")]
+async fn snapcast_set_volume(
+    State(state): State<AppState>,
+    Path(client_id): Path<String>,
+    Json(body): Json<SnapVolumeUpdate>,
+) -> Result<StatusCode, AppError> {
+    let manager = state
+        .players
+        .snapcast_manager()
+        .await
+        .ok_or_else(|| AppError::not_found("snapcast is not enabled"))?;
+    let control = snapcast::SnapControl::new(manager.control_addr());
+    control
+        .set_volume(&client_id, body.percent)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_sources(State(state): State<AppState>) -> Result<Json<Vec<SourceView>>, AppError> {
@@ -4599,8 +4851,15 @@ async fn album_artwork(
         }
         let content_type = image_content_type(&ext);
         if let Some(bytes) = state.artwork_cache.get(&key, &ext).await {
-            return serve_sized_artwork(&state.artwork_cache, &key, content_type, bytes, size, etag)
-                .await;
+            return serve_sized_artwork(
+                &state.artwork_cache,
+                &key,
+                content_type,
+                bytes,
+                size,
+                etag,
+            )
+            .await;
         }
         // Cache miss (cleared/evicted) but we recorded the source — re-fetch once.
         if let Some(url) = acquired.remote_url.clone() {
@@ -4647,8 +4906,15 @@ async fn album_artwork(
         }
         if let Some(bytes) = state.artwork_cache.get(&key, EMBEDDED_CACHE_EXT).await {
             let content_type = sniff_image_content_type(&bytes);
-            return serve_sized_artwork(&state.artwork_cache, &key, content_type, bytes, size, etag)
-                .await;
+            return serve_sized_artwork(
+                &state.artwork_cache,
+                &key,
+                content_type,
+                bytes,
+                size,
+                etag,
+            )
+            .await;
         }
         // Read the audio file (over the source provider or local disk) once, extract its
         // embedded cover, and cache the image so the network stays off the hot path.
@@ -4706,8 +4972,15 @@ async fn album_artwork(
                 AppError::not_found(format!("album artwork unavailable: {error}"))
             })?;
             state.artwork_cache.put(&key, extension, &bytes).await;
-            return serve_sized_artwork(&state.artwork_cache, &key, content_type, bytes, size, etag)
-                .await;
+            return serve_sized_artwork(
+                &state.artwork_cache,
+                &key,
+                content_type,
+                bytes,
+                size,
+                etag,
+            )
+            .await;
         }
     }
 
@@ -4735,8 +5008,15 @@ async fn artist_artwork(
         }
         let content_type = image_content_type(&ext);
         if let Some(bytes) = state.artwork_cache.get(&key, &ext).await {
-            return serve_sized_artwork(&state.artwork_cache, &key, content_type, bytes, size, etag)
-                .await;
+            return serve_sized_artwork(
+                &state.artwork_cache,
+                &key,
+                content_type,
+                bytes,
+                size,
+                etag,
+            )
+            .await;
         }
         // Cache miss but we recorded the source — re-fetch once.
         if let Some(url) = acquired.remote_url.clone() {
@@ -4979,7 +5259,10 @@ struct ArtworkQuery {
 /// no size is asked for or it's at/above the largest rung.
 fn normalize_size(requested: Option<u32>) -> Option<u32> {
     let requested = requested?;
-    ARTWORK_SIZES.iter().copied().find(|&rung| requested <= rung)
+    ARTWORK_SIZES
+        .iter()
+        .copied()
+        .find(|&rung| requested <= rung)
 }
 
 /// A size-aware ETag so a client can't reuse a thumbnail body for the full cover (or vice
@@ -4995,7 +5278,9 @@ fn artwork_etag(key: &str, size: Option<u32>) -> String {
 /// and re-encode as JPEG. `None` if the bytes can't be decoded — the caller then serves
 /// the original untouched. Synchronous + CPU-bound: call inside `spawn_blocking`.
 fn resize_to_jpeg(original: &[u8], size: u32) -> Option<Vec<u8>> {
-    let thumbnail = image::load_from_memory(original).ok()?.thumbnail(size, size);
+    let thumbnail = image::load_from_memory(original)
+        .ok()?
+        .thumbnail(size, size);
     let mut buffer = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, 82)
         .encode_image(&thumbnail.to_rgb8())
@@ -5850,7 +6135,12 @@ mod tests {
             .await,
         )
         .unwrap();
-        assert!(list["items"][0].as_object().unwrap().contains_key("artwork_url"));
+        assert!(
+            list["items"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("artwork_url")
+        );
 
         // No image acquired yet → the artwork endpoint 404s (UI shows the monogram).
         let response = app
@@ -6968,7 +7258,10 @@ mod tests {
             1000,
             image::Rgb([90, 120, 150]),
         ))
-        .write_to(&mut std::io::Cursor::new(&mut cover), image::ImageFormat::Jpeg)
+        .write_to(
+            &mut std::io::Cursor::new(&mut cover),
+            image::ImageFormat::Jpeg,
+        )
         .unwrap();
         fs::write(fixture.root.join("1994 - Paramparcad/cover.jpg"), &cover).unwrap();
 
@@ -6983,8 +7276,8 @@ mod tests {
         let app = fixture.app_with_library(library).await;
 
         let request = |etag: Option<&str>| {
-            let mut builder = Request::builder()
-                .uri(format!("/api/albums/{album_id}/artwork?size=300"));
+            let mut builder =
+                Request::builder().uri(format!("/api/albums/{album_id}/artwork?size=300"));
             if let Some(etag) = etag {
                 builder = builder.header(IF_NONE_MATCH, etag);
             }
@@ -7439,12 +7732,18 @@ mod tests {
         assert!(super::mb_search_match_is_confident(&good, &target));
         // Below the score floor → rejected even with matching names.
         assert!(!super::mb_search_match_is_confident(
-            &RecordingSearchMatch { score: 80, ..good.clone() },
+            &RecordingSearchMatch {
+                score: 80,
+                ..good.clone()
+            },
             &target
         ));
         // High score but a different artist → rejected (guards confident-but-wrong rows).
         assert!(!super::mb_search_match_is_confident(
-            &RecordingSearchMatch { artist: "Some Other Band".into(), ..good.clone() },
+            &RecordingSearchMatch {
+                artist: "Some Other Band".into(),
+                ..good.clone()
+            },
             &target
         ));
         // Diacritic/case differences still match; genuinely different names don't.
@@ -8030,17 +8329,22 @@ mod tests {
                 .save_library(&mut library)
                 .await
                 .expect("save fixture library");
-            let players = PlayerManager::load(database.clone(), "http://127.0.0.1".to_string())
-                .await
-                .expect("player manager");
             let mut registry = ProviderRegistry::new();
             registry.push(ProviderHandle::local(LocalDiskProvider::new(&self.root)));
             registry.push(ProviderHandle::radio(crate::providers::RadioProvider::new(
                 database.clone(),
             )));
+            let providers = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
+            let players = PlayerManager::load(
+                database.clone(),
+                "http://127.0.0.1".to_string(),
+                providers.clone(),
+            )
+            .await
+            .expect("player manager");
             app(
                 database,
-                std::sync::Arc::new(tokio::sync::RwLock::new(registry)),
+                providers,
                 players,
                 std::sync::Arc::new(crate::activity::ActivityLog::default()),
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),

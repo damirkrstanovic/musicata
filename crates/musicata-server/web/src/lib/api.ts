@@ -9,6 +9,7 @@ import type { RadioStation } from "../types/RadioStation";
 import type { Player } from "../types/Player";
 import type { SourceView } from "../types/SourceView";
 import type { AppSettings } from "../types/AppSettings";
+import type { SnapcastStatus } from "../types/SnapcastStatus";
 import type { ArtistAliasGroup } from "../types/ArtistAliasGroup";
 import type { Activity } from "../types/Activity";
 import type { TrackMetadataReviewResponse } from "../types/TrackMetadataReviewResponse";
@@ -266,6 +267,17 @@ export const api = {
   // Settings
   settings: () => getJson<AppSettings>("/api/settings"),
   saveSettings: (body: AppSettings) => sendJson("/api/settings", "PATCH", body),
+
+  // Snapcast multi-room (synchronized playback across rooms)
+  snapcastStatus: () => getJson<SnapcastStatus>("/api/snapcast/status"),
+  setSnapcastEnabled: (enabled: boolean) =>
+    sendJson<SnapcastStatus>("/api/snapcast/status", "PATCH", { enabled }),
+  setSnapcastVolume: (clientId: string, percent: number) =>
+    sendJson(
+      `/api/snapcast/clients/${encodeURIComponent(clientId)}/volume`,
+      "POST",
+      { percent },
+    ),
 
   // Recommendations: radio (seed + similar tracks) + continuous-play toggle.
   trackRadio: (id: string, limit = 25) =>
