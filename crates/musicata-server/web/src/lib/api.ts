@@ -10,6 +10,7 @@ import type { Player } from "../types/Player";
 import type { SourceView } from "../types/SourceView";
 import type { AppSettings } from "../types/AppSettings";
 import type { SnapcastStatus } from "../types/SnapcastStatus";
+import type { SnapRoomView } from "../types/SnapRoomView";
 import type { ArtistAliasGroup } from "../types/ArtistAliasGroup";
 import type { Activity } from "../types/Activity";
 import type { TrackMetadataReviewResponse } from "../types/TrackMetadataReviewResponse";
@@ -270,8 +271,19 @@ export const api = {
 
   // Snapcast multi-room (synchronized playback across rooms)
   snapcastStatus: () => getJson<SnapcastStatus>("/api/snapcast/status"),
-  setSnapcastEnabled: (enabled: boolean) =>
-    sendJson<SnapcastStatus>("/api/snapcast/status", "PATCH", { enabled }),
+  updateSnapcast: (update: {
+    enabled?: boolean;
+    auth_enabled?: boolean;
+    server_host?: string;
+  }) => sendJson<SnapcastStatus>("/api/snapcast/status", "PATCH", update),
+  snapcastRooms: () => getJson<SnapRoomView[]>("/api/snapcast/rooms"),
+  addSnapcastRoom: (name: string) =>
+    sendJson<SnapRoomView[]>("/api/snapcast/rooms", "POST", { name }),
+  deleteSnapcastRoom: (name: string) =>
+    sendJson<SnapRoomView[]>(
+      `/api/snapcast/rooms/${encodeURIComponent(name)}`,
+      "DELETE",
+    ),
   setSnapcastVolume: (clientId: string, percent: number) =>
     sendJson(
       `/api/snapcast/clients/${encodeURIComponent(clientId)}/volume`,

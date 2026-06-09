@@ -45,6 +45,42 @@ Its data model maps cleanly onto ours:
 
 ---
 
+## Security / endpoint auth — per-room passwords (forward-compat) + room provisioning
+
+**Verified-the-hard-way fact:** Snapcast 0.35's **username/password auth is stubbed out
+upstream** — `snapserver.cpp` hardcodes `settings.auth.enabled = false; // TODO: auth`,
+overriding any `[authorization]` config. The whole framework (the Hello `Auth` field,
+`Server.Authenticate`, roles/users, per-method permissions) is *present but inert*: a client
+sending an **empty** password connects fine (confirmed live). The only access control that
+actually *enforces* on 0.35 is **mutual TLS** (`verify_clients` + client certs over `wss`),
+which works but is a meaningful lift (a CA + per-device certs, `wss` clients) for a home setup
+— so it's **not** what we ship here.
+
+What Musicata implements (`server.rs`, gated by `auth_enabled`):
+
+- **Per-room passwords + provisioning.** `/admin` → Multi-room → *Rooms*: name a room
+  ("kitchen"), Musicata generates a 128-bit password, and gives you the ready
+  `snapclient 'tcp://kitchen:<pw>@<host>:1704' --hostID 'kitchen'` command to run on the
+  device. Rooms persist as JSON (`snapcast.rooms`); each becomes an `authorization.user` entry.
+  `--hostID` makes the room show its connection state back in `/admin`.
+- **Forward-compatible config.** When `auth_enabled`, we write the `[authorization]` block
+  (`enabled = true`, `role = stream:Streaming`, one `user = <name>:<pw>:stream` per room). On
+  0.35 it does nothing; the moment a future snapserver flips `auth.enabled`, the *same* config +
+  passwords start enforcing with zero Musicata changes. Room/auth changes are written at
+  startup, so they apply on restart.
+
+**This is honest, not enforcing-today.** The `/admin` toggle carries a loud banner: the
+passwords are *not* checked by snapserver 0.35, so rooms stay open on the LAN — keep the server
+on a trusted network. We deliberately don't dress inert config up as working auth. The
+provisioning interface (the install command per room) is useful regardless. (We prototyped the
+TLS-cert path and reverted it: too complex for the gain on a home LAN; the password plumbing is
+the cheaper bet that turns real on an upstream update.)
+
+Future: when upstream finishes auth this becomes enforcing for free; a per-room TLS option can
+return if someone needs real isolation before then.
+
+---
+
 ## How it stays reliable + in sync (the mechanism)
 
 The crux, from `doc/binary_protocol.md` + `client/`:

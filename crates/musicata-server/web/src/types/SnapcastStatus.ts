@@ -11,6 +11,15 @@ enabled: boolean,
  */
 running: boolean, 
 /**
+ * Persisted "require a per-room password" flag. **Not enforced by snapserver 0.35** (auth
+ * is stubbed upstream) — the UI says so; it's forward-compatible config.
+ */
+auth_enabled: boolean, 
+/**
+ * The address rooms dial (shown in each room's install command).
+ */
+server_host: string, 
+/**
  * Connected snapclients (rooms), each a synchronized output.
  */
 clients: Array<SnapClient>, };

@@ -1719,7 +1719,28 @@ async fn snapcast_settings_from_db(
             settings.http_port = port;
         }
     }
+    if let Some(value) = get("snapcast.auth_enabled").await? {
+        settings.auth_enabled = value == "true";
+    }
+    if let Some(value) = get("snapcast.server_host").await? {
+        if !value.is_empty() {
+            settings.server_host = value;
+        }
+    }
+    settings.rooms = snapcast_rooms_from_db(database).await;
     Ok(settings)
+}
+
+/// The provisioned rooms persisted as a JSON array in the `snapcast.rooms` setting.
+#[cfg(feature = "snapcast")]
+async fn snapcast_rooms_from_db(database: &musicata_storage::Database) -> Vec<snapcast::SnapRoom> {
+    database
+        .get_setting("snapcast.rooms")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
 }
 
 /// Read a track's audio bytes from its provider — SMB over the wire, else local disk.
@@ -3928,6 +3949,14 @@ fn snapcast_routes() -> Router<AppState> {
             get(snapcast_status).patch(snapcast_update),
         )
         .route(
+            "/api/snapcast/rooms",
+            get(snapcast_rooms).post(snapcast_add_room),
+        )
+        .route(
+            "/api/snapcast/rooms/{name}",
+            axum::routing::delete(snapcast_delete_room),
+        )
+        .route(
             "/api/snapcast/clients/{id}/volume",
             post(snapcast_set_volume),
         )
@@ -3951,6 +3980,17 @@ async fn snapcast_enabled_setting(database: &Database) -> bool {
 }
 
 #[cfg(feature = "snapcast")]
+async fn snapcast_server_host(database: &Database) -> String {
+    database
+        .get_setting("snapcast.server_host")
+        .await
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+#[cfg(feature = "snapcast")]
 #[derive(Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct SnapcastStatus {
@@ -3958,6 +3998,11 @@ struct SnapcastStatus {
     enabled: bool,
     /// Whether the managed snapserver + player are actually running this session.
     running: bool,
+    /// Persisted "require a per-room password" flag. **Not enforced by snapserver 0.35** (auth
+    /// is stubbed upstream) — the UI says so; it's forward-compatible config.
+    auth_enabled: bool,
+    /// The address rooms dial (shown in each room's install command).
+    server_host: String,
     /// Connected snapclients (rooms), each a synchronized output.
     clients: Vec<snapcast::SnapClient>,
 }
@@ -3965,6 +4010,15 @@ struct SnapcastStatus {
 #[cfg(feature = "snapcast")]
 async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastStatus>, AppError> {
     let enabled = snapcast_enabled_setting(&state.database).await;
+    let auth_enabled = state
+        .database
+        .get_setting("snapcast.auth_enabled")
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    let server_host = snapcast_server_host(&state.database).await;
     let manager = state.players.snapcast_manager().await;
     let mut clients = Vec::new();
     if let Some(manager) = &manager {
@@ -3976,6 +4030,8 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
     Ok(Json(SnapcastStatus {
         enabled,
         running: manager.is_some(),
+        auth_enabled,
+        server_host,
         clients,
     }))
 }
@@ -3983,7 +4039,9 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
 #[cfg(feature = "snapcast")]
 #[derive(Debug, Deserialize)]
 struct SnapcastSettingsUpdate {
-    enabled: bool,
+    enabled: Option<bool>,
+    auth_enabled: Option<bool>,
+    server_host: Option<String>,
 }
 
 #[cfg(feature = "snapcast")]
@@ -3991,22 +4049,155 @@ async fn snapcast_update(
     State(state): State<AppState>,
     Json(update): Json<SnapcastSettingsUpdate>,
 ) -> Result<Json<SnapcastStatus>, AppError> {
-    state
-        .database
-        .set_setting(
-            "snapcast.enabled",
-            if update.enabled { "true" } else { "false" },
-        )
-        .await
-        .map_err(db_error)?;
-    // Start the subsystem immediately when enabled; a disable persists and takes effect on
-    // restart (we don't tear down a live snapserver mid-session).
-    if update.enabled && state.players.snapcast_manager().await.is_none() {
+    if let Some(enabled) = update.enabled {
+        state
+            .database
+            .set_setting("snapcast.enabled", if enabled { "true" } else { "false" })
+            .await
+            .map_err(db_error)?;
+    }
+    if let Some(auth) = update.auth_enabled {
+        state
+            .database
+            .set_setting("snapcast.auth_enabled", if auth { "true" } else { "false" })
+            .await
+            .map_err(db_error)?;
+    }
+    if let Some(host) = update.server_host {
+        let host = host.trim();
+        if !host.is_empty() {
+            state
+                .database
+                .set_setting("snapcast.server_host", host)
+                .await
+                .map_err(db_error)?;
+        }
+    }
+    // Start the subsystem immediately when newly enabled; auth/host changes persist and take
+    // effect on the next restart (config is regenerated at startup).
+    if snapcast_enabled_setting(&state.database).await
+        && state.players.snapcast_manager().await.is_none()
+    {
         maybe_enable_snapcast(&state.database, &state.players)
             .await
             .map_err(|error| AppError::internal(error.to_string()))?;
     }
     snapcast_status(State(state)).await
+}
+
+/// A provisioned room as shown in `/admin`: its name, the snapclient command (password
+/// embedded), and whether a snapclient with that name is currently connected.
+#[cfg(feature = "snapcast")]
+#[derive(Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+struct SnapRoomView {
+    name: String,
+    command: String,
+    connected: bool,
+}
+
+#[cfg(feature = "snapcast")]
+async fn snapcast_room_views(state: &AppState) -> Vec<SnapRoomView> {
+    let rooms = snapcast_rooms_from_db(&state.database).await;
+    let host = snapcast_server_host(&state.database).await;
+    // Which provisioned rooms are connected: the install command sets `--hostID <name>`, which
+    // becomes the snapclient's *id* (its display name still defaults to the device hostname).
+    let connected: std::collections::HashSet<String> = match state.players.snapcast_manager().await
+    {
+        Some(manager) => snapcast::SnapControl::new(manager.control_addr())
+            .clients()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.connected)
+            .map(|c| c.id)
+            .collect(),
+        None => std::collections::HashSet::new(),
+    };
+    rooms
+        .iter()
+        .map(|room| SnapRoomView {
+            name: room.name.clone(),
+            command: snapcast::install_command(&host, room),
+            connected: connected.contains(&room.name),
+        })
+        .collect()
+}
+
+#[cfg(feature = "snapcast")]
+async fn snapcast_rooms(State(state): State<AppState>) -> Json<Vec<SnapRoomView>> {
+    Json(snapcast_room_views(&state).await)
+}
+
+#[cfg(feature = "snapcast")]
+#[derive(Debug, Deserialize)]
+struct AddRoomRequest {
+    name: String,
+}
+
+#[cfg(feature = "snapcast")]
+async fn snapcast_add_room(
+    State(state): State<AppState>,
+    Json(req): Json<AddRoomRequest>,
+) -> Result<Json<Vec<SnapRoomView>>, AppError> {
+    let name = req.name.trim().to_string();
+    if name.is_empty()
+        || name.len() > 32
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(AppError::bad_request(
+            "room name must be 1–32 chars: letters, digits, '-' or '_'",
+        ));
+    }
+    let mut rooms = snapcast_rooms_from_db(&state.database).await;
+    if rooms.iter().any(|r| r.name == name) {
+        return Err(AppError::bad_request(
+            "a room with that name already exists",
+        ));
+    }
+    rooms.push(snapcast::SnapRoom {
+        name,
+        password: generate_room_password(),
+    });
+    save_snapcast_rooms(&state.database, &rooms).await?;
+    Ok(Json(snapcast_room_views(&state).await))
+}
+
+#[cfg(feature = "snapcast")]
+async fn snapcast_delete_room(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<SnapRoomView>>, AppError> {
+    let mut rooms = snapcast_rooms_from_db(&state.database).await;
+    rooms.retain(|r| r.name != name);
+    save_snapcast_rooms(&state.database, &rooms).await?;
+    Ok(Json(snapcast_room_views(&state).await))
+}
+
+#[cfg(feature = "snapcast")]
+async fn save_snapcast_rooms(
+    database: &Database,
+    rooms: &[snapcast::SnapRoom],
+) -> Result<(), AppError> {
+    let json = serde_json::to_string(rooms).map_err(|e| AppError::internal(e.to_string()))?;
+    database
+        .set_setting("snapcast.rooms", &json)
+        .await
+        .map_err(db_error)?;
+    Ok(())
+}
+
+/// A random 128-bit room password as 32 hex chars (URI-safe — it goes in `tcp://name:pw@host`).
+#[cfg(feature = "snapcast")]
+fn generate_room_password() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(feature = "snapcast")]
