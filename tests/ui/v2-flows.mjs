@@ -210,6 +210,19 @@ check(
   eqTitleBefore === (await js(`document.querySelector('#now-title')?.textContent`)),
   `${eqTitleBefore}`,
 );
+// AutoEq picker: search the bundled curated set + pick a real model → it becomes a saved profile.
+await js(`(()=>{
+  const d=[...document.querySelectorAll('details.eq-import')].find(x=>x.querySelector('summary')?.textContent.includes('Pick your headphone'));
+  if(d){ d.open=true; const i=d.querySelector('input'); if(i){ i.value='HD 600'; i.dispatchEvent(new Event('input',{bubbles:true})); } }
+})()`);
+await sleep(400);
+await js(`[...document.querySelectorAll('.hp-matches button')].find(b=>b.textContent.includes('HD 600'))?.click()`);
+await sleep(900);
+check(
+  "autoeq picker saves a headphone profile",
+  await js(`[...document.querySelectorAll('.eq-field select option')].some(o=>o.textContent.includes('HD 600'))`),
+);
+
 await js(`(()=>{const s=document.querySelector('.eq-field select'); if(s){s.value=''; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
 await clickText(".eq-head button", "Close");
 await sleep(300);

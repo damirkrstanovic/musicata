@@ -1,11 +1,31 @@
 <script lang="ts">
   import { dsp } from "../lib/dsp.svelte";
   import { audioDevices } from "../lib/audioDevices.svelte";
+  import { parseParametricEq } from "../lib/dsp";
   import { responseCurveDb, logFreqs } from "../lib/eqcurve";
+  import autoeqPresets from "../lib/autoeq-presets.json";
 
   function addOutput() {
     audioDevices.addPreset(audioDevices.presets.length === 0 ? "Speakers" : "Headphones");
     audioDevices.refreshDevices();
+  }
+
+  // AutoEq headphone picker: search the bundled curated set of real ParametricEQ presets,
+  // parse the chosen one (reusing the import parser), and save it as a headphones profile.
+  const HP_MODELS = Object.keys(autoeqPresets as Record<string, string>).sort();
+  let hpSearch = $state("");
+  const hpMatches = $derived(
+    hpSearch.trim()
+      ? HP_MODELS.filter((m) => m.toLowerCase().includes(hpSearch.trim().toLowerCase())).slice(0, 8)
+      : [],
+  );
+  async function pickHeadphone(model: string) {
+    const text = (autoeqPresets as Record<string, string>)[model];
+    const prof = parseParametricEq(text, model);
+    if (prof.bands.length === 0) return;
+    prof.kind = "headphones";
+    await dsp.saveProfile(prof);
+    hpSearch = "";
   }
 
   let importName = $state("");
@@ -186,6 +206,31 @@
     </details>
 
     <details class="eq-import">
+      <summary>Pick your headphone (AutoEq)</summary>
+      <p class="eq-note">
+        Zero-effort correction — pick your model and it's applied instantly (real AutoEq presets;
+        a preference target, so nudge the bass to taste). Not listed? Use the paste box below.
+      </p>
+      <input
+        class="eq-name"
+        type="text"
+        placeholder="Search headphones (e.g. HD 600)"
+        bind:value={hpSearch}
+      />
+      {#if hpMatches.length > 0}
+        <ul class="hp-matches">
+          {#each hpMatches as model (model)}
+            <li>
+              <button type="button" onclick={() => pickHeadphone(model)}>{model}</button>
+            </li>
+          {/each}
+        </ul>
+      {:else if hpSearch.trim()}
+        <p class="eq-note">No match in the bundled set — paste its ParametricEQ below.</p>
+      {/if}
+    </details>
+
+    <details class="eq-import">
       <summary>Import a headphone preset</summary>
       <p class="eq-note">
         Find your headphone on <strong>autoeq.app</strong> (or the AutoEq project) and paste its
@@ -204,3 +249,39 @@
     </details>
   </section>
 {/if}
+
+<style>
+  .hp-matches {
+    list-style: none;
+    margin: 0.4rem 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .hp-matches button {
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 0.4rem;
+    color: inherit;
+    padding: 0.4rem 0.55rem;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .hp-matches button:hover {
+    background: rgba(212, 175, 55, 0.14);
+  }
+  .eq-output {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.3rem;
+    padding: 0.5rem 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  }
+  .eq-output select,
+  .eq-output input {
+    width: 100%;
+  }
+</style>
