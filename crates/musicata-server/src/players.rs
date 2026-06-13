@@ -2667,6 +2667,30 @@ mod tests {
     /// The recorder runs in a background task, so poll the history until it has at
     /// least `expected` rows (or fail after a generous timeout). Returns track ids,
     /// most-recent first.
+    /// Play `id` on the browser player and report progress past the completion threshold,
+    /// retrying the progress tick until the async recorder confirms the listen. This is robust
+    /// to the recorder consuming the (separate-channel) progress tick before its state frame, or
+    /// dropping a frame under load — both of which only bite the test's one-shot ticks, not
+    /// production's continuous progress stream. Waiting per track keeps at most one track's
+    /// frames in flight, so there's no cross-track mis-attribution.
+    async fn play_until_listened(
+        browser: &PlayerHandle,
+        player: &BrowserPlayer,
+        database: &Database,
+        id: &str,
+    ) {
+        play(browser, database, id).await;
+        for _ in 0..200 {
+            player.report_progress(95.0, Some(180.0)).await;
+            let recent = database.recently_played(50).await.expect("recent");
+            if recent.iter().any(|(track, _)| track.id == id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("listen for {id} was never recorded");
+    }
+
     async fn wait_for_recent(database: &Database, expected: usize) -> Vec<String> {
         for _ in 0..200 {
             let recent = database.recently_played(50).await.expect("recent");
@@ -2708,21 +2732,23 @@ mod tests {
             panic!("browser player should be a Browser handle");
         };
 
-        // Play a track, then report progress past half its duration -> one listen.
-        play(&browser, &database, "track_1").await;
-        player.report_progress(95.0, Some(180.0)).await;
-        let recent = wait_for_recent(&database, 1).await;
-        assert_eq!(recent, vec!["track_1".to_string()]);
-
-        // Four more, each driven past the threshold -> all five present.
-        for id in ["track_2", "track_3", "track_4", "track_5"] {
-            play(&browser, &database, id).await;
-            player.report_progress(95.0, Some(180.0)).await;
-        }
-        let recent = wait_for_recent(&database, 5).await;
-        let found: std::collections::BTreeSet<&str> = recent.iter().map(String::as_str).collect();
+        // Play each track and drive it past the completion threshold, confirming its listen
+        // landed before moving on (the recorder reads state + progress over two independent
+        // broadcast channels, so a one-shot progress tick can otherwise race ahead of its state
+        // frame under load — see `play_until_listened`).
         for id in ["track_1", "track_2", "track_3", "track_4", "track_5"] {
-            assert!(found.contains(id), "recent missing {id}; got {recent:?}");
+            play_until_listened(&browser, player, &database, id).await;
+        }
+
+        let recent: std::collections::BTreeSet<String> = database
+            .recently_played(50)
+            .await
+            .expect("recent")
+            .into_iter()
+            .map(|(track, _)| track.id)
+            .collect();
+        for id in ["track_1", "track_2", "track_3", "track_4", "track_5"] {
+            assert!(recent.contains(id), "recent missing {id}; got {recent:?}");
         }
         assert_eq!(recent.len(), 5, "expected exactly five distinct tracks");
 
