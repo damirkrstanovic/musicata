@@ -469,8 +469,9 @@ Tasks:
   surfaces — fresh ordering each session, deterministic per press; `weighted_artist_track_order`
   in `recommendations.rs`), and a **skip penalty** (`frequently_skipped_track_ids` — tracks
   skipped more than finished, ≥2 skips — held back and used only to reach the target, so radio
-  leans away from them without banning them). *Remaining:* verify the ListenBrainz live path
-  against the real API.
+  leans away from them without banning them). **Live path verified** against the production
+  ListenBrainz Labs API (both algorithm strings valid, response shapes parse) via an
+  `#[ignore]`d smoke test (`listenbrainz_live_path`; run with `--ignored`). Slice complete.
 - Add optional ListenBrainz scrobbling and recommendation import.
 - Design an optional `musicata-ml` service for future audio embeddings, genre/mood inference, and similarity search.
 
