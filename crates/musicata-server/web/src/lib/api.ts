@@ -195,6 +195,12 @@ export class ApiError extends Error {
   }
 }
 
+// A 401 means the session expired or never existed — tell the session store (via a DOM event,
+// to avoid an import cycle) so the app falls back to the login screen.
+function signalIfUnauthorized(status: number) {
+  if (status === 401) window.dispatchEvent(new Event("musicata:unauthorized"));
+}
+
 async function getJson<T>(
   path: string,
   params?: Record<string, string | number | undefined>,
@@ -205,7 +211,10 @@ async function getJson<T>(
     if (value !== undefined) url.searchParams.set(key, String(value));
   }
   const response = await fetch(url, { headers: { accept: "application/json" }, signal });
-  if (!response.ok) throw new ApiError(response.status, `GET ${path} → ${response.status}`);
+  if (!response.ok) {
+    signalIfUnauthorized(response.status);
+    throw new ApiError(response.status, `GET ${path} → ${response.status}`);
+  }
   return (await response.json()) as T;
 }
 
@@ -219,6 +228,7 @@ async function sendJson<T>(path: string, method: string, body?: unknown): Promis
   }
   const response = await fetch(path, init);
   if (!response.ok) {
+    signalIfUnauthorized(response.status);
     let detail = `${response.status} ${response.statusText}`;
     try {
       const payload = (await response.json()) as { error?: { message?: string } };
@@ -353,4 +363,30 @@ export const api = {
     getJson<UnidentifiedAlbum[]>("/api/identification/unidentified", { kind: "album", limit }),
   unidentifiedArtists: (limit = 25) =>
     getJson<UnidentifiedArtist[]>("/api/identification/unidentified", { kind: "artist", limit }),
+
+  // Auth & users
+  authStatus: () => getJson<{ setup_required: boolean }>("/api/auth/status"),
+  me: () => getJson<SessionUser>("/api/auth/me"),
+  login: (username: string, password: string) =>
+    sendJson<{ user: SessionUser }>("/api/auth/login", "POST", { username, password }),
+  setup: (username: string, password: string) =>
+    sendJson<{ user: SessionUser }>("/api/auth/setup", "POST", { username, password }),
+  logout: () => sendJson("/api/auth/logout", "POST"),
+  changePassword: (current_password: string, new_password: string) =>
+    sendJson("/api/auth/password", "POST", { current_password, new_password }),
+  apiToken: () => getJson<{ api_token: string }>("/api/auth/token"),
+  rotateApiToken: () => sendJson<{ api_token: string }>("/api/auth/token", "POST"),
+  listUsers: () => getJson<{ users: SessionUser[] }>("/api/users"),
+  createUser: (username: string, password: string, role: string) =>
+    sendJson<SessionUser>("/api/users", "POST", { username, password, role }),
+  updateUser: (id: string, patch: { role?: string; password?: string }) =>
+    sendJson(`/api/users/${encodeURIComponent(id)}`, "PATCH", patch),
+  deleteUser: (id: string) => sendJson(`/api/users/${encodeURIComponent(id)}`, "DELETE"),
 };
+
+/** The authenticated user (matches the server's UserView). */
+export interface SessionUser {
+  id: string;
+  username: string;
+  role: string;
+}

@@ -31,6 +31,7 @@
   import PlaylistView from "./PlaylistView.svelte";
   import SmartPlaylistView from "./SmartPlaylistView.svelte";
   import InstallPrompt from "./InstallPrompt.svelte";
+  import AccountMenu from "./AccountMenu.svelte";
   import { install } from "../lib/install.svelte";
 
   let audioEl: HTMLAudioElement;
@@ -249,6 +250,7 @@
             <option value={`zone:${z.id}`}>Zone · {z.name}</option>
           {/each}
         </select>
+        <AccountMenu />
       </div>
     </div>
     <div class="rail-top">

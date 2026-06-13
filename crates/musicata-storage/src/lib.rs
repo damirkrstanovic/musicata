@@ -284,6 +284,13 @@ impl Database {
             set_user_version(&self.pool, 27).await?;
         }
 
+        if version < 28 {
+            for statement in MIGRATION_028_USERS_AND_SESSIONS {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 28).await?;
+        }
+
         Ok(())
     }
 
@@ -2539,6 +2546,159 @@ impl Database {
         Ok(())
     }
 
+    // ---- Users + sessions (hashing/token generation live in the server crate) ----
+
+    /// How many accounts exist — zero means the app is in first-run "setup" mode.
+    pub async fn count_users(&self) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM users")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("n")?)
+    }
+
+    pub async fn create_user(&self, user: &UserRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, api_token, created_at_unix_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&user.id)
+        .bind(&user.username)
+        .bind(&user.password_hash)
+        .bind(&user.role)
+        .bind(&user.api_token)
+        .bind(user.created_at_unix_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn user_by_username(&self, username: &str) -> Result<Option<UserRecord>> {
+        self.user_where("username = ?1", username).await
+    }
+
+    pub async fn user_by_id(&self, id: &str) -> Result<Option<UserRecord>> {
+        self.user_where("id = ?1", id).await
+    }
+
+    /// Look up the user owning an API token (Subsonic / bearer auth). Cleartext compare.
+    pub async fn user_by_api_token(&self, token: &str) -> Result<Option<UserRecord>> {
+        self.user_where("api_token = ?1", token).await
+    }
+
+    async fn user_where(&self, predicate: &str, value: &str) -> Result<Option<UserRecord>> {
+        let row = sqlx::query(&format!(
+            "SELECT id, username, password_hash, role, api_token, created_at_unix_seconds
+             FROM users WHERE {predicate}"
+        ))
+        .bind(value)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| user_from_row(&row)).transpose()
+    }
+
+    pub async fn list_users(&self) -> Result<Vec<UserRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, username, password_hash, role, api_token, created_at_unix_seconds
+             FROM users ORDER BY username",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(user_from_row).collect()
+    }
+
+    pub async fn delete_user(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_user_password(&self, id: &str, password_hash: &str) -> Result<()> {
+        sqlx::query("UPDATE users SET password_hash = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(password_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_user_role(&self, id: &str, role: &str) -> Result<()> {
+        sqlx::query("UPDATE users SET role = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(role)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_user_api_token(&self, id: &str, api_token: &str) -> Result<()> {
+        sqlx::query("UPDATE users SET api_token = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(api_token)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Record a login session keyed by the **hash** of the cookie token.
+    pub async fn create_session(
+        &self,
+        token_hash: &str,
+        user_id: &str,
+        created_at: i64,
+        expires_at: i64,
+        user_agent: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, created_at_unix_seconds, expires_at_unix_seconds, user_agent)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(token_hash)
+        .bind(user_id)
+        .bind(created_at)
+        .bind(expires_at)
+        .bind(user_agent)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The user behind a (hashed) session token, if the session exists and hasn't expired.
+    pub async fn session_user(&self, token_hash: &str, now: i64) -> Result<Option<UserRecord>> {
+        let row = sqlx::query(
+            "SELECT u.id, u.username, u.password_hash, u.role, u.api_token, u.created_at_unix_seconds
+             FROM sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.token_hash = ?1 AND s.expires_at_unix_seconds > ?2",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| user_from_row(&row)).transpose()
+    }
+
+    pub async fn delete_session(&self, token_hash: &str) -> Result<()> {
+        sqlx::query("DELETE FROM sessions WHERE token_hash = ?1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Drop expired sessions (called periodically); returns how many were removed.
+    pub async fn prune_expired_sessions(&self, now: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM sessions WHERE expires_at_unix_seconds <= ?1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     // ---- Players & zones -----------------------------------------------------
 
     pub async fn list_players(&self) -> Result<Vec<PlayerRecord>> {
@@ -3527,6 +3687,29 @@ pub struct ActivityRecord {
     pub started_at_unix_seconds: i64,
     pub finished_at_unix_seconds: Option<i64>,
     pub message: Option<String>,
+}
+
+/// A user account. `password_hash` is an argon2 PHC string (hashing lives in the server
+/// crate); `api_token` is a random per-user secret for Subsonic/API clients, cleartext at rest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserRecord {
+    pub id: String,
+    pub username: String,
+    pub password_hash: String,
+    pub role: String,
+    pub api_token: String,
+    pub created_at_unix_seconds: i64,
+}
+
+fn user_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<UserRecord> {
+    Ok(UserRecord {
+        id: row.try_get("id")?,
+        username: row.try_get("username")?,
+        password_hash: row.try_get("password_hash")?,
+        role: row.try_get("role")?,
+        api_token: row.try_get("api_token")?,
+        created_at_unix_seconds: row.try_get("created_at_unix_seconds")?,
+    })
 }
 
 /// A persisted music source beyond the local-disk root. Today this is an SMB
@@ -4606,6 +4789,30 @@ const MIGRATION_027_SIMILARITY_CACHE: &[&str] = &["CREATE TABLE IF NOT EXISTS si
         PRIMARY KEY (entity_kind, seed_mbid)
     )"];
 
+// User accounts + login sessions. `password_hash` is an argon2 PHC string; `api_token` is a
+// random per-user secret for Subsonic/programmatic clients, stored in cleartext because
+// Subsonic's salted-token auth needs to recompute md5(token+salt) server-side (the same
+// plaintext-secret-at-rest reality as SMB/Subsonic passwords — see roadmap M12). Sessions store
+// the **sha256** of the cookie token, so a DB leak yields no live sessions.
+const MIGRATION_028_USERS_AND_SESSIONS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'listener',
+        api_token TEXT NOT NULL,
+        created_at_unix_seconds INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created_at_unix_seconds INTEGER NOT NULL,
+        expires_at_unix_seconds INTEGER NOT NULL,
+        user_agent TEXT
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
+];
+
 // MusicBrainz metadata fetched for a track via its (fingerprinted) recording MBID —
 // real title/artist/album/track-number, applied to the canonical library so an untagged
 // track stops showing folder-derived junk. Like track_fingerprint / acquired_album_artwork,
@@ -4901,7 +5108,9 @@ async fn ensure_column(
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivityRecord, Database, ListenKind, ResolvedMusicBrainzMetadata, SourceRecord};
+    use super::{
+        ActivityRecord, Database, ListenKind, ResolvedMusicBrainzMetadata, SourceRecord, UserRecord,
+    };
     use musicata_core::{
         Album, Artist, BrowseFilter, Library, MetadataApprovalState, MetadataFieldValue,
         ProviderMapping, ScanIssue, Track, TrackMetadataObservation,
@@ -5596,6 +5805,50 @@ mod tests {
         let penalized = database.frequently_skipped_track_ids().await.unwrap();
         assert_eq!(penalized.len(), 1, "only t_skip qualifies: {penalized:?}");
         assert!(penalized.contains("t_skip"));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn users_and_sessions_round_trip() {
+        let db_path = temp_db_path("users-sessions");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        assert_eq!(database.count_users().await.unwrap(), 0, "starts in setup mode");
+
+        let admin = UserRecord {
+            id: "u1".into(),
+            username: "alice".into(),
+            password_hash: "argon2-hash".into(),
+            role: "admin".into(),
+            api_token: "tok-abc".into(),
+            created_at_unix_seconds: 100,
+        };
+        database.create_user(&admin).await.unwrap();
+        assert_eq!(database.count_users().await.unwrap(), 1);
+        assert_eq!(database.user_by_username("alice").await.unwrap().unwrap().role, "admin");
+        assert_eq!(database.user_by_api_token("tok-abc").await.unwrap().unwrap().id, "u1");
+        assert!(database.user_by_api_token("nope").await.unwrap().is_none());
+
+        // Session lookup respects expiry.
+        database.create_session("hash1", "u1", 100, 1000, Some("phone")).await.unwrap();
+        assert_eq!(database.session_user("hash1", 500).await.unwrap().unwrap().username, "alice");
+        assert!(database.session_user("hash1", 2000).await.unwrap().is_none(), "expired");
+        assert!(database.session_user("missing", 500).await.unwrap().is_none());
+
+        // Pruning drops only expired rows.
+        database.create_session("hash2", "u1", 100, 5000, None).await.unwrap();
+        assert_eq!(database.prune_expired_sessions(2000).await.unwrap(), 1);
+        assert!(database.session_user("hash2", 2000).await.unwrap().is_some());
+
+        // Updates + deletion (which also clears sessions).
+        database.set_user_role("u1", "listener").await.unwrap();
+        database.set_user_api_token("u1", "tok-xyz").await.unwrap();
+        assert!(database.user_by_api_token("tok-abc").await.unwrap().is_none());
+        assert_eq!(database.user_by_username("alice").await.unwrap().unwrap().role, "listener");
+        database.delete_user("u1").await.unwrap();
+        assert_eq!(database.count_users().await.unwrap(), 0);
+        assert!(database.session_user("hash2", 1000).await.unwrap().is_none(), "sessions cascade");
 
         let _ = std::fs::remove_file(db_path);
     }

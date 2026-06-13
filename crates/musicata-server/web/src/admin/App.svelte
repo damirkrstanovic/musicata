@@ -7,6 +7,8 @@
   import PlayersZonesPanel from "./PlayersZonesPanel.svelte";
   import SnapcastPanel from "./SnapcastPanel.svelte";
   import MergedArtistsPanel from "./MergedArtistsPanel.svelte";
+  import UsersPanel from "./UsersPanel.svelte";
+  import AccountPanel from "./AccountPanel.svelte";
 </script>
 
 <header class="admin-bar">
@@ -36,6 +38,10 @@
 
   <h2 class="admin-group-title">Curation</h2>
   <MergedArtistsPanel />
+
+  <h2 class="admin-group-title">Accounts</h2>
+  <UsersPanel />
+  <AccountPanel />
 
   <Modal />
 </main>

@@ -10,7 +10,23 @@ const PATH = process.argv[3] || "/v2";
 const MODE = process.argv[4] || "behavior";
 const base = `http://127.0.0.1:${PORT}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const api = (path, init) => fetch(base + path, init).then((r) => (r.ok ? r.json().catch(() => null) : null));
+
+// Auth: a fresh DB starts in setup mode. Create the smoke admin (or log in if it already
+// exists) and keep its session cookie for the Node-side API calls below. The browser logs in
+// separately (in-page) so it gets its own cookie. Password ≥ 8 chars (server requirement).
+const SMOKE_CREDS = { username: "smoke", password: "smoke-admin-1" };
+let COOKIE = "";
+{
+  const headers = { "content-type": "application/json" };
+  const body = JSON.stringify(SMOKE_CREDS);
+  let r = await fetch(base + "/api/auth/setup", { method: "POST", headers, body });
+  if (!r.ok) r = await fetch(base + "/api/auth/login", { method: "POST", headers, body });
+  COOKIE = (r.headers.get("set-cookie") || "").split(";")[0]; // "musicata_session=…"
+}
+const api = (path, init = {}) =>
+  fetch(base + path, { ...init, headers: { ...(init.headers || {}), cookie: COOKIE } }).then((r) =>
+    r.ok ? r.json().catch(() => null) : null,
+  );
 
 let failures = 0;
 function check(name, ok, detail = "") {
@@ -67,6 +83,16 @@ await send("Runtime.enable");
 await send("Page.enable");
 // A real viewport so the app's internal scrollers engage (scroll-driven infinite scroll).
 await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
+// Give the browser the smoke admin's session cookie (captured by Node above), then reload past
+// the auth gate into the app. Injecting via CDP is deterministic — no fetch-timing race.
+await send("Network.enable");
+await send("Network.setCookie", {
+  name: "musicata_session",
+  value: COOKIE.slice(COOKIE.indexOf("=") + 1),
+  domain: "127.0.0.1",
+  path: "/",
+});
+await send("Page.reload");
 await sleep(2500);
 
 console.log(`Svelte UI smoke (${PATH}, ${MODE}):`);

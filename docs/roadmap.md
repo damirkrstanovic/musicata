@@ -764,12 +764,26 @@ Tasks:
 - Add release builds for Linux first.
 - Add systemd service examples.
 - Add Docker or container image if useful.
-- Add user authentication and local-network security model. Document the recommended
-  deployment for reaching remote services (MPD, SMB) over untrusted networks — an SSH
-  tunnel or WireGuard/Tailscale VPN — since those protocols carry credentials in clear
-  text and MPD has no native TLS (see Milestone 5's "MPD authentication + secure
-  transport"). Note which stored secrets are plaintext at rest (SMB/MPD/Subsonic
-  passwords) and decide whether to encrypt them.
+- [x] **User authentication (multi-user)** — brought forward for phone/PWA use.
+  `crate::auth` + migration v28 (`users` + `sessions`): argon2-hashed passwords, opaque
+  **cookie sessions** (sha256-hashed at rest, 30-day TTL), and a per-user **API token**
+  (cleartext — Subsonic salted-token auth must recompute it) for Subsonic/programmatic
+  clients. A `require_auth` middleware guards `/api/*` (open `health`/`auth` endpoints
+  excepted); **setup mode** when no accounts exist (first launch creates an admin in-product,
+  no flag); admin-vs-listener roles gate `/api/users`, `/api/sources`, `/api/settings`. The
+  WebSockets authenticate via the same cookie (or `?token=`); the Subsonic `/rest` surface now
+  authenticates against the accounts (username + API token), closing the open-`/rest` bypass.
+  Web: a login/setup gate (`AuthGate`), a player account menu (password/token/sign-out), and an
+  admin Users + Account panel. **Posture: LAN-first, defense-in-depth** — cookies are
+  `SameSite=Lax` + `HttpOnly` (no `Secure`, so plain-http LAN works); the documented remote
+  path is a **VPN (Tailscale/WireGuard)**, not raw internet. Still open: encrypting the
+  remaining plaintext-at-rest secrets (SMB/MPD/OpenSubsonic source passwords), and per-player
+  endpoint auth (M10).
+- Document the recommended deployment for reaching remote services (MPD, SMB) over untrusted
+  networks — an SSH tunnel or WireGuard/Tailscale VPN — since those protocols carry credentials
+  in clear text and MPD has no native TLS (see Milestone 5's "MPD authentication + secure
+  transport"). Note which stored secrets are plaintext at rest (SMB/MPD/Subsonic passwords) and
+  decide whether to encrypt them.
 - Add backup/restore documentation for database and config.
 - Add diagnostics for scan, metadata, provider, and playback failures.
 

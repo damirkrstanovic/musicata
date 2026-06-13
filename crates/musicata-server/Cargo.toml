@@ -28,6 +28,7 @@ snapcast = ["dep:rubato", "dep:libc"]
 
 [dependencies]
 anyhow.workspace = true
+argon2 = "0.5"
 axum.workspace = true
 md-5.workspace = true
 musicata-core = { path = "../musicata-core" }
@@ -35,6 +36,7 @@ musicata-storage = { path = "../musicata-storage" }
 notify = "6.1"
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true

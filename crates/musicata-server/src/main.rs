@@ -1,6 +1,7 @@
 mod activity;
 mod artwork;
 mod artwork_providers;
+mod auth;
 mod backup;
 mod fingerprint;
 mod loudness;
@@ -2062,6 +2063,24 @@ fn app(
         .parent()
         .map(|parent| parent.join("artwork"))
         .unwrap_or_else(|| PathBuf::from("artwork"));
+    let state = AppState {
+        database,
+        providers,
+        players,
+        musicbrainz: MusicBrainzClient::default(),
+        radio_browser: radiobrowser::RadioBrowserClient::default(),
+        listenbrainz: Arc::new(recommendations::ListenBrainzClient::new()),
+        activity,
+        rescan_lock,
+        most_played_cache: Arc::new(Mutex::new(None)),
+        playback_sessions: Arc::new(RwLock::new(BTreeMap::new())),
+        next_playback_session: Arc::new(AtomicU64::new(1)),
+        subsonic: subsonic_auth,
+        artwork_cache,
+        db_path,
+        artwork_dir,
+        export_status: Arc::new(std::sync::Mutex::new(backup::ExportStatus::default())),
+    };
     Router::new()
         .merge(subsonic::routes())
         // The embedded Svelte app (built from web/ by build.rs). Hashed bundles under
@@ -2189,26 +2208,28 @@ fn app(
         .route("/api/tracks/{id}/stream", get(stream_track))
         .route("/api/tracks/{id}/radio", get(track_radio))
         .route("/api/autoplay", get(get_autoplay).put(set_autoplay))
+        // Auth: open status/login/setup; the rest require a session (enforced by require_auth).
+        .route("/api/auth/status", get(auth::auth_status))
+        .route("/api/auth/setup", post(auth::setup))
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/me", get(auth::me))
+        .route("/api/auth/password", post(auth::change_password))
+        .route("/api/auth/token", get(auth::my_token).post(auth::rotate_token))
+        // User management (admin-only, gated by path in require_auth).
+        .route("/api/users", get(auth::list_users).post(auth::create_user))
+        .route("/api/users/{id}", patch(auth::update_user).delete(auth::delete_user))
         .fallback(fallback)
+        // require_auth runs inner (closest to handlers); log_request wraps it so 401s are logged.
+        .layer(middleware::from_fn({
+            let state = state.clone();
+            move |request: Request, next: Next| {
+                let state = state.clone();
+                async move { auth::require_auth(state, request, next).await }
+            }
+        }))
         .layer(middleware::from_fn(log_request))
-        .with_state(AppState {
-            database,
-            providers,
-            players,
-            musicbrainz: MusicBrainzClient::default(),
-            radio_browser: radiobrowser::RadioBrowserClient::default(),
-            listenbrainz: Arc::new(recommendations::ListenBrainzClient::new()),
-            activity,
-            rescan_lock,
-            most_played_cache: Arc::new(Mutex::new(None)),
-            playback_sessions: Arc::new(RwLock::new(BTreeMap::new())),
-            next_playback_session: Arc::new(AtomicU64::new(1)),
-            subsonic: subsonic_auth,
-            artwork_cache,
-            db_path,
-            artwork_dir,
-            export_status: Arc::new(std::sync::Mutex::new(backup::ExportStatus::default())),
-        })
+        .with_state(state)
 }
 
 async fn log_request(request: Request, next: Next) -> Response {
@@ -5924,6 +5945,22 @@ impl AppError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal_error",
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
             message: message.into(),
         }
     }

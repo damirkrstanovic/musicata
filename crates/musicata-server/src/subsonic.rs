@@ -137,7 +137,7 @@ async fn handle(
         .collect();
 
     let format = format_of(&params);
-    if let Err((code, message)) = authenticate(&state.subsonic, &params) {
+    if let Err((code, message)) = authenticate_request(&state, &params).await {
         return error_response(format, code, message);
     }
 
@@ -216,6 +216,31 @@ async fn handle(
 
 /// Returns `Ok(())` when the request is authorized, else a `(code, message)` Subsonic
 /// error. Open mode (no configured password) accepts any credentials.
+/// Verify the Subsonic password params (`p`, `p=enc:<hex>`, or salted `t`+`s` token) against an
+/// `expected` secret. Shared by the single-user (legacy/setup) and per-account paths.
+fn verify_credential(
+    params: &HashMap<String, String>,
+    expected: &str,
+) -> Result<(), (u32, &'static str)> {
+    if let Some(provided) = params.get("p") {
+        let provided = match provided.strip_prefix("enc:") {
+            Some(hex) => decode_hex(hex).ok_or((40, "Wrong username or password."))?,
+            None => provided.clone(),
+        };
+        return (provided == expected)
+            .then_some(())
+            .ok_or((40, "Wrong username or password."));
+    }
+    if let (Some(token), Some(salt)) = (params.get("t"), params.get("s")) {
+        let computed = md5_hex(&format!("{expected}{salt}"));
+        return computed
+            .eq_ignore_ascii_case(token)
+            .then_some(())
+            .ok_or((40, "Wrong username or password."));
+    }
+    Err((10, "Required parameter is missing."))
+}
+
 fn authenticate(
     auth: &SubsonicAuth,
     params: &HashMap<String, String>,
@@ -223,31 +248,34 @@ fn authenticate(
     let Some(expected) = auth.password.as_deref() else {
         return Ok(());
     };
-
     if params.get("u").map(String::as_str) != Some(auth.user.as_str()) {
         return Err((40, "Wrong username or password."));
     }
+    verify_credential(params, expected)
+}
 
-    if let Some(provided) = params.get("p") {
-        let provided = match provided.strip_prefix("enc:") {
-            Some(hex) => decode_hex(hex).ok_or((40, "Wrong username or password."))?,
-            None => provided.clone(),
-        };
-        if provided == expected {
-            return Ok(());
-        }
-        return Err((40, "Wrong username or password."));
+/// Authenticate a Subsonic request. When user accounts exist (the normal case), authenticate
+/// against them — `u` is the username and the credential is checked against that user's API
+/// token (the cleartext secret the salted-token scheme needs). With no accounts yet (setup /
+/// legacy), fall back to the single configured Subsonic user, or open mode when unset.
+async fn authenticate_request(
+    state: &AppState,
+    params: &HashMap<String, String>,
+) -> Result<(), (u32, &'static str)> {
+    if state.database.count_users().await.unwrap_or(0) == 0 {
+        return authenticate(&state.subsonic, params);
     }
-
-    if let (Some(token), Some(salt)) = (params.get("t"), params.get("s")) {
-        let computed = md5_hex(&format!("{expected}{salt}"));
-        if computed.eq_ignore_ascii_case(token) {
-            return Ok(());
-        }
-        return Err((40, "Wrong username or password."));
-    }
-
-    Err((10, "Required parameter is missing."))
+    let Some(username) = params.get("u") else {
+        return Err((10, "Required parameter is missing."));
+    };
+    let user = state
+        .database
+        .user_by_username(username)
+        .await
+        .ok()
+        .flatten()
+        .ok_or((40, "Wrong username or password."))?;
+    verify_credential(params, &user.api_token)
 }
 
 fn md5_hex(input: &str) -> String {
