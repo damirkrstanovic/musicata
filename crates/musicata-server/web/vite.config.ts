@@ -22,12 +22,16 @@ export default defineConfig({
       manifest: {
         name: "Musicata",
         short_name: "Musicata",
+        description: "Your music library and multi-room player.",
+        categories: ["music", "entertainment"],
         start_url: "/",
         scope: "/",
         display: "standalone",
         background_color: "#16181d",
         theme_color: "#16181d",
-        icons: [{ src: "/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" }],
+        icons: [
+          { src: "/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any maskable" },
+        ],
       },
     }),
   ],

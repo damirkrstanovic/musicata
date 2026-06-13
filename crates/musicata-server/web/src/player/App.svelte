@@ -30,6 +30,8 @@
   import FavoritesView from "./FavoritesView.svelte";
   import PlaylistView from "./PlaylistView.svelte";
   import SmartPlaylistView from "./SmartPlaylistView.svelte";
+  import InstallPrompt from "./InstallPrompt.svelte";
+  import { install } from "../lib/install.svelte";
 
   let audioEl: HTMLAudioElement;
   let audio: BrowserAudio | null = null;
@@ -123,6 +125,7 @@
 
     favorites.load();
     autoplay.load();
+    install.init();
     await loadTargets();
     const browser = players.find((p) => p.kind === "browser") ?? players[0];
     if (browser) connect("player", browser.id);
@@ -259,4 +262,5 @@
 </main>
 
 <Modal />
+<InstallPrompt />
 <audio bind:this={audioEl} preload="none" hidden></audio>
