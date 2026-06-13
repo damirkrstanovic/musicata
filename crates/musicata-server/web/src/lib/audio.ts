@@ -40,6 +40,12 @@ export class BrowserAudio {
   private bypassed = false;
   private graphFailed = false;
 
+  // Room correction (Phase 4): a ConvolverNode after the EQ bands loaded from a profile's WAV
+  // impulse response. `convBuffer` is the decoded IR; `convProfileId` tracks which profile's IR
+  // is loaded so we don't refetch on every rebuild.
+  private convBuffer: AudioBuffer | null = null;
+  private convProfileId: string | null = null;
+
   // Volume leveling (EBU R128). `levelingGain` sits at the end of the chain; its gain is set
   // per track from the now-playing item's LUFS, combined with the EQ preamp for clip safety.
   private levelingGain?: GainNode;
@@ -93,6 +99,28 @@ export class BrowserAudio {
       this.rebuildChain();
       this.ctx.resume().catch(() => {});
     }
+    void this.loadRoomIr(profile); // async; rebuilds again once the IR is decoded
+  }
+
+  /** Fetch + decode a profile's room-correction impulse response (or clear it), then rebuild so
+   *  the ConvolverNode is inserted. No-ops if the same profile's IR is already loaded. */
+  private async loadRoomIr(profile: EqProfile | null): Promise<void> {
+    const id = profile?.roomIr ? profile.id : null;
+    if (id === this.convProfileId) return;
+    this.convProfileId = id;
+    if (!id || !this.ctx) {
+      this.convBuffer = null;
+      if (this.ctx) this.rebuildChain();
+      return;
+    }
+    try {
+      const resp = await fetch(`/api/dsp/profiles/${encodeURIComponent(id)}/impulse`);
+      if (!resp.ok) throw new Error("no impulse");
+      this.convBuffer = await this.ctx.decodeAudioData(await resp.arrayBuffer());
+    } catch {
+      this.convBuffer = null; // missing/undecodable → just skip convolution, never silence
+    }
+    if (this.convProfileId === id) this.rebuildChain();
   }
 
   /** A/B bypass: route source straight to output (no preamp/EQ), keeping the active profile. */
@@ -196,6 +224,14 @@ export class BrowserAudio {
           prev = f;
           this.eqBands.push(f);
         }
+      }
+      // Room correction: a ConvolverNode after the EQ, when the profile carries an IR.
+      if (this.convBuffer) {
+        const conv = ctx.createConvolver();
+        conv.normalize = false; // correction IRs must NOT be loudness-normalised
+        conv.buffer = this.convBuffer;
+        prev.connect(conv);
+        prev = conv;
       }
     }
     // Leveling is the last stage; the analyser tap is post-leveling so the VU shows output.

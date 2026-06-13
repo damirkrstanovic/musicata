@@ -2216,6 +2216,13 @@ fn app(
             "/api/dsp/profiles/{id}",
             put(dsp::upsert_profile).delete(dsp::delete_profile),
         )
+        .route(
+            "/api/dsp/profiles/{id}/impulse",
+            get(dsp::get_impulse)
+                .post(dsp::upload_impulse)
+                .delete(dsp::delete_impulse)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
         // Auth: open status/login/setup; the rest require a session (enforced by require_auth).
         .route("/api/auth/status", get(auth::auth_status))
         .route("/api/auth/setup", post(auth::setup))

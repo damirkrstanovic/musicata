@@ -1,6 +1,7 @@
 <script lang="ts">
   import { dsp } from "../lib/dsp.svelte";
   import { audioDevices } from "../lib/audioDevices.svelte";
+  import { api } from "../lib/api";
   import { parseParametricEq } from "../lib/dsp";
   import { responseCurveDb, logFreqs } from "../lib/eqcurve";
   import autoeqPresets from "../lib/autoeq-presets.json";
@@ -26,6 +27,31 @@
     prof.kind = "headphones";
     await dsp.saveProfile(prof);
     hpSearch = "";
+  }
+
+  // Room correction: a speakers profile (no EQ bands needed) that carries a measured WAV
+  // impulse response, applied via a ConvolverNode in the browser graph.
+  async function newRoomProfile() {
+    await dsp.saveProfile({
+      id: `room-${Date.now().toString(36)}`,
+      name: "Room correction",
+      preampDb: 0,
+      bands: [],
+      kind: "speakers",
+    });
+  }
+  async function uploadRoomIr(event: Event) {
+    const file = (event.currentTarget as HTMLInputElement).files?.[0];
+    const id = dsp.activeId;
+    if (!file || !id) return;
+    await api.uploadRoomIr(id, await file.arrayBuffer());
+    await dsp.load(); // profile.roomIr now set → the App $effect re-applies → convolver loads
+  }
+  async function clearRoomIr() {
+    const id = dsp.activeId;
+    if (!id) return;
+    await api.deleteRoomIr(id);
+    await dsp.load();
   }
 
   let importName = $state("");
@@ -203,6 +229,31 @@
         </div>
       {/each}
       <button class="ghost-button" type="button" onclick={addOutput}>+ Add output</button>
+    </details>
+
+    <details class="eq-import">
+      <summary>Room correction (speakers)</summary>
+      <p class="eq-note">
+        Apply a measured room-correction filter (a WAV impulse response from REW/DRC). Stereo;
+        corrects bass/low-mids. Create a profile, then upload its IR.
+      </p>
+      {#if dsp.activeId && dsp.isCustom(dsp.activeId)}
+        {#if dsp.active?.roomIr}
+          <p class="eq-note">
+            Impulse response loaded ({dsp.active.roomIr.sampleRate || "?"} Hz).
+          </p>
+          <button class="ghost-button" type="button" onclick={clearRoomIr}>Remove impulse response</button>
+        {:else}
+          <label class="eq-field">
+            <span>Upload impulse response (.wav)</span>
+            <input type="file" accept=".wav,audio/wav,audio/x-wav" onchange={uploadRoomIr} />
+          </label>
+        {/if}
+      {:else}
+        <button class="ghost-button" type="button" onclick={newRoomProfile}>
+          + New room-correction profile
+        </button>
+      {/if}
     </details>
 
     <details class="eq-import">

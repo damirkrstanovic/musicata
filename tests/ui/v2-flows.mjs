@@ -238,6 +238,35 @@ check(
   `vol=${await js(`document.querySelector('.transport-aux input[type=range]')?.value`)}`,
 );
 
+// Room correction: upload a WAV impulse response to a profile and confirm it's recorded + served.
+{
+  const wav = new ArrayBuffer(48);
+  const dv = new DataView(wav);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); dv.setUint32(4, 40, true); w(8, "WAVE");
+  w(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 2, true);
+  dv.setUint32(24, 48000, true); dv.setUint32(28, 192000, true); dv.setUint16(32, 4, true); dv.setUint16(34, 16, true);
+  w(36, "data"); dv.setUint32(40, 4, true);
+  await fetch(base + "/api/dsp/profiles/smoke-room", {
+    method: "PUT",
+    headers: { "content-type": "application/json", cookie: COOKIE },
+    body: JSON.stringify({ id: "smoke-room", name: "Smoke Room", preampDb: 0, bands: [], kind: "speakers" }),
+  });
+  const up = await fetch(base + "/api/dsp/profiles/smoke-room/impulse", {
+    method: "POST",
+    headers: { cookie: COOKIE },
+    body: wav,
+  });
+  const list = (await api("/api/dsp/profiles")) || [];
+  const saved = list.find((p) => p.id === "smoke-room");
+  const served = await fetch(base + "/api/dsp/profiles/smoke-room/impulse", { headers: { cookie: COOKIE } });
+  check(
+    "room IR uploads, records sampleRate, and serves back",
+    up.ok && saved?.roomIr?.sampleRate === 48000 && served.ok,
+    `up=${up.status} sr=${saved?.roomIr?.sampleRate} get=${served.status}`,
+  );
+}
+
 // VU meter: opening it renders the two (L/R) McIntosh-style meters.
 await js(`[...document.querySelectorAll('.eq-btn')].find(b=>/vu/i.test(b.title))?.click()`);
 await sleep(400);

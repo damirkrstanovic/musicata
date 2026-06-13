@@ -370,6 +370,18 @@ export const api = {
   saveDspProfile: (p: EqProfile) =>
     sendJson<EqProfile>(`/api/dsp/profiles/${encodeURIComponent(p.id)}`, "PUT", p),
   deleteDspProfile: (id: string) => sendJson(`/api/dsp/profiles/${encodeURIComponent(id)}`, "DELETE"),
+  uploadRoomIr: async (id: string, wav: ArrayBuffer): Promise<void> => {
+    const r = await fetch(`/api/dsp/profiles/${encodeURIComponent(id)}/impulse`, {
+      method: "POST",
+      body: wav,
+    });
+    if (!r.ok) {
+      signalIfUnauthorized(r.status);
+      throw new ApiError(r.status, `upload impulse → ${r.status}`);
+    }
+  },
+  deleteRoomIr: (id: string) =>
+    sendJson(`/api/dsp/profiles/${encodeURIComponent(id)}/impulse`, "DELETE"),
 
   // Auth & users
   authStatus: () => getJson<{ setup_required: boolean }>("/api/auth/status"),
