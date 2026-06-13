@@ -464,8 +464,13 @@ Tasks:
   MBID→local matcher; recency dedup); **"Start radio from this"** (`/api/tracks/{id}/radio` + a
   footer button); and a decoupled **`autoplay_loop`** (global `autoplay` setting + queue-drawer
   toggle) that tops up a playing queue (browser + zones) with similar tracks when < 5 remain,
-  sliding the seed to the current track. *Remaining:* verify the ListenBrainz live path against
-  the real API; per-artist cap + skip-penalty variety filters; weighted-by-score sampling.
+  sliding the seed to the current track. **Variety filters shipped:** a per-artist cap (2),
+  **weighted-by-score sampling** of similar artists (closer artists lead but the tail still
+  surfaces — fresh ordering each session, deterministic per press; `weighted_artist_track_order`
+  in `recommendations.rs`), and a **skip penalty** (`frequently_skipped_track_ids` — tracks
+  skipped more than finished, ≥2 skips — held back and used only to reach the target, so radio
+  leans away from them without banning them). *Remaining:* verify the ListenBrainz live path
+  against the real API.
 - Add optional ListenBrainz scrobbling and recommendation import.
 - Design an optional `musicata-ml` service for future audio embeddings, genre/mood inference, and similarity search.
 

@@ -284,12 +284,93 @@ async fn seed_artist_mbid(
     mbid
 }
 
+/// SplitMix64 — a tiny, dependency-free PRNG. Deterministic given the seed, so a single radio
+/// "press" is reproducible and tests are stable; we seed it with the wall-clock + the seed
+/// track so each session shuffles differently.
+fn split_mix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Next pseudo-random f64 in `[0, 1)` (53-bit mantissa).
+fn next_f64(state: &mut u64) -> f64 {
+    (split_mix64(state) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// FNV-1a over a string — a stable, dependency-free hash to fold the seed track id into the RNG
+/// seed (so different seeds shuffle differently even within the same wall-clock second).
+fn fnv1a(s: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Weighted-by-score sampling of similar artists into an ordered track list. Each artist is
+/// drawn with probability proportional to its ListenBrainz similarity score (closer artists
+/// appear earlier and more often, but the long tail still gets a chance — variety across radio
+/// sessions, vs. a strict score-ordered round-robin), contributing at most `per_artist` of its
+/// local tracks. `by_artist` maps a lowercased artist name to its local track ids (already in
+/// random order from SQL). Deterministic given `seed`.
+fn weighted_artist_track_order(
+    artists: &[ScoredArtist],
+    by_artist: &std::collections::HashMap<String, Vec<String>>,
+    seed: u64,
+    per_artist: usize,
+) -> Vec<String> {
+    // Pool entry per artist that has local tracks: (weight, its tracks, cursor, picks taken).
+    // The +1 floors the weight so a zero-score artist still gets a (uniform) chance and the
+    // total is never zero.
+    let mut pool: Vec<(f64, &Vec<String>, usize, usize)> = artists
+        .iter()
+        .filter_map(|a| {
+            let tracks = by_artist.get(&a.name.to_lowercase())?;
+            (!tracks.is_empty()).then_some((a.score.max(0.0) + 1.0, tracks, 0usize, 0usize))
+        })
+        .collect();
+
+    let mut state = seed ^ 0x9E3779B97F4A7C15;
+    let mut out = Vec::new();
+    loop {
+        let active: Vec<usize> = (0..pool.len())
+            .filter(|&i| pool[i].3 < per_artist && pool[i].2 < pool[i].1.len())
+            .collect();
+        if active.is_empty() {
+            break;
+        }
+        let total: f64 = active.iter().map(|&i| pool[i].0).sum();
+        let target = next_f64(&mut state) * total;
+        let mut acc = 0.0;
+        let mut chosen = *active.last().expect("active is non-empty");
+        for &i in &active {
+            acc += pool[i].0;
+            if target < acc {
+                chosen = i;
+                break;
+            }
+        }
+        let cursor = pool[chosen].2;
+        out.push(pool[chosen].1[cursor].clone());
+        pool[chosen].2 += 1;
+        pool[chosen].3 += 1;
+    }
+    out
+}
+
 /// Up to `limit` local track ids to play after `seed_track_id`, highest-relevance first:
 /// **(1)** ListenBrainz **similar-artists** of the seed's artist → those artists' local tracks
-/// (the radio workhorse, round-robin so no artist dominates); **(2)** ListenBrainz
-/// similar-recordings (a bonus — sparse coverage); **(3)** local genre/artist content
-/// similarity. Excludes the seed and the `exclude` set; `recency_window_secs` (autoplay only)
-/// additionally excludes recently-played tracks.
+/// (the radio workhorse, **weighted-by-score sampling** so closer artists lead but the tail
+/// still surfaces, capped per artist so none dominates); **(2)** ListenBrainz similar-recordings
+/// (a bonus — sparse coverage); **(3)** local genre/artist content similarity. Excludes the seed
+/// and the `exclude` set; `recency_window_secs` (autoplay only) additionally excludes
+/// recently-played tracks. **Frequently-skipped** tracks (a skip penalty) are deprioritized —
+/// held back and used only to reach `limit` — so radio leans away from what you keep skipping
+/// without banning it outright (which would starve a small library).
 pub async fn similar_track_ids(
     database: &Database,
     client: &Arc<ListenBrainzClient>,
@@ -307,10 +388,28 @@ pub async fn similar_track_ids(
             seen.extend(recent);
         }
     }
+    // Skip penalty: tracks the listener keeps skipping are held back, not banned (see below).
+    let penalized = database.frequently_skipped_track_ids().await.unwrap_or_default();
 
     let mut out: Vec<String> = Vec::new();
+    let mut deferred: Vec<String> = Vec::new();
+    // Route a candidate to `out` (or `deferred` if it's a frequent skip), de-duplicating via
+    // `seen`. Returns true once `out` has reached `limit`.
+    macro_rules! consider {
+        ($id:expr) => {{
+            let id = $id;
+            if seen.insert(id.clone()) {
+                if penalized.contains(&id) {
+                    deferred.push(id);
+                } else {
+                    out.push(id);
+                }
+            }
+            out.len() >= limit
+        }};
+    }
 
-    // 1. Similar artists (best coverage) → their local tracks, round-robin (variety).
+    // 1. Similar artists (best coverage) → their local tracks, weighted-by-score sampling.
     if let Some(artist_mbid) = seed_artist_mbid(database, mb, seed_track_id, now_unix).await {
         let artists = cached_similar_artists(database, client, &artist_mbid, now_unix).await;
         if !artists.is_empty() {
@@ -321,18 +420,10 @@ pub async fn similar_track_ids(
                 for (name, track_id) in pairs {
                     by_artist.entry(name).or_default().push(track_id);
                 }
-                'rounds: for round in 0..PER_ARTIST {
-                    for artist in &artists {
-                        if let Some(track) =
-                            by_artist.get(&artist.name.to_lowercase()).and_then(|t| t.get(round))
-                        {
-                            if seen.insert(track.clone()) {
-                                out.push(track.clone());
-                                if out.len() >= limit {
-                                    break 'rounds;
-                                }
-                            }
-                        }
+                let seed = (now_unix as u64) ^ fnv1a(seed_track_id);
+                for id in weighted_artist_track_order(&artists, &by_artist, seed, PER_ARTIST) {
+                    if consider!(id) {
+                        break;
                     }
                 }
             }
@@ -347,11 +438,8 @@ pub async fn similar_track_ids(
                 let mbids: Vec<String> = scored.into_iter().map(|s| s.mbid).collect();
                 if let Ok(local) = database.tracks_for_recording_mbids(&mbids).await {
                     for id in local {
-                        if seen.insert(id.clone()) {
-                            out.push(id);
-                            if out.len() >= limit {
-                                break;
-                            }
+                        if consider!(id) {
+                            break;
                         }
                     }
                 }
@@ -364,14 +452,19 @@ pub async fn similar_track_ids(
         let want = ((limit - out.len()) * 4).max(limit) as i64;
         if let Ok(local) = database.similar_local_track_ids(seed_track_id, want).await {
             for id in local {
-                if seen.insert(id.clone()) {
-                    out.push(id);
-                    if out.len() >= limit {
-                        break;
-                    }
+                if consider!(id) {
+                    break;
                 }
             }
         }
+    }
+
+    // Pull in the held-back frequent-skips only if we still owe tracks to reach `limit`.
+    for id in deferred {
+        if out.len() >= limit {
+            break;
+        }
+        out.push(id);
     }
 
     out
@@ -431,5 +524,64 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0], ScoredArtist { name: "Nile Rodgers".into(), score: 10614.0 });
         assert_eq!(parsed[1].name, "Gorillaz");
+    }
+
+    fn artist(name: &str, score: f64) -> ScoredArtist {
+        ScoredArtist { name: name.into(), score }
+    }
+
+    fn pool(entries: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
+        entries
+            .iter()
+            .map(|(name, tracks)| {
+                (name.to_lowercase(), tracks.iter().map(|t| t.to_string()).collect())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn weighted_order_is_deterministic_for_a_seed() {
+        let artists = [artist("A", 100.0), artist("B", 50.0), artist("C", 10.0)];
+        let by_artist = pool(&[("A", &["a1", "a2"]), ("B", &["b1"]), ("C", &["c1", "c2"])]);
+        let first = weighted_artist_track_order(&artists, &by_artist, 42, 2);
+        let again = weighted_artist_track_order(&artists, &by_artist, 42, 2);
+        assert_eq!(first, again, "same seed must reproduce the same order");
+        // A different seed should (almost surely) reshuffle.
+        let other = weighted_artist_track_order(&artists, &by_artist, 7, 2);
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn weighted_order_respects_per_artist_cap_and_track_supply() {
+        let artists = [artist("A", 100.0), artist("B", 50.0)];
+        let by_artist = pool(&[("A", &["a1", "a2", "a3"]), ("B", &["b1"])]);
+        let order = weighted_artist_track_order(&artists, &by_artist, 99, 2);
+        // A is capped at 2 of its 3 tracks; B contributes its only track. 3 total.
+        assert_eq!(order.len(), 3);
+        let a_count = order.iter().filter(|t| t.starts_with('a')).count();
+        assert_eq!(a_count, 2, "per-artist cap of 2");
+        assert!(order.contains(&"b1".to_string()));
+    }
+
+    #[test]
+    fn weighted_order_skips_artists_with_no_local_tracks() {
+        let artists = [artist("A", 100.0), artist("Ghost", 90.0), artist("B", 10.0)];
+        let by_artist = pool(&[("A", &["a1"]), ("B", &["b1"])]);
+        let order = weighted_artist_track_order(&artists, &by_artist, 5, 2);
+        assert_eq!(order.len(), 2);
+        assert!(order.iter().all(|t| t == "a1" || t == "b1"));
+    }
+
+    #[test]
+    fn weighted_order_favors_higher_scores() {
+        // One track each so first-pick reflects the artist draw. Over many seeds the
+        // far-higher-scored artist should lead the great majority of the time.
+        let artists = [artist("High", 1000.0), artist("Low", 1.0)];
+        let by_artist = pool(&[("High", &["h"]), ("Low", &["l"])]);
+        let high_first = (0..400u64)
+            .filter(|&seed| weighted_artist_track_order(&artists, &by_artist, seed, 1).first()
+                == Some(&"h".to_string()))
+            .count();
+        assert!(high_first > 320, "expected High to lead most draws, got {high_first}/400");
     }
 }

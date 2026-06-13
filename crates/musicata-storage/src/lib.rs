@@ -2157,6 +2157,24 @@ impl Database {
         rows.iter().map(|row| Ok(row.try_get("track_id")?)).collect()
     }
 
+    /// Track ids the listener skips more than they finish — the "skip penalty" set radio and
+    /// autoplay deprioritize. A track qualifies when its skips strictly exceed its confirmed
+    /// plays *and* there are at least two skips (a minimum sample, so one stray skip never
+    /// sidelines a track). `played`/`skipped` are the only `event_kind`s today.
+    pub async fn frequently_skipped_track_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let rows = sqlx::query(
+            "SELECT track_id
+             FROM listens
+             GROUP BY track_id
+             HAVING SUM(CASE WHEN event_kind = 'skipped' THEN 1 ELSE 0 END)
+                  > SUM(CASE WHEN event_kind = 'played' THEN 1 ELSE 0 END)
+                AND SUM(CASE WHEN event_kind = 'skipped' THEN 1 ELSE 0 END) >= 2",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|row| Ok(row.try_get("track_id")?)).collect()
+    }
+
     /// Local content similarity fallback (no network): tracks sharing a genre with the seed or
     /// by the same artist, Jellyfin-style weighted (genre 10, same-artist 30), seed excluded.
     pub async fn similar_local_track_ids(
@@ -5528,6 +5546,56 @@ mod tests {
             .map(|t| t.id)
             .collect();
         assert_eq!(forgotten, ["t_b"]);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn frequently_skipped_needs_more_skips_than_plays_and_a_min_sample() {
+        let db_path = temp_db_path("frequently-skipped");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        for id in ["t_skip", "t_ok", "t_one", "t_tie"] {
+            sqlx::query(
+                "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id,
+                    artist_name, album_id, album_title, extension, relative_path, stream_url,
+                    path, added_at_unix_seconds)
+                 VALUES (?1, 'local-disk', ?1, ?1, 'artist_1', 'Artist', 'album_1', 'Album',
+                    'mp3', ?2, ?3, ?4, 10)",
+            )
+            .bind(id)
+            .bind(format!("album/{id}.mp3"))
+            .bind(format!("/api/tracks/{id}/stream"))
+            .bind(format!("/music/album/{id}.mp3"))
+            .execute(&database.pool)
+            .await
+            .expect("insert track");
+        }
+
+        let (played, skipped) = (ListenKind::Played, ListenKind::Skipped);
+        // t_skip: 3 skips vs 1 play → penalized (skips > plays, >= 2 skips).
+        for t in [10, 20, 30] {
+            database.record_listen("t_skip", "p", t, skipped).await.unwrap();
+        }
+        database.record_listen("t_skip", "p", 40, played).await.unwrap();
+        // t_ok: 1 skip vs 3 plays → not penalized.
+        database.record_listen("t_ok", "p", 10, skipped).await.unwrap();
+        for t in [20, 30, 40] {
+            database.record_listen("t_ok", "p", t, played).await.unwrap();
+        }
+        // t_one: a single skip, no plays → skips > plays but below the 2-skip floor.
+        database.record_listen("t_one", "p", 10, skipped).await.unwrap();
+        // t_tie: 2 skips vs 2 plays → not strictly more skips.
+        for t in [10, 20] {
+            database.record_listen("t_tie", "p", t, skipped).await.unwrap();
+        }
+        for t in [30, 40] {
+            database.record_listen("t_tie", "p", t, played).await.unwrap();
+        }
+
+        let penalized = database.frequently_skipped_track_ids().await.unwrap();
+        assert_eq!(penalized.len(), 1, "only t_skip qualifies: {penalized:?}");
+        assert!(penalized.contains("t_skip"));
 
         let _ = std::fs::remove_file(db_path);
     }
