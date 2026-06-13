@@ -10,7 +10,6 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use axum::extract::{Request, State};
@@ -48,9 +47,19 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Cryptographically-random bytes (via the OS). Used for the argon2 salt and session/API tokens.
+/// Direct `getrandom` rather than argon2's re-exported `OsRng`, which isn't available under
+/// `--no-default-features` (nothing enables `rand_core`'s getrandom there).
+fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0u8; N];
+    getrandom::getrandom(&mut bytes).expect("OS RNG unavailable");
+    bytes
+}
+
 /// Argon2id hash of a password as a PHC string.
 fn hash_password(password: &str) -> Result<String, AppError> {
-    let salt = SaltString::generate(&mut OsRng);
+    let salt = SaltString::encode_b64(&random_bytes::<16>())
+        .map_err(|error| AppError::internal(format!("salt: {error}")))?;
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
@@ -68,9 +77,7 @@ fn verify_password(password: &str, hash: &str) -> bool {
 
 /// A fresh 256-bit random secret as hex (session cookie value or API token).
 fn generate_token() -> String {
-    let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    to_hex(&bytes)
+    to_hex(&random_bytes::<32>())
 }
 
 /// sha256 of a session token — what we store, so a DB leak yields no live sessions.

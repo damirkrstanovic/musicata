@@ -30,6 +30,7 @@ snapcast = ["dep:rubato", "dep:libc"]
 anyhow.workspace = true
 argon2 = "0.5"
 axum.workspace = true
+getrandom = "0.2"
 md-5.workspace = true
 musicata-core = { path = "../musicata-core" }
 musicata-storage = { path = "../musicata-storage" }
