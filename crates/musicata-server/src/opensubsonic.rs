@@ -540,6 +540,7 @@ struct AlbumScanPlan {
 
 fn plan_album_fetches(prior_counts: &HashMap<String, usize>, albums: &[AlbumRef]) -> AlbumScanPlan {
     let mut reuse = Vec::new();
+    let mut reused: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut fetch = Vec::new();
     for album in albums {
         let content_id = album
@@ -551,7 +552,12 @@ fn plan_album_fetches(prior_counts: &HashMap<String, usize>, albums: &[AlbumRef]
             (Some(content_id), Some(count))
                 if count > 0 && prior_counts.get(&content_id) == Some(&(count as usize)) =>
             {
-                reuse.push(content_id)
+                // Dedup: two upstream albums can normalise to the same content id (same
+                // artist+title); the prior tracks for it must be re-emitted only ONCE, else
+                // they'd duplicate with identical ids (identity:None keeps the id).
+                if reused.insert(content_id.clone()) {
+                    reuse.push(content_id);
+                }
             }
             _ => fetch.push(album.id.clone()),
         }
@@ -870,6 +876,23 @@ mod tests {
         let plan = plan_album_fetches(&prior, &albums);
         assert_eq!(plan.reuse, vec![a_id]);
         assert_eq!(plan.fetch, vec!["rB".to_string(), "rC".to_string()]);
+    }
+
+    #[test]
+    fn incremental_dedups_colliding_album_content_ids() {
+        // Two distinct upstream albums normalise to the same content id (same artist+title) and
+        // each match the prior count — the reuse list must contain it only ONCE, else the prior
+        // tracks would be emitted twice with identical ids.
+        let id = album_identity("Various", "Greatest Hits", None);
+        let mut prior = HashMap::new();
+        prior.insert(id.clone(), 2usize);
+        let albums = vec![
+            album_ref("r1", "Various", "Greatest Hits", 2),
+            album_ref("r2", "Various", "Greatest Hits", 2),
+        ];
+        let plan = plan_album_fetches(&prior, &albums);
+        assert_eq!(plan.reuse, vec![id], "colliding content id reused once");
+        assert!(plan.fetch.is_empty());
     }
 
     #[test]

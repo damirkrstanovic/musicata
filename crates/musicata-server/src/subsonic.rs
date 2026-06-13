@@ -262,7 +262,9 @@ async fn authenticate_request(
     state: &AppState,
     params: &HashMap<String, String>,
 ) -> Result<(), (u32, &'static str)> {
-    if state.database.count_users().await.unwrap_or(0) == 0 {
+    // Only an explicit "no accounts yet" falls back to the single-user/open mode; a DB error
+    // fails closed (reject) rather than dropping `/rest` auth on an instance that has users.
+    if matches!(state.database.count_users().await, Ok(0)) {
         return authenticate(&state.subsonic, params);
     }
     let Some(username) = params.get("u") else {

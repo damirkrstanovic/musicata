@@ -199,8 +199,10 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
     // Extract credentials up front (owned), so no `&Request` is held across an await below.
     let cookie = cookie_value(request.headers(), SESSION_COOKIE);
     let api_token = query_token(request.uri()).or_else(|| bearer_token(request.headers()));
-    // Setup mode: no accounts yet — let the create-admin flow (and a first look) through.
-    if state.database.count_users().await.unwrap_or(0) == 0 {
+    // Setup mode: no accounts yet — let the create-admin flow (and a first look) through. Fail
+    // CLOSED on a DB error (only an explicit `Ok(0)` opens the API) so a transient query failure
+    // can't drop auth on an instance that actually has users.
+    if matches!(state.database.count_users().await, Ok(0)) {
         return next.run(request).await;
     }
     let Some(user) = resolve_user(&state, cookie, api_token).await else {

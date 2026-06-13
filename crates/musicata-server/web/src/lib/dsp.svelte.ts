@@ -43,10 +43,14 @@ class Dsp {
         server = legacy;
       }
       this.custom = server;
+      // Only now is it safe to rewrite localStorage without the legacy `custom` key — the
+      // migration fully succeeded (or there was nothing to migrate / the server already had
+      // profiles). On a failure above we fall to `catch` and leave localStorage intact so the
+      // un-uploaded profiles survive for the next load's retry.
+      this.saveLocal();
     } catch {
       this.custom = [];
     }
-    this.saveLocal(); // rewrites prefs without the legacy `custom` key
     this.loaded = true;
   }
 

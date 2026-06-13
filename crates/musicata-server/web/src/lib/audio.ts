@@ -45,6 +45,7 @@ export class BrowserAudio {
   // is loaded so we don't refetch on every rebuild.
   private convBuffer: AudioBuffer | null = null;
   private convProfileId: string | null = null;
+  private conv?: ConvolverNode;
 
   // Volume leveling (EBU R128). `levelingGain` sits at the end of the chain; its gain is set
   // per track from the now-playing item's LUFS, combined with the EQ preamp for clip safety.
@@ -113,14 +114,19 @@ export class BrowserAudio {
       if (this.ctx) this.rebuildChain();
       return;
     }
+    let decoded: AudioBuffer | null = null;
     try {
       const resp = await fetch(`/api/dsp/profiles/${encodeURIComponent(id)}/impulse`);
       if (!resp.ok) throw new Error("no impulse");
-      this.convBuffer = await this.ctx.decodeAudioData(await resp.arrayBuffer());
+      decoded = await this.ctx.decodeAudioData(await resp.arrayBuffer());
     } catch {
-      this.convBuffer = null; // missing/undecodable → just skip convolution, never silence
+      decoded = null; // missing/undecodable → just skip convolution, never silence
     }
-    if (this.convProfileId === id) this.rebuildChain();
+    // Only commit if this is still the active request — a newer profile switch (a later
+    // loadRoomIr) must not be clobbered by this one's late-resolving fetch.
+    if (this.convProfileId !== id) return;
+    this.convBuffer = decoded;
+    this.rebuildChain();
   }
 
   /** A/B bypass: route source straight to output (no preamp/EQ), keeping the active profile. */
@@ -195,7 +201,9 @@ export class BrowserAudio {
     const { ctx, srcNode: src, preamp, levelingGain: lvl, splitter, analyserL: aL, analyserR: aR } =
       this;
     if (!ctx || !src || !preamp || !lvl || !splitter || !aL || !aR) return;
-    for (const n of [src, preamp, lvl, ...this.eqBands]) {
+    const previous: AudioNode[] = [src, preamp, lvl, ...this.eqBands];
+    if (this.conv) previous.push(this.conv); // disconnect the old convolver too, else it leaks
+    for (const n of previous) {
       try {
         n.disconnect();
       } catch {
@@ -203,6 +211,7 @@ export class BrowserAudio {
       }
     }
     this.eqBands = [];
+    this.conv = undefined;
     const p = this.bypassed ? null : this.profile;
     this.eqPreampDb = p ? p.preampDb : 0;
     let prev: AudioNode;
@@ -230,6 +239,7 @@ export class BrowserAudio {
         const conv = ctx.createConvolver();
         conv.normalize = false; // correction IRs must NOT be loudness-normalised
         conv.buffer = this.convBuffer;
+        this.conv = conv; // keep a handle so the next rebuild disconnects it
         prev.connect(conv);
         prev = conv;
       }
