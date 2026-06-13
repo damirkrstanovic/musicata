@@ -38,10 +38,10 @@
   const GRID = [100, 1000, 10000];
   const GRID_LABEL: Record<number, string> = { 100: "100", 1000: "1k", 10000: "10k" };
 
-  function doImport() {
+  async function doImport() {
     importError = "";
     const name = importName.trim() || "Imported preset";
-    const prof = dsp.importText(importText, name);
+    const prof = await dsp.importText(importText, name);
     if (!prof) {
       importError =
         "No filters found. Paste a ParametricEQ.txt — lines like 'Filter 1: ON PK Fc 100 Hz Gain 3 dB Q 1'.";

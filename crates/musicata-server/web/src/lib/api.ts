@@ -16,6 +16,7 @@ import type { Activity } from "../types/Activity";
 import type { TrackMetadataReviewResponse } from "../types/TrackMetadataReviewResponse";
 import type { TrackMetadataFieldObservation } from "../types/TrackMetadataFieldObservation";
 import type { MetadataFieldReviewUpdate } from "../types/MetadataFieldReviewUpdate";
+import type { EqProfile } from "./dsp";
 
 // Re-export the generated metadata-review types under the names the editor components use.
 export type { MetadataApprovalState } from "../types/MetadataApprovalState";
@@ -363,6 +364,12 @@ export const api = {
     getJson<UnidentifiedAlbum[]>("/api/identification/unidentified", { kind: "album", limit }),
   unidentifiedArtists: (limit = 25) =>
     getJson<UnidentifiedArtist[]>("/api/identification/unidentified", { kind: "artist", limit }),
+
+  // DSP profile library (server-synced EQ / room correction)
+  dspProfiles: () => getJson<EqProfile[]>("/api/dsp/profiles"),
+  saveDspProfile: (p: EqProfile) =>
+    sendJson<EqProfile>(`/api/dsp/profiles/${encodeURIComponent(p.id)}`, "PUT", p),
+  deleteDspProfile: (id: string) => sendJson(`/api/dsp/profiles/${encodeURIComponent(id)}`, "DELETE"),
 
   // Auth & users
   authStatus: () => getJson<{ setup_required: boolean }>("/api/auth/status"),

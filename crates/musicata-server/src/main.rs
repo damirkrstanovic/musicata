@@ -2,6 +2,7 @@ mod activity;
 mod artwork;
 mod artwork_providers;
 mod auth;
+mod dsp;
 mod backup;
 mod fingerprint;
 mod loudness;
@@ -2208,6 +2209,13 @@ fn app(
         .route("/api/tracks/{id}/stream", get(stream_track))
         .route("/api/tracks/{id}/radio", get(track_radio))
         .route("/api/autoplay", get(get_autoplay).put(set_autoplay))
+        // DSP profile library (EQ + room correction). Authenticated, not admin-only — EQ is a
+        // playback preference; see crate::dsp + docs/dsp.md.
+        .route("/api/dsp/profiles", get(dsp::list_profiles))
+        .route(
+            "/api/dsp/profiles/{id}",
+            put(dsp::upsert_profile).delete(dsp::delete_profile),
+        )
         // Auth: open status/login/setup; the rest require a session (enforced by require_auth).
         .route("/api/auth/status", get(auth::auth_status))
         .route("/api/auth/setup", post(auth::setup))

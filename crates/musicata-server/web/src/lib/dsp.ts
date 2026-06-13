@@ -21,6 +21,10 @@ export interface EqProfile {
   /** Preamp/headroom in dB — applied as a front gain so band boosts don't clip. */
   preampDb: number;
   bands: EqBand[];
+  /** "headphones" | "speakers" — drives the output switcher; room IR only on speakers. */
+  kind?: "headphones" | "speakers";
+  /** Set when a room-correction WAV impulse response is stored for this profile (speakers). */
+  roomIr?: { sampleRate: number };
 }
 
 // AutoEq/REW filter-type tokens → biquad kind. PK = peaking, LSC/LS = low shelf, HSC/HS = high

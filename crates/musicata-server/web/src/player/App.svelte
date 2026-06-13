@@ -126,6 +126,7 @@
 
     favorites.load();
     autoplay.load();
+    dsp.load();
     install.init();
     await loadTargets();
     const browser = players.find((p) => p.kind === "browser") ?? players[0];
