@@ -572,6 +572,32 @@ mod tests {
         assert!(order.iter().all(|t| t == "a1" || t == "b1"));
     }
 
+    /// Live smoke test of the real ListenBrainz Labs path: exercises our actual client
+    /// (request, query params, the `LB_*_ALGORITHM` constants, the parser) end-to-end against
+    /// the production API. `#[ignore]`d so default `cargo test` stays offline; run on demand
+    /// with `cargo test -p musicata-server --bins -- --ignored listenbrainz_live` to confirm
+    /// the algorithm strings haven't been retired upstream and the response shape still parses.
+    #[test]
+    #[ignore = "hits the live ListenBrainz Labs API"]
+    fn listenbrainz_live_path() {
+        let client = ListenBrainzClient::new();
+
+        // similar-artists: the radio workhorse. The Beatles → well-populated neighbors.
+        let artists = client
+            .similar_artists("b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d")
+            .expect("live similar-artists call");
+        assert!(!artists.is_empty(), "expected similar artists for The Beatles");
+        assert!(artists[0].score > 0.0, "first artist should carry a score");
+        assert!(!artists[0].name.is_empty(), "first artist should have a name");
+
+        // similar-recordings: sparse, but a top LB-indexed Beatles recording has neighbors.
+        let recordings = client
+            .similar_recordings("0cdc9b5b-b16b-4ff1-9f16-5b4ba76f1c17")
+            .expect("live similar-recordings call");
+        assert!(!recordings.is_empty(), "expected similar recordings for an indexed MBID");
+        assert!(recordings[0].score > 0.0, "first recording should carry a score");
+    }
+
     #[test]
     fn weighted_order_favors_higher_scores() {
         // One track each so first-pick reflects the artist draw. Over many seeds the
