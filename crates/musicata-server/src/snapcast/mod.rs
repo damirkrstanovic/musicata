@@ -18,6 +18,7 @@
 
 mod control;
 mod decode;
+mod dsp;
 mod server;
 mod writer;
 
@@ -31,6 +32,7 @@ use crate::providers::ProviderRegistry;
 
 pub use control::{SnapClient, SnapControl, SnapStream};
 pub use decode::DecodedTrack;
+pub use dsp::StereoEq;
 pub use server::{
     AIRPLAY_STREAM_NAME, SPOTIFY_STREAM_NAME, STREAM_NAME, SnapRoom, SnapcastManager,
     SnapcastSettings, binary_present, install_command,

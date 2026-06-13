@@ -17,6 +17,8 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+use musicata_storage::Database;
+
 use crate::{AppError, AppState, db_error};
 
 const DSP_PROFILES_KEY: &str = "dsp_profiles";
@@ -56,10 +58,8 @@ pub struct DspProfile {
     pub room_ir: Option<RoomIr>,
 }
 
-async fn load_profiles(state: &AppState) -> Vec<DspProfile> {
-    state
-        .database
-        .get_setting(DSP_PROFILES_KEY)
+async fn load_profiles(db: &Database) -> Vec<DspProfile> {
+    db.get_setting(DSP_PROFILES_KEY)
         .await
         .ok()
         .flatten()
@@ -67,19 +67,20 @@ async fn load_profiles(state: &AppState) -> Vec<DspProfile> {
         .unwrap_or_default()
 }
 
-async fn store_profiles(state: &AppState, profiles: &[DspProfile]) -> Result<(), AppError> {
+async fn store_profiles(db: &Database, profiles: &[DspProfile]) -> Result<(), AppError> {
     let json = serde_json::to_string(profiles).map_err(|e| AppError::internal(e.to_string()))?;
-    state
-        .database
-        .set_setting(DSP_PROFILES_KEY, &json)
-        .await
-        .map_err(db_error)
+    db.set_setting(DSP_PROFILES_KEY, &json).await.map_err(db_error)
+}
+
+/// One profile by id (for the server-side Snapcast EQ — see `apply_snapcast_dsp` in main.rs).
+pub async fn profile_by_id(db: &Database, id: &str) -> Option<DspProfile> {
+    load_profiles(db).await.into_iter().find(|p| p.id == id)
 }
 
 /// The profile library, in stored order. Authenticated but not admin-only — EQ is a playback
 /// preference, so any signed-in user can read it (and edit it via PUT/DELETE).
 pub async fn list_profiles(State(state): State<AppState>) -> Json<Vec<DspProfile>> {
-    Json(load_profiles(&state).await)
+    Json(load_profiles(&state.database).await)
 }
 
 /// Upsert a profile by id (the id in the path wins over the body's). Returns the saved profile.
@@ -92,10 +93,10 @@ pub async fn upsert_profile(
     if profile.name.trim().is_empty() {
         return Err(AppError::bad_request("profile name is required"));
     }
-    let mut profiles = load_profiles(&state).await;
+    let mut profiles = load_profiles(&state.database).await;
     profiles.retain(|p| p.id != profile.id);
     profiles.push(profile.clone());
-    store_profiles(&state, &profiles).await?;
+    store_profiles(&state.database, &profiles).await?;
     Ok(Json(profile))
 }
 
@@ -103,11 +104,11 @@ pub async fn delete_profile(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let mut profiles = load_profiles(&state).await;
+    let mut profiles = load_profiles(&state.database).await;
     let before = profiles.len();
     profiles.retain(|p| p.id != id);
     if profiles.len() != before {
-        store_profiles(&state, &profiles).await?;
+        store_profiles(&state.database, &profiles).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -150,7 +151,7 @@ pub async fn upload_impulse(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode, AppError> {
-    let mut profiles = load_profiles(&state).await;
+    let mut profiles = load_profiles(&state.database).await;
     let profile = profiles
         .iter_mut()
         .find(|p| p.id == id)
@@ -168,7 +169,7 @@ pub async fn upload_impulse(
     profile.room_ir = Some(RoomIr {
         sample_rate: wav_sample_rate(&body),
     });
-    store_profiles(&state, &profiles).await?;
+    store_profiles(&state.database, &profiles).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -189,10 +190,10 @@ pub async fn delete_impulse(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let _ = tokio::fs::remove_file(impulse_path(&state, &id)).await;
-    let mut profiles = load_profiles(&state).await;
+    let mut profiles = load_profiles(&state.database).await;
     if let Some(profile) = profiles.iter_mut().find(|p| p.id == id) {
         profile.room_ir = None;
-        store_profiles(&state, &profiles).await?;
+        store_profiles(&state.database, &profiles).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }

@@ -743,10 +743,17 @@ polish remain.
 - [x] **Phase 4 — room correction in the browser.** A `ConvolverNode` (`normalize=false`) loading
   a user-uploaded WAV impulse response (stored as a file, served by `/api/dsp/profiles/{id}/impulse`);
   stereo only. Missing/undecodable IR skips convolution rather than silencing.
-- [ ] **Phase 5 — CamillaDSP subprocess (the DAC tier).** Managed subprocess (control via
-  `PatchConfig` over WebSocket), ALSA-loopback routing for MPD→DAC, the *same* profile
-  compiled to CamillaDSP YAML; multichannel + crossovers. Cargo-feature-gated, "require
-  installed," like the SMB source.
+- [x] **Phase 5 (revised) — server-side DSP, in-process (NOT a subprocess).** Re-verified that
+  CamillaDSP's filter math is a clean library (`Filter::process_waveform`), so audio Musicata
+  itself produces is corrected in-process — no subprocess, no ALSA loopback. **Done for Snapcast:**
+  `crate::snapcast::dsp` applies an RBJ-cookbook biquad cascade + preamp (our own ~150 lines)
+  built from the **same server `DspProfile`** in the decode→FIFO writer (`WriterMsg::SetDsp`),
+  chosen via a `snapcast.dsp_profile_id` setting + `/admin` selector, pushed live. Server-side FIR
+  **room** convolution for Snapcast (vendor `fftconv.rs`) is the natural next step.
+- [ ] **CamillaDSP subprocess — deferred, niche.** Only for correcting audio Musicata does *not*
+  produce — the **MPD→external-DAC** path (CamillaDSP intercepts the OS audio via `snd-aloop`;
+  same `DspProfile`→YAML, live `PatchConfig` over WS). Cargo-feature-gated, "require installed."
+  Not the primary path.
 - **Phase 6 — Volume Leveling (Track mode): DONE.** EBU R128 analysis at scan time
   (`ebur128`, `track_loudness` table v26, `loudness_loop`), a per-track browser leveling gain
   with the clip check combined with the EQ preamp; Off/Track toggle. Design + remaining work

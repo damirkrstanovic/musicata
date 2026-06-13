@@ -1675,8 +1675,33 @@ async fn maybe_enable_snapcast(
     }
     let manager = Arc::new(snapcast::SnapcastManager::start(settings).await?);
     players.enable_snapcast(manager).await?;
+    apply_snapcast_dsp(database, players).await;
     tracing::info!("snapcast: multi-room enabled");
     Ok(())
+}
+
+/// Build the server-side EQ from the `snapcast.dsp_profile_id` setting and push it to the
+/// Snapcast writer (in-process correction — no CamillaDSP subprocess). A no-op when snapcast
+/// isn't running or no profile is selected.
+#[cfg(feature = "snapcast")]
+async fn apply_snapcast_dsp(database: &musicata_storage::Database, players: &Arc<PlayerManager>) {
+    let Some(manager) = players.snapcast_manager().await else {
+        return;
+    };
+    let rate = manager.sample_rate();
+    let id = database
+        .get_setting("snapcast.dsp_profile_id")
+        .await
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_empty());
+    let eq = match id {
+        Some(id) => dsp::profile_by_id(database, &id)
+            .await
+            .and_then(|profile| snapcast::StereoEq::from_profile(&profile, rate)),
+        None => None,
+    };
+    players.set_snapcast_dsp(eq).await;
 }
 
 /// Build [`snapcast::SnapcastSettings`] from the persisted `snapcast.*` settings keys,
@@ -4096,6 +4121,8 @@ struct SnapcastStatus {
     airplay_installed: bool,
     spotify_enabled: bool,
     spotify_installed: bool,
+    /// The DSP profile applied server-side to the Snapcast stream (`""`/none = no correction).
+    dsp_profile_id: Option<String>,
 }
 
 #[cfg(feature = "snapcast")]
@@ -4148,6 +4175,7 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
         airplay_installed: snapcast::binary_present(&airplay_binary),
         spotify_enabled,
         spotify_installed: snapcast::binary_present(&spotify_binary),
+        dsp_profile_id: setting("snapcast.dsp_profile_id").await.ok().flatten(),
     }))
 }
 
@@ -4163,6 +4191,8 @@ struct SnapcastSettingsUpdate {
     spotify_enabled: Option<bool>,
     /// The stream all rooms play (`Musicata`/`AirPlay`/`Spotify`) — applied live.
     active_input: Option<String>,
+    /// Server-side EQ profile for the Snapcast stream (`""` clears it) — applied live.
+    dsp_profile_id: Option<String>,
 }
 
 #[cfg(feature = "snapcast")]
@@ -4229,6 +4259,15 @@ async fn snapcast_update(
                 let _ = control.assign_all_to_stream(input).await;
             }
         }
+    }
+    // Server-side EQ correction for the Snapcast stream — persisted + applied live to the writer.
+    if let Some(profile_id) = update.dsp_profile_id {
+        state
+            .database
+            .set_setting("snapcast.dsp_profile_id", profile_id.trim())
+            .await
+            .map_err(db_error)?;
+        apply_snapcast_dsp(&state.database, &state.players).await;
     }
     // Start the subsystem immediately when newly enabled; auth/host/input-enable changes persist
     // and take effect on the next restart (the snapserver config is regenerated at startup).

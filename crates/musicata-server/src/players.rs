@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use crate::mpd::{MpdConnection, MpdStatus};
 use crate::providers::ProviderRegistry;
 #[cfg(feature = "snapcast")]
-use crate::snapcast::{DecodedTrack, SnapcastManager, WriterEvent, WriterMsg};
+use crate::snapcast::{DecodedTrack, SnapcastManager, StereoEq, WriterEvent, WriterMsg};
 
 /// Stable id of the always-present local browser player.
 pub const BROWSER_PLAYER_ID: &str = "browser-local";
@@ -492,6 +492,16 @@ impl PlayerManager {
     #[cfg(feature = "snapcast")]
     pub async fn snapcast_manager(&self) -> Option<Arc<SnapcastManager>> {
         self.snapcast.read().await.clone()
+    }
+
+    /// Set (or clear) the server-side EQ correction applied to the Snapcast stream.
+    #[cfg(feature = "snapcast")]
+    pub async fn set_snapcast_dsp(&self, eq: Option<StereoEq>) {
+        if let Some(entry) = self.players.read().await.get(SNAPCAST_PLAYER_ID) {
+            if let PlayerHandle::Snapcast(player) = &entry.handle {
+                player.set_dsp(eq);
+            }
+        }
     }
 
     /// Bring up the runtime entry for a persisted player record.
@@ -2031,6 +2041,11 @@ impl SnapcastPlayer {
             events_rx: std::sync::Mutex::new(Some(events_rx)),
             loaded: Mutex::new(LoadedTrack::default()),
         })
+    }
+
+    /// Set (or clear) the server-side EQ correction applied to the outgoing PCM (before the FIFO).
+    pub fn set_dsp(&self, eq: Option<StereoEq>) {
+        let _ = self.writer_tx.send(WriterMsg::SetDsp(Box::new(eq)));
     }
 
     pub fn is_online(&self) -> bool {

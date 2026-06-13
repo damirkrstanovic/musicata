@@ -3,9 +3,11 @@
   import type { SnapcastStatus } from "../types/SnapcastStatus";
   import type { SnapClient } from "../types/SnapClient";
   import type { SnapRoomView } from "../types/SnapRoomView";
+  import type { EqProfile } from "../lib/dsp";
 
   let status = $state<SnapcastStatus | null>(null);
   let rooms = $state<SnapRoomView[]>([]);
+  let dspProfiles = $state<EqProfile[]>([]);
   let newRoom = $state("");
   let host = $state("");
   let message = $state("");
@@ -17,6 +19,7 @@
       status = await api.snapcastStatus();
       host = status.server_host;
       if (status.running) rooms = await api.snapcastRooms();
+      dspProfiles = await api.dspProfiles().catch(() => []);
     } catch {
       // Built without the snapcast feature, or unavailable — hide the panel.
       status = null;
@@ -32,6 +35,7 @@
       airplay_enabled?: boolean;
       spotify_enabled?: boolean;
       active_input?: string;
+      dsp_profile_id?: string;
     },
     note: string,
   ) {
@@ -219,6 +223,29 @@
         {/each}
       </div>
     {/if}
+
+    <!-- Server-side correction: apply an EQ/room profile to the multi-room PCM, in-process. -->
+    <div class="admin-subhead">Correction (EQ / room)</div>
+    <p class="admin-hint">
+      Apply an EQ or room-correction profile to the multi-room output, processed on the server
+      (no extra software). Create profiles in the player's Equalizer.
+    </p>
+    <label class="field">
+      <select
+        value={status.dsp_profile_id ?? ""}
+        disabled={busy}
+        onchange={(e) =>
+          update(
+            { dsp_profile_id: (e.currentTarget as HTMLSelectElement).value },
+            "Saved correction.",
+          )}
+      >
+        <option value="">None</option>
+        {#each dspProfiles as p (p.id)}
+          <option value={p.id}>{p.name}</option>
+        {/each}
+      </select>
+    </label>
 
     {#if status.running}
       <!-- Rooms: provision a device with a name → get its install command. -->

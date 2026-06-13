@@ -331,13 +331,31 @@ per-player volume already in `PlaybackState.volume`; the proven
 speakers profile; `normalize = false` **before** assigning `.buffer`; upload/select UI.
 Stereo only — multichannel needs the CamillaDSP tier.
 
-### Phase 5 — CamillaDSP subprocess (the DAC tier, separate effort)
+### Phase 5 — server-side DSP (revised: in-process, NOT a subprocess by default) — DONE for Snapcast
 
-Managed subprocess (Option A): provision `snd-aloop`, write MPD's output stanza, compile the
-**same `DspProfile`** → CamillaDSP YAML (devices stable), launch `-w` + statefile, push live
-edits via **`PatchConfig`** over WS, surface `GetProcessingLoad`/clip in the activity log.
-Cargo-feature-gated + "require installed." Here a "Speakers" preset's `sink` points at the
-CamillaDSP endpoint instead of a browser device — same profile model, multichannel + crossovers.
+**Re-verified against CamillaDSP 4.1.3 (`../camilladsp`): the DSP is a clean library, so a
+subprocess is *not* needed for audio Musicata itself produces.** The engine is built on
+`pub trait Filter { fn process_waveform(&mut self, &mut [PrcFmt]); }` (`src/filters/mod.rs:39`)
+with public, engine-free constructors (`BiquadCoefficients::new`, `Biquad::new`/`from_config`,
+`FftConv::new`). Neither `camilladsp` nor `camillalib` is published on crates.io, and a git-dep
+drags the whole crate (ALSA/CoreAudio/WASAPI backends + websocket, edition 2024) — so **vendor the
+math, don't depend on the crate**.
+
+**What's built (in-process, for Snapcast):** `crate::snapcast::dsp` — an RBJ-cookbook biquad
+cascade + preamp (`StereoEq`, our own ~150 lines, the same EqualizerAPO/AutoEq target; no GPL
+vendoring needed for biquads) applied **in the decode→FIFO writer** before the FIFO
+(`writer.rs`, `WriterMsg::SetDsp`), built from the **same server `DspProfile`** as the browser
+tier. A `snapcast.dsp_profile_id` setting (an `/admin` Multi-room selector) chooses the profile;
+it's pushed to the writer live (`PlayerManager::set_snapcast_dsp`). **No subprocess, no ALSA
+loopback** — Musicata already owns the PCM here. (Server-side **FIR room convolution** for
+Snapcast is the natural next step: vendor `fftconv.rs` (realfft overlap-add) and add a `Conv`
+stage in the writer; the browser tier already does room conv.)
+
+**The subprocess stays a niche, deferred option** only for correcting audio Musicata does *not*
+produce — the **MPD → external-DAC** path, where CamillaDSP must intercept the OS audio path
+(snd-aloop). There a managed subprocess (Option A: `-w` + statefile, live `PatchConfig` over WS,
+the same `DspProfile` → CamillaDSP YAML) is the only option; cargo-feature-gated + "require
+installed." Not the primary plan.
 
 ### Phase 6 — polish
 

@@ -265,6 +265,16 @@ check(
     up.ok && saved?.roomIr?.sampleRate === 48000 && served.ok,
     `up=${up.status} sr=${saved?.roomIr?.sampleRate} get=${served.status}`,
   );
+
+  // Server-side Snapcast EQ: selecting a DSP profile for the multi-room output persists +
+  // reflects in status (the in-process correction is applied to the writer when running).
+  const patched = await fetch(base + "/api/snapcast/status", {
+    method: "PATCH",
+    headers: { "content-type": "application/json", cookie: COOKIE },
+    body: JSON.stringify({ dsp_profile_id: "smoke-room" }),
+  });
+  const snap = patched.ok ? await patched.json() : null;
+  check("snapcast server-side DSP profile selection persists", snap?.dsp_profile_id === "smoke-room");
 }
 
 // VU meter: opening it renders the two (L/R) McIntosh-style meters.

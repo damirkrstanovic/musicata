@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::decode::{CHANNELS, DecodedTrack};
+use super::dsp::StereoEq;
 
 /// PCM frames written per `write_all`. snapserver reads its pipe in small chunks paced to
 /// real time (its `chunk_ms`, default 20 ms); feeding in **matching ~20 ms granularity** keeps
@@ -62,6 +63,9 @@ pub enum WriterMsg {
     SetVolume(u8),
     /// Reposition the current track's cursor (seek), in frames from the start.
     Seek { frame: usize },
+    /// Replace the active EQ correction (or clear it with `None`). Applied per chunk before the
+    /// FIFO — server-side correction for Snapcast, in-process (no CamillaDSP subprocess).
+    SetDsp(Box<Option<StereoEq>>),
     /// Stop and clear everything (Stop / Clear).
     Stop,
     /// Tear the thread down.
@@ -92,6 +96,8 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
     let mut playing = false;
     // Master volume as a linear factor (0.0–1.0); defaults to full scale.
     let mut volume = 1.0f32;
+    // Optional server-side EQ correction applied per chunk (stateful per channel).
+    let mut eq: Option<StereoEq> = None;
     // Wall-clock time the *next* frame to be written should reach the stream — the
     // real-time playout clock. `None` whenever we're idle (reset so a resume starts fresh,
     // not trying to "catch up" across the silent gap). The sample rate is fixed per stream.
@@ -103,7 +109,7 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
         loop {
             match rx.try_recv() {
                 Ok(msg) => {
-                    if !apply(msg, &mut current, &mut next, &mut playing, &mut volume) {
+                    if !apply(msg, &mut current, &mut next, &mut playing, &mut volume, &mut eq) {
                         return;
                     }
                 }
@@ -118,7 +124,7 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
             clock = None;
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(msg) => {
-                    if !apply(msg, &mut current, &mut next, &mut playing, &mut volume) {
+                    if !apply(msg, &mut current, &mut next, &mut playing, &mut volume, &mut eq) {
                         return;
                     }
                 }
@@ -135,16 +141,26 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
             let start = loaded.cursor_frames.min(total);
             let end = (start + CHUNK_FRAMES).min(total);
             // Combine the per-track leveling gain with the live master volume. When both
-            // are unity this is a plain copy; otherwise each sample is scaled + clamped.
+            // are unity and there's no EQ this is a plain copy; otherwise each frame is
+            // (optionally) EQ-filtered then scaled + clamped.
             let factor = loaded.gain * volume;
+            let chunk = &loaded.track.samples[start * CHANNELS..end * CHANNELS];
             scratch.clear();
-            for sample in &loaded.track.samples[start * CHANNELS..end * CHANNELS] {
-                let value = if (factor - 1.0).abs() < f32::EPSILON {
-                    *sample
-                } else {
-                    (*sample as f32 * factor).clamp(i16::MIN as f32, i16::MAX as f32) as i16
-                };
-                scratch.extend_from_slice(&value.to_le_bytes());
+            if eq.is_none() && (factor - 1.0).abs() < f32::EPSILON {
+                for sample in chunk {
+                    scratch.extend_from_slice(&sample.to_le_bytes());
+                }
+            } else {
+                let f = factor as f64;
+                for frame in chunk.chunks(CHANNELS) {
+                    let (mut l, mut r) = (frame[0] as f64, frame.get(1).copied().unwrap_or(0) as f64);
+                    if let Some(eq) = eq.as_mut() {
+                        (l, r) = eq.process_frame(l, r);
+                    }
+                    let q = |v: f64| (v * f).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                    scratch.extend_from_slice(&q(l).to_le_bytes());
+                    scratch.extend_from_slice(&q(r).to_le_bytes());
+                }
             }
             loaded.cursor_frames = end;
             if let Err(error) = file.write_all(&scratch) {
@@ -199,6 +215,7 @@ fn apply(
     next: &mut Option<(Arc<DecodedTrack>, f32)>,
     playing: &mut bool,
     volume: &mut f32,
+    eq: &mut Option<StereoEq>,
 ) -> bool {
     match msg {
         WriterMsg::Load {
@@ -213,6 +230,9 @@ fn apply(
                 gain,
             });
             *next = None;
+            if let Some(eq) = eq.as_mut() {
+                eq.reset(); // don't bleed the previous track's filter state into the new one
+            }
         }
         WriterMsg::Preload { track, gain } => *next = Some((track, gain)),
         WriterMsg::SetPlaying(value) => *playing = value,
@@ -221,7 +241,11 @@ fn apply(
             if let Some(loaded) = current.as_mut() {
                 loaded.cursor_frames = frame.min(loaded.track.frames());
             }
+            if let Some(eq) = eq.as_mut() {
+                eq.reset();
+            }
         }
+        WriterMsg::SetDsp(chain) => *eq = *chain,
         WriterMsg::Stop => {
             *current = None;
             *next = None;

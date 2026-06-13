@@ -35,4 +35,8 @@ active_input: string,
 /**
  * Cast-in input config (the toggles + whether the helper binary is installed).
  */
-airplay_enabled: boolean, airplay_installed: boolean, spotify_enabled: boolean, spotify_installed: boolean, };
+airplay_enabled: boolean, airplay_installed: boolean, spotify_enabled: boolean, spotify_installed: boolean, 
+/**
+ * The DSP profile applied server-side to the Snapcast stream (`""`/none = no correction).
+ */
+dsp_profile_id: string | null, };
