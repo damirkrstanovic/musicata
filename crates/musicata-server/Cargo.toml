@@ -6,14 +6,18 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# SMB and Snapcast are on by default so a plain build can read network shares and do
-# synchronized multi-room playout; build with `--no-default-features` for a minimal binary
-# without the `smb` dependency or the Snapcast decode path (the latter also needs the
-# `snapserver`/`snapclient` binaries installed at runtime).
-default = ["provider-smb", "snapcast"]
+# SMB, OpenSubsonic, and Snapcast are on by default so a plain build can read network
+# shares, consume an upstream Subsonic/Navidrome/Funkwhale server, and do synchronized
+# multi-room playout; build with `--no-default-features` for a minimal binary without the
+# `smb` dependency, the OpenSubsonic client, or the Snapcast decode path (the last also
+# needs the `snapserver`/`snapclient` binaries installed at runtime).
+default = ["provider-smb", "provider-opensubsonic", "snapcast"]
 # Read music from an SMB/CIFS network share directly (pure Rust, no mount). Pulls
 # in the `smb` crate; see crate::smb.
 provider-smb = ["dep:smb", "dep:futures"]
+# Consume a remote OpenSubsonic/Navidrome/Funkwhale server as a music source (pure ureq +
+# serde; no extra deps — the feature gates code only). See crate::opensubsonic.
+provider-opensubsonic = []
 # Generate TypeScript types for the web client from the server's response structs (the
 # admin DTOs). Off by default; see scripts/gen-web-types.sh.
 ts = ["dep:ts-rs", "musicata-core/ts"]

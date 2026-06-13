@@ -14,6 +14,8 @@ use musicata_core::{
 };
 use musicata_storage::{Database, SourceRecord};
 
+#[cfg(feature = "provider-opensubsonic")]
+use crate::opensubsonic::OpenSubsonicProvider;
 #[cfg(feature = "provider-smb")]
 use crate::smb::SmbProvider;
 
@@ -30,6 +32,14 @@ pub fn provider_from_record(record: &SourceRecord) -> anyhow::Result<ProviderHan
         "smb" => anyhow::bail!(
             "SMB support is not compiled into this build (enable the `provider-smb` feature)"
         ),
+        #[cfg(feature = "provider-opensubsonic")]
+        "opensubsonic" => Ok(ProviderHandle::OpenSubsonic(std::sync::Arc::new(
+            OpenSubsonicProvider::from_record(record)?,
+        ))),
+        #[cfg(not(feature = "provider-opensubsonic"))]
+        "opensubsonic" => anyhow::bail!(
+            "OpenSubsonic support is not compiled into this build (enable the `provider-opensubsonic` feature)"
+        ),
         other => anyhow::bail!("unknown source kind: {other}"),
     }
 }
@@ -44,6 +54,18 @@ pub fn smb_provider_id(host: &str, share: &str, base_path: &str) -> String {
         format!("/{}", base.replace('\\', "/"))
     };
     format!("smb:{}/{}{}", host.to_lowercase(), share, suffix)
+}
+
+/// The provider id for an upstream OpenSubsonic source — stable across restarts (so its tracks
+/// keep their attribution) and distinct from `smb:`/`local-disk`/`radio`. Derived from the base
+/// URL with the scheme stripped and lowercased, e.g. `opensubsonic:navidrome.example.com`.
+#[cfg(feature = "provider-opensubsonic")]
+pub fn opensubsonic_provider_id(base_url: &str) -> String {
+    let without_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    format!("opensubsonic:{}", without_scheme.trim_end_matches('/').to_lowercase())
 }
 
 /// Stable id of the built-in internet-radio source. Like `local-disk`, it is always
@@ -111,6 +133,8 @@ pub enum ProviderHandle {
     Radio(Arc<RadioProvider>),
     #[cfg(feature = "provider-smb")]
     Smb(Arc<SmbProvider>),
+    #[cfg(feature = "provider-opensubsonic")]
+    OpenSubsonic(Arc<OpenSubsonicProvider>),
 }
 
 impl ProviderHandle {
@@ -128,6 +152,8 @@ impl ProviderHandle {
             ProviderHandle::Radio(_) => RADIO_PROVIDER_ID.to_string(),
             #[cfg(feature = "provider-smb")]
             ProviderHandle::Smb(provider) => provider.provider_id().clone(),
+            #[cfg(feature = "provider-opensubsonic")]
+            ProviderHandle::OpenSubsonic(provider) => provider.provider_id().clone(),
         }
     }
 
@@ -137,6 +163,8 @@ impl ProviderHandle {
             ProviderHandle::Radio(provider) => provider.capabilities(),
             #[cfg(feature = "provider-smb")]
             ProviderHandle::Smb(_) => ProviderCapabilities::DISK,
+            #[cfg(feature = "provider-opensubsonic")]
+            ProviderHandle::OpenSubsonic(_) => ProviderCapabilities::DISK,
         }
     }
 
@@ -148,6 +176,8 @@ impl ProviderHandle {
             ProviderHandle::Local(_) | ProviderHandle::Radio(_) => Ok(()),
             #[cfg(feature = "provider-smb")]
             ProviderHandle::Smb(provider) => provider.validate().await,
+            #[cfg(feature = "provider-opensubsonic")]
+            ProviderHandle::OpenSubsonic(provider) => provider.validate().await,
         }
     }
 
@@ -164,6 +194,10 @@ impl ProviderHandle {
             ProviderHandle::Smb(_) => {
                 anyhow::bail!("SMB shares are browsed through the library endpoints")
             }
+            #[cfg(feature = "provider-opensubsonic")]
+            ProviderHandle::OpenSubsonic(_) => {
+                anyhow::bail!("OpenSubsonic sources are browsed through the library endpoints")
+            }
         }
     }
 
@@ -179,6 +213,10 @@ impl ProviderHandle {
             #[cfg(feature = "provider-smb")]
             ProviderHandle::Smb(_) => {
                 anyhow::bail!("SMB tracks are streamed through /api/tracks/{{id}}/stream")
+            }
+            #[cfg(feature = "provider-opensubsonic")]
+            ProviderHandle::OpenSubsonic(_) => {
+                anyhow::bail!("OpenSubsonic tracks are streamed through /api/tracks/{{id}}/stream")
             }
         }
     }
@@ -217,6 +255,10 @@ impl ProviderHandle {
             }
             #[cfg(feature = "provider-smb")]
             ProviderHandle::Smb(provider) => provider.scan_with_progress(prior, progress).await,
+            #[cfg(feature = "provider-opensubsonic")]
+            ProviderHandle::OpenSubsonic(provider) => {
+                provider.scan_with_progress(prior, progress).await
+            }
         }
     }
 }

@@ -6,6 +6,8 @@ mod fingerprint;
 mod loudness;
 mod mpd;
 mod musicbrainz;
+#[cfg(feature = "provider-opensubsonic")]
+mod opensubsonic;
 mod players;
 mod providers;
 mod radiobrowser;
@@ -4265,51 +4267,106 @@ async fn create_source(
     State(state): State<AppState>,
     Json(request): Json<CreateSourceRequest>,
 ) -> Result<Json<SourceView>, AppError> {
-    if request.kind != "smb" {
-        return Err(AppError::bad_request(format!(
-            "unsupported source kind: {}",
-            request.kind
-        )));
-    }
-    let host = request
-        .host
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::bad_request("host is required for an SMB source"))?;
-    let share = request
-        .share
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::bad_request("share is required for an SMB source"))?;
-    let base_path = request
-        .base_path
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_string();
-
-    let id = providers::smb_provider_id(host, share, &base_path);
-    let display_name = request
-        .display_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{host}/{share}"));
-    let record = musicata_storage::SourceRecord {
-        id: id.clone(),
-        kind: "smb".to_string(),
-        display_name,
-        enabled: true,
-        host: Some(host.to_string()),
-        share: Some(share.to_string()),
-        base_path: (!base_path.is_empty()).then(|| base_path.clone()),
-        username: request.username.clone(),
-        password: request.password.clone(),
-        domain: request.domain.clone(),
-        created_at_unix_seconds: now_unix_seconds(),
+    let record = match request.kind.as_str() {
+        "smb" => {
+            let host = request
+                .host
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::bad_request("host is required for an SMB source"))?;
+            let share = request
+                .share
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::bad_request("share is required for an SMB source"))?;
+            let base_path = request
+                .base_path
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            let display_name = request
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{host}/{share}"));
+            musicata_storage::SourceRecord {
+                id: providers::smb_provider_id(host, share, &base_path),
+                kind: "smb".to_string(),
+                display_name,
+                enabled: true,
+                host: Some(host.to_string()),
+                share: Some(share.to_string()),
+                base_path: (!base_path.is_empty()).then(|| base_path.clone()),
+                username: request.username.clone(),
+                password: request.password.clone(),
+                domain: request.domain.clone(),
+                created_at_unix_seconds: now_unix_seconds(),
+            }
+        }
+        #[cfg(feature = "provider-opensubsonic")]
+        "opensubsonic" => {
+            // `host` carries the full base URL; user + password are required (Subsonic uses
+            // salted-token auth, so an empty credential can't authenticate).
+            let url = request
+                .host
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::bad_request("server URL is required for an OpenSubsonic source")
+                })?;
+            let username = request
+                .username
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::bad_request("username is required for an OpenSubsonic source")
+                })?;
+            let password = request
+                .password
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::bad_request("password is required for an OpenSubsonic source")
+                })?;
+            let display_name = request
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    url.split_once("://")
+                        .map(|(_, rest)| rest)
+                        .unwrap_or(url)
+                        .trim_end_matches('/')
+                        .to_string()
+                });
+            musicata_storage::SourceRecord {
+                id: providers::opensubsonic_provider_id(url),
+                kind: "opensubsonic".to_string(),
+                display_name,
+                enabled: true,
+                host: Some(url.to_string()),
+                share: None,
+                base_path: None,
+                username: Some(username.to_string()),
+                password: Some(password.to_string()),
+                domain: None,
+                created_at_unix_seconds: now_unix_seconds(),
+            }
+        }
+        other => {
+            return Err(AppError::bad_request(format!(
+                "unsupported source kind: {other}"
+            )));
+        }
     };
 
     // Build the provider, then verify it's actually reachable and readable (connect
@@ -4893,8 +4950,55 @@ async fn stream_track(
         return smb_stream_response(&smb, &track, range_header, content_type).await;
     }
 
+    // OpenSubsonic: proxy the upstream server's stream, forwarding the Range header so seeks and
+    // partial fetches work and the upstream's credentials never leave this server.
+    #[cfg(feature = "provider-opensubsonic")]
+    if let Some(providers::ProviderHandle::OpenSubsonic(os)) = state
+        .providers
+        .read()
+        .await
+        .get(&track.provider.provider_id)
+    {
+        return opensubsonic_stream_response(&os, &track, range_header, content_type).await;
+    }
+
     let bytes = tokio::fs::read(&track.path).await?;
     ranged_response(bytes, range_header, content_type)
+}
+
+/// Serve an OpenSubsonic-backed track by proxying the upstream `/rest/stream` (see
+/// `opensubsonic::OpenSubsonicProvider::read_range_stream`). The upstream did the range math, so
+/// we pass its status (200/206) and `Content-Type`/`Content-Range`/`Content-Length`/
+/// `Accept-Ranges` through verbatim, falling back to our extension-derived `content_type` when
+/// the upstream omits it. The body streams in chunks (no whole-file buffering).
+#[cfg(feature = "provider-opensubsonic")]
+async fn opensubsonic_stream_response(
+    provider: &opensubsonic::OpenSubsonicProvider,
+    track: &musicata_core::Track,
+    range: Option<&str>,
+    content_type: &str,
+) -> Result<Response, AppError> {
+    let (status, headers, stream) = provider
+        .read_range_stream(&track.provider.item_id, range.map(str::to_string))
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+
+    let mut builder = Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+        .header(ACCEPT_RANGES, "bytes");
+    let mut saw_content_type = false;
+    for (name, value) in &headers {
+        if name.eq_ignore_ascii_case("content-type") {
+            saw_content_type = true;
+        }
+        builder = builder.header(name, value);
+    }
+    if !saw_content_type {
+        builder = builder.header(CONTENT_TYPE, content_type);
+    }
+    builder
+        .body(Body::from_stream(stream))
+        .map_err(AppError::from)
 }
 
 /// Serve an SMB-backed track by **streaming** the requested byte range in chunks

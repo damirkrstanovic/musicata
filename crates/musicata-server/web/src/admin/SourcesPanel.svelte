@@ -6,6 +6,7 @@
   let status = $state("");
   let error = $state(false);
   let busy = $state(false);
+  let kind = $state<"smb" | "opensubsonic">("smb");
 
   const CAPS: [keyof SourceView["capabilities"], string][] = [
     ["can_scan", "Scan"],
@@ -28,7 +29,7 @@
     error = isError;
   }
 
-  async function addSmb(event: SubmitEvent) {
+  async function addSource(event: SubmitEvent) {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
     const data = new FormData(form);
@@ -36,15 +37,25 @@
     busy = true;
     setStatus("Connecting…");
     try {
-      await api.createSource({
-        kind: "smb",
-        host: text("host"),
-        share: text("share"),
-        base_path: text("base_path") || undefined,
-        display_name: text("display_name") || undefined,
-        username: text("username") || undefined,
-        password: text("password") || undefined,
-      });
+      if (kind === "smb") {
+        await api.createSource({
+          kind: "smb",
+          host: text("host"),
+          share: text("share"),
+          base_path: text("base_path") || undefined,
+          display_name: text("display_name") || undefined,
+          username: text("username") || undefined,
+          password: text("password") || undefined,
+        });
+      } else {
+        await api.createSource({
+          kind: "opensubsonic",
+          host: text("host"),
+          username: text("username") || undefined,
+          password: text("password") || undefined,
+          display_name: text("display_name") || undefined,
+        });
+      }
       form.reset();
       setStatus("Added — scanning in the background.");
       await load();
@@ -110,18 +121,34 @@
     {/each}
   </div>
 
-  <form class="field-form" onsubmit={addSmb}>
-    <h3>Add an SMB share</h3>
-    <div class="field-grid">
-      <label class="field"><span>Host</span><input name="host" placeholder="192.168.1.10" required /></label>
-      <label class="field"><span>Share</span><input name="share" placeholder="Music" required /></label>
-      <label class="field"><span>Path (optional)</span><input name="base_path" placeholder="Albums" /></label>
-      <label class="field"><span>Name (optional)</span><input name="display_name" placeholder="NAS" /></label>
-      <label class="field"><span>User (optional)</span><input name="username" /></label>
-      <label class="field"><span>Password (optional)</span><input name="password" type="password" /></label>
-    </div>
+  <form class="field-form" onsubmit={addSource}>
+    <h3>Add a music source</h3>
+    <label class="field">
+      <span>Type</span>
+      <select bind:value={kind}>
+        <option value="smb">SMB / network share</option>
+        <option value="opensubsonic">OpenSubsonic server</option>
+      </select>
+    </label>
+    {#if kind === "smb"}
+      <div class="field-grid">
+        <label class="field"><span>Host</span><input name="host" placeholder="192.168.1.10" required /></label>
+        <label class="field"><span>Share</span><input name="share" placeholder="Music" required /></label>
+        <label class="field"><span>Path (optional)</span><input name="base_path" placeholder="Albums" /></label>
+        <label class="field"><span>Name (optional)</span><input name="display_name" placeholder="NAS" /></label>
+        <label class="field"><span>User (optional)</span><input name="username" /></label>
+        <label class="field"><span>Password (optional)</span><input name="password" type="password" /></label>
+      </div>
+    {:else}
+      <div class="field-grid">
+        <label class="field"><span>Server URL</span><input name="host" placeholder="https://navidrome.example.com" required /></label>
+        <label class="field"><span>User</span><input name="username" required /></label>
+        <label class="field"><span>Password</span><input name="password" type="password" required /></label>
+        <label class="field"><span>Name (optional)</span><input name="display_name" placeholder="My server" /></label>
+      </div>
+    {/if}
     <div class="field-actions">
-      <button type="submit" class="primary-button" disabled={busy}>Add share</button>
+      <button type="submit" class="primary-button" disabled={busy}>Add source</button>
       <span class="form-status" class:error>{status}</span>
     </div>
   </form>

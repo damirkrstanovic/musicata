@@ -574,9 +574,26 @@ Tasks:
   reverse-engineered client, and any DRM circumvention (Spotify/Tidal-HiFi/Deezer/Amazon)
   adds DMCA §1201 exposure that is sharper for an AGPL project publishing its source.
   So **build the open/DRM-free tier first** — and these become the next provider tasks:
-  - [ ] **OpenSubsonic/Funkwhale upstream client** — consume Navidrome/Gonic AND
+  - [x] **OpenSubsonic/Funkwhale upstream client** — consume Navidrome/Gonic AND
     federated Funkwhale pods (all speak Subsonic) as a source; lossless FLAC, no DRM,
-    reuses our existing OpenSubsonic server knowledge. Highest leverage; do first.
+    reuses our existing OpenSubsonic server knowledge. **Done** (`crate::opensubsonic`,
+    feature `provider-opensubsonic`, default-on, no new deps): a sync `ureq` client (salted-token
+    auth, `getAlbumList2` paging → `getAlbum`) builds a `Library` **directly** from the remote's
+    already-parsed metadata — no `SourceFs`/lofty — producing `BuiltTrack`s for the shared
+    `assemble_library` so ids/grouping/merging match the local + SMB scanners. **Incremental**:
+    an album whose upstream `songCount` matches the prior track count is reused wholesale (no
+    `getAlbum`), so a steady-state rescan is O(album-list pages) — vital since the remote is over
+    the network (`MUSICATA_OPENSUBSONIC_FULL_RESCAN` forces a full crawl). Streaming **proxies**
+    the upstream `/rest/stream` (`format=raw`), forwarding the client `Range` header so seeks work
+    and upstream credentials stay server-side (a new `stream_track` branch beside SMB). Added via
+    the `/admin` "Music sources" panel (a kind selector + Server URL/user/pass). Verified
+    end-to-end by pointing a second Musicata instance at the first (123 tracks merged, a proxied
+    MP3 streamed with correct 206/Content-Range, idempotent rescan); unit-tested auth vector, DTO
+    parsing, the incremental reuse plan, content-type fallback; a `#[ignore]`d live smoke test
+    (`opensubsonic_live_path`). *Caveat:* our own `/rest/stream` reads `track.path` and bypasses
+    the provider registry, so an upstream instance must serve local/SMB tracks (not OpenSubsonic
+    ones) — routing that through the registry is a later milestone. Cover art from upstream is a
+    follow-up (the artwork pass fills album art meanwhile).
   - [ ] **Podcasts (RSS / Podcast Index) + Internet Archive** — DRM-free, public APIs.
   - [ ] **Jamendo** (Creative Commons) — public REST API (free `client_id`),
     FLAC/OGG/MP3; `jamendo-rs` crate.
