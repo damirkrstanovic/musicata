@@ -25,7 +25,14 @@
   load();
 
   async function update(
-    patch: { enabled?: boolean; auth_enabled?: boolean; server_host?: string },
+    patch: {
+      enabled?: boolean;
+      auth_enabled?: boolean;
+      server_host?: string;
+      airplay_enabled?: boolean;
+      spotify_enabled?: boolean;
+      active_input?: string;
+    },
     note: string,
   ) {
     busy = true;
@@ -150,6 +157,68 @@
         >Save</button>
       </div>
     </label>
+
+    <!-- Cast TO Musicata: snapserver spawns shairport-sync / librespot and exposes each as a
+         stream rooms can be switched to. The phone controls playback; Musicata just routes it. -->
+    <div class="admin-subhead">Cast to Musicata</div>
+    <p class="admin-hint">
+      Let a phone AirPlay or Spotify-Connect audio into Musicata and play it across your rooms.
+      Musicata doesn't own the playlist — the phone controls it — but ships it to multi-room.
+    </p>
+    <label class="toggle-row">
+      <input
+        type="checkbox"
+        checked={status.airplay_enabled}
+        disabled={busy}
+        onchange={(e) =>
+          update(
+            { airplay_enabled: (e.currentTarget as HTMLInputElement).checked },
+            "Saved. Restart the server to apply the input change.",
+          )}
+      />
+      <span>Accept AirPlay (any iPhone / iPad / Mac)</span>
+    </label>
+    {#if status.airplay_enabled && !status.airplay_installed}
+      <p class="admin-hint warn">⚠️ <code>shairport-sync</code> isn't installed — install it for AirPlay to work.</p>
+    {/if}
+    <label class="toggle-row">
+      <input
+        type="checkbox"
+        checked={status.spotify_enabled}
+        disabled={busy}
+        onchange={(e) =>
+          update(
+            { spotify_enabled: (e.currentTarget as HTMLInputElement).checked },
+            "Saved. Restart the server to apply the input change.",
+          )}
+      />
+      <span>Accept Spotify Connect (any device, incl. Android)</span>
+    </label>
+    {#if status.spotify_enabled && !status.spotify_installed}
+      <p class="admin-hint warn">⚠️ <code>librespot</code> isn't installed — install it for Spotify Connect to work.</p>
+    {/if}
+    {#if (status.airplay_enabled || status.spotify_enabled) && !status.running}
+      <p class="admin-hint">Restart the server to start receiving — the input streams are declared at startup.</p>
+    {/if}
+
+    {#if status.running && status.inputs.length > 1}
+      <!-- Which input all rooms play. Applied live; only streams snapserver actually has appear. -->
+      <div class="admin-subhead">Playing in all rooms</div>
+      <div class="input-picker">
+        {#each status.inputs as input (input.id)}
+          <button
+            type="button"
+            class="input-chip"
+            class:active={input.id === status.active_input}
+            disabled={busy}
+            onclick={() => update({ active_input: input.id }, `Switched rooms to ${input.id}.`)}
+          >
+            <span class="input-name">{input.id === "Musicata" ? "Library" : input.id}</span>
+            {#if input.now_playing}<span class="input-now">{input.now_playing}</span>{/if}
+          </button>
+        {/each}
+      </div>
+    {/if}
 
     {#if status.running}
       <!-- Rooms: provision a device with a name → get its install command. -->
@@ -283,6 +352,36 @@
   .room-pct {
     text-align: right;
     font-variant-numeric: tabular-nums;
+    opacity: 0.7;
+  }
+  .input-picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.4rem;
+  }
+  .input-chip {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    align-items: flex-start;
+    padding: 0.45rem 0.7rem;
+    border-radius: 0.5rem;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+  .input-chip.active {
+    border-color: #d4af37;
+    background: rgba(212, 175, 55, 0.12);
+  }
+  .input-name {
+    font-weight: 600;
+    font-size: 0.85rem;
+  }
+  .input-now {
+    font-size: 0.72rem;
     opacity: 0.7;
   }
 </style>

@@ -21,8 +21,47 @@ use serde::{Deserialize, Serialize};
 
 use super::decode::CHANNELS;
 
-/// The fixed stream name snapserver advertises and we point groups at.
+/// The fixed stream name snapserver advertises for Musicata's own decoded library audio.
 pub const STREAM_NAME: &str = "Musicata";
+/// Stream id for the AirPlay input (snapserver spawns shairport-sync and exposes it as a stream).
+pub const AIRPLAY_STREAM_NAME: &str = "AirPlay";
+/// Stream id for the Spotify Connect input (snapserver spawns librespot).
+pub const SPOTIFY_STREAM_NAME: &str = "Spotify";
+
+/// Resolve a binary name (or path) to an existing file: an absolute/relative path is checked
+/// directly, a bare name is searched on `$PATH`. Used both to build the stream `source = ` URI
+/// and to tell the UI whether the binary is installed.
+pub fn resolve_binary(name: &str) -> Option<PathBuf> {
+    let candidate = std::path::Path::new(name);
+    if name.contains('/') {
+        return candidate.is_file().then(|| candidate.to_path_buf());
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let full = dir.join(name);
+        full.is_file().then_some(full)
+    })
+}
+
+/// Whether a binary (name or path) is present — for the "shairport-sync not found" UI hint.
+pub fn binary_present(name: &str) -> bool {
+    resolve_binary(name).is_some()
+}
+
+/// Percent-encode a value for a snapserver `source = ` query parameter (device names may carry
+/// spaces or reserved characters).
+fn query_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
 
 /// A provisioned room: a name (also the snapclient's auth username + display id) and its
 /// generated password. Persisted as JSON in the `snapcast.rooms` setting.
@@ -61,6 +100,22 @@ pub struct SnapcastSettings {
     pub server_host: String,
     /// Provisioned rooms (name + password). Written as `authorization.user` entries.
     pub rooms: Vec<SnapRoom>,
+    /// Accept AirPlay *into* Musicata: snapserver spawns `shairport-sync` and exposes it as the
+    /// `AirPlay` stream, which rooms can be switched to. Requires shairport-sync installed.
+    pub airplay_enabled: bool,
+    /// The `shairport-sync` binary (name on `PATH` or a path).
+    pub airplay_binary: String,
+    /// The name the AirPlay receiver advertises (what shows in the phone's AirPlay picker).
+    pub airplay_device_name: String,
+    /// Accept Spotify Connect *into* Musicata: snapserver spawns `librespot` and exposes it as
+    /// the `Spotify` stream. Requires librespot installed (and a Spotify account on the phone).
+    pub spotify_enabled: bool,
+    /// The `librespot` binary (name on `PATH` or a path).
+    pub spotify_binary: String,
+    /// The name the Spotify Connect device advertises.
+    pub spotify_device_name: String,
+    /// librespot stream bitrate (96/160/320).
+    pub spotify_bitrate: u32,
 }
 
 impl Default for SnapcastSettings {
@@ -77,6 +132,13 @@ impl Default for SnapcastSettings {
             auth_enabled: false,
             server_host: "localhost".to_string(),
             rooms: Vec::new(),
+            airplay_enabled: false,
+            airplay_binary: "shairport-sync".to_string(),
+            airplay_device_name: "Musicata".to_string(),
+            spotify_enabled: false,
+            spotify_binary: "librespot".to_string(),
+            spotify_device_name: "Musicata".to_string(),
+            spotify_bitrate: 320,
         }
     }
 }
@@ -199,32 +261,77 @@ pub fn install_command(host: &str, room: &SnapRoom) -> String {
     )
 }
 
-/// Write a minimal snapserver config for our pipe stream and spawn the process.
+/// Render the snapserver config: the Musicata library pipe stream, any enabled AirPlay/Spotify
+/// input streams (snapserver spawns shairport-sync/librespot itself — skipped with a warning
+/// when the binary is missing so a missing dep degrades gracefully), the control/HTTP ports, and
+/// the forward-compatible auth block. Pure (no IO) so it's unit-testable.
+fn render_config(settings: &SnapcastSettings) -> String {
+    // Musicata's own decoded library audio.
+    let mut config = format!(
+        "[stream]\n\
+         source = pipe://{fifo}?name={name}&sampleformat={rate}:16:{channels}&codec=flac&mode=read\n",
+        fifo = settings.fifo_path.display(),
+        name = STREAM_NAME,
+        rate = settings.sample_rate,
+        channels = CHANNELS,
+    );
+    // Optional inputs *into* Musicata. AirPlay/librespot run at 44.1 kHz; the per-stream
+    // sampleformat says so (only one stream plays per group at a time, so mixed rates are fine).
+    if settings.airplay_enabled {
+        match resolve_binary(&settings.airplay_binary) {
+            Some(bin) => config.push_str(&format!(
+                "[stream]\n\
+                 source = airplay://{bin}?name={name}&devicename={device}&port=7000&sampleformat=44100:16:2\n",
+                bin = bin.display(),
+                name = AIRPLAY_STREAM_NAME,
+                device = query_encode(&settings.airplay_device_name),
+            )),
+            None => tracing::warn!(
+                binary = %settings.airplay_binary,
+                "snapcast: AirPlay input enabled but shairport-sync not found; skipping the stream"
+            ),
+        }
+    }
+    if settings.spotify_enabled {
+        match resolve_binary(&settings.spotify_binary) {
+            Some(bin) => config.push_str(&format!(
+                "[stream]\n\
+                 source = librespot://{bin}?name={name}&devicename={device}&bitrate={bitrate}&sampleformat=44100:16:2\n",
+                bin = bin.display(),
+                name = SPOTIFY_STREAM_NAME,
+                device = query_encode(&settings.spotify_device_name),
+                bitrate = settings.spotify_bitrate,
+            )),
+            None => tracing::warn!(
+                binary = %settings.spotify_binary,
+                "snapcast: Spotify input enabled but librespot not found; skipping the stream"
+            ),
+        }
+    }
+    config.push_str(&format!(
+        "[tcp]\n\
+         enabled = true\n\
+         port = {tcp}\n\
+         [http]\n\
+         enabled = true\n\
+         port = {http}\n",
+        tcp = settings.control_port,
+        http = settings.http_port,
+    ));
+    if settings.auth_enabled {
+        config.push_str(&authorization_block(&settings.rooms));
+    }
+    config
+}
+
+/// Write the snapserver config for our streams and spawn the process.
 async fn spawn_server(settings: &SnapcastSettings) -> Result<Child> {
     let config_path = settings
         .fifo_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("snapserver.conf");
-    let mut config = format!(
-        "[stream]\n\
-         source = pipe://{fifo}?name={name}&sampleformat={rate}:16:{channels}&codec=flac&mode=read\n\
-         [tcp]\n\
-         enabled = true\n\
-         port = {tcp}\n\
-         [http]\n\
-         enabled = true\n\
-         port = {http}\n",
-        fifo = settings.fifo_path.display(),
-        name = STREAM_NAME,
-        rate = settings.sample_rate,
-        channels = CHANNELS,
-        tcp = settings.control_port,
-        http = settings.http_port,
-    );
-    if settings.auth_enabled {
-        config.push_str(&authorization_block(&settings.rooms));
-    }
+    let config = render_config(settings);
     tokio::fs::write(&config_path, config)
         .await
         .with_context(|| format!("write snapserver config {}", config_path.display()))?;
@@ -278,5 +385,47 @@ mod tests {
             cmd,
             "snapclient 'tcp://kitchen:secret@musicata.local:1704' --hostID 'kitchen'"
         );
+    }
+
+    #[test]
+    fn render_config_has_only_the_library_stream_by_default() {
+        let config = render_config(&SnapcastSettings::default());
+        assert_eq!(config.matches("[stream]").count(), 1);
+        assert!(config.contains(&format!("name={STREAM_NAME}")));
+        assert!(!config.contains("airplay://"));
+        assert!(!config.contains("librespot://"));
+    }
+
+    #[test]
+    fn render_config_adds_input_streams_when_enabled_and_binary_present() {
+        // Use a binary that exists on every dev/CI box so resolution succeeds.
+        let mut settings = SnapcastSettings {
+            airplay_enabled: true,
+            airplay_binary: "/bin/sh".to_string(),
+            airplay_device_name: "Living Room".to_string(),
+            spotify_enabled: true,
+            spotify_binary: "/bin/sh".to_string(),
+            spotify_bitrate: 320,
+            ..SnapcastSettings::default()
+        };
+        let config = render_config(&settings);
+        assert_eq!(config.matches("[stream]").count(), 3);
+        assert!(config.contains(&format!("airplay:///bin/sh?name={AIRPLAY_STREAM_NAME}")));
+        assert!(config.contains("devicename=Living%20Room")); // spaces are encoded
+        assert!(config.contains(&format!("librespot:///bin/sh?name={SPOTIFY_STREAM_NAME}")));
+        assert!(config.contains("bitrate=320"));
+
+        // A missing binary is skipped (graceful), leaving only the library + spotify streams.
+        settings.airplay_binary = "/nonexistent/shairport-sync".to_string();
+        let config = render_config(&settings);
+        assert_eq!(config.matches("[stream]").count(), 2);
+        assert!(!config.contains("airplay://"));
+    }
+
+    #[test]
+    fn resolve_binary_finds_absolute_paths_and_misses() {
+        assert!(resolve_binary("/bin/sh").is_some());
+        assert!(resolve_binary("/nope/definitely-not-here").is_none());
+        assert!(binary_present("/bin/sh"));
     }
 }

@@ -25,6 +25,17 @@ pub struct SnapClient {
     pub muted: bool,
 }
 
+/// A snapserver stream (the Musicata library stream, or an AirPlay/Spotify input).
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct SnapStream {
+    pub id: String,
+    /// snapserver stream status: usually `"playing"` or `"idle"`.
+    pub status: String,
+    /// "Artist — Title" from the stream's metadata, when it carries any (AirPlay/Spotify do).
+    pub now_playing: Option<String>,
+}
+
 /// A control client bound to one snapserver's JSON-RPC endpoint (`host:port`).
 pub struct SnapControl {
     addr: String,
@@ -97,7 +108,20 @@ impl SnapControl {
         .map(|_| ())
     }
 
-    /// Point every group at `stream` so all connected clients play the Musicata audio.
+    /// The streams snapserver currently has defined (Musicata + any enabled AirPlay/Spotify
+    /// inputs), with their status and now-playing metadata — for the input picker.
+    pub async fn streams(&self) -> Result<Vec<SnapStream>> {
+        let status = self.call("Server.GetStatus", Value::Null).await?;
+        let streams = status
+            .pointer("/server/streams")
+            .and_then(|s| s.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(streams.iter().map(parse_stream).collect())
+    }
+
+    /// Point every group at `stream` so all connected clients play it in sync. A no-op for a
+    /// stream snapserver doesn't have (e.g. an input enabled but not yet live after a restart).
     pub async fn assign_all_to_stream(&self, stream: &str) -> Result<()> {
         let status = self.call("Server.GetStatus", Value::Null).await?;
         for group in groups(&status) {
@@ -121,6 +145,40 @@ fn groups(status: &Value) -> Vec<Value> {
         .and_then(|g| g.as_array())
         .cloned()
         .unwrap_or_default()
+}
+
+fn parse_stream(stream: &Value) -> SnapStream {
+    // Metadata lives under properties.metadata for active inputs (airplay/librespot).
+    let meta = stream.pointer("/properties/metadata");
+    let title = meta
+        .and_then(|m| m.get("title"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let artist = meta
+        .and_then(|m| m.get("artist"))
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .or_else(|| meta.and_then(|m| m.get("artist")).and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty());
+    let now_playing = match (artist, title) {
+        (Some(a), Some(t)) => Some(format!("{a} — {t}")),
+        (None, Some(t)) => Some(t.to_string()),
+        _ => None,
+    };
+    SnapStream {
+        id: stream
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        status: stream
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        now_playing,
+    }
 }
 
 fn parse_client(client: &Value) -> SnapClient {

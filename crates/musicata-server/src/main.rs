@@ -1729,8 +1729,52 @@ async fn snapcast_settings_from_db(
             settings.server_host = value;
         }
     }
+    if let Some(value) = get("snapcast.airplay_enabled").await? {
+        settings.airplay_enabled = value == "true";
+    }
+    if let Some(value) = get("snapcast.airplay_binary").await? {
+        if !value.is_empty() {
+            settings.airplay_binary = value;
+        }
+    }
+    if let Some(value) = get("snapcast.airplay_device_name").await? {
+        if !value.is_empty() {
+            settings.airplay_device_name = value;
+        }
+    }
+    if let Some(value) = get("snapcast.spotify_enabled").await? {
+        settings.spotify_enabled = value == "true";
+    }
+    if let Some(value) = get("snapcast.spotify_binary").await? {
+        if !value.is_empty() {
+            settings.spotify_binary = value;
+        }
+    }
+    if let Some(value) = get("snapcast.spotify_device_name").await? {
+        if !value.is_empty() {
+            settings.spotify_device_name = value;
+        }
+    }
+    if let Some(value) = get("snapcast.spotify_bitrate").await? {
+        if let Ok(bitrate) = value.parse() {
+            settings.spotify_bitrate = bitrate;
+        }
+    }
     settings.rooms = snapcast_rooms_from_db(database).await;
     Ok(settings)
+}
+
+/// The stream all rooms currently play (`Musicata`, `AirPlay`, or `Spotify`). Persisted so it
+/// survives restarts and is reasserted on each status poll; defaults to the library stream.
+#[cfg(feature = "snapcast")]
+async fn snapcast_active_input(database: &musicata_storage::Database) -> String {
+    database
+        .get_setting("snapcast.active_input")
+        .await
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| snapcast::STREAM_NAME.to_string())
 }
 
 /// The provisioned rooms persisted as a JSON array in the `snapcast.rooms` setting.
@@ -4007,6 +4051,15 @@ struct SnapcastStatus {
     server_host: String,
     /// Connected snapclients (rooms), each a synchronized output.
     clients: Vec<snapcast::SnapClient>,
+    /// Streams snapserver currently has live (Musicata + any enabled inputs) with now-playing.
+    inputs: Vec<snapcast::SnapStream>,
+    /// Which stream all rooms are currently playing (`Musicata`/`AirPlay`/`Spotify`).
+    active_input: String,
+    /// Cast-in input config (the toggles + whether the helper binary is installed).
+    airplay_enabled: bool,
+    airplay_installed: bool,
+    spotify_enabled: bool,
+    spotify_installed: bool,
 }
 
 #[cfg(feature = "snapcast")]
@@ -4021,20 +4074,44 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
         .as_deref()
         == Some("true");
     let server_host = snapcast_server_host(&state.database).await;
+    let active_input = snapcast_active_input(&state.database).await;
     let manager = state.players.snapcast_manager().await;
     let mut clients = Vec::new();
+    let mut inputs = Vec::new();
     if let Some(manager) = &manager {
         let control = snapcast::SnapControl::new(manager.control_addr());
-        // Point any group at our stream so every connected client hears the audio.
-        let _ = control.assign_all_to_stream(snapcast::STREAM_NAME).await;
+        // Point every room at the selected input so new/idle clients converge on it.
+        let _ = control.assign_all_to_stream(&active_input).await;
         clients = control.clients().await.unwrap_or_default();
+        inputs = control.streams().await.unwrap_or_default();
     }
+    let setting = |key: &'static str| state.database.get_setting(key);
+    let airplay_enabled = setting("snapcast.airplay_enabled").await.ok().flatten().as_deref() == Some("true");
+    let spotify_enabled = setting("snapcast.spotify_enabled").await.ok().flatten().as_deref() == Some("true");
+    let airplay_binary = setting("snapcast.airplay_binary")
+        .await
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "shairport-sync".to_string());
+    let spotify_binary = setting("snapcast.spotify_binary")
+        .await
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "librespot".to_string());
     Ok(Json(SnapcastStatus {
         enabled,
         running: manager.is_some(),
         auth_enabled,
         server_host,
         clients,
+        inputs,
+        active_input,
+        airplay_enabled,
+        airplay_installed: snapcast::binary_present(&airplay_binary),
+        spotify_enabled,
+        spotify_installed: snapcast::binary_present(&spotify_binary),
     }))
 }
 
@@ -4044,6 +4121,12 @@ struct SnapcastSettingsUpdate {
     enabled: Option<bool>,
     auth_enabled: Option<bool>,
     server_host: Option<String>,
+    /// Enable accepting AirPlay / Spotify Connect input (takes effect on the next restart —
+    /// the stream is declared in the regenerated snapserver config).
+    airplay_enabled: Option<bool>,
+    spotify_enabled: Option<bool>,
+    /// The stream all rooms play (`Musicata`/`AirPlay`/`Spotify`) — applied live.
+    active_input: Option<String>,
 }
 
 #[cfg(feature = "snapcast")]
@@ -4075,8 +4158,44 @@ async fn snapcast_update(
                 .map_err(db_error)?;
         }
     }
-    // Start the subsystem immediately when newly enabled; auth/host changes persist and take
-    // effect on the next restart (config is regenerated at startup).
+    if let Some(airplay) = update.airplay_enabled {
+        state
+            .database
+            .set_setting("snapcast.airplay_enabled", if airplay { "true" } else { "false" })
+            .await
+            .map_err(db_error)?;
+    }
+    if let Some(spotify) = update.spotify_enabled {
+        state
+            .database
+            .set_setting("snapcast.spotify_enabled", if spotify { "true" } else { "false" })
+            .await
+            .map_err(db_error)?;
+    }
+    // Switch which input all rooms play — applied live via Group.SetStream (only among streams
+    // snapserver actually has; an input enabled but not yet restarted simply won't switch yet).
+    if let Some(input) = update.active_input {
+        let input = input.trim();
+        if [
+            snapcast::STREAM_NAME,
+            snapcast::AIRPLAY_STREAM_NAME,
+            snapcast::SPOTIFY_STREAM_NAME,
+        ]
+        .contains(&input)
+        {
+            state
+                .database
+                .set_setting("snapcast.active_input", input)
+                .await
+                .map_err(db_error)?;
+            if let Some(manager) = state.players.snapcast_manager().await {
+                let control = snapcast::SnapControl::new(manager.control_addr());
+                let _ = control.assign_all_to_stream(input).await;
+            }
+        }
+    }
+    // Start the subsystem immediately when newly enabled; auth/host/input-enable changes persist
+    // and take effect on the next restart (the snapserver config is regenerated at startup).
     if snapcast_enabled_setting(&state.database).await
         && state.players.snapcast_manager().await.is_none()
     {

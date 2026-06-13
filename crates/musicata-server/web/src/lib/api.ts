@@ -275,6 +275,9 @@ export const api = {
     enabled?: boolean;
     auth_enabled?: boolean;
     server_host?: string;
+    airplay_enabled?: boolean;
+    spotify_enabled?: boolean;
+    active_input?: string;
   }) => sendJson<SnapcastStatus>("/api/snapcast/status", "PATCH", update),
   snapcastRooms: () => getJson<SnapRoomView[]>("/api/snapcast/rooms"),
   addSnapcastRoom: (name: string) =>
