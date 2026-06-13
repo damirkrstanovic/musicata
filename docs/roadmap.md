@@ -720,18 +720,29 @@ headphones, one-tap switch, each with its own correction + volume) is the drivin
 
 Tasks (browser-first; see `docs/dsp.md` for per-phase detail + the files touched):
 
-- [ ] **Phase 0–1 — profile model + browser DSP core.** `DspProfile` types
-  (musicata-core) + JSON-in-settings storage + `/api/dsp/*`; a `/admin` profiles panel; the
-  Web Audio graph in `BrowserAudio` (`MediaElementSource → preamp → biquads → master →
-  destination`) with `applyProfile`/`setBypass`. Hot-path-safe (no DOM, no element reload).
-- [ ] **Phase 2 — output presets + speakers/headphones switcher (the home-office MVP).** A
-  client `audioDevices` store (presets in `localStorage`, `enumerateDevices`); a footer
-  🔊/🎧 toggle that swaps profile + sink (`AudioContext.setSinkId`) + remembered per-output
-  volume (a safety feature). Document the setSinkId support/fallback.
-- [ ] **Phase 3 — AutoEq headphone profiles.** Bundle a curated AutoEq preset set (MIT) +
-  model picker + a `ParametricEQ.txt` importer → instant zero-mic headphone correction.
-- [ ] **Phase 4 — room correction in the browser.** `ConvolverNode` + user WAV impulse
-  response (`normalize=false`), same graph; stereo only.
+The **entire browser DSP tier (Phases 0–4) is DONE** — see `crate::dsp`, `web/src/lib/{audio,dsp,
+audioDevices}.ts`, `web/src/player/EqPanel.svelte`. Only the CamillaDSP DAC tier (Phase 5) +
+polish remain.
+
+- [x] **Phase 0–1 — profile model + browser DSP core.** Browser EQ: a Web Audio graph in
+  `BrowserAudio` (`source → preamp → biquads → convolver → leveling → destination`) with
+  `setEq`/`setBypass`/`setSink`, hot-path-safe. Profiles are **server-stored** (`crate::dsp`,
+  `DspProfile` JSON in the `dsp_profiles` setting; `GET /api/dsp/profiles` + `PUT/DELETE
+  /api/dsp/profiles/{id}`, authenticated, not admin-gated) so they sync across devices; per-browser
+  bits (active/enabled/leveling) stay local. Edited in the player `EqPanel` (not a separate /admin
+  panel — that's where EQ already lives). The `ParametricEQ.txt` parser + paste-import predate this.
+- [x] **Phase 2 — output presets + speakers/headphones switcher (the home-office MVP).** A
+  client `audioDevices` store (`OutputPreset[]` in `localStorage`, `enumerateDevices`); a footer
+  toggle that swaps profile + sink (`AudioContext.setSinkId`, feature-detected — Safari/FF fall
+  back to the OS default) + remembered per-output volume (a safety feature). Verified by smoke
+  (switch applies the remembered volume).
+- [x] **Phase 3 — AutoEq headphone profiles.** Bundled a curated set of **19 popular models'
+  real ParametricEQ presets** (MIT, fetched verbatim from the AutoEq project →
+  `web/src/lib/autoeq-presets.json`) + a searchable model picker → instant zero-mic correction;
+  paste-import covers the long tail.
+- [x] **Phase 4 — room correction in the browser.** A `ConvolverNode` (`normalize=false`) loading
+  a user-uploaded WAV impulse response (stored as a file, served by `/api/dsp/profiles/{id}/impulse`);
+  stereo only. Missing/undecodable IR skips convolution rather than silencing.
 - [ ] **Phase 5 — CamillaDSP subprocess (the DAC tier).** Managed subprocess (control via
   `PatchConfig` over WebSocket), ALSA-loopback routing for MPD→DAC, the *same* profile
   compiled to CamillaDSP YAML; multichannel + crossovers. Cargo-feature-gated, "require
