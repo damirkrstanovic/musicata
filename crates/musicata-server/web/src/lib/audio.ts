@@ -37,6 +37,7 @@ export class BrowserAudio {
   private bufL?: Float32Array<ArrayBuffer>;
   private bufR?: Float32Array<ArrayBuffer>;
   private profile: EqProfile | null = null;
+  private bypassed = false;
   private graphFailed = false;
 
   // Volume leveling (EBU R128). `levelingGain` sits at the end of the chain; its gain is set
@@ -91,6 +92,27 @@ export class BrowserAudio {
     if (this.ctx) {
       this.rebuildChain();
       this.ctx.resume().catch(() => {});
+    }
+  }
+
+  /** A/B bypass: route source straight to output (no preamp/EQ), keeping the active profile. */
+  setBypass(on: boolean): void {
+    this.bypassed = on;
+    this.ensureGraph();
+    if (this.ctx) this.rebuildChain();
+  }
+
+  /** Route output to a specific device via `AudioContext.setSinkId`. Unsupported on
+   *  Safari/Firefox — there we no-op and the OS default is used (the profile + volume still
+   *  swap, which covers the common single-output setup). `null`/"" selects the default. */
+  async setSink(sinkId: string | null): Promise<void> {
+    this.ensureGraph();
+    const ctx = this.ctx as (AudioContext & { setSinkId?: (id: string) => Promise<void> }) | undefined;
+    if (!ctx || typeof ctx.setSinkId !== "function") return;
+    try {
+      await ctx.setSinkId(sinkId ?? "");
+    } catch {
+      // invalid / unplugged device — fall back to the OS default rather than dropping audio
     }
   }
 
@@ -153,21 +175,27 @@ export class BrowserAudio {
       }
     }
     this.eqBands = [];
-    const p = this.profile;
+    const p = this.bypassed ? null : this.profile;
     this.eqPreampDb = p ? p.preampDb : 0;
-    preamp.gain.value = p ? 10 ** (p.preampDb / 20) : 1;
-    src.connect(preamp);
-    let prev: AudioNode = preamp;
-    if (p) {
-      for (const band of p.bands) {
-        const f = ctx.createBiquadFilter();
-        f.type = band.type;
-        f.frequency.value = band.freq;
-        f.Q.value = band.q;
-        f.gain.value = band.gain;
-        prev.connect(f);
-        prev = f;
-        this.eqBands.push(f);
+    let prev: AudioNode;
+    if (this.bypassed) {
+      // Straight passthrough for A/B (no preamp, no bands).
+      prev = src;
+    } else {
+      preamp.gain.value = p ? 10 ** (p.preampDb / 20) : 1;
+      src.connect(preamp);
+      prev = preamp;
+      if (p) {
+        for (const band of p.bands) {
+          const f = ctx.createBiquadFilter();
+          f.type = band.type;
+          f.frequency.value = band.freq;
+          f.Q.value = band.q;
+          f.gain.value = band.gain;
+          prev.connect(f);
+          prev = f;
+          this.eqBands.push(f);
+        }
       }
     }
     // Leveling is the last stage; the analyser tap is post-leveling so the VU shows output.

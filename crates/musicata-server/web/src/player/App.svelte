@@ -33,6 +33,7 @@
   import InstallPrompt from "./InstallPrompt.svelte";
   import AccountMenu from "./AccountMenu.svelte";
   import { install } from "../lib/install.svelte";
+  import { audioDevices } from "../lib/audioDevices.svelte";
 
   let audioEl: HTMLAudioElement;
   let audio: BrowserAudio | null = null;
@@ -126,11 +127,15 @@
 
     favorites.load();
     autoplay.load();
-    dsp.load();
     install.init();
+    audioDevices.init();
     await loadTargets();
     const browser = players.find((p) => p.kind === "browser") ?? players[0];
     if (browser) connect("player", browser.id);
+    // Restore the active output's EQ profile + sink (not its volume — don't override the
+    // restored playback level just from booting). Wait for profiles to load first.
+    await dsp.load();
+    audioDevices.applyActive(false);
   });
 
   // Players + zones for the output switcher.

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { player } from "../lib/player.svelte";
   import { dsp } from "../lib/dsp.svelte";
+  import { audioDevices } from "../lib/audioDevices.svelte";
   import { meter } from "../lib/meter.svelte";
   import { startRadio } from "../lib/playback";
   import { sendCommand, type PlayerCommand } from "../lib/commands";
@@ -70,14 +71,33 @@
   </div>
 
   <div class="transport-aux">
+    {#if audioDevices.hasPresets}
+      <div class="output-switch" role="group" aria-label="Output">
+        {#each audioDevices.presets as preset (preset.id)}
+          <button
+            type="button"
+            class="output-btn"
+            class:active={preset.id === audioDevices.activeId}
+            aria-pressed={preset.id === audioDevices.activeId}
+            title={`Play on ${preset.label}`}
+            onclick={() => audioDevices.switchTo(preset.id)}
+          >
+            {preset.label}
+          </button>
+        {/each}
+      </div>
+    {/if}
     <input
       type="range"
       min="0"
       max="100"
       value={player.volume}
       aria-label="Volume"
-      onchange={(e) =>
-        send({ command: "set_volume", volume: Number((e.currentTarget as HTMLInputElement).value) })}
+      onchange={(e) => {
+        const v = Number((e.currentTarget as HTMLInputElement).value);
+        send({ command: "set_volume", volume: v });
+        audioDevices.rememberVolume(v);
+      }}
     />
     <button
       class="eq-btn radio-btn"
@@ -122,3 +142,27 @@
     </button>
   </div>
 </footer>
+
+<style>
+  .output-switch {
+    display: inline-flex;
+    gap: 2px;
+    margin-right: 0.4rem;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 0.5rem;
+    overflow: hidden;
+  }
+  .output-btn {
+    background: transparent;
+    border: none;
+    color: inherit;
+    padding: 0.3rem 0.55rem;
+    font-size: 0.75rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .output-btn.active {
+    background: rgba(212, 175, 55, 0.18);
+    color: #d4af37;
+  }
+</style>

@@ -92,6 +92,18 @@ await send("Network.setCookie", {
   domain: "127.0.0.1",
   path: "/",
 });
+if (MODE === "behavior") {
+  // Seed two output presets (different remembered volumes) so the footer switcher renders and
+  // the test below can verify a switch applies the preset's volume.
+  const outputs = JSON.stringify({
+    presets: [
+      { id: "out-spk", label: "Speakers", sinkId: null, profileId: null, volume: 55 },
+      { id: "out-hp", label: "Headphones", sinkId: null, profileId: null, volume: 20 },
+    ],
+    activeId: "out-spk",
+  });
+  await js(`localStorage.setItem('musicata-outputs', ${JSON.stringify(outputs)})`);
+}
 await send("Page.reload");
 await sleep(2500);
 
@@ -201,6 +213,17 @@ check(
 await js(`(()=>{const s=document.querySelector('.eq-field select'); if(s){s.value=''; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
 await clickText(".eq-head button", "Close");
 await sleep(300);
+
+// Output switcher: the seeded presets render in the footer; switching to "Headphones" applies
+// that preset's remembered volume (55 → 20) — proves profile/sink/volume swap on one tap.
+check("output switcher renders presets", (await js(`document.querySelectorAll('.output-btn').length`)) >= 2);
+await clickText(".output-btn", "Headphones");
+await sleep(900);
+check(
+  "output switch applies remembered volume",
+  Number(await js(`document.querySelector('.transport-aux input[type=range]')?.value`)) === 20,
+  `vol=${await js(`document.querySelector('.transport-aux input[type=range]')?.value`)}`,
+);
 
 // VU meter: opening it renders the two (L/R) McIntosh-style meters.
 await js(`[...document.querySelectorAll('.eq-btn')].find(b=>/vu/i.test(b.title))?.click()`);

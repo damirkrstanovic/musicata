@@ -1,6 +1,12 @@
 <script lang="ts">
   import { dsp } from "../lib/dsp.svelte";
+  import { audioDevices } from "../lib/audioDevices.svelte";
   import { responseCurveDb, logFreqs } from "../lib/eqcurve";
+
+  function addOutput() {
+    audioDevices.addPreset(audioDevices.presets.length === 0 ? "Speakers" : "Headphones");
+    audioDevices.refreshDevices();
+  }
 
   let importName = $state("");
   let importText = $state("");
@@ -132,6 +138,52 @@
         {/if}
       </div>
     {/if}
+
+    <details class="eq-import">
+      <summary>Outputs (speakers / headphones)</summary>
+      <p class="eq-note">
+        Bind a device + EQ profile + volume to a one-tap output; switch between them from the
+        footer. Each output remembers its own volume.
+      </p>
+      {#each audioDevices.presets as preset (preset.id)}
+        <div class="eq-output">
+          <input
+            class="eq-name"
+            value={preset.label}
+            oninput={(e) =>
+              audioDevices.updatePreset(preset.id, { label: (e.currentTarget as HTMLInputElement).value })}
+          />
+          <select
+            value={preset.sinkId ?? ""}
+            onchange={(e) =>
+              audioDevices.updatePreset(preset.id, {
+                sinkId: (e.currentTarget as HTMLSelectElement).value || null,
+              })}
+          >
+            <option value="">System default device</option>
+            {#each audioDevices.devices as d (d.deviceId)}
+              <option value={d.deviceId}>{d.label || "Output device"}</option>
+            {/each}
+          </select>
+          <select
+            value={preset.profileId ?? ""}
+            onchange={(e) =>
+              audioDevices.updatePreset(preset.id, {
+                profileId: (e.currentTarget as HTMLSelectElement).value || null,
+              })}
+          >
+            <option value="">No EQ</option>
+            {#each dsp.profiles as p (p.id)}
+              <option value={p.id}>{p.name}</option>
+            {/each}
+          </select>
+          <button class="ghost-button" type="button" onclick={() => audioDevices.removePreset(preset.id)}>
+            Remove
+          </button>
+        </div>
+      {/each}
+      <button class="ghost-button" type="button" onclick={addOutput}>+ Add output</button>
+    </details>
 
     <details class="eq-import">
       <summary>Import a headphone preset</summary>
