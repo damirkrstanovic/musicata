@@ -3636,8 +3636,28 @@ impl Database {
         rows.iter().map(activity_from_row).collect()
     }
 
-    /// Replace the persisted activity log with the current set (≤ a few dozen rows).
+    /// Replace the persisted activity log with the current set (≤ a few dozen rows). Best-effort
+    /// and idempotent (a full replace, re-run on every change), so on a transient "database is
+    /// locked" — a long bulk write (the scan's `save_library`) holding the single WAL writer past
+    /// the busy-timeout — retry a few times. Each attempt **releases the pooled connection**
+    /// before backing off, so a blocked retry doesn't add to read-pool starvation (reads share
+    /// the same pool). By the next attempt the bulk write has usually finished.
     pub async fn replace_activities(&self, activities: &[ActivityRecord]) -> Result<()> {
+        let mut delay = std::time::Duration::from_millis(250);
+        for attempt in 0..4u32 {
+            match self.replace_activities_once(activities).await {
+                Ok(()) => return Ok(()),
+                Err(error) if attempt < 3 && is_locked(&error) => {
+                    tokio::time::sleep(delay).await;
+                    delay *= 3;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("the final attempt returns Ok or Err")
+    }
+
+    async fn replace_activities_once(&self, activities: &[ActivityRecord]) -> Result<(), sqlx::Error> {
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         let result = async {
@@ -3670,10 +3690,19 @@ impl Database {
             }
             Err(error) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(error.into())
+                Err(error)
             }
         }
     }
+}
+
+/// Whether a sqlx error is a SQLite "database is locked"/"busy" — i.e. retryable contention
+/// (SQLITE_BUSY = 5, SQLITE_LOCKED = 6) rather than a real failure.
+fn is_locked(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| code == "5" || code == "6")
 }
 
 /// A persisted background activity (a library scan/rescan and its outcome). Mirrors
