@@ -126,14 +126,6 @@ impl SnapcastManager {
             self.settings.control_host, self.settings.control_port
         )
     }
-
-    /// Stop a managed snapserver (no-op for an external one). Kills and reaps it.
-    pub async fn shutdown(&self) {
-        if let Some(mut child) = self.child.lock().expect("snapcast child lock").take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
 }
 
 impl Drop for SnapcastManager {

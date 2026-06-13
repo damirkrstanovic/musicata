@@ -6,9 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# SMB is on by default so a plain build can read network shares; build with
-# `--no-default-features` for a minimal binary without the `smb` dependency.
-default = ["provider-smb"]
+# SMB and Snapcast are on by default so a plain build can read network shares and do
+# synchronized multi-room playout; build with `--no-default-features` for a minimal binary
+# without the `smb` dependency or the Snapcast decode path (the latter also needs the
+# `snapserver`/`snapclient` binaries installed at runtime).
+default = ["provider-smb", "snapcast"]
 # Read music from an SMB/CIFS network share directly (pure Rust, no mount). Pulls
 # in the `smb` crate; see crate::smb.
 provider-smb = ["dep:smb", "dep:futures"]
