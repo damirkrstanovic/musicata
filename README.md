@@ -2,7 +2,7 @@
 
 Musicata is an open source, Roon-like music platform for personal and shared music libraries. The goal is a central server that can discover music, enrich metadata, stream audio, manage players, and expose controller APIs without coupling the core model to any single music source.
 
-Initial support will focus on local disk libraries. The architecture must still treat local files as one provider among many future providers, such as Tidal, Spotify, Qobuz, internet radio, network shares, or other catalogs.
+Musicata supports local disk libraries, SMB network shares, and upstream OpenSubsonic/Navidrome servers as music sources today. The architecture treats each as one provider among many, so future catalogs (Tidal, Spotify, Qobuz, internet radio) slot in the same way.
 
 ## Architecture Direction
 
@@ -12,7 +12,7 @@ Musicata follows a strict Server / Control / Output split:
 - **Music providers** expose searchable and playable media without leaking storage details into the domain model.
 - **Player providers** expose independent playback endpoints and zones.
 - **Controllers** are web, desktop, mobile, or automation clients that talk only through public APIs.
-- **DSP** is deferred, but the playback pipeline should leave a per-zone insertion point for future processing.
+- **DSP** (parametric EQ, room & headphone correction) runs per output; the playback pipeline carries a per-zone insertion point. See [docs/dsp.md](docs/dsp.md).
 
 ## Rust-First Stack
 
@@ -21,7 +21,7 @@ The project should use Rust as much as practical:
 - **Backend runtime:** Tokio.
 - **HTTP/API server:** Axum with Tower middleware.
 - **Persistence:** SQLite via SQLx for the first local-server release.
-- **Search:** Tantivy for embedded full-text library search.
+- **Search:** SQLite FTS5 for embedded full-text library search.
 - **Metadata:** Lofty for audio tags and artwork extraction.
 - **Decode/transcode research:** Symphonia first, with FFmpeg as an optional compatibility fallback if needed.
 - **Observability:** `tracing` and structured logs.
@@ -42,21 +42,23 @@ Native mobile apps are not required for the initial product if the web app is go
 - Media Session integration for OS lock-screen/media controls where supported;
 - service worker and web app manifest for installability and resilient loading.
 
-Recommended first choice: **Leptos + Axum**, using Rust/WASM for the web UI and explicit server APIs for playback, library, and integrations. Leptos is web-focused and supports SPA, server-rendered, and progressively enhanced modes from the same Rust code. Dioxus remains a strong alternative if sharing one Rust UI across web, desktop, and mobile becomes more important than web-first ergonomics.
+The web app is built with **Svelte 5 + TypeScript + Vite**, compiled by `build.rs` and embedded in the server binary via `rust-embed`. It has two surfaces: the player (`/`) and the admin console (`/admin`).
 
-## Initial MVP
+## Features (0.9)
 
-- Central server.
-- Local disk music provider.
-- Library scan and incremental rescan.
-- Metadata extraction, artwork, lyrics, MusicBrainz IDs where available.
-- Search and browse by artist, album, track, and genre.
-- Native HTTP/WebSocket APIs.
-- Basic OpenSubsonic compatibility.
-- Web/PWA controller.
-- One working playback path with an independent queue.
+- Central Rust server with a SQLite-backed, incrementally-rescanned library.
+- Music sources: local disk, SMB network shares, and upstream OpenSubsonic/Navidrome servers.
+- Metadata extraction (Lofty), artwork fetching (iTunes / Deezer / Cover Art Archive / fanart.tv), MusicBrainz enrichment, and AcoustID fingerprinting — each on its own background worker.
+- Full-text search and browse by artist, album, track, genre, year, composer, and folder.
+- Playback queues and multi-player zones; MPD and Snapcast player backends plus browser playback.
+- Per-output DSP (parametric EQ, room & headphone correction) and EBU R128 loudness leveling.
+- Listening history with ListenBrainz similar-track radio and continuous play.
+- Multi-user accounts with cookie sessions and per-user API tokens.
+- OpenSubsonic API surface — Musicata both serves it and can consume another server.
+- Native HTTP + WebSocket APIs and an installable Svelte PWA controller.
+- Library export/import for backup and migration.
 
-## Running The Prototype
+## Running The Server
 
 The server scans `testdata` by default and serves the web controller plus JSON APIs:
 
@@ -71,7 +73,7 @@ cargo run -p musicata-server -- --library /path/to/music --addr 127.0.0.1:3031
 cargo run -p musicata-server -- --library /path/to/music --database .musicata/musicata.db --rescan
 ```
 
-Configuration can also come from a config file or environment variables. Precedence is `defaults < config file < environment < CLI`.
+User-facing settings (music sources, players, API keys, artwork fetching) live in the product — edit them live on the **/admin** Settings page; no restart, no config files. CLI flags and environment variables exist only for *bootstrap* (where the library and database live, the bind address), with precedence `defaults < config file < environment < CLI`.
 
 ```sh
 cargo run -p musicata-server -- --config musicata.example.conf
@@ -186,18 +188,25 @@ If a sandbox or CI image has a read-only global Cargo registry, set `CARGO_HOME`
 
 ## Documentation
 
+- [Roadmap](docs/roadmap.md)
+- [Prior Art](docs/prior-art.md)
+- [Native + OpenSubsonic API](docs/api.md)
+- [Metadata Update Strategy](docs/metadata.md)
+- [DSP — EQ, room & headphone correction](docs/dsp.md)
+- [Loudness (EBU R128)](docs/loudness.md)
+- [Recommendations & Radio](docs/recommendations.md)
+- [Continuous Play](docs/continuous-play.md)
+- [Snapcast Transport](docs/snapcast.md)
+- [Plugins](docs/plugins.md)
+- [Web UI Style Guide](docs/style-guide.md)
 - [Research](docs/research.md)
 - [Initial Requirements](docs/requirements.md)
-- [Roadmap](docs/roadmap.md)
-- [Metadata Update Strategy](docs/metadata.md)
-- [Listening History And Recommendations Research](docs/recommendations.md)
 
 ## Source References
 
 - Axum: https://docs.rs/axum/latest/axum/
 - Tokio: https://tokio.rs/
-- Leptos: https://docs.rs/leptos/latest/leptos/
-- Dioxus: https://dioxuslabs.com/learn/0.7/essentials/fullstack/
+- Svelte: https://svelte.dev/docs
 - PWA manifest: https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps/Manifest
 - Service workers: https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API/Using_Service_Workers
 - Media Session API: https://developer.mozilla.org/en-US/docs/Web/API/MediaSession
