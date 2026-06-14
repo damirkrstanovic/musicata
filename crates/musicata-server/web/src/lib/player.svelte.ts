@@ -21,6 +21,10 @@ class Player {
   browserId = $state<string | null>(null);
   browserZoneId = $state<string | null>(null);
   playback = $state<PlaybackState | null>(null);
+  /** Live link to the active player's state stream. Drives the reconnecting indicator so a
+   *  dropped/uninitialised connection reads as "Reconnecting…" instead of a misleading
+   *  "Nothing playing". */
+  connection = $state<"connecting" | "online" | "reconnecting">("connecting");
 
   // Hot-path signals — see the note above.
   elapsed = $state(0);

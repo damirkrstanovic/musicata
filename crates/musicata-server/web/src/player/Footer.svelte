@@ -33,8 +33,22 @@
       {/if}
     </div>
     <div class="now-text">
-      <strong id="now-title">{player.nowPlaying?.title ?? "Nothing playing"}</strong>
-      <span>{subtitle}</span>
+      <strong id="now-title"
+        >{player.nowPlaying?.title ??
+          (player.connection === "online"
+            ? "Nothing playing"
+            : player.connection === "connecting"
+              ? "Connecting…"
+              : "Reconnecting…")}</strong
+      >
+      {#if player.connection === "online"}
+        <span>{subtitle}</span>
+      {:else}
+        <span class="conn-sub">
+          Lost the server connection.
+          <button type="button" class="conn-reload" onclick={() => location.reload()}>Reload</button>
+        </span>
+      {/if}
     </div>
   </div>
 
@@ -164,5 +178,17 @@
   .output-btn.active {
     background: rgba(212, 175, 55, 0.18);
     color: #d4af37;
+  }
+  .conn-sub {
+    color: #e0a86b;
+  }
+  .conn-reload {
+    background: none;
+    border: none;
+    padding: 0;
+    color: inherit;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
   }
 </style>

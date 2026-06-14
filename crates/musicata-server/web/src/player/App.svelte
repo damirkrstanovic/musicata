@@ -71,6 +71,7 @@
   }
 
   function applyState(next: PlaybackState) {
+    player.connection = "online"; // a snapshot arrived → the link is live
     const trackChanged =
       (player.playback?.now_playing?.track_id ?? null) !== (next.now_playing?.track_id ?? null);
     const statusChanged = player.playback?.status !== next.status;
@@ -128,9 +129,7 @@
     autoplay.load();
     install.init();
     audioDevices.init();
-    await loadTargets();
-    const browser = players.find((p) => p.kind === "browser") ?? players[0];
-    if (browser) connect("player", browser.id);
+    await initConnection();
     // Restore the active output's EQ profile + sink (not its volume — don't override the
     // restored playback level just from booting). Wait for profiles to load first.
     await dsp.load();
@@ -140,7 +139,13 @@
   // Players + zones for the output switcher.
   let players = $state<Player[]>([]);
   let zones = $state<Zone[]>([]);
-  async function loadTargets() {
+
+  // Connection resilience. Once `connect()` runs, connectPlayer reconnects the WS forever, so
+  // the only gap is the *initial* target fetch failing (server not up yet, a transient 401);
+  // initConnection retries that until it lands.
+  let connectRetry: ReturnType<typeof setTimeout> | undefined;
+
+  async function loadTargets(): Promise<boolean> {
     try {
       const [ps, zs] = await Promise.all([api.players(), api.zones()]);
       players = ps;
@@ -148,9 +153,24 @@
       const browser = ps.find((p) => p.kind === "browser");
       player.browserId = browser?.id ?? null;
       player.browserZoneId = browser?.zone_id ?? null;
+      return true;
     } catch {
-      // keep previous
+      return false; // keep previous lists
     }
+  }
+
+  async function initConnection() {
+    clearTimeout(connectRetry);
+    if (await loadTargets()) {
+      const browser = players.find((p) => p.kind === "browser") ?? players[0];
+      if (browser) {
+        connect("player", browser.id); // the WS owns reconnection from here
+        return;
+      }
+    }
+    // Couldn't reach the server (or no player yet): show it and retry.
+    player.connection = "reconnecting";
+    connectRetry = setTimeout(initConnection, 2000);
   }
 
   function connect(kind: "player" | "zone", id: string) {
@@ -160,11 +180,14 @@
     player.playback = null;
     player.elapsed = 0;
     player.duration = 0;
+    player.connection = "connecting";
     ws = connectPlayer(kind, id, {
       onState: applyState,
       onProgress: applyTick,
       onDisconnect: () => {
-        // Server went away — don't let buffered audio keep playing on this tab.
+        // Server went away — surface it and don't let buffered audio keep playing on this tab.
+        // connectPlayer keeps retrying to the same (stable) id, so this self-heals on its own.
+        player.connection = "reconnecting";
         if (player.isBrowserOutput) audio?.pause();
       },
     });
@@ -176,6 +199,7 @@
   }
 
   onDestroy(() => {
+    clearTimeout(connectRetry);
     ws?.close();
     audio?.stop();
   });
