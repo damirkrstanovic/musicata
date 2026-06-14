@@ -6,6 +6,7 @@
   import { promptText } from "../lib/modal";
   import { playStream } from "../lib/playback";
   import BrowseFilters from "./BrowseFilters.svelte";
+  import AccountMenu from "./AccountMenu.svelte";
 
   let playlists = $state<Playlist[]>([]);
   let smart = $state<SmartPlaylist[]>([]);
@@ -103,4 +104,6 @@
       {/each}
     </div>
   </section>
+
+  <AccountMenu />
 </aside>

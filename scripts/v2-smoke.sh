@@ -19,8 +19,9 @@ SRV=""
 cleanup() { kill "${SRV:-}" "${CHR:-}" 2>/dev/null || true; rm -rf "$TMP"; }
 trap cleanup EXIT
 
+# --mute-audio: the behavior phase actually plays tracks (real Web Audio), so mute the speakers.
 "$CHROME" --headless=new --no-sandbox --disable-gpu --remote-debugging-port=9222 \
-  --remote-allow-origins='*' --autoplay-policy=no-user-gesture-required about:blank >"$TMP/chrome.log" 2>&1 &
+  --remote-allow-origins='*' --autoplay-policy=no-user-gesture-required --mute-audio about:blank >"$TMP/chrome.log" 2>&1 &
 CHR=$!
 for _ in $(seq 1 20); do curl -sf http://127.0.0.1:9222/json/version >/dev/null 2>&1 && break; sleep 0.3; done
 
@@ -48,6 +49,9 @@ if [ -f "$REAL_DB" ]; then
   cp "$REAL_DB" "$TMP/scale.db"
   cp "$REAL_DB-wal" "$TMP/scale.db-wal" 2>/dev/null || true
   cp "$REAL_DB-shm" "$TMP/scale.db-shm" 2>/dev/null || true
+  # The throwaway copy may carry real user accounts; clear them so the flows' "set up a fresh
+  # admin" auth path works (otherwise setup fails "already completed" and we can't sign in).
+  sqlite3 "$TMP/scale.db" "DELETE FROM sessions; DELETE FROM users;" 2>/dev/null || true
   # Symlink the real artwork cache (sibling of the DB) so the scale server can serve covers
   # (the album artwork-render check) without copying ~hundreds of MB. Read-only, derived dir
   # name must match the server's `<db-dir>/artwork`.
