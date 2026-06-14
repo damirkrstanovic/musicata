@@ -194,12 +194,11 @@ impl Drop for SnapcastManager {
     fn drop(&mut self) {
         // Best-effort: if `shutdown` wasn't called, kill the child so we don't leak a
         // snapserver process.
-        if let Ok(mut guard) = self.child.try_lock() {
-            if let Some(child) = guard.as_mut() {
+        if let Ok(mut guard) = self.child.try_lock()
+            && let Some(child) = guard.as_mut() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-        }
     }
 }
 

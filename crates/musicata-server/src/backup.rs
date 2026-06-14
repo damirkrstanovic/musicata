@@ -8,7 +8,7 @@
 //! startup (before the DB is opened) so we never replace a database the server has open.
 
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -98,7 +98,7 @@ pub fn extract_import(zip_bytes: &[u8], db_import: &Path, artwork_import: &Path)
         let name = entry.name().to_string();
         if name == "musicata.db" {
             let mut out = std::fs::File::create(db_import)?;
-            copy(&mut entry, &mut out)?;
+            std::io::copy(&mut entry, &mut out)?;
             found_db = true;
         } else if let Some(rel) = name.strip_prefix("artwork/") {
             if entry.is_dir() || rel.is_empty() {
@@ -109,17 +109,12 @@ pub fn extract_import(zip_bytes: &[u8], db_import: &Path, artwork_import: &Path)
                 std::fs::create_dir_all(parent)?;
             }
             let mut out = std::fs::File::create(&dest)?;
-            copy(&mut entry, &mut out)?;
+            std::io::copy(&mut entry, &mut out)?;
         }
     }
     if !found_db {
         bail!("archive does not contain a Musicata database (musicata.db)");
     }
-    Ok(())
-}
-
-fn copy(reader: &mut impl Read, writer: &mut impl Write) -> anyhow::Result<()> {
-    std::io::copy(reader, writer)?;
     Ok(())
 }
 

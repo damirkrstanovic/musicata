@@ -497,11 +497,10 @@ impl PlayerManager {
     /// Set (or clear) the server-side EQ correction applied to the Snapcast stream.
     #[cfg(feature = "snapcast")]
     pub async fn set_snapcast_dsp(&self, eq: Option<StereoEq>) {
-        if let Some(entry) = self.players.read().await.get(SNAPCAST_PLAYER_ID) {
-            if let PlayerHandle::Snapcast(player) = &entry.handle {
+        if let Some(entry) = self.players.read().await.get(SNAPCAST_PLAYER_ID)
+            && let PlayerHandle::Snapcast(player) = &entry.handle {
                 player.set_dsp(eq);
             }
-        }
     }
 
     /// Bring up the runtime entry for a persisted player record.
@@ -885,15 +884,14 @@ impl MpdPlayer {
                     queue_to_mpd_uris(&state.queue, &self.public_base_url)
                 };
                 let mut guard = self.connection.lock().await;
-                if let Ok(connection) = ensure_connected(&mut guard, &self.addr).await {
-                    if connection.load_queue(&uris).await.is_ok() {
+                if let Ok(connection) = ensure_connected(&mut guard, &self.addr).await
+                    && connection.load_queue(&uris).await.is_ok() {
                         self.online.store(true, Ordering::Relaxed);
                         if let Ok(status) = connection.read_status().await {
                             self.expected_playlist_version
                                 .store(status.playlist_version, Ordering::Relaxed);
                         }
                     }
-                }
             }
             Ok(None) => {
                 // No server queue yet: adopt MPD's current queue (mirror its state — it
@@ -1158,13 +1156,13 @@ impl MpdPlayer {
                     != self.expected_playlist_version.load(Ordering::Relaxed);
 
             let status = if drifted {
-                let refreshed = {
+                
+                {
                     let mut guard = self.connection.lock().await;
                     let connection = ensure_connected(&mut guard, &self.addr).await?;
                     self.reassert(connection).await?;
                     connection.read_status().await?
-                };
-                refreshed
+                }
             } else {
                 status
             };
@@ -1285,15 +1283,14 @@ async fn enrich_state(state: &mut PlaybackState, database: &Database) {
                         .flatten();
                 }
             }
-        } else if item.artwork_url.is_none() {
-            if let Ok(Some(track)) = database.track(&track_id).await {
+        } else if item.artwork_url.is_none()
+            && let Ok(Some(track)) = database.track(&track_id).await {
                 item.artwork_url = database
                     .album_artwork_url(&track.album_id)
                     .await
                     .ok()
                     .flatten();
             }
-        }
     }
 }
 
@@ -2327,12 +2324,11 @@ impl SnapcastPlayer {
             loaded.next_track_id = None;
         }
         // Best-effort: set the seek-bar duration for the new current track.
-        if let Some(track_id) = &new_track_id {
-            if let Ok(Some(track)) = self.database.track(track_id).await {
+        if let Some(track_id) = &new_track_id
+            && let Ok(Some(track)) = self.database.track(track_id).await {
                 let mut state = self.state.lock().await;
                 state.duration_seconds = track.duration_seconds;
             }
-        }
         self.broadcast().await;
         self.persist_playback().await;
         self.preload(next_item).await;
@@ -2360,11 +2356,10 @@ impl SnapcastPlayer {
                 return;
             }
             let mut elapsed = state.elapsed_seconds.unwrap_or(0.0) + 1.0;
-            if let Some(duration) = state.duration_seconds {
-                if elapsed > duration {
+            if let Some(duration) = state.duration_seconds
+                && elapsed > duration {
                     elapsed = duration;
                 }
-            }
             state.elapsed_seconds = Some(elapsed);
             (elapsed, state.duration_seconds, state.playback())
         };

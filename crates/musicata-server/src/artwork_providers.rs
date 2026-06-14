@@ -46,11 +46,8 @@ pub fn download_image(url: &str) -> Result<(Vec<u8>, &'static str), String> {
 /// and source URL, so a changed cover yields a new key (busting the client cache).
 pub fn acquired_cache_key(album_id: &str, image_url: &str) -> String {
     let digest = Md5::digest(format!("{album_id}|{image_url}").as_bytes());
-    let mut key = String::from("acq");
-    for byte in digest {
-        key.push_str(&format!("{byte:02x}"));
-    }
-    key
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("acq{hex}")
 }
 
 /// What we know about an album when looking for its cover.

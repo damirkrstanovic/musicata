@@ -2643,28 +2643,6 @@ body.admin {
   min-width: 0;
 }
 
-.activity-when {
-  flex: 0 0 auto;
-  font-size: 0.78rem;
-  color: var(--muted);
-}
-
-.activity-message {
-  margin: 8px 0 0;
-  padding: 8px 10px;
-  background: var(--bg);
-  border-radius: 6px;
-  font-family: var(--font-mono);
-  font-size: 0.78rem;
-  color: var(--muted);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.status-error .activity-message {
-  color: color-mix(in srgb, var(--danger) 80%, var(--text));
-}
-
 @media (max-width: 760px) {
   .admin-grid {
     grid-template-columns: 1fr;

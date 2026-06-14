@@ -121,11 +121,10 @@ async fn handle(
     // Subsonic clients pass parameters in the query string (GET) or a form-urlencoded
     // body (POST); accept both.
     let mut pairs = parse_pairs(parts.uri.query().unwrap_or(""));
-    if parts.method == Method::POST && is_form_body(&parts.headers) {
-        if let Ok(bytes) = to_bytes(body, 64 * 1024).await {
+    if parts.method == Method::POST && is_form_body(&parts.headers)
+        && let Ok(bytes) = to_bytes(body, 64 * 1024).await {
             pairs.extend(parse_pairs(&String::from_utf8_lossy(&bytes)));
         }
-    }
     // `all` keeps every value per key (for repeated params); `params` is first-value.
     let mut all: HashMap<String, Vec<String>> = HashMap::new();
     for (key, value) in pairs {
@@ -281,17 +280,10 @@ async fn authenticate_request(
 }
 
 fn md5_hex(input: &str) -> String {
-    let digest = Md5::digest(input.as_bytes());
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push(hex_digit(byte >> 4));
-        out.push(hex_digit(byte & 0x0f));
-    }
-    out
-}
-
-fn hex_digit(nibble: u8) -> char {
-    char::from_digit(nibble as u32, 16).unwrap_or('0')
+    Md5::digest(input.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn decode_hex(hex: &str) -> Option<String> {

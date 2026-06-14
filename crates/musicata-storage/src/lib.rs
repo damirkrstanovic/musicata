@@ -492,7 +492,7 @@ impl Database {
             }
             Err(error) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(error.into())
+                Err(error)
             }
         }
     }
@@ -1989,12 +1989,11 @@ impl Database {
     /// queue tables don't store it). Keeps a restored queue's volume leveling working.
     async fn fill_queue_loudness(&self, items: &mut [QueueItem]) -> Result<()> {
         for item in items.iter_mut() {
-            if let Some(id) = item.track_id.clone() {
-                if let Some((lufs, peak)) = self.track_loudness(&id).await? {
+            if let Some(id) = item.track_id.clone()
+                && let Some((lufs, peak)) = self.track_loudness(&id).await? {
                     item.integrated_loudness_lufs = Some(lufs);
                     item.true_peak_dbtp = Some(peak);
                 }
-            }
         }
         Ok(())
     }
@@ -3353,26 +3352,16 @@ impl Database {
         comment: Option<&str>,
         now: i64,
     ) -> Result<()> {
-        if let Some(name) = name {
-            sqlx::query(
-                "UPDATE playlists SET name = ?2, updated_at_unix_seconds = ?3 WHERE id = ?1",
-            )
-            .bind(id)
-            .bind(name)
-            .bind(now)
-            .execute(&self.pool)
-            .await?;
-        }
-        if let Some(comment) = comment {
-            sqlx::query(
-                "UPDATE playlists SET comment = ?2, updated_at_unix_seconds = ?3 WHERE id = ?1",
-            )
-            .bind(id)
-            .bind(comment)
-            .bind(now)
-            .execute(&self.pool)
-            .await?;
-        }
+        sqlx::query(
+            "UPDATE playlists SET name = COALESCE(?2, name), \
+             comment = COALESCE(?3, comment), updated_at_unix_seconds = ?4 WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(comment)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -3531,27 +3520,17 @@ impl Database {
         stream_url: Option<&str>,
         homepage_url: Option<&str>,
     ) -> Result<()> {
-        if let Some(name) = name {
-            sqlx::query("UPDATE radio_stations SET name = ?2 WHERE id = ?1")
-                .bind(id)
-                .bind(name)
-                .execute(&self.pool)
-                .await?;
-        }
-        if let Some(stream_url) = stream_url {
-            sqlx::query("UPDATE radio_stations SET stream_url = ?2 WHERE id = ?1")
-                .bind(id)
-                .bind(stream_url)
-                .execute(&self.pool)
-                .await?;
-        }
-        if let Some(homepage_url) = homepage_url {
-            sqlx::query("UPDATE radio_stations SET homepage_url = ?2 WHERE id = ?1")
-                .bind(id)
-                .bind(homepage_url)
-                .execute(&self.pool)
-                .await?;
-        }
+        sqlx::query(
+            "UPDATE radio_stations SET name = COALESCE(?2, name), \
+             stream_url = COALESCE(?3, stream_url), \
+             homepage_url = COALESCE(?4, homepage_url) WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(stream_url)
+        .bind(homepage_url)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

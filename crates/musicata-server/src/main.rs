@@ -906,9 +906,9 @@ async fn autoplay_loop(
         if !on {
             continue;
         }
-        if let Some(handle) = players.get(players::BROWSER_PLAYER_ID).await {
-            if let Ok(state) = handle.state(&database).await {
-                if let Some(ids) =
+        if let Some(handle) = players.get(players::BROWSER_PLAYER_ID).await
+            && let Ok(state) = handle.state(&database).await
+                && let Some(ids) =
                     autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await
                 {
                     let _ = handle
@@ -919,19 +919,16 @@ async fn autoplay_loop(
                         )
                         .await;
                 }
-            }
-        }
         if let Ok(zones) = players.zones().await {
             for zone in zones {
-                if let Ok(state) = players.zone_state(&zone.id).await {
-                    if let Some(ids) =
+                if let Ok(state) = players.zone_state(&zone.id).await
+                    && let Some(ids) =
                         autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await
                     {
                         let _ = players
                             .command_zone(&zone.id, PlayerCommand::Enqueue { track_ids: ids })
                             .await;
                     }
-                }
             }
         }
     }
@@ -1718,75 +1715,63 @@ async fn snapcast_settings_from_db(
     if let Some(value) = get("snapcast.manage_server").await? {
         settings.manage_server = value == "true";
     }
-    if let Some(value) = get("snapcast.server_binary").await? {
-        if !value.is_empty() {
+    if let Some(value) = get("snapcast.server_binary").await?
+        && !value.is_empty() {
             settings.server_binary = value;
         }
-    }
-    if let Some(value) = get("snapcast.fifo_path").await? {
-        if !value.is_empty() {
+    if let Some(value) = get("snapcast.fifo_path").await?
+        && !value.is_empty() {
             settings.fifo_path = value.into();
         }
-    }
-    if let Some(value) = get("snapcast.sample_rate").await? {
-        if let Ok(rate) = value.parse() {
+    if let Some(value) = get("snapcast.sample_rate").await?
+        && let Ok(rate) = value.parse() {
             settings.sample_rate = rate;
         }
-    }
-    if let Some(value) = get("snapcast.control_host").await? {
-        if !value.is_empty() {
+    if let Some(value) = get("snapcast.control_host").await?
+        && !value.is_empty() {
             settings.control_host = value;
         }
-    }
-    if let Some(value) = get("snapcast.control_port").await? {
-        if let Ok(port) = value.parse() {
+    if let Some(value) = get("snapcast.control_port").await?
+        && let Ok(port) = value.parse() {
             settings.control_port = port;
         }
-    }
-    if let Some(value) = get("snapcast.http_port").await? {
-        if let Ok(port) = value.parse() {
+    if let Some(value) = get("snapcast.http_port").await?
+        && let Ok(port) = value.parse() {
             settings.http_port = port;
         }
-    }
     if let Some(value) = get("snapcast.auth_enabled").await? {
         settings.auth_enabled = value == "true";
     }
-    if let Some(value) = get("snapcast.server_host").await? {
-        if !value.is_empty() {
+    if let Some(value) = get("snapcast.server_host").await?
+        && !value.is_empty() {
             settings.server_host = value;
         }
-    }
     if let Some(value) = get("snapcast.airplay_enabled").await? {
         settings.airplay_enabled = value == "true";
     }
-    if let Some(value) = get("snapcast.airplay_binary").await? {
-        if !value.is_empty() {
+    if let Some(value) = get("snapcast.airplay_binary").await?
+        && !value.is_empty() {
             settings.airplay_binary = value;
         }
-    }
-    if let Some(value) = get("snapcast.airplay_device_name").await? {
-        if !value.is_empty() {
+    if let Some(value) = get("snapcast.airplay_device_name").await?
+        && !value.is_empty() {
             settings.airplay_device_name = value;
         }
-    }
     if let Some(value) = get("snapcast.spotify_enabled").await? {
         settings.spotify_enabled = value == "true";
     }
-    if let Some(value) = get("snapcast.spotify_binary").await? {
-        if !value.is_empty() {
+    if let Some(value) = get("snapcast.spotify_binary").await?
+        && !value.is_empty() {
             settings.spotify_binary = value;
         }
-    }
-    if let Some(value) = get("snapcast.spotify_device_name").await? {
-        if !value.is_empty() {
+    if let Some(value) = get("snapcast.spotify_device_name").await?
+        && !value.is_empty() {
             settings.spotify_device_name = value;
         }
-    }
-    if let Some(value) = get("snapcast.spotify_bitrate").await? {
-        if let Ok(bitrate) = value.parse() {
+    if let Some(value) = get("snapcast.spotify_bitrate").await?
+        && let Ok(bitrate) = value.parse() {
             settings.spotify_bitrate = bitrate;
         }
-    }
     settings.rooms = snapcast_rooms_from_db(database).await;
     Ok(settings)
 }
@@ -6323,45 +6308,26 @@ impl ConfigOverrides {
     }
 
     fn apply_to(self, config: &mut Config) {
-        if let Some(library) = self.library {
-            config.library = library;
+        macro_rules! set {
+            ($f:ident) => {
+                if let Some(v) = self.$f {
+                    config.$f = v;
+                }
+            };
         }
-
-        if let Some(database) = self.database {
-            config.database = database;
-        }
-
-        if let Some(addr) = self.addr {
-            config.addr = addr;
-        }
-
-        if let Some(rescan) = self.rescan {
-            config.rescan = rescan;
-        }
-
-        if let Some(no_incremental_rescan) = self.no_incremental_rescan {
-            config.no_incremental_rescan = no_incremental_rescan;
-        }
-
-        if let Some(scan_once) = self.scan_once {
-            config.scan_once = scan_once;
-        }
-        if let Some(no_scan) = self.no_scan {
-            config.no_scan = no_scan;
-        }
-
-        if let Some(mpd_addrs) = self.mpd_addrs {
-            config.mpd_addrs = mpd_addrs;
-        }
-
+        set!(library);
+        set!(database);
+        set!(addr);
+        set!(rescan);
+        set!(no_incremental_rescan);
+        set!(scan_once);
+        set!(no_scan);
+        set!(mpd_addrs);
+        set!(subsonic_user);
+        // These wrap into Option, so they don't fit the macro.
         if let Some(public_url) = self.public_url {
             config.public_url = Some(public_url);
         }
-
-        if let Some(subsonic_user) = self.subsonic_user {
-            config.subsonic_user = subsonic_user;
-        }
-
         if let Some(subsonic_password) = self.subsonic_password {
             config.subsonic_password = Some(subsonic_password);
         }

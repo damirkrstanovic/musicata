@@ -95,13 +95,10 @@ impl OpenSubsonicConfig {
 }
 
 fn md5_hex(input: &str) -> String {
-    let digest = Md5::digest(input.as_bytes());
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
-        out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
-    }
-    out
+    Md5::digest(input.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------

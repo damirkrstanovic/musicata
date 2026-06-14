@@ -94,7 +94,7 @@ where
     let mut issues = Vec::new();
     let mut frontier = vec![root];
     while !frontier.is_empty() {
-        let level: Vec<_> = futures::stream::iter(frontier.into_iter())
+        let level: Vec<_> = futures::stream::iter(frontier)
             .map(|dir| {
                 let fs = fs.clone();
                 let limiter = limiter.clone();
@@ -369,7 +369,7 @@ impl SmbProvider {
 
         let task_root = root.clone();
         let task_limiter = limiter.clone();
-        let mut stream = futures::stream::iter(files.into_iter())
+        let mut stream = futures::stream::iter(files)
             .map(move |file| {
                 let fs = fs.clone();
                 let index = index.clone();

@@ -39,12 +39,7 @@ fn now() -> i64 {
 }
 
 fn to_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
-        out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
-    }
-    out
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Cryptographically-random bytes (via the OS). Used for the argon2 salt and session/API tokens.

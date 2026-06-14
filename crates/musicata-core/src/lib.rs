@@ -2001,11 +2001,10 @@ fn infer_track_metadata(root: &Path, path: &Path) -> TrackMetadata {
 }
 
 fn parse_album_dir(album_dir: &str) -> (Option<u16>, String) {
-    if let Some((year, title)) = album_dir.split_once(" - ") {
-        if year.len() == 4 && year.chars().all(|char| char.is_ascii_digit()) {
+    if let Some((year, title)) = album_dir.split_once(" - ")
+        && year.len() == 4 && year.chars().all(|char| char.is_ascii_digit()) {
             return (year.parse().ok(), clean_title(title));
         }
-    }
 
     (None, clean_title(album_dir))
 }

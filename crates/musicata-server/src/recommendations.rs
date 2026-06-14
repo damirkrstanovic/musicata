@@ -145,8 +145,9 @@ impl ListenBrainzClient {
     }
 }
 
-/// Parse a similar-artists response (a flat array of `{name, artist_mbid, score}`) into names.
-fn parse_similar_artists(value: &Value) -> Vec<ScoredArtist> {
+/// Parse a scored-rows response, tolerant of the shapes the endpoints have used: a top-level
+/// array, a `{"data":[…]}` wrapper, or `[[…]]`. Each row contributes `(field, score)` to `make`.
+fn parse_scored<T>(value: &Value, field: &str, make: impl Fn(String, f64) -> T) -> Vec<T> {
     let arr = value
         .as_array()
         .cloned()
@@ -160,35 +161,21 @@ fn parse_similar_artists(value: &Value) -> Vec<ScoredArtist> {
     items
         .iter()
         .filter_map(|item| {
-            let name = item.get("name")?.as_str()?.to_string();
+            let key = item.get(field)?.as_str()?.to_string();
             let score = item.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-            Some(ScoredArtist { name, score })
+            Some(make(key, score))
         })
         .collect()
 }
 
-/// Parse a ListenBrainz Labs similar-recordings response into scored MBIDs. Tolerant of the
-/// shapes the endpoint has used: a top-level array, a `{"data":[…]}` wrapper, or `[[…]]`.
+/// Parse a similar-artists response (a flat array of `{name, artist_mbid, score}`) into names.
+fn parse_similar_artists(value: &Value) -> Vec<ScoredArtist> {
+    parse_scored(value, "name", |name, score| ScoredArtist { name, score })
+}
+
+/// Parse a ListenBrainz Labs similar-recordings response into scored MBIDs.
 fn parse_similar_recordings(value: &Value) -> Vec<ScoredMbid> {
-    let arr = value
-        .as_array()
-        .cloned()
-        .or_else(|| value.get("data").and_then(|d| d.as_array()).cloned())
-        .unwrap_or_default();
-    // Some labs endpoints wrap the rows in an extra array.
-    let items = if arr.len() == 1 && arr[0].is_array() {
-        arr[0].as_array().cloned().unwrap_or_default()
-    } else {
-        arr
-    };
-    items
-        .iter()
-        .filter_map(|item| {
-            let mbid = item.get("recording_mbid")?.as_str()?.to_string();
-            let score = item.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-            Some(ScoredMbid { mbid, score })
-        })
-        .collect()
+    parse_scored(value, "recording_mbid", |mbid, score| ScoredMbid { mbid, score })
 }
 
 /// Cached similar recordings for a seed MBID: serve the cache if fresh, else fetch (once,
@@ -200,11 +187,9 @@ async fn cached_similar_recordings(
     now_unix: i64,
 ) -> Vec<ScoredMbid> {
     if let Ok(Some((json, fetched))) = database.get_similarity_cache("recording", recording_mbid).await
-    {
-        if now_unix - fetched < CACHE_TTL_SECONDS {
+        && now_unix - fetched < CACHE_TTL_SECONDS {
             return serde_json::from_str(&json).unwrap_or_default();
         }
-    }
     let client = client.clone();
     let mbid = recording_mbid.to_string();
     let fetched = tokio::task::spawn_blocking(move || client.similar_recordings(&mbid)).await;
@@ -229,11 +214,10 @@ async fn cached_similar_artists(
     artist_mbid: &str,
     now_unix: i64,
 ) -> Vec<ScoredArtist> {
-    if let Ok(Some((json, fetched))) = database.get_similarity_cache("artist", artist_mbid).await {
-        if now_unix - fetched < CACHE_TTL_SECONDS {
+    if let Ok(Some((json, fetched))) = database.get_similarity_cache("artist", artist_mbid).await
+        && now_unix - fetched < CACHE_TTL_SECONDS {
             return serde_json::from_str(&json).unwrap_or_default();
         }
-    }
     let client = client.clone();
     let mbid = artist_mbid.to_string();
     match tokio::task::spawn_blocking(move || client.similar_artists(&mbid)).await {
@@ -267,11 +251,10 @@ async fn seed_artist_mbid(
     if key.is_empty() {
         return None;
     }
-    if let Ok(Some((cached, fetched))) = database.get_similarity_cache("artist_name", &key).await {
-        if now_unix - fetched < CACHE_TTL_SECONDS {
+    if let Ok(Some((cached, fetched))) = database.get_similarity_cache("artist_name", &key).await
+        && now_unix - fetched < CACHE_TTL_SECONDS {
             return (!cached.is_empty()).then_some(cached);
         }
-    }
     let mb = mb.clone();
     let name = artist_name.clone();
     let mbid = match tokio::task::spawn_blocking(move || mb.search_artist_mbid(&name)).await {
@@ -383,11 +366,10 @@ pub async fn similar_track_ids(
 ) -> Vec<String> {
     let mut seen = exclude.clone();
     seen.insert(seed_track_id.to_string());
-    if let Some(window) = recency_window_secs {
-        if let Ok(recent) = database.recently_played_track_ids(now_unix - window).await {
+    if let Some(window) = recency_window_secs
+        && let Ok(recent) = database.recently_played_track_ids(now_unix - window).await {
             seen.extend(recent);
         }
-    }
     // Skip penalty: tracks the listener keeps skipping are held back, not banned (see below).
     let penalized = database.frequently_skipped_track_ids().await.unwrap_or_default();
 
@@ -431,8 +413,8 @@ pub async fn similar_track_ids(
     }
 
     // 2. Similar recordings (bonus — often empty for a given recording MBID).
-    if out.len() < limit {
-        if let Ok(Some(mbid)) = database.track_recording_mbid(seed_track_id).await {
+    if out.len() < limit
+        && let Ok(Some(mbid)) = database.track_recording_mbid(seed_track_id).await {
             let scored = cached_similar_recordings(database, client, &mbid, now_unix).await;
             if !scored.is_empty() {
                 let mbids: Vec<String> = scored.into_iter().map(|s| s.mbid).collect();
@@ -445,7 +427,6 @@ pub async fn similar_track_ids(
                 }
             }
         }
-    }
 
     // 3. Local content fallback (always available, no network).
     if out.len() < limit {

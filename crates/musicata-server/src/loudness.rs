@@ -92,14 +92,9 @@ pub fn analyze_loudness(audio: &[u8], extension: &str) -> Result<(f64, f64), Str
 
     // `true_peak` returns a linear amplitude (1.0 = 0 dBFS, may exceed 1.0); take the max
     // across channels and convert to dBTP.
-    let mut peak = 0.0f64;
-    for ch in 0..channels {
-        if let Ok(p) = ebu.true_peak(ch) {
-            if p > peak {
-                peak = p;
-            }
-        }
-    }
+    let peak = (0..channels)
+        .filter_map(|ch| ebu.true_peak(ch).ok())
+        .fold(0.0f64, f64::max);
     let true_peak_dbtp = if peak > 0.0 { 20.0 * peak.log10() } else { -120.0 };
 
     Ok((lufs, true_peak_dbtp))
