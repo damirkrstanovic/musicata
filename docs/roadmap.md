@@ -222,7 +222,7 @@ Search design decisions:
 
 ## Milestone 5: Playback, Queues, And Zones
 
-Status: in progress.
+Status: complete.
 
 Goal: move from “play this URL in browser” to server-managed playback state.
 
@@ -268,7 +268,7 @@ Tasks:
   reporting `ended`) can drift in position until the user hits next/previous —
   mapping MPD state back to the zone is a future improvement.
 - [x] Add commands: play, pause, stop, seek, next, previous, enqueue, clear,
-  shuffle, repeat. (Reorder still to do.)
+  shuffle, repeat.
 - [x] Add WebSocket state updates for controllers.
 - [x] Add a web UI to register, name, zone, and control players (transport plus
   "play the current view on this player"), with live state over the WebSocket.
@@ -361,6 +361,8 @@ Done when:
 
 ## Milestone 6: Web Controller Upgrade
 
+Status: complete.
+
 Goal: make the web app good enough to defer native mobile apps.
 
 Tasks:
@@ -421,6 +423,8 @@ Done when:
 - [x] Core playback and queue control do not require a native app.
 
 ## Milestone 7: Listening History And Recommendations
+
+Status: in progress.
 
 Goal: turn playback behavior into useful local discovery without compromising privacy.
 
@@ -486,6 +490,8 @@ Reference: [Listening History And Recommendations Research](recommendations.md)
 
 ## Milestone 8: Native API And OpenSubsonic
 
+Status: complete.
+
 Goal: make Musicata useful beyond its first-party web app.
 
 Tasks:
@@ -528,6 +534,8 @@ Done when:
 - [x] Native API docs are accurate enough for integration work.
 
 ## Milestone 9: Provider And Plugin System
+
+Status: in progress.
 
 Goal: make the architecture ready for sources beyond local disk.
 
@@ -662,6 +670,8 @@ Done when:
 
 ## Milestone 10: Player Providers And Endpoints
 
+Status: in progress.
+
 Goal: support playback outside the browser.
 
 Tasks:
@@ -698,7 +708,7 @@ Tasks:
   sample-identical (sub-ms offset). MVP scope: one synced stream to N rooms (independent
   per-room streams are a future extension). **Note:** the loudness analysis loop can spin on
   certain malformed tracks — a *pre-existing* issue surfaced during testing, tracked separately.
-- Later evaluate AirPlay, Chromecast, UPnP/DLNA, and MPD integrations.
+- Later evaluate Chromecast and UPnP/DLNA.
 
 Done when:
 
@@ -706,6 +716,8 @@ Done when:
 - Browser and endpoint players share the same queue/zone command model.
 
 ## Milestone 11: DSP — EQ, room & headphone correction
+
+Status: in progress.
 
 Goal: let an ordinary user improve how their music sounds — headphone correction with zero
 effort, room correction if they'll measure — without becoming an audio operator.
@@ -775,6 +787,8 @@ Done when:
 
 ## Milestone 12: Packaging, Security, And Operations
 
+Status: in progress.
+
 Goal: make Musicata installable and safe enough for real users.
 
 Tasks:
@@ -811,19 +825,15 @@ Done when:
 
 ## Immediate Next Steps
 
-Milestones 0–4, 6, and 8 are complete. **Milestone 5** is effectively done — its
-"Done when" criteria are met and the server-owned queue model now covers all player
+Milestones 0–6 and 8 are complete (M5's server-owned queue model now covers all player
 kinds: the browser player, **per-zone queues** (`ZonePlayer`, migration v18), and
-**MPD's queue is server-owned** (Musicata owns content/order, MPD owns the cursor;
-restored paused on startup, re-asserted over external edits). What remains in M5 is
-polish — drag-and-drop reorder, player add validation/probe + discovery, deeper
-mobile now-playing sheet — plus the deferred "MPD authentication + secure transport".
+**MPD's queue is server-owned** — Musicata owns content/order, MPD owns the cursor;
+restored paused on startup, re-asserted over external edits). Milestones 7, 9, 10, 11,
+and 12 are in progress.
 
-The next implementation slice is **Milestone 7 (Listening History And
-Recommendations)**: the history foundation (the `listens` table, recently/most-played,
-playlists, favorites) is in place, so the next work is richer playback events, the
-ListenBrainz completion rule, stats views (never-played / skipped / rediscovery),
-deterministic smart playlists, and metadata-based recommendations. Two high-value
-side-quests outside the strict sequence: **sized artwork thumbnails** (`?size=`, the
-open Milestone 3 staged item — biggest grid perf win) and the **OpenSubsonic/Funkwhale
-upstream provider** (Milestone 9, flagged highest-leverage among new sources).
+The remaining work lives in those in-progress milestones: **M7** — optional ListenBrainz
+scrobbling, richer playback events, and session/streak stats views; **M9** — podcasts /
+commercial providers and plugin isolation; **M10** — the `PlayerProvider` trait, a native
+endpoint, and a Squeezelite bridge; **M11** — the CamillaDSP/DAC tier plus signal-path and
+leveling polish; **M12** — release builds, systemd/Docker packaging, backup/restore docs,
+and diagnostics.

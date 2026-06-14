@@ -62,6 +62,13 @@ if predicted_peak_dBTP > −1.0:                          # streaming ceiling
 **Target: −14 LUFS default, user-configurable** (DB-backed setting, not a flag): offer −14
 (streaming consensus, matches Roon) / −16 (Apple-style, more headroom) / −18 (RG-native).
 
+> **As built (two tiers, two fixed targets, no configurable target yet):** the **browser**
+> tier targets **−14 LUFS** (`LEVELING_TARGET_LUFS` in `web/src/lib/audio.ts`); the
+> **server-side Snapcast** tier targets **−18 LUFS** (`const TARGET_LUFS: f64 = -18.0` in
+> `players.rs`). Both are **fixed** — the configurable target is unbuilt. The
+> `loudness_mode` / `loudness_target_lufs` setting names below are **aspirational (not
+> shipped)**; only `loudness_analysis_enabled` exists and it gates the analysis loop.
+
 ## ⚠️ The one thing most likely to ship broken: double-clipping with the EQ preamp
 
 The DSP graph is `source → preampGain → [biquads] → … → destination`. The EQ **preamp** is a

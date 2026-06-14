@@ -13,7 +13,7 @@ Build an open source, Roon-like music platform centered on a local server. The s
 - Local files are one provider, not a special architectural case.
 - Players connect to the server and are controlled independently.
 - Controllers must use public APIs, not private database or filesystem access.
-- DSP is deferred, but the playback pipeline must leave a clear insertion point for per-zone processing.
+- DSP is deferred, but the playback pipeline must leave a clear insertion point for per-zone processing. (Update: DSP shipped — per-output EQ + room/headphone correction, browser + server-side Snapcast tiers.)
 - Rust is the default implementation language for server, domain, provider, metadata, playback, and web UI code where practical.
 
 ## Stack Requirements
@@ -26,7 +26,7 @@ Initial stack direction:
 - Use Axum for HTTP, WebSocket, streaming, and API routes.
 - Use Tower/Tower HTTP middleware for tracing, compression, CORS, timeouts, and static assets.
 - Use SQLite through SQLx for the first embedded database.
-- Use Tantivy for local full-text search indexes.
+- Use SQLite FTS5 for local full-text search (Tantivy was dropped — see roadmap M4).
 - Use Lofty for audio metadata extraction.
 - Evaluate Symphonia for audio decoding and stream inspection.
 - Keep FFmpeg as an optional compatibility fallback, not the core abstraction.
@@ -35,7 +35,7 @@ Initial stack direction:
 
 Non-Rust exceptions are allowed for browser-required pieces such as CSS, PWA manifest files, and a minimal service worker.
 
-Current implementation note: the server now uses Axum, Tokio, Serde, `tracing`, and SQLite persistence. Search indexing and metadata extraction crates are still future milestones.
+Current implementation note: the server now uses Axum, Tokio, Serde, `tracing`, and SQLite persistence. Search (SQLite FTS5), metadata extraction (Lofty), and enrichment (MusicBrainz/AcoustID/artwork) have now shipped.
 
 ## Core Components
 
@@ -141,14 +141,19 @@ The first useful release should include:
 
 ## Deferred Features
 
-- Spotify, Tidal, Qobuz, and other online providers.
-- Multi-user permissions beyond basic admin/user needs.
-- Multiroom synchronized playback.
-- Advanced recommendations and radio.
-- DSP, convolution, EQ, sample-rate conversion, and volume leveling.
+- Commercial streaming-service *sources* (Spotify, Tidal, Qobuz, …) remain deferred.
+  An OpenSubsonic-upstream source and AirPlay/Spotify cast-in have already shipped.
+- Finer-grained multi-user permissions remain deferred; basic multi-user admin/listener
+  roles shipped.
 - Offline downloads.
 - Native mobile and desktop apps.
 - Metadata editing and tag writing.
+
+Shipped in 0.9 (previously deferred):
+
+- Multiroom synchronized playback (via Snapcast).
+- Advanced recommendations and radio (via ListenBrainz).
+- DSP, convolution, EQ, sample-rate conversion, and volume leveling.
 
 ## Non-Functional Requirements
 
@@ -162,8 +167,8 @@ The first useful release should include:
 ## Open Questions
 
 - Exact Cargo workspace layout.
-- SQLite migration strategy and schema versioning.
+- SQLite migration strategy and schema versioning. **Resolved:** `PRAGMA user_version` (migrations through v28).
 - Audio decoding/transcoding stack.
-- Whether the first endpoint is browser playback, a native local player, or a Squeezelite/Snapcast bridge.
+- Whether the first endpoint is browser playback, a native local player, or a Squeezelite/Snapcast bridge. **Resolved:** browser + MPD + Snapcast shipped.
 - Plugin runtime model: in-process modules, subprocesses, WebAssembly, or external services.
-- Web UI framework final choice: Leptos as the current front-runner, Dioxus as the main alternative.
+- Web UI framework final choice: Leptos as the current front-runner, Dioxus as the main alternative. **Resolved:** chose Svelte 5 + TypeScript + Vite.

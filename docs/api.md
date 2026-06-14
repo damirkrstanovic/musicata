@@ -23,6 +23,19 @@ The native API is versioned as **v1**. `GET /api/health` reports the current ver
 The version is bumped only on breaking changes to routes or payloads. New
 fields/endpoints are additive within a version.
 
+### Authentication
+
+`/api/*` requires authentication once an account exists. Until the first user is
+created the server runs in **setup mode** and the API is open. These paths are always
+open: `/api/health`, `/api/auth/status`, `/api/auth/login`, `/api/auth/setup`.
+
+Authenticate with any of:
+
+- the session cookie `musicata_session` (set by `POST /api/auth/login`), or
+- an API token via `?token=…`, or `Authorization: Bearer …`.
+
+`POST /api/auth/setup` creates the first admin account (allowed only in setup mode).
+
 ### Conventions
 
 - Responses are JSON. List endpoints return a page envelope:
@@ -31,12 +44,34 @@ fields/endpoints are additive within a version.
   status (400 invalid request, 403 forbidden, 404 not found, 500 internal).
 - IDs are opaque strings (`track_…`, `album_…`, `artist_…`).
 
+### Accounts & auth
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET | `/api/auth/status` | Whether setup is needed and who (if anyone) is signed in. (open) |
+| POST | `/api/auth/setup` | Create the first admin account (setup mode only). (open) |
+| POST | `/api/auth/login` | Sign in; sets the `musicata_session` cookie. (open) |
+| POST | `/api/auth/logout` | Sign out; clears the session. |
+| GET | `/api/auth/me` | The current account. |
+| POST | `/api/auth/password` | Change the current account's password. |
+| GET/POST | `/api/auth/token` | Get / rotate the current account's API token. |
+
+### Users (admin-only)
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET/POST | `/api/users` | List users / create a user. |
+| PATCH/DELETE | `/api/users/{id}` | Update / remove a user. |
+
 ### Library, browse, search
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
 | GET | `/api/library/summary` | Track/album/artist counts and provider. |
 | POST | `/api/library/rescan` | Force a filesystem rescan (the server also rescans on a timer). |
+| GET/POST | `/api/library/export` | Export status / start a background library export. |
+| GET | `/api/library/export/download` | Download the completed export archive. |
+| POST | `/api/library/import` | Import a previously exported library archive. |
 | GET | `/api/artists`, `/api/artists/{id}` | List artists / artist detail. |
 | GET | `/api/albums`, `/api/albums/{id}` | List albums / album detail (with tracks). |
 | GET | `/api/tracks` | List tracks. Filters: `genre`, `year`, `composer`, `folder`; paging: `limit`, `offset`, `sort`. |
@@ -60,6 +95,8 @@ network sources are added at runtime and persisted.
 | POST | `/api/sources` | Add a network source. SMB: `{ "kind":"smb", "host", "share", "base_path"?, "display_name"?, "username"?, "password"? }`. Builds + scans it. Requires the `provider-smb` build feature. |
 | DELETE | `/api/sources/{id}` | Remove a source and re-merge the library (not the local source). |
 | POST | `/api/sources/{id}/rescan` | Rescan all sources and persist the merged library. |
+| GET | `/api/sources/{id}/browse` | Browse a source's hierarchy (for browse-only providers like radio). |
+| GET | `/api/sources/{id}/resolve` | Resolve a browse entry to a streamable track. |
 
 SMB shares are read directly over the wire in pure Rust (no kernel mount);
 streaming fetches only the requested byte range.
@@ -83,6 +120,8 @@ streaming fetches only the requested byte range.
 | GET | `/api/favorites` | Starred `{ tracks, albums, artists }`. |
 | PUT | `/api/favorites/{kind}/{id}` | Star (`kind` = `track`/`album`/`artist`). |
 | DELETE | `/api/favorites/{kind}/{id}` | Unstar. |
+| GET | `/api/smart-playlists` | List smart (rule-based) playlists. |
+| GET | `/api/smart-playlists/{id}` | A smart playlist with its computed tracks. |
 
 ### Players and zones
 
@@ -95,8 +134,11 @@ streaming fetches only the requested byte range.
 | GET | `/api/players/{id}/state` | Current `PlaybackState` snapshot. |
 | POST | `/api/players/{id}/commands` | Send a `PlayerCommand` (see below). |
 | GET | `/api/players/{id}/ws` | WebSocket of live `PlaybackState`. |
-| GET/POST | `/api/zones`, `/api/zones/{id}` | Manage zones (named groups of players). |
+| GET/POST | `/api/zones` | List zones / create a zone (named groups of players). |
+| PATCH/DELETE | `/api/zones/{id}` | Rename / remove a zone. |
+| GET | `/api/zones/{id}/state` | Current `PlaybackState` for the zone. |
 | POST | `/api/zones/{id}/commands` | Apply a command to every player in the zone. |
+| GET | `/api/zones/{id}/ws` | WebSocket of live zone `PlaybackState`. |
 
 The local browser player is always present as id `browser-local`.
 
@@ -161,6 +203,82 @@ re-broadcasts position to other controllers as the `progress` frame above):
 { "type": "ended" }
 ```
 
+### Playback sessions
+
+A browser claims audio output by opening a playback session; the heartbeat over its
+event stream keeps it alive.
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| POST | `/api/playback/sessions` | Open a playback session (claim browser output). |
+| DELETE | `/api/playback/sessions/{id}` | Close a playback session. |
+| GET | `/api/playback/sessions/{id}/events` | Session event stream / heartbeat. |
+
+### History, autoplay, radio
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET/PUT | `/api/autoplay` | Get / set the autoplay (continuous-play) settings. |
+| GET/POST | `/api/radio` | List internet-radio stations / add one. |
+| GET | `/api/radio/directory` | Browse the Radio Browser directory. |
+| PATCH/DELETE | `/api/radio/{id}` | Edit / remove a station. |
+| GET | `/api/tracks/{id}/radio` | A track-seeded radio (similar tracks). |
+
+### Identification & enrichment
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET | `/api/identification/stats` | Fingerprint/identification progress counts. |
+| GET | `/api/identification/unidentified` | Tracks still awaiting identification. |
+| GET | `/api/artists/aliases` | List artist merge aliases. |
+| DELETE | `/api/artists/aliases/{alias_key}` | Unmerge an artist alias. |
+| POST | `/api/artists/merge` | Merge artists under one identity. |
+
+### Metadata & artwork review
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET | `/api/tracks/{id}/metadata/review` | The track's per-field metadata review. |
+| PATCH | `/api/tracks/{id}/metadata/review/fields` | Approve/reject reviewed fields. |
+| GET | `/api/tracks/{id}/metadata/musicbrainz` | MusicBrainz lookup for the track. |
+| GET | `/api/tracks/{id}/metadata/musicbrainz/candidates` | MusicBrainz match candidates. |
+| GET | `/api/metadata/write-back` | Tag write-back policy status (POST rejects write-back). |
+| GET | `/api/albums/{id}/metadata/musicbrainz/candidates` | Album MusicBrainz candidates. |
+| GET | `/api/albums/{id}/artwork/cover-art-archive/candidates` | Cover Art Archive candidates. |
+| GET | `/api/albums/{id}/artwork/review` | The album's artwork review. |
+| GET | `/api/albums/{id}/artwork/candidates/{artwork_id}` | One artwork candidate's bytes. |
+| PATCH | `/api/albums/{id}/artwork` | Select / set the album's artwork. |
+| GET | `/api/artists/{id}/artwork` | Artist image (404 until acquired). |
+
+### Activity & settings
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET | `/api/activity` | Recent background-work activity log. |
+| GET | `/api/activity/ws` | WebSocket of live activity entries. |
+| GET/PATCH | `/api/settings` | Read / update product settings. |
+
+### DSP profiles
+
+EQ + room/headphone correction profiles. Authenticated (not admin-only).
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET | `/api/dsp/profiles` | List DSP profiles. |
+| PUT/DELETE | `/api/dsp/profiles/{id}` | Upsert / delete a profile. |
+| GET/POST/DELETE | `/api/dsp/profiles/{id}/impulse` | Get / upload (WAV) / delete a profile's impulse response. |
+
+### Snapcast (feature-gated)
+
+Present only with the `snapcast` build feature.
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET/PATCH | `/api/snapcast/status` | Snapcast config / state. |
+| GET/POST | `/api/snapcast/rooms` | List / add a room. |
+| DELETE | `/api/snapcast/rooms/{name}` | Remove a room. |
+| POST | `/api/snapcast/clients/{id}/volume` | Set a client's volume. |
+
 ---
 
 ## OpenSubsonic API (`/rest`)
@@ -183,9 +301,10 @@ Clients authenticate per request with the standard Subsonic parameters:
 - or `t` + `s` — token auth, where `t = md5(password + salt)` and `s` is the salt
 - `v` — protocol version, `c` — client name, `f` — `xml` (default) or `json`
 
-If no `subsonic_password` is configured the API runs **open** (any credentials
-accepted) for trusted-LAN use; the server logs a warning at startup. Real user
-authentication and a network security model are Milestone 12.
+`/rest` now authenticates against real accounts via the user's API token (the
+salted-token `t`+`s`, plaintext `p`, or hex `p=enc:<hex>` forms above are matched
+against the account's token). Open / single-user fallback applies only in setup mode
+(before any account exists), for trusted-LAN use; the server logs a warning at startup.
 
 ### Response format
 
@@ -229,7 +348,10 @@ missing parameter, `40` wrong username/password, `70` not found.
 | `createPlaylist` / `updatePlaylist` / `deletePlaylist` | Create (name + `songId`s), edit (`songIdToAdd`/`songIndexToRemove`), delete. |
 | `star` / `unstar` | Star/unstar by `id` (song/album/artist), `albumId`, or `artistId`. |
 | `getStarred` / `getStarred2` | Starred artists, albums, and songs. |
-| `getUser` | Reports stream/download/scrobble roles. |
+| `getInternetRadioStations` | List internet-radio stations. |
+| `createInternetRadioStation` / `updateInternetRadioStation` / `deleteInternetRadioStation` | Manage internet-radio stations. |
+| `setRating` | Accepted as a no-op (ratings aren't stored). |
+| `getUser` | Reports `streamRole`, `downloadRole`, and `scrobblingEnabled`. |
 
 IDs are Musicata's own (`artist_…`, `album_…`, `track_…`); clients treat them as
 opaque. `coverArt` on albums and songs is the album id.
@@ -241,5 +363,4 @@ opaque. `coverArt` on albums and songs is the album id.
   duration on their next rescan (or a forced `--rescan`).
 - No transcoding: `stream` returns the original file.
 - Numeric ratings (`setRating`) and play-queue sync (`savePlayQueue`) aren't stored yet;
-  internet radio, shares, and the jukebox are not implemented.
-- Starring/ratings/playlists are not persisted yet.
+  shares and the jukebox are not implemented.

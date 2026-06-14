@@ -198,7 +198,7 @@ Recommended backend stack:
 - Axum for HTTP APIs, WebSocket/SSE, streaming routes, static assets, and middleware integration.
 - Tower/Tower HTTP for shared middleware such as tracing, compression, authorization, CORS, and timeouts.
 - SQLx with SQLite for the initial embedded database.
-- Tantivy for embedded full-text search.
+- Tantivy for embedded full-text search. (Adopted instead: SQLite FTS5 — see roadmap M4.)
 - `serde` for API and provider DTOs.
 - `tracing` for structured logging.
 
@@ -231,6 +231,8 @@ Native mobile apps are not required initially if the web controller is good enou
 Recommended first choice: Leptos with Axum. Leptos is a full-stack Rust web framework that can build browser-rendered SPAs, server-rendered apps, and progressively enhanced apps from the same Rust code. This makes it a good fit for a Rust-first web controller while still allowing explicit HTTP/WebSocket APIs for integrations.
 
 Dioxus is the main alternative. It is attractive if one Rust UI codebase for web, desktop, and mobile becomes a higher priority. Its fullstack mode integrates with Axum and supports WebSockets and HTTP streams. For this project, Leptos is the better initial default because the requirement is a polished web app, not native mobile.
+
+(Adopted instead: the web controller shipped in **Svelte 5 + TypeScript + Vite**, not Leptos/Dioxus or a Rust/WASM UI. The Svelte bundle is built by `build.rs` and embedded via `rust-embed`; see `docs/svelte-migration.md`.)
 
 The web app should use:
 

@@ -4,6 +4,12 @@ Background for Milestones 9 (music providers) and 10 (player providers/endpoints
 We studied Roon for the architecture, then chose an open, in-process model matching
 how comparable open-source servers do it.
 
+> **Status — this remains a design/plan; no plugin system exists in code.** What shipped is
+> the narrower **provider** abstraction: `MusicProvider` (core) + the
+> `ProviderHandle` / `ProviderRegistry` / `ProviderCapabilities` trio (server, enum-dispatch).
+> The `PlayerProvider` trait below was **planned but NOT built** — players still dispatch via
+> the `PlayerHandle` enum. (See the per-item "As built" notes in the Rollout section.)
+
 ## How Roon does it (research)
 
 Roon splits into three roles: **Core** (the brain — library, metadata, queue, DSP,
@@ -68,8 +74,12 @@ plugins matter). This matches the existing `PlayerHandle` enum pattern (an enum,
 **Mechanics:**
 - Dispatch by **enum**, consistent with `PlayerHandle`; adding a provider = one variant
   + match arms.
-- **Cargo features** (`provider-radio`, `player-airplay`, …) compile providers in/out;
-  default = local disk + browser + MPD.
+- **Cargo features** (`provider-smb`, `provider-opensubsonic`, `snapcast`, …) compile
+  providers in/out; default = local disk + browser + MPD.
+  > **As built:** the actual features are `provider-smb`, `provider-opensubsonic`, `snapcast`,
+  > and `ts`. The `provider-radio` / `player-airplay` names in this doc do **not** exist —
+  > radio is always-present (not feature-gated), and AirPlay/Spotify cast-in is via Snapcast,
+  > not a cargo feature.
 - A **`ProviderRegistry`** built at startup from an explicit list (one entry per
   feature). Explicit list beats macro auto-registration for a handful of providers;
   adopt `inventory`/`linkme` only if that list becomes friction.
@@ -108,8 +118,14 @@ task); endpoint tiering native vs bridged.
   feature `provider-smb`: scanning drives the shared scanner over an SMB `SourceFs`
   (`Read+Seek`-over-`read_at` with a read-ahead cache for lofty); streaming reads only
   the requested byte range. Credentials stored plaintext for now (HARDEN IN M12).
+  ④ **OpenSubsonic-as-source also shipped** — `ProviderHandle::OpenSubsonic` behind the
+  `provider-opensubsonic` feature consumes a remote Subsonic/Navidrome/Funkwhale server as a
+  music source. ✅
 - **M10 (players):** ③ re-express Browser + MPD behind `PlayerProvider`; ④ one bridged
   endpoint (Snapcast or AirPlay/Chromecast) as the "Roon Tested" tier.
+  > **As built:** item ③ did **not** happen — there is no `PlayerProvider` trait; Browser and
+  > MPD still dispatch via the `PlayerHandle` enum. Item ④ **did** ship: the Snapcast bridged
+  > endpoint (`PlayerHandle::Snapcast`, `snapcast` feature). See `docs/snapcast.md`.
 
 References: Roon KB (RAAT, partner programs), `node-roon-api`, Music Assistant
 developer docs, Mopidy backend API, the `inventory`/`linkme` crates.

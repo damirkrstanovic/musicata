@@ -1,5 +1,8 @@
 # Frontend migration: vanilla JS → Svelte
 
+> **HISTORICAL** — the Svelte migration is complete; the web app is fully Svelte 5 + TS +
+> Vite, served at `/` and `/admin`. Kept as a record of the cutover, not as live work.
+
 Plan for rewriting the embedded web app (`crates/musicata-server/static/`) as a
 Svelte + TypeScript app, built with Vite and embedded into the server binary.
 
@@ -31,9 +34,10 @@ calls.
   `sw.js`.
 
 - **Phase 0 (toolchain) — done.** `web/` (Svelte 5 + TS + Vite, two entries) builds via
-  `build.rs`, embeds through `rust-embed`, served at `/v2` + `/v2/admin`. Headless-verified
-  the Svelte app mounts. Old app at `/` untouched.
-- **Phase 3 (player) — in progress.** Phase 3a (shell + playback hot path) done: a runes
+  `build.rs`, embeds through `rust-embed`. Initially served at the historical scaffold paths
+  `/v2` + `/v2/admin` (the app now serves `/` and `/admin` after cutover). Headless-verified
+  the Svelte app mounts. Old app at `/` untouched at that stage.
+- **Phase 3 (player) — done.** Phase 3a (shell + playback hot path) done: a runes
   `player` store whose `elapsed`/`duration` are their own signals (the hot path — a progress
   tick mutates only those, so the footer time/seek move while now-playing/queue, which derive
   from `playback`, don't), a reconnecting per-player WebSocket routing `progress` ticks vs
@@ -50,8 +54,8 @@ calls.
   remove/clear via commands, current-track highlight) and a debounced, AbortController-guarded
   search over `/api/search`. CDP-verified: 8-item queue, reorder reflected after the
   round-trip; search "dar" → artists/albums/tracks, 16 cards.
-  Next: browse filters, playlists/favorites, metadata panel — then run the smoke suite's lag
-  assertions against `/v2`.
+  Remaining work — browse filters, playlists/favorites, metadata panel — all shipped, and the
+  smoke suite's lag assertions run against the cutover paths.
 - **Phase 2 (admin page) — done.** `/v2/admin` is a full Svelte port: Sources, Artwork &
   Settings, Players & Zones, Merged artists, Identification, Activity (live WS). Reuses the
   promise-based `Modal`, the typed `api` client, and the existing `styles.css`. Server admin
@@ -59,9 +63,9 @@ calls.
   `ProviderCapabilities` are now ts-rs-generated; `i64`/`u64` wire fields overridden to
   `number` (ts-rs defaults them to `bigint`). Headless-verified: all panels render real data,
   remove-button rules correct (local source / browser player excluded). `svelte-check` clean.
-- **Phase 1 (shared types) — in progress.** `ts` feature on `musicata-core` (off by default)
+- **Phase 1 (shared types) — done.** `ts` feature on `musicata-core` (off by default)
   generates TS via ts-rs; `scripts/gen-web-types.sh` regenerates into `web/src/types/`.
-  Typed `web/src/lib/api.ts`. The `/v2` shell renders real `/api/library/summary` data
+  Typed `web/src/lib/api.ts`. The Svelte shell renders real `/api/library/summary` data
   through the typed client; `svelte-check` is clean.
   - **Done:** the flat library types — `LibrarySummary`, `Artist`, `Album`, `Playlist`,
     `RadioStation`, `Zone`.

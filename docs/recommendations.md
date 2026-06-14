@@ -293,13 +293,21 @@ informed by a deep prior-art pass over Immich, Jellyfin, Navidrome and the exter
 
 ## Architecture — reuse over new code
 
+> **As built (flatter than the trait-based plan below):** there is no `SimilarityProvider`
+> trait, no `SimilarityRegistry`, no `LocalSimilarityProvider` type, and no
+> `recommendation_loop`. Instead `crates/musicata-server/src/recommendations.rs` exposes a
+> `similar_track_ids()` service that chains a `ListenBrainz` client + a local genre/artist
+> fallback first-hit-wins, and the background pre-warm/refill is the **`autoplay_loop`**
+> (`main.rs`). `similarity_cache` shipped at **migration v27**. The trait/registry framing in
+> items 2–4 below was not built.
+
 Mirror the **artwork-provider lane** (`crates/musicata-server/src/artwork_providers.rs`:
 `ArtworkProvider` trait + `ArtworkProviderRegistry` in priority order) and the **decoupled
 background-loop** convention (`*_loop` fns in `main.rs`).
 
 New pieces:
 
-1. **Storage (migration v26, next after v25 `MIGRATION_025_ARTIST_ALIASES`)** — a
+1. **Storage (migration v27)** — a
    `similarity_cache(entity_kind TEXT, seed_mbid TEXT, payload_json TEXT, fetched_at INTEGER,
    PRIMARY KEY(entity_kind, seed_mbid))` table. `entity_kind ∈ {artist, recording}`. Payload
    is the scored MBID list. TTL-checked on read; a `not_found`/empty marker prevents re-querying
@@ -327,6 +335,8 @@ New pieces:
 5. **Native API**: `GET /api/artists/{id}/similar`, `/api/albums/{id}/similar`,
    `/api/tracks/{id}/similar`, `/api/artists/{id}/radio`, `/api/tracks/{id}/radio`. Returns
    scored **local** entities. Generate TS types via `scripts/gen-web-types.sh`.
+   > **As built:** only `GET /api/tracks/{id}/radio` exists. The `…/similar` routes and
+   > `/api/artists/{id}/radio` are not yet built.
 6. **Web UI** (`crates/musicata-server/web/src/`): a "More like this" section + "Start radio"
    button on artist/album/track detail views, reusing the existing `TrackList`/album-grid
    components. A discover row ("Because you played …") can come in Slice 2.
@@ -336,6 +346,7 @@ New pieces:
 8. **OpenSubsonic (bonus, infra now exists)**: `getSimilarSongs`/`getSimilarSongs2`,
    `getArtistInfo`/`2` (`similarArtist`), `getTopSongs` map 1:1 onto the new service and real
    clients use them.
+   > **As built:** none of these OpenSubsonic endpoints are implemented yet.
 
 ## Later slices (sketch, not this PR)
 

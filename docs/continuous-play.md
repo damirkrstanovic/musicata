@@ -6,15 +6,15 @@ Date: 2026-06-07
 
 "I play something and then it keeps going with similar stuff" — Spotify-style **Autoplay** /
 **Song Radio**. When the queue is about to run out, Musicata appends *similar* tracks so the
-music never stops, endlessly, without repeating. This builds directly on the (shelved)
+music never stops, endlessly, without repeating. This builds directly on the
 ListenBrainz similarity research in **`docs/recommendations.md`** — continuous play is the
-concrete, motivating use case that un-shelves a focused slice of it: the music doesn't *stop*,
+concrete, motivating use case for a focused slice of it: the music doesn't *stop*,
 rather than a "browse similar" page.
 
-**The engine rides on the planned "Similar & Radio" slice** (`docs/recommendations.md`):
-`SimilarityProvider` trait + `ListenBrainzLabsProvider` (CC0, no key, MBID-in/out) +
-`LocalSimilarityProvider` (Jellyfin genre/artist/era fallback) + an MBID→local matcher +
-`similarity_cache` (migration v26). None of that exists yet; **it's the prerequisite.**
+**The engine is the shipped "Similar & Radio" slice** (`docs/recommendations.md`): a
+`ListenBrainz` client (CC0, no key, MBID-in/out) + a local genre/artist/era fallback + an
+MBID→local matcher + `similarity_cache` (migration v27). That similarity engine is built
+(`recommendations.rs`); continuous play consumes it.
 
 ## Two affordances, one engine
 
@@ -92,8 +92,8 @@ Every implementation is the same loop; the good ones differ in two details that 
 - **Seed data per track:** recording MBID from `track_musicbrainz_metadata` /
   `track_metadata_observations.musicbrainz_recording_id`; `genres` (JSON) + artist for the
   local fallback. **Dedup source:** `listens` (`recently_played` / a "played since" query).
-- **Candidate fetch task:** a new `recommendation_loop` (the `*_loop` pattern in `main.rs`)
-  with a rate-limited `ListenBrainzLabsClient` (`ureq` in `spawn_blocking`, like
+- **Candidate fetch task:** a new `autoplay_loop` (the `*_loop` pattern in `main.rs`)
+  with a rate-limited `ListenBrainz` client (`ureq` in `spawn_blocking`, like
   `MusicBrainzClient`), warming `similarity_cache`. The refill reads the cache (never blocks on
   the network); a cold seed enqueues a fetch and uses the local fallback meanwhile.
 

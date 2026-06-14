@@ -274,6 +274,9 @@ per-player volume already in `PlaybackState.volume`; the proven
 
 - **`musicata-core`**: add the `DspProfile` / `Band` / `ConvSpec` types
   (`crates/musicata-core/src/lib.rs`), `#[derive(ts_rs::TS)]`.
+  > **As built:** the types live in `crates/musicata-server/src/dsp.rs` (not
+  > `musicata-core`) and are named `DspProfile` / `DspBand` / `RoomIr` (not `Band` /
+  > `ConvSpec`).
 - **Storage**: persist the profile library. Start simplest — a `dsp_profiles` JSON value via
   the existing `get_setting`/`set_setting` (`crates/musicata-storage/src/lib.rs`); promote to
   a dedicated table only if it grows. No migration needed for the JSON-in-settings route.
@@ -283,6 +286,8 @@ per-player volume already in `PlaybackState.volume`; the proven
 - **`/admin` panel**: `admin/DSPProfilesPanel.svelte` (create/edit/delete a profile: name,
   kind, preamp, a small band editor + a **paste-a-`ParametricEQ.txt`** import box), wired into
   `admin/App.svelte`. Mirrors `SettingsPanel.svelte`.
+  > **As built:** the DSP/EQ UI is the player-side `web/src/player/EqPanel.svelte` (an AutoEq
+  > model picker + an inline ParametricEQ paste box), not an `/admin` panel.
 
 ### Phase 1 — Browser DSP core (prove it: one global profile, audible, hot-path-safe)
 
@@ -324,6 +329,10 @@ per-player volume already in `PlaybackState.volume`; the proven
   ~thousands-of-models DB is a size decision — defer; curated + import covers the MVP.)
 - A small `ParametricEQ.txt` parser (`Preamp` + `Filter N: ON PK Fc … Gain … Q …`) → bands;
   unit-tested. This is the shared importer for both the picker and the paste box.
+  > **As built:** there is no `GET /api/dsp/headphones?q=` endpoint and no Rust parser. The
+  > AutoEq presets ship as a **bundled client asset** `web/src/lib/autoeq-presets.json`, and the
+  > `ParametricEQ.txt` parser is **TypeScript** in `web/src/lib/dsp.ts` — the picker and paste
+  > box both run client-side against that asset.
 
 ### Phase 4 — Room correction (convolution) in the browser
 

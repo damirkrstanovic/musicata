@@ -57,7 +57,7 @@ Status legend: ✅ solid · 🟡 partial / one layer only · ❌ none.
 
 | Feature | Unit | API integration | Browser e2e | Status |
 |---|---|---|---|---|
-| Listening history aggregates | `listening_history_aggregates_*`, `listens_distinguish_plays_from_skips`, `frequently_skipped_*` (storage) | — | — | 🟡 (no route/e2e test for `/api/history/*`) |
+| Listening history aggregates | `listening_history_aggregates_*`, `listens_distinguish_plays_from_skips`, `frequently_skipped_*` (storage) | `history_routes_reflect_recorded_listens` | — | 🟡 (route test exists; no e2e for `/api/history/*`) |
 | Similarity / weighted radio | `weighted_order_*`, `parses_similar_*` (recommendations); `listenbrainz_live_path` (live) | `track_radio` via route? — only `radio_native_and_subsonic` | `radio endpoint returns tracks`, `radio play sets now-playing` | 🟡 |
 | Autoplay | — | — | `autoplay toggle persists` | 🟡 (logic `autoplay_candidates` untested at unit level) |
 | Internet-radio stations | `radio_stations_round_trip` (storage) | `radio_native_and_subsonic`, `list_radio` | `radio station listed`, `radio button present` | ✅ |
@@ -102,7 +102,7 @@ Status legend: ✅ solid · 🟡 partial / one layer only · ❌ none.
 | EBU R128 loudness analysis | `measures_a_sine_tone`, `louder_tone_measures_higher` (loudness); `leveling_gain_targets_*` (players) | — | `volume leveling boosts a quiet track` | ✅ |
 | Browser EQ / response curve / leveling | — | — | `eq preset applies bands`, `eq biquads applied`, `eq graph processes audio`, `eq response curve renders` | ✅ |
 | DSP profile shape + WAV parse | `profile_json_matches_the_web_client_shape`, `wav_sample_rate_reads_*` (dsp) | — | room-IR round-trip + `output switcher renders presets` | 🟡 |
-| **DSP profile CRUD + impulse routes** (`/api/dsp/profiles`, `/impulse`) | — | — | partial (smoke PUTs one profile) | ❌ (no Rust route test) |
+| **DSP profile CRUD + impulse routes** (`/api/dsp/profiles`, `/impulse`) | — | `dsp_profile_crud_and_impulse_round_trip` | partial (smoke PUTs one profile) | ✅ |
 | Snapcast config render / auth / decode / in-process EQ | `render_config_*`, `authorization_block_*`, `decodes_*`, `resamples_*`, `low_shelf_dc_gain_*`, `preamp_scales_*` (snapcast) | — | `snapcast server-side DSP profile selection persists` | ✅ (no live streaming e2e — needs binary) |
 
 ## Auth (multi-user) & settings
@@ -111,8 +111,8 @@ Status legend: ✅ solid · 🟡 partial / one layer only · ❌ none.
 |---|---|---|---|---|
 | Password hash / tokens / path classification / cookie parse | `password_hash_round_trips`, `tokens_are_unique_*`, `admin_and_open_path_classification`, `cookie_parsing` (auth) | — | — | 🟡 |
 | Users/sessions storage | `users_and_sessions_round_trip` (storage) | — | — | ✅ (unit) |
-| **Auth endpoints** (setup/login/logout/me/token/password) | — | — | login UI bypassed (smoke seeds cookie via CDP) | ❌ (no route test) |
-| **`require_auth` middleware gating** (401 without creds, admin-only paths, fail-open setup) | `is_admin_path`/`is_open_path` classify only | — | — | ❌ (no end-to-end gate test) |
+| **Auth endpoints** (setup/login/logout/me/token/password) | — | `auth_setup_then_gates_protected_routes` | login UI bypassed (smoke seeds cookie via CDP) | ✅ |
+| **`require_auth` middleware gating** (401 without creds, admin-only paths, fail-open setup) | `is_admin_path`/`is_open_path` classify only | `auth_setup_then_gates_protected_routes` | — | ✅ |
 | Settings get/update | `settings_round_trip` (storage) | — | persistence implied by autoplay/snapcast | 🟡 (no direct route test) |
 
 ## Infra / misc
@@ -124,7 +124,7 @@ Status legend: ✅ solid · 🟡 partial / one layer only · ❌ none.
 | Error envelopes | — | `serves_stable_error_envelopes` | — | ✅ |
 | Activity log | `activities_round_trip` (storage) | `activity_endpoint_returns_array` | — | ✅ |
 | Activity persist under lock contention | `a_held_write_does_not_block_reads` (storage) | — | — | 🟡 (`replace_activities` retry/backoff untested) |
-| **Library export / import** (`/api/library/export*`, import) | — | — | — | ❌ (no test at all) |
+| **Library export / import** (`/api/library/export*`, import) | — | `library_export_download_and_reimport` | — | ✅ |
 | SQLite scan concurrency governor | `grows_when_healthy_*`, `never_exceeds_max` (scan_concurrency) | — | — | ✅ |
 
 ---

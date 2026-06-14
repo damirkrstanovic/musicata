@@ -123,6 +123,25 @@ cargo run -p musicata-server -- --scan-once
 cargo run -p musicata-server -- --scan-once --rescan
 ```
 
+### Synchronized multi-room (Snapcast)
+
+Musicata plays the same music **perfectly in sync across rooms** via [Snapcast](https://github.com/badaix/snapcast). A zone's queue is decoded to PCM on the server and streamed through a managed `snapserver` to lightweight `snapclient` players — a Raspberry Pi by the speakers, a desktop, a phone, or the in-browser Snapweb client. Each client buffers ~1 s and plays on a server-stamped timestamp, so rooms stay sample-accurate (at a deliberate ~0.5–1 s latency — great for music, not for tight A/V sync). This is also how server-side per-zone DSP is applied (see [docs/dsp.md](docs/dsp.md)).
+
+**Prerequisites** (Snapcast is built into the default binary, but the daemons are not bundled):
+
+- `snapserver` on the Musicata host.
+- `snapclient` on each playback device (or use the Snapweb browser client snapserver serves on port 1780).
+- Optional cast-*in*: `shairport-sync` (AirPlay) and/or `librespot` (Spotify Connect) on the host — snapserver exposes each as an input you can play to all rooms.
+- **In Docker:** the slim image does **not** include `snapserver`; add it in a derived image (`apt-get install snapserver`) or run snapserver on the host and point Musicata at it.
+
+**Set it up** — all in the web UI, no flags or config files:
+
+1. **/admin → Multi-room (Snapcast)**: toggle it on and set the server host (the address devices reach this machine at, e.g. `musicata.local`).
+2. Under **Rooms**, name a room (e.g. `kitchen`); Musicata generates it and shows the exact `snapclient` command to run on that device. Repeat per device.
+3. Pick which input the rooms play, and set per-room volume live. To stream from a phone instead, enable the AirPlay/Spotify inputs and cast to "Musicata".
+
+**Security:** snapserver 0.35 does **not** enforce the per-room passwords yet (auth is stubbed upstream), so multi-room is **LAN-only** — keep the server on a trusted network. Musicata writes forward-compatible auth config that starts enforcing the moment a future snapserver enables it.
+
 ### Where artwork is stored
 
 Musicata splits cover art into two cases:
@@ -185,6 +204,28 @@ cargo test --offline
 ```
 
 If a sandbox or CI image has a read-only global Cargo registry, set `CARGO_HOME` to a writable directory before building.
+
+## Deploying
+
+Musicata ships as a single static binary with the web app embedded — no runtime dependencies. Tagged releases attach Linux binaries for x86_64 and aarch64.
+
+1. Download and extract the archive for your architecture from the [latest release](https://github.com/damirkrstanovic/musicata/releases/latest):
+
+   ```sh
+   tar -xzf musicata-x86_64-unknown-linux-musl.tar.gz
+   cd musicata-x86_64-unknown-linux-musl
+   ./musicata-server --library /path/to/music --addr 0.0.0.0:3030
+   ```
+
+2. Open `http://<host>:3030`, create the admin account, then add music sources and players from the **/admin** Settings page.
+
+### As a systemd service
+
+A sample unit ships in the archive (`musicata.service`); follow the install steps in its header comment. It runs the server as a system user, keeps state (database + artwork cache) in `/var/lib/musicata`, and binds the LAN.
+
+### Remote access
+
+Musicata is **LAN-first**: session cookies are not `Secure`, and MPD/SMB/OpenSubsonic source credentials are stored in clear text. Reach it from outside your network over a VPN (Tailscale/WireGuard) or an SSH tunnel — not the raw internet.
 
 ## Documentation
 

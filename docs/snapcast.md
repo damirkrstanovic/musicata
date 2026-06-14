@@ -310,7 +310,7 @@ stream. Build it standalone before touching the player model.
   `Group.SetClients`, `Client.SetVolume`/`Client.SetLatency`. Subscribe to
   `Client.OnConnect/OnDisconnect/OnVolumeChanged`, `Group.OnStreamChanged`, `Server.OnUpdate`
   to keep state live.
-- **snapserver lifecycle:** manage it as a subprocess via `tokio::process::Command` (Musicata
+- **snapserver lifecycle:** manage it as a subprocess via `std::process::Command` (Musicata
   manages **no** subprocess today — genuinely new; mirrors the planned CamillaDSP management in
   `docs/dsp.md`), owning FIFO creation (`mode=read`). External/already-running snapserver also
   supported.

@@ -7,8 +7,8 @@ How Musicata is tested today, and what's planned. Two layers:
   path. Fast, deterministic, no browser. Run on every commit (see the pre-commit hook).
 - **UI / lag smoke suite** (`scripts/ui-smoke.sh`, see [`tests/ui/README.md`](../tests/ui/README.md))
   — drives the real web app in headless Chromium over CDP and asserts on user flows
-  *and* responsiveness. `cargo test` never touches `static/`, so this is the only thing
-  that exercises the actual UI. Runs against a read-only copy of the real library DB
+  *and* responsiveness. `cargo test` never builds `web/` (the web app builds to
+  `crates/musicata-server/web/dist/`), so this is the only thing that exercises the actual UI. Runs against a read-only copy of the real library DB
   (~11k tracks) when present, for realistic scale; falls back to the testdata fixture.
   Also runs on every commit (skips cleanly if no Chromium).
 
@@ -48,8 +48,10 @@ Rust-only. Add:
 - [ ] **Heartbeat / disconnect** — browser playback stops when the playback-session
   heartbeat is lost; the player socket reconnects and controls recover after a server
   restart.
-- [ ] **Server↔player auth** (blocked on Milestone 10) — once endpoints authenticate,
-  test that an unauthenticated device can't register or control a player.
+- [ ] **Server↔player auth** — core multi-user auth has shipped (`auth.rs`, with
+  `auth_setup_then_gates_protected_routes` covering the gate); the remaining item is
+  per-*player* endpoint auth: test that an unauthenticated device can't register or
+  control a player.
 
 ### Multi-controller & realtime
 

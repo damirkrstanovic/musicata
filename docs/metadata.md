@@ -217,7 +217,7 @@ Artwork priority:
 
 Store artwork as assets with source, dimensions, MIME type, hash, and relation to album/release/release group. Do not embed new artwork into files unless the user explicitly chooses write-back.
 
-Current implementation: Musicata reviews local artwork files, lets the user select an album candidate in the web controller, serves selected artwork with asset-keyed URLs plus HTTP cache validators, and can fetch Cover Art Archive candidates on demand for MusicBrainz-linked albums. Cover Art Archive candidates are review-only for now; selecting and caching remote artwork as a local asset remains future work. Embedded artwork extraction remains a future candidate source.
+Current implementation: Musicata reviews local artwork files, lets the user select an album candidate in the web controller, serves selected artwork with asset-keyed URLs plus HTTP cache validators, and fetches remote candidates on demand for MusicBrainz-linked albums from **four providers in priority order — Cover Art Archive, fanart.tv, iTunes, Deezer** (`artwork_providers.rs`: `CoverArtArchiveProvider`, `FanartTvProvider`, `ItunesProvider`, `DeezerProvider`). Selecting a remote candidate **downloads and caches it as a local asset** (`acquired_cache_key` + the artwork cache; `upsert_acquired_artwork` / `reapply_acquired_artwork` survive rescans). Embedded-artwork extraction (using a file's embedded image as a served source) remains a future candidate source.
 
 ## Lyrics
 
