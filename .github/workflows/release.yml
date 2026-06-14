@@ -1,0 +1,76 @@
+name: release
+
+# Build static musl binaries for the tagged release. Triggered by pushing a `v*`
+# tag; `workflow_dispatch` lets us (re)attach binaries to an existing release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to attach binaries to (e.g. v0.9)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Portable x86-64 (SSE4.2) — runs on any realistic NAS, including the
+          # Celeron J4025 (Gemini Lake, no AVX2). The default x86 download.
+          - name: musicata-x86_64-linux
+            target: x86_64-unknown-linux-musl
+            rustflags: "-C target-cpu=x86-64-v2"
+          # High-end x86-64 (v3: AVX2 + FMA) — faster fingerprinting on modern CPUs.
+          # SIGILLs on pre-2015 / low-power chips (incl. Celeron NAS) — do not use there.
+          - name: musicata-x86_64-v3-linux
+            target: x86_64-unknown-linux-musl
+            rustflags: "-C target-cpu=x86-64-v3"
+          - name: musicata-aarch64-linux
+            target: aarch64-unknown-linux-musl
+            rustflags: ""
+    env:
+      # Overrides .cargo/config.toml's [build] rustflags for this build.
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the embedded web app once (it's arch-independent); the Rust build
+      # then reuses web/dist via MUSICATA_SKIP_WEB_BUILD.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build web assets
+        working-directory: crates/musicata-server/web
+        run: npm ci && npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build
+        env:
+          MUSICATA_SKIP_WEB_BUILD: "1"
+        run: cargo zigbuild --release -p musicata-server --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          dist="${{ matrix.name }}"
+          mkdir "$dist"
+          cp "target/${{ matrix.target }}/release/musicata-server" "$dist/"
+          cp packaging/musicata.service README.md "$dist/"
+          tar -czf "$dist.tar.gz" "$dist"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: ${{ matrix.name }}.tar.gz

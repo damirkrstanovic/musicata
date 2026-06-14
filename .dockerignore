@@ -1,0 +1,7 @@
+target
+**/node_modules
+crates/musicata-server/web/dist
+.git
+.github
+testdata
+.musicata

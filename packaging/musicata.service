@@ -1,0 +1,49 @@
+# systemd unit for Musicata. Example — edit the two marked lines, then:
+#
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin musicata
+#   sudo cp musicata-server /usr/local/bin/
+#   sudo cp musicata.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now musicata
+#
+# State (database + artwork cache) lives in /var/lib/musicata, created and owned
+# automatically by StateDirectory. Everything user-facing (sources, players, keys)
+# is configured in the web UI at http://<host>:3030/admin — not here.
+
+[Unit]
+Description=Musicata music server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# EDIT: a system account that can READ your music library (or set this to your
+# own user). The music library is read-only to the service.
+User=musicata
+Group=musicata
+
+ExecStart=/usr/local/bin/musicata-server
+Restart=on-failure
+RestartSec=5
+
+# /var/lib/musicata, owned by the service user.
+StateDirectory=musicata
+Environment=MUSICATA_DATABASE=/var/lib/musicata/musicata.db
+# Bind on all interfaces so the LAN can reach it (default is localhost only).
+Environment=MUSICATA_ADDR=0.0.0.0:3030
+# EDIT: path to your music library.
+Environment=MUSICATA_LIBRARY=/srv/music
+
+# Hardening. ProtectHome=read-only lets the service read a library under /home;
+# set it to "yes" if your library lives elsewhere (e.g. /srv).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
