@@ -124,6 +124,25 @@ if (MODE === "scale") {
   await sleep(1000);
   const results = await js(`document.querySelectorAll('.track-list .track').length`);
   check("search at scale returns a bounded page", results > 0 && results <= 300, `results=${results}`);
+  // "Show the artwork" (against the real library): a cover <img> only renders for albums that
+  // have art, and naturalWidth>0 means the bytes actually loaded over the authenticated artwork
+  // endpoint — not just that the element is in the DOM. This is the UI-layer guard the
+  // artist-artwork regression lacked. (testdata has no album covers, so this must run at scale.)
+  await js(`(()=>{const el=document.querySelector('.search input'); if(el){el.value=''; el.dispatchEvent(new Event('input',{bubbles:true}));}})()`);
+  await sleep(400);
+  await clickText(".seg", "Albums");
+  await sleep(800);
+  let coverLoaded = 0;
+  for (let i = 0; i < 15 && !coverLoaded; i++) {
+    coverLoaded = await js(
+      `[...document.querySelectorAll('.album-card .card-cover img')].filter(im=>im.complete && im.naturalWidth>0).length`,
+    );
+    if (!coverLoaded) {
+      await js(`document.querySelector('.album-card:last-child')?.scrollIntoView()`);
+      await sleep(400);
+    }
+  }
+  check("album artwork renders (img bytes loaded)", coverLoaded > 0, `loaded=${coverLoaded}`);
   check("no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
   console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);
   ws.close();
@@ -147,10 +166,57 @@ check("playback started", (await js(`document.querySelector('.transport')?.datas
 check("hot path: elapsed text updates on ticks", (await js(`window.__t`)) >= 2);
 check("hot path: now-title NOT swept on ticks", (await js(`window.__n`)) === 0);
 
-// Queue
+// ---- Transport: the core music-playing controls (pause/resume, skip, seek) ----
+// Clicking a track queued the whole list (playTracks), so next/previous have somewhere to go.
+const titleA = await js(`document.querySelector('#now-title')?.textContent`);
+// Pause → paused; play → playing again, on the SAME track (resume must not reload).
+await js(`document.querySelector('.transport-buttons .control.play')?.click()`);
+await sleep(700);
+check("pause halts playback", (await js(`document.querySelector('.transport')?.dataset.status`)) === "paused");
+await js(`document.querySelector('.transport-buttons .control.play')?.click()`);
+await sleep(700);
+check("resume returns to playing", (await js(`document.querySelector('.transport')?.dataset.status`)) === "playing");
+check("resume keeps the same track", (await js(`document.querySelector('#now-title')?.textContent`)) === titleA, `${titleA}`);
+// Next → a different track becomes current.
+await js(`[...document.querySelectorAll('.transport-buttons .control')].find(b=>b.title==='Next')?.click()`);
+await sleep(1800);
+const titleB = await js(`document.querySelector('#now-title')?.textContent`);
+check("next advances to another track", !!titleB && titleB !== titleA, `${titleA} -> ${titleB}`);
+// Previous → back to the original track (the browser player steps the queue index, no restart).
+await js(`[...document.querySelectorAll('.transport-buttons .control')].find(b=>b.title==='Previous')?.click()`);
+await sleep(1800);
+check("previous steps back a track", (await js(`document.querySelector('#now-title')?.textContent`)) === titleA, `back to ${titleA}`);
+// Seek → the elapsed clock jumps forward to the dragged position (tracks are ≥86s here).
+const seekBefore = await js(`(()=>{const i=document.querySelector('input.seek'); return i?Number(i.value):0;})()`);
+await js(`(()=>{const i=document.querySelector('input.seek'); if(!i) return; const dur=Number(i.max)||0; const tgt=Math.max(2,Math.floor(dur*0.5)); i.value=tgt; i.dispatchEvent(new Event('input',{bubbles:true})); i.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+await sleep(1200);
+const seekAfter = await js(`(()=>{const i=document.querySelector('input.seek'); return i?Number(i.value):0;})()`);
+check("seek jumps the playback position", seekAfter > seekBefore + 3, `before=${seekBefore} after=${seekAfter}`);
+
+// Favorite a track: the heart toggles (aria-pressed flips) and persists via the favorites store.
+const favSel = `.track-list .track button[aria-pressed]`;
+const favBefore = await js(`document.querySelector('${favSel}')?.getAttribute('aria-pressed')`);
+await js(`document.querySelector('${favSel}')?.click()`);
+await sleep(500);
+const favAfter = await js(`document.querySelector('${favSel}')?.getAttribute('aria-pressed')`);
+check("favorite toggles a track", !!favBefore && favAfter !== favBefore, `${favBefore} -> ${favAfter}`);
+await js(`document.querySelector('${favSel}')?.click()`); // restore
+await sleep(300);
+
+// Queue (list + editing)
 await js(`document.querySelector('.queue-btn')?.click()`);
 await sleep(500);
 check("queue drawer lists tracks", (await js(`document.querySelectorAll('.queue-row').length`)) > 0);
+// Reorder: move the first row down → a different track heads the queue.
+const qFirst = await js(`document.querySelector('.queue-row .q-title')?.textContent`);
+const qLen = await js(`document.querySelectorAll('.queue-row').length`);
+await js(`document.querySelector('.queue-row .q-actions button[title="Move down"]')?.click()`);
+await sleep(500);
+check("queue reorder moves an item", (await js(`document.querySelector('.queue-row .q-title')?.textContent`)) !== qFirst, `was ${qFirst}`);
+// Remove the last row → the queue shrinks by one.
+await js(`(()=>{const r=[...document.querySelectorAll('.queue-row')]; r.at(-1)?.querySelector('button[title="Remove"]')?.click();})()`);
+await sleep(500);
+check("queue remove drops a row", (await js(`document.querySelectorAll('.queue-row').length`)) < qLen, `len ${qLen}`);
 await clickText(".queue-head button", "Close");
 
 // Browse filter + search persistence
@@ -161,6 +227,14 @@ await js(`(()=>{const s=document.querySelector('.browse-filters select'); if(s&&
 await sleep(900);
 check("browse filter changes the grid", (await js(`document.querySelectorAll('.album-card').length`)) <= all);
 await clickText("button", "Clear");
+await sleep(400);
+// Play an album from the cover ▶ (a primary way to start music): pause first, then the album
+// play button must resume playback (proving the control plays the album, not just that audio ran).
+await js(`document.querySelector('.transport-buttons .control.play')?.click()`); // pause (currently playing)
+await sleep(400);
+await js(`document.querySelector('.album-card .card-play')?.click()`);
+await sleep(2000);
+check("play album from the grid starts playback", (await js(`document.querySelector('.transport')?.dataset.status`)) === "playing");
 await js(`(()=>{const el=document.querySelector('.search input'); el.value='dar'; el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
 await sleep(900);
 const tA = await js(`document.querySelector('.content-title h2')?.textContent`);
@@ -177,10 +251,14 @@ await js(`[...document.querySelectorAll('.library-panel .nav-link')].find(b=>/ne
 await sleep(900);
 check("smart playlist opens + lists tracks", (await js(`document.querySelectorAll('.track-list .track').length`)) > 0);
 
-// Metadata
+// Metadata: open the review panel and approve a field (✓). setField PATCHes then re-fetches,
+// so the button reactively shows `active` only if the approval actually persisted server-side.
 await js(`document.querySelector('.track-meta')?.click()`);
 await sleep(900);
 check("metadata panel opens", await js(`!!document.querySelector('.metadata-drawer')`));
+await js(`document.querySelector('.meta-field .icon-button')?.click()`); // ✓ approve the first field
+await sleep(700);
+check("metadata field approval persists", await js(`!!document.querySelector('.meta-field .icon-button.active')`));
 await clickText(".queue-head button", "Close");
 
 // Equalizer: opening the panel + applying a preset must render bands and NOT disturb the
@@ -334,6 +412,14 @@ const z1 = await js(`document.querySelector('.seek-row .time')?.textContent`);
 await sleep(2200);
 const z2 = await js(`document.querySelector('.seek-row .time')?.textContent`);
 check("zone plays (elapsed advances)", z1 !== z2, `${z1} -> ${z2}`);
+
+// Clear the queue → it empties (the Clear control, end-to-end on the active player).
+await js(`document.querySelector('.queue-btn')?.click()`);
+await sleep(500);
+await clickText(".queue-head button", "Clear");
+await sleep(800);
+check("clear empties the queue", (await js(`document.querySelectorAll('.queue-row').length`)) === 0);
+await clickText(".queue-head button", "Close");
 
 check("no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
 console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);

@@ -2,8 +2,8 @@ mod activity;
 mod artwork;
 mod artwork_providers;
 mod auth;
-mod dsp;
 mod backup;
+mod dsp;
 mod fingerprint;
 mod loudness;
 mod mpd;
@@ -2255,10 +2255,16 @@ fn app(
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/me", get(auth::me))
         .route("/api/auth/password", post(auth::change_password))
-        .route("/api/auth/token", get(auth::my_token).post(auth::rotate_token))
+        .route(
+            "/api/auth/token",
+            get(auth::my_token).post(auth::rotate_token),
+        )
         // User management (admin-only, gated by path in require_auth).
         .route("/api/users", get(auth::list_users).post(auth::create_user))
-        .route("/api/users/{id}", patch(auth::update_user).delete(auth::delete_user))
+        .route(
+            "/api/users/{id}",
+            patch(auth::update_user).delete(auth::delete_user),
+        )
         .fallback(fallback)
         // require_auth runs inner (closest to handlers); log_request wraps it so 401s are logged.
         .layer(middleware::from_fn({
@@ -2472,6 +2478,9 @@ async fn rescan_library(
     let summary = scanned.summary();
     if updated {
         state.database.save_library(&mut scanned).await?;
+        // save_library rewrote albums/artists to folder-derived rows, clearing acquired
+        // artwork + grouping; republish them immediately (as the discovery loop does).
+        restore_after_scan(&state.database).await;
     }
 
     Ok(Json(RescanResponse {
@@ -4149,8 +4158,18 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
         inputs = control.streams().await.unwrap_or_default();
     }
     let setting = |key: &'static str| state.database.get_setting(key);
-    let airplay_enabled = setting("snapcast.airplay_enabled").await.ok().flatten().as_deref() == Some("true");
-    let spotify_enabled = setting("snapcast.spotify_enabled").await.ok().flatten().as_deref() == Some("true");
+    let airplay_enabled = setting("snapcast.airplay_enabled")
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    let spotify_enabled = setting("snapcast.spotify_enabled")
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
     let airplay_binary = setting("snapcast.airplay_binary")
         .await
         .ok()
@@ -4227,14 +4246,20 @@ async fn snapcast_update(
     if let Some(airplay) = update.airplay_enabled {
         state
             .database
-            .set_setting("snapcast.airplay_enabled", if airplay { "true" } else { "false" })
+            .set_setting(
+                "snapcast.airplay_enabled",
+                if airplay { "true" } else { "false" },
+            )
             .await
             .map_err(db_error)?;
     }
     if let Some(spotify) = update.spotify_enabled {
         state
             .database
-            .set_setting("snapcast.spotify_enabled", if spotify { "true" } else { "false" })
+            .set_setting(
+                "snapcast.spotify_enabled",
+                if spotify { "true" } else { "false" },
+            )
             .await
             .map_err(db_error)?;
     }
@@ -4852,6 +4877,8 @@ async fn update_track_metadata_field_review(
     let response = metadata_review_response(track);
 
     state.database.save_library(&mut updated_library).await?;
+    // save_library cleared acquired artwork + grouping; republish them immediately.
+    restore_after_scan(&state.database).await;
 
     Ok(Json(response))
 }
@@ -6660,6 +6687,100 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Regression: a rescan rewrites the artists table, clearing `artwork_url`; the rescan
+    /// handler must re-apply acquired art via `restore_after_scan`, or artist images vanish
+    /// until a background loop happens to catch up. (Bug fixed 2026-06-14 — `/api/library/rescan`
+    /// and the metadata write-back saved the library without restoring acquired artwork.)
+    #[tokio::test]
+    async fn rescan_preserves_acquired_artist_artwork() {
+        let fixture = TestFixture::new("rescan-artwork");
+        let library = fixture.library();
+        let artist_id = library
+            .artists
+            .iter()
+            .find(|artist| artist.name == "Darkwood Dub")
+            .expect("artist")
+            .id
+            .clone();
+        let app = fixture.app_with_library(library).await;
+
+        // Simulate the artwork worker acquiring an image and applying it to the artists table.
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .expect("connect fixture database");
+        database
+            .upsert_acquired_artist_artwork(
+                &artist_id,
+                "deezer",
+                Some("https://example.invalid/artist.jpg"),
+                Some("acqtestkey"),
+                Some("jpg"),
+                Some(640),
+                "acquired",
+                1_700_000_000,
+            )
+            .await
+            .expect("acquire artist artwork");
+        assert_eq!(
+            database
+                .reapply_acquired_artist_artwork()
+                .await
+                .expect("reapply"),
+            1
+        );
+
+        async fn artwork_url(app: &axum::Router, artist_id: &str) -> Option<String> {
+            let list: serde_json::Value = serde_json::from_str(
+                &body_text(
+                    app.clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri("/api/artists")
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap()
+                        .into_body(),
+                )
+                .await,
+            )
+            .unwrap();
+            list["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"].as_str() == Some(artist_id))
+                .and_then(|item| item["artwork_url"].as_str().map(str::to_string))
+        }
+
+        // Sanity: the acquired image is exposed before the rescan.
+        assert!(
+            artwork_url(&app, &artist_id).await.is_some(),
+            "artwork_url should be set after acquisition"
+        );
+
+        // Force a rescan, which rewrites the artists table from folder-derived rows.
+        let rescan = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/library/rescan?force=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rescan.status(), StatusCode::OK);
+
+        // Regression guard: the acquired image survives — restore_after_scan re-applied it.
+        assert!(
+            artwork_url(&app, &artist_id).await.is_some(),
+            "rescan must re-apply acquired artist artwork (restore_after_scan)"
+        );
+    }
+
     #[tokio::test]
     async fn merge_and_unmerge_artists() {
         let fixture = TestFixture::new("merge-artists");
@@ -7307,6 +7428,371 @@ mod tests {
         );
         // Unknown bytes default to JPEG (the common embedded-cover case).
         assert_eq!(sniff_image_content_type(b"\0\0\0\0"), "image/jpeg");
+    }
+
+    /// The `require_auth` gate: open while no accounts exist (fail-open setup), then closed —
+    /// a session cookie is required for protected routes and the admin role for admin paths.
+    #[tokio::test]
+    async fn auth_setup_then_gates_protected_routes() {
+        let fixture = TestFixture::new("auth-gate");
+        let app = fixture.app().await;
+
+        // No users yet: the gate fails open so the create-admin flow (and a first look) work.
+        let open = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/library/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open.status(), StatusCode::OK, "no users → fail open");
+
+        // Setup creates the first admin and returns a session cookie.
+        let setup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/setup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"password123"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(setup.status(), StatusCode::OK);
+        let cookie = setup
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|raw| raw.split(';').next())
+            .expect("session cookie")
+            .to_string();
+
+        // A user now exists: the same protected route 401s without the session.
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/library/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            denied.status(),
+            StatusCode::UNAUTHORIZED,
+            "user exists → gate closed without a session"
+        );
+
+        // With the session cookie, protected and admin-only (/api/users) routes succeed.
+        for path in ["/api/library/summary", "/api/auth/me", "/api/users"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("cookie", &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "authed GET {path}");
+        }
+
+        // The admin path also 401s without a session (gated before the role check).
+        let users_denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/users")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(users_denied.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// DSP profile CRUD + room-IR impulse round-trip over the HTTP API (gap #3).
+    #[tokio::test]
+    async fn dsp_profile_crud_and_impulse_round_trip() {
+        let fixture = TestFixture::new("dsp-routes");
+        let app = fixture.app().await;
+
+        async fn profiles(app: &axum::Router) -> serde_json::Value {
+            serde_json::from_str(
+                &body_text(
+                    app.clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri("/api/dsp/profiles")
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap()
+                        .into_body(),
+                )
+                .await,
+            )
+            .unwrap()
+        }
+
+        // Empty to start.
+        assert_eq!(profiles(&app).await.as_array().unwrap().len(), 0);
+
+        // Upsert: the path id wins over the body, and the camelCase shape matches the web client.
+        let put = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/dsp/profiles/hd600")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":"ignored","name":"HD 600","preampDb":-6.8,"bands":[{"type":"peaking","freq":21,"gain":4.7,"q":0.7}],"kind":"speakers"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+        let saved: serde_json::Value =
+            serde_json::from_str(&body_text(put.into_body()).await).unwrap();
+        assert_eq!(saved["id"], "hd600");
+        assert_eq!(saved["preampDb"], -6.8);
+        assert_eq!(profiles(&app).await.as_array().unwrap().len(), 1);
+
+        // Upload a WAV impulse response (raw body) → 204, and the profile records its rate.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&[0; 4]);
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&48_000u32.to_le_bytes()); // sample rate @ offset 24
+        wav.extend_from_slice(&[0; 8]);
+        let upload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dsp/profiles/hd600/impulse")
+                    .body(Body::from(wav))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+        assert_eq!(profiles(&app).await[0]["roomIr"]["sampleRate"], 48_000);
+
+        // Served back as audio/wav.
+        let got = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dsp/profiles/hd600/impulse")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+        assert_eq!(got.headers().get(CONTENT_TYPE).unwrap(), "audio/wav");
+        assert!(
+            !to_bytes(got.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Delete the impulse → roomIr cleared; delete the profile → empty again.
+        for uri in ["/api/dsp/profiles/hd600/impulse", "/api/dsp/profiles/hd600"] {
+            let del = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(del.status(), StatusCode::NO_CONTENT, "DELETE {uri}");
+        }
+        assert_eq!(profiles(&app).await.as_array().unwrap().len(), 0);
+    }
+
+    /// Library export → download → re-import round-trip stages the archive (gap #4).
+    #[tokio::test]
+    async fn library_export_download_and_reimport() {
+        let fixture = TestFixture::new("export-import");
+        let app = fixture.app().await;
+
+        // Kick off the background export.
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/library/export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        // Poll until it finishes (a tiny fixture export is quick).
+        let mut ready = false;
+        for _ in 0..200 {
+            let status: serde_json::Value = serde_json::from_str(
+                &body_text(
+                    app.clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri("/api/library/export")
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap()
+                        .into_body(),
+                )
+                .await,
+            )
+            .unwrap();
+            assert!(
+                status["error"].is_null(),
+                "export failed: {}",
+                status["error"]
+            );
+            if status["running"] == false && !status["latest"].is_null() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready, "export did not finish in time");
+
+        // Download the archive.
+        let download = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/library/export/download")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(download.status(), StatusCode::OK);
+        assert_eq!(
+            download.headers().get(CONTENT_TYPE).unwrap(),
+            "application/zip"
+        );
+        let archive = to_bytes(download.into_body(), usize::MAX).await.unwrap();
+        assert!(!archive.is_empty());
+
+        // Re-import the exact archive we exported → stages it for the next startup.
+        let import = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/library/import")
+                    .body(Body::from(archive.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(import.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text(import.into_body()).await).unwrap();
+        assert_eq!(body["restart_required"], true);
+        assert!(
+            crate::backup::staged_db(&fixture.root.join("musicata.db")).exists(),
+            "import should stage the DB for the next startup"
+        );
+    }
+
+    /// `/api/history/recent` + `/most-played` reflect recorded listens (gap #5).
+    #[tokio::test]
+    async fn history_routes_reflect_recorded_listens() {
+        let fixture = TestFixture::new("history-routes");
+        let (app, database) = fixture.app_with_library_db(fixture.library()).await;
+
+        async fn history(app: &axum::Router, path: &str) -> serde_json::Value {
+            serde_json::from_str(
+                &body_text(
+                    app.clone()
+                        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap()
+                        .into_body(),
+                )
+                .await,
+            )
+            .unwrap()
+        }
+
+        // Empty history → empty arrays.
+        assert_eq!(
+            history(&app, "/api/history/recent")
+                .await
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // A real, stored track id (avoids any pre/post-save id mismatch).
+        let tracks = history(&app, "/api/tracks").await;
+        let track_id = tracks["items"][0]["id"]
+            .as_str()
+            .expect("a stored track id")
+            .to_string();
+
+        // Record a confirmed listen through the app's own pool, then it shows in both rankings.
+        database
+            .record_listen(
+                &track_id,
+                "browser",
+                1_700_000_000,
+                musicata_storage::ListenKind::Played,
+            )
+            .await
+            .expect("record listen");
+
+        // The track fields are flattened into each item, alongside the listen metadata.
+        let recent = history(&app, "/api/history/recent").await;
+        let recent_item = recent
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == track_id)
+            .expect("recent should list the played track");
+        assert_eq!(recent_item["last_listened_at"], 1_700_000_000);
+
+        let most = history(&app, "/api/history/most-played").await;
+        let most_item = most
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == track_id)
+            .expect("most-played should list the played track");
+        assert_eq!(most_item["play_count"], 1);
     }
 
     #[tokio::test]
@@ -8826,7 +9312,14 @@ mod tests {
             self.app_with_library(library).await
         }
 
-        async fn app_with_library(&self, mut library: Library) -> axum::Router {
+        async fn app_with_library(&self, library: Library) -> axum::Router {
+            self.app_with_library_db(library).await.0
+        }
+
+        /// Like `app_with_library`, but also returns the very `Database` the router uses, so a
+        /// test can seed rows (e.g. listens) and read them back through the app without opening
+        /// a second connection pool to the same file.
+        async fn app_with_library_db(&self, mut library: Library) -> (axum::Router, Database) {
             let database = Database::connect(self.root.join("musicata.db"))
                 .await
                 .expect("connect fixture database");
@@ -8847,8 +9340,8 @@ mod tests {
             )
             .await
             .expect("player manager");
-            app(
-                database,
+            let router = app(
+                database.clone(),
                 providers,
                 players,
                 std::sync::Arc::new(crate::activity::ActivityLog::default()),
@@ -8859,7 +9352,8 @@ mod tests {
                 },
                 std::sync::Arc::new(crate::artwork::ArtworkCache::new(self.root.join("artwork"))),
                 self.root.join("musicata.db"),
-            )
+            );
+            (router, database)
         }
 
         fn write(&self, relative_path: &str) {

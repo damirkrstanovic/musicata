@@ -48,6 +48,11 @@ if [ -f "$REAL_DB" ]; then
   cp "$REAL_DB" "$TMP/scale.db"
   cp "$REAL_DB-wal" "$TMP/scale.db-wal" 2>/dev/null || true
   cp "$REAL_DB-shm" "$TMP/scale.db-shm" 2>/dev/null || true
+  # Symlink the real artwork cache (sibling of the DB) so the scale server can serve covers
+  # (the album artwork-render check) without copying ~hundreds of MB. Read-only, derived dir
+  # name must match the server's `<db-dir>/artwork`.
+  real_art="$(cd "$(dirname "$REAL_DB")" && pwd)/artwork"
+  [ -d "$real_art" ] && ln -s "$real_art" "$TMP/artwork"
   run_phase scale 3978 --no-scan --database "$TMP/scale.db" || fail=1
 else
   echo "Svelte UI smoke (scale): skipped (no $REAL_DB)"
