@@ -25,6 +25,40 @@ snapserver installed," like the SMB source.
 
 ---
 
+## Setting it up (user guide)
+
+Musicata plays the same music **perfectly in sync across rooms**. A zone's queue is decoded to
+PCM on the server and streamed through a managed `snapserver` to lightweight `snapclient`
+players — a Raspberry Pi by the speakers, a desktop, a phone, or the in-browser Snapweb client.
+Each client buffers ~1 s and plays on a server-stamped timestamp, so rooms stay sample-accurate
+(at a deliberate ~0.5–1 s latency — great for music, not for tight A/V sync). This is also how
+server-side per-zone DSP is applied (see [dsp.md](dsp.md)).
+
+**Prerequisites** (Snapcast is built into the default binary, but the daemons are not bundled):
+
+- `snapserver` on the Musicata host.
+- `snapclient` on each playback device (or use the Snapweb browser client snapserver serves on
+  port 1780).
+- Optional cast-*in*: `shairport-sync` (AirPlay) and/or `librespot` (Spotify Connect) on the
+  host — snapserver exposes each as an input you can play to all rooms.
+- **In Docker:** the slim image does **not** include `snapserver`; add it in a derived image
+  (`apt-get install snapserver`) or run snapserver on the host and point Musicata at it.
+
+**Set it up** — all in the web UI, no flags or config files:
+
+1. **/admin → Multi-room (Snapcast)**: toggle it on and set the server host (the address
+   devices reach this machine at, e.g. `musicata.local`).
+2. Under **Rooms**, name a room (e.g. `kitchen`); Musicata generates it and shows the exact
+   `snapclient` command to run on that device. Repeat per device.
+3. Pick which input the rooms play, and set per-room volume live. To stream from a phone
+   instead, enable the AirPlay/Spotify inputs and cast to "Musicata".
+
+**Security:** snapserver 0.35 does **not** enforce the per-room passwords yet (auth is stubbed
+upstream), so multi-room is **LAN-only** — keep the server on a trusted network. Musicata writes
+forward-compatible auth config that starts enforcing the moment a future snapserver enables it.
+
+---
+
 ## What Snapcast is, and why it fits "reliable transport"
 
 A **snapserver** reads a continuous PCM stream from a source (a named FIFO is the usual

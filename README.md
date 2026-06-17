@@ -1,237 +1,80 @@
 # Musicata
 
-Musicata is an open source, Roon-like music platform for personal and shared music libraries. The goal is a central server that can discover music, enrich metadata, stream audio, manage players, and expose controller APIs without coupling the core model to any single music source.
+**Your music, your server, every room.** Musicata is an open-source, self-hosted music
+platform for personal and shared libraries — a Roon-like experience you run yourself. Point it
+at your music, open it in any browser, and play to your speakers, anywhere in the house.
 
-Musicata supports local disk libraries, SMB network shares, and upstream OpenSubsonic/Navidrome servers as music sources today. The architecture treats each as one provider among many, so future catalogs (Tidal, Spotify, Qobuz, internet radio) slot in the same way.
+It runs as a single Rust binary with the web app built in. No cloud account, no subscription,
+no phoning home — your library and listening history stay on your machine.
 
-## Architecture Direction
+## Why Musicata?
 
-Musicata follows a strict Server / Control / Output split:
+- **It's yours.** Local-first and self-hosted. Your files, your metadata, your data — on
+  hardware you control, on your own network.
+- **Bring your music from anywhere.** Local folders, SMB network shares, or another
+  OpenSubsonic/Navidrome server — Musicata pulls them all into one library. New sources are
+  added the same way, so streaming catalogs can slot in later.
+- **It makes your library look great.** Automatic artwork, MusicBrainz enrichment, and
+  acoustic fingerprinting clean up and complete your collection in the background while you
+  keep listening.
+- **Play it everywhere, in sync.** Stream to your browser, drive an MPD player, or play the
+  same track *perfectly in sync across rooms* with Snapcast.
+- **Sounds the way you want.** Per-output EQ and room/headphone correction, plus loudness
+  leveling so albums and playlists play at an even volume.
+- **No config files.** Every user-facing setting lives in the app — add a music source, a
+  player, or an API key right in the Settings page. Live, no restart.
+- **Works with what you already use.** Musicata speaks the OpenSubsonic API, so existing
+  Subsonic apps can browse and stream your library too.
 
-- **Server** owns library state, metadata, provider mappings, queues, zones, users, player registry, and APIs.
-- **Music providers** expose searchable and playable media without leaking storage details into the domain model.
-- **Player providers** expose independent playback endpoints and zones.
-- **Controllers** are web, desktop, mobile, or automation clients that talk only through public APIs.
-- **DSP** (parametric EQ, room & headphone correction) runs per output; the playback pipeline carries a per-zone insertion point. See [docs/dsp.md](docs/dsp.md).
+## Features
 
-## Rust-First Stack
+- A central server with a SQLite-backed library that rescans incrementally as your files
+  change.
+- **Music sources:** local disk, SMB network shares, and upstream OpenSubsonic/Navidrome
+  servers.
+- **Rich metadata:** tag extraction, artwork fetching (iTunes / Deezer / Cover Art Archive /
+  fanart.tv), MusicBrainz enrichment, and AcoustID fingerprinting — each running quietly on its
+  own background worker.
+- **Browse & search:** full-text search and browse by artist, album, track, genre, year,
+  composer, and folder.
+- **Playback everywhere:** playback queues and multi-player zones; browser playback plus MPD
+  and Snapcast backends.
+- **Synchronized multi-room:** play the same music sample-accurately across rooms via Snapcast,
+  with optional AirPlay / Spotify Connect cast-in.
+- **Great sound:** per-output DSP (parametric EQ, room & headphone correction) and EBU R128
+  loudness leveling.
+- **Discovery:** listening history with ListenBrainz similar-track radio and continuous play.
+- **Multi-user:** accounts with cookie sessions and per-user API tokens.
+- **Open APIs:** native HTTP + WebSocket APIs, an OpenSubsonic surface (Musicata both serves
+  and consumes it), and an installable Svelte PWA controller.
+- **Backup & migrate:** library export/import.
 
-The project should use Rust as much as practical:
+## Getting started
 
-- **Backend runtime:** Tokio.
-- **HTTP/API server:** Axum with Tower middleware.
-- **Persistence:** SQLite via SQLx for the first local-server release.
-- **Search:** SQLite FTS5 for embedded full-text library search.
-- **Metadata:** Lofty for audio tags and artwork extraction.
-- **Decode/transcode research:** Symphonia first, with FFmpeg as an optional compatibility fallback if needed.
-- **Observability:** `tracing` and structured logs.
-- **Plugin direction:** Rust traits internally; evaluate WebAssembly or subprocess isolation before third-party plugins are enabled.
-
-This is Rust-first, not Rust-only. Browser APIs, CSS, a minimal service worker, and optional external audio tools are acceptable when they are the pragmatic choice.
-
-The current server uses Axum, Tokio, Serde, and `tracing` while keeping the core provider model in `musicata-core`.
-
-## Web App Direction
-
-Native mobile apps are not required for the initial product if the web app is good enough. The primary controller should be a responsive installable PWA with:
-
-- mobile-first and desktop-friendly layouts;
-- fast library browsing and search;
-- now-playing and queue control;
-- player/zone selection;
-- Media Session integration for OS lock-screen/media controls where supported;
-- service worker and web app manifest for installability and resilient loading.
-
-The web app is built with **Svelte 5 + TypeScript + Vite**, compiled by `build.rs` and embedded in the server binary via `rust-embed`. It has two surfaces: the player (`/`) and the admin console (`/admin`).
-
-## Features (0.9)
-
-- Central Rust server with a SQLite-backed, incrementally-rescanned library.
-- Music sources: local disk, SMB network shares, and upstream OpenSubsonic/Navidrome servers.
-- Metadata extraction (Lofty), artwork fetching (iTunes / Deezer / Cover Art Archive / fanart.tv), MusicBrainz enrichment, and AcoustID fingerprinting — each on its own background worker.
-- Full-text search and browse by artist, album, track, genre, year, composer, and folder.
-- Playback queues and multi-player zones; MPD and Snapcast player backends plus browser playback.
-- Per-output DSP (parametric EQ, room & headphone correction) and EBU R128 loudness leveling.
-- Listening history with ListenBrainz similar-track radio and continuous play.
-- Multi-user accounts with cookie sessions and per-user API tokens.
-- OpenSubsonic API surface — Musicata both serves it and can consume another server.
-- Native HTTP + WebSocket APIs and an installable Svelte PWA controller.
-- Library export/import for backup and migration.
-
-## Running The Server
-
-The server scans `testdata` by default and serves the web controller plus JSON APIs:
+Download the binary for your machine from the
+[latest release](https://github.com/damirkrstanovic/musicata/releases/latest), then:
 
 ```sh
-cargo run -p musicata-server
+tar -xzf musicata-x86_64-unknown-linux-musl.tar.gz
+./musicata-server --library /path/to/music --addr 0.0.0.0:3030
 ```
 
-Use another library path or port when needed:
+Open `http://<host>:3030`, create your admin account, and add your music sources and players
+from the **Settings** page. That's it.
 
-```sh
-cargo run -p musicata-server -- --library /path/to/music --addr 127.0.0.1:3031
-cargo run -p musicata-server -- --library /path/to/music --database .musicata/musicata.db --rescan
-```
+Building from source, controlling MPD, running as a systemd service, and remote access are all
+covered in **[Running & deploying Musicata](docs/deployment.md)**.
 
-User-facing settings (music sources, players, API keys, artwork fetching) live in the product — edit them live on the **/admin** Settings page; no restart, no config files. CLI flags and environment variables exist only for *bootstrap* (where the library and database live, the bind address), with precedence `defaults < config file < environment < CLI`.
-
-```sh
-cargo run -p musicata-server -- --config musicata.example.conf
-MUSICATA_LIBRARY=/path/to/music MUSICATA_DATABASE=.musicata/musicata.db MUSICATA_ADDR=127.0.0.1:3031 cargo run -p musicata-server
-```
-
-On first run the server scans the configured library, reads embedded tags with Lofty, and stores canonical tracks plus provenance-aware observed metadata in SQLite. Later runs load from the database unless `--rescan` or `MUSICATA_RESCAN=true` is set.
-By default, startup performs a lightweight incremental rescan check using provider item IDs, file sizes, modified timestamps, and content hashes. Use `--no-incremental-rescan` to load only from the database.
-The running server can also rescan through `POST /api/library/rescan`; add `?force=true` to rewrite the stored library even when no changes are detected.
-
-### Controlling an MPD player
-
-Musicata can control a local [MPD](https://www.musicpd.org/) instance: it drives MPD over its native protocol, hands MPD Musicata stream URLs to play (so MPD needs no access to your files), and pushes live playback state to controllers over a WebSocket.
-
-Start MPD with the sample config (it streams from Musicata, so its `music_directory` can be empty), then point the server at it:
-
-```sh
-mkdir -p /tmp/musicata-mpd/music
-mpd --no-daemon docs/mpd.example.conf
-
-# in another shell:
-cargo run -p musicata-server -- --mpd 127.0.0.1:6600 --public-url http://127.0.0.1:3030
-# or: MUSICATA_MPD=127.0.0.1:6600 MUSICATA_PUBLIC_URL=http://127.0.0.1:3030
-```
-
-`--public-url` is the address MPD uses to fetch streams from this server. `--mpd` is optional convenience seeding — you can also register players from the web app's **Players** panel (or `POST /api/players`), name them, group them into zones, and control them (transport plus "play the current view on this player"); registrations persist across restarts. Then:
-
-```sh
-curl localhost:3030/api/players
-curl -X POST localhost:3030/api/players/mpd/commands \
-  -H 'content-type: application/json' \
-  -d '{"command":"play_tracks","track_ids":["<track-id-from-/api/tracks>"]}'
-curl localhost:3030/api/players/mpd/state
-```
-
-A live integration test exercises the full path against a real MPD (it spawns MPD with a null output, serves a WAV at a Musicata stream URL, and drives playback). It is ignored by default since it needs the `mpd` binary; run it with:
-
-```sh
-cargo test -p musicata-server -- --ignored live_mpd
-# set MUSICATA_MPD_BIN if mpd is not on PATH
-```
-
-Use `--scan-once` for a non-server scan/update command:
-
-```sh
-cargo run -p musicata-server -- --scan-once
-cargo run -p musicata-server -- --scan-once --rescan
-```
-
-### Synchronized multi-room (Snapcast)
-
-Musicata plays the same music **perfectly in sync across rooms** via [Snapcast](https://github.com/badaix/snapcast). A zone's queue is decoded to PCM on the server and streamed through a managed `snapserver` to lightweight `snapclient` players — a Raspberry Pi by the speakers, a desktop, a phone, or the in-browser Snapweb client. Each client buffers ~1 s and plays on a server-stamped timestamp, so rooms stay sample-accurate (at a deliberate ~0.5–1 s latency — great for music, not for tight A/V sync). This is also how server-side per-zone DSP is applied (see [docs/dsp.md](docs/dsp.md)).
-
-**Prerequisites** (Snapcast is built into the default binary, but the daemons are not bundled):
-
-- `snapserver` on the Musicata host.
-- `snapclient` on each playback device (or use the Snapweb browser client snapserver serves on port 1780).
-- Optional cast-*in*: `shairport-sync` (AirPlay) and/or `librespot` (Spotify Connect) on the host — snapserver exposes each as an input you can play to all rooms.
-- **In Docker:** the slim image does **not** include `snapserver`; add it in a derived image (`apt-get install snapserver`) or run snapserver on the host and point Musicata at it.
-
-**Set it up** — all in the web UI, no flags or config files:
-
-1. **/admin → Multi-room (Snapcast)**: toggle it on and set the server host (the address devices reach this machine at, e.g. `musicata.local`).
-2. Under **Rooms**, name a room (e.g. `kitchen`); Musicata generates it and shows the exact `snapclient` command to run on that device. Repeat per device.
-3. Pick which input the rooms play, and set per-room volume live. To stream from a phone instead, enable the AirPlay/Spotify inputs and cast to "Musicata".
-
-**Security:** snapserver 0.35 does **not** enforce the per-room passwords yet (auth is stubbed upstream), so multi-room is **LAN-only** — keep the server on a trusted network. Musicata writes forward-compatible auth config that starts enforcing the moment a future snapserver enables it.
-
-### Where artwork is stored
-
-Musicata splits cover art into two cases:
-
-- **Fetched / acquired covers** (from the artwork-provider lane — iTunes, Deezer,
-  Cover Art Archive, fanart.tv). The image **bytes are cached as files on disk**, next to
-  the database in a content-addressed, sharded layout:
-
-  ```
-  .musicata/artwork/<first-2-chars-of-key>/<cache_key>.<ext>
-  ```
-
-  The cache directory is derived from the database path (`<db parent>/artwork/`). The
-  database stores only **provenance**, not the bytes — the `acquired_album_artwork` table
-  records `album_id, provider, remote_url, cache_key, ext, width, status, acquired_at`,
-  and `cache_key` maps a row to its file on disk. The table is intentionally foreign-key-
-  less so a rescan's album rewrite can't wipe it; acquired covers are re-pointed back onto
-  their albums after every scan.
-
-- **Local / embedded covers** (a folder `cover.jpg`, or art embedded in the audio tags).
-  These are **not copied** — `albums.artwork_path` points straight at the original file
-  (the audio file itself for embedded art). Embedded art is extracted on demand at serve
-  time and then cached in the same `.musicata/artwork/` directory.
-
-Audio fingerprinting (AcoustID) feeds the first case: once an untagged track resolves to
-MusicBrainz IDs, the id-exact providers (Cover Art Archive / fanart.tv) can download its
-cover into that cache. Inspect it with:
-
-```sh
-ls .musicata/artwork/
-sqlite3 .musicata/musicata.db "select album_id, provider, ext, status from acquired_album_artwork limit 10"
-```
-
-Useful endpoints:
-
-- `GET /` web controller.
-- `GET /api/library/summary` library counts.
-- `POST /api/library/rescan` scan the configured provider and update the database when files changed.
-- `GET /api/artists`, `GET /api/albums`, `GET /api/tracks` paginated, sortable lists (`?limit=&offset=&sort=`); each returns `{ items, total, limit, offset, sort }`.
-- `GET /api/tracks?genre=Dub&year=2004&composer=Name&folder=Path` filtered track list.
-- `GET /api/artists/{id}` artist detail with albums and tracks.
-- `GET /api/albums/{id}` album detail with artist and track list.
-- `GET /api/browse` metadata facets for genre, year, composer, and folder.
-- `GET /api/browse/recently-added` tracks ordered by when they entered the database.
-- `GET /api/search?q=darkwood&limit=50` ranked SQLite FTS5 search (tokenized, prefix, accent- and case-insensitive) across artists, albums, and tracks.
-- `GET /api/players` registered players (e.g. MPD) with capabilities, zone, and online state; `POST /api/players` registers one (`{"address":"host:port","name":"..."}`).
-- `PATCH /api/players/{id}` rename or assign a zone (`{"name":"..."}` and/or `{"zone_id":"..."}`, null to clear); `DELETE /api/players/{id}` removes it.
-- `GET /api/players/{id}/state` current playback state (status, now playing, queue, volume).
-- `POST /api/players/{id}/commands` issue a command, e.g. `{"command":"play_tracks","track_ids":["..."]}`, `{"command":"pause"}`, `{"command":"seek","position_seconds":30}`.
-- `GET /api/players/{id}/ws` WebSocket stream of live playback state.
-- `GET/POST /api/zones`, `PATCH/DELETE /api/zones/{id}`, `POST /api/zones/{id}/commands` manage zones and control all players in a zone.
-- `GET /api/albums/{id}/artwork/cover-art-archive/candidates` reviewed remote artwork candidates for MusicBrainz-linked albums.
-- `GET /api/metadata/write-back` current file tag write-back policy.
-- `GET /api/tracks/{id}/stream` audio stream with basic byte-range support.
-
-Run tests with:
-
-```sh
-cargo test --offline
-```
-
-If a sandbox or CI image has a read-only global Cargo registry, set `CARGO_HOME` to a writable directory before building.
-
-## Deploying
-
-Musicata ships as a single static binary with the web app embedded — no runtime dependencies. Tagged releases attach Linux binaries for x86_64 and aarch64.
-
-1. Download and extract the archive for your architecture from the [latest release](https://github.com/damirkrstanovic/musicata/releases/latest):
-
-   ```sh
-   tar -xzf musicata-x86_64-unknown-linux-musl.tar.gz
-   cd musicata-x86_64-unknown-linux-musl
-   ./musicata-server --library /path/to/music --addr 0.0.0.0:3030
-   ```
-
-2. Open `http://<host>:3030`, create the admin account, then add music sources and players from the **/admin** Settings page.
-
-### As a systemd service
-
-A sample unit ships in the archive (`musicata.service`); follow the install steps in its header comment. It runs the server as a system user, keeps state (database + artwork cache) in `/var/lib/musicata`, and binds the LAN.
-
-### Remote access
-
-Musicata is **LAN-first**: session cookies are not `Secure`, and MPD/SMB/OpenSubsonic source credentials are stored in clear text. Reach it from outside your network over a VPN (Tailscale/WireGuard) or an SSH tunnel — not the raw internet.
+> **Heads up — Musicata is LAN-first.** Keep it on a trusted home network and reach it from
+> outside over a VPN or SSH tunnel, not the raw internet. See
+> [Remote access](docs/deployment.md#remote-access).
 
 ## Documentation
 
+- [Running & deploying](docs/deployment.md) — build from source, MPD, systemd, remote access
+- [Native + OpenSubsonic API](docs/api.md)
 - [Roadmap](docs/roadmap.md)
 - [Prior Art](docs/prior-art.md)
-- [Native + OpenSubsonic API](docs/api.md)
 - [Metadata Update Strategy](docs/metadata.md)
 - [DSP — EQ, room & headphone correction](docs/dsp.md)
 - [Loudness (EBU R128)](docs/loudness.md)
@@ -243,15 +86,9 @@ Musicata is **LAN-first**: session cookies are not `Secure`, and MPD/SMB/OpenSub
 - [Research](docs/research.md)
 - [Initial Requirements](docs/requirements.md)
 
-## Source References
+Contributors: see **[AGENTS.md](AGENTS.md)** for architecture, conventions, and the build/test
+workflow.
 
-- Axum: https://docs.rs/axum/latest/axum/
-- Tokio: https://tokio.rs/
-- Svelte: https://svelte.dev/docs
-- PWA manifest: https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps/Manifest
-- Service workers: https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API/Using_Service_Workers
-- Media Session API: https://developer.mozilla.org/en-US/docs/Web/API/MediaSession
-- SQLx: https://github.com/launchbadge/sqlx
-- Lofty: https://docs.rs/lofty/latest/lofty/
-- Symphonia: https://docs.rs/symphonia/latest/symphonia/
-- Tantivy: https://docs.rs/tantivy/latest/tantivy/
+## License
+
+AGPL-3.0.
