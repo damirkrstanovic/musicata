@@ -114,6 +114,50 @@ Musicata is **LAN-first**: session cookies are not `Secure`, and MPD/SMB/OpenSub
 credentials are stored in clear text. Reach it from outside your network over a VPN
 (Tailscale/WireGuard) or an SSH tunnel — not the raw internet.
 
+### Stored secrets at rest
+
+A few secrets live in the database in clear text: the **SMB / MPD / OpenSubsonic source
+passwords** you enter in Settings, and each user's **API token** (the Subsonic salted-token
+scheme has to recompute it, so it can't be hashed). User login passwords are argon2-hashed and
+session tokens are SHA-256-hashed, so those are *not* recoverable from the database.
+
+These plaintext secrets are **deliberately not encrypted** today. Encryption only helps if the
+key lives somewhere the database reader can't reach; without an OS keyring or hardware-backed
+key the key would sit next to the database and the encryption would be decorative. The honest
+mitigation, given the LAN-first posture, is **filesystem permissions**: the systemd unit runs as
+a locked-down system user with state in `0750` `/var/lib/musicata`, so only that user (and root)
+can read the database. Keep the state directory off shared/world-readable storage. Real
+encryption is revisited if an OS-keyring integration lands. See
+[decisions.md](decisions.md).
+
+## Backup & restore
+
+All durable state is two things under the state directory (next to the database, or
+`/var/lib/musicata` under systemd):
+
+- `musicata.db` — the SQLite library cache, players, playlists, favorites, settings, users,
+  history, loudness, fingerprints, …
+- `artwork/` — the content-addressed cover-art cache.
+
+**Cold backup (recommended):** stop the server and copy the whole state directory (or snapshot
+the filesystem). Restoring is the reverse — drop the directory back and start the server.
+
+**Migrating to another machine:** use the in-product **library export/import** (Settings →
+`POST /api/library/export` → download the archive; `POST /api/library/import` on the new
+instance stages it for the next startup). The export bundles the database snapshot plus the
+artwork cache, so the imported instance comes up with the same library and covers without
+re-scanning. (Source passwords travel with it — treat the archive as a secret.)
+
+## Diagnostics
+
+Background work (scan, metadata enrichment, fingerprinting, artwork, loudness, source
+discovery) reports through the **activity log**: `GET /api/activity` lists recent activities,
+each with a `running` / `ok` / `error` status and a message, and `GET /api/activity/ws` streams
+them live (this is what the `/admin` activity view shows). A failed scan or an unreachable
+source surfaces there as an `error` activity rather than a silent stall. `GET /api/health`
+reports the API/server version, the active provider, and the track count for a quick liveness
+check.
+
 ## Running the tests
 
 ```sh

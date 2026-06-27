@@ -815,7 +815,11 @@ Done when:
 
 ## Milestone 12: Packaging, Security, And Operations
 
-Status: in progress.
+Status: complete (LAN-first scope). Release builds, systemd unit, and Docker image ship;
+multi-user auth is in; backup/restore, diagnostics, and the at-rest-secret posture are
+documented and decided. Two items are **deliberate, documented deferrals**, not gaps:
+encrypting plaintext source secrets (decorative without an OS keyring) and per-player endpoint
+auth (lands with the M10 native endpoint). See [decisions.md](decisions.md).
 
 Goal: make Musicata installable and safe enough for real users.
 
@@ -840,16 +844,27 @@ Tasks:
   Web: a login/setup gate (`AuthGate`), a player account menu (password/token/sign-out), and an
   admin Users + Account panel. **Posture: LAN-first, defense-in-depth** — cookies are
   `SameSite=Lax` + `HttpOnly` (no `Secure`, so plain-http LAN works); the documented remote
-  path is a **VPN (Tailscale/WireGuard)**, not raw internet. Still open: encrypting the
-  remaining plaintext-at-rest secrets (SMB/MPD/OpenSubsonic source passwords), and per-player
-  endpoint auth (M10).
-- Document the recommended deployment for reaching remote services (MPD, SMB) over untrusted
-  networks — an SSH tunnel or WireGuard/Tailscale VPN — since those protocols carry credentials
-  in clear text and MPD has no native TLS (see Milestone 5's "MPD authentication + secure
-  transport"). Note which stored secrets are plaintext at rest (SMB/MPD/Subsonic passwords) and
-  decide whether to encrypt them.
-- Add backup/restore documentation for database and config.
-- Add diagnostics for scan, metadata, provider, and playback failures.
+  path is a **VPN (Tailscale/WireGuard)**, not raw internet. Plaintext-at-rest secrets
+  (SMB/MPD/OpenSubsonic source passwords) are **deliberately left unencrypted** for now
+  (filesystem-permission mitigation; see [decisions.md](decisions.md)); per-player endpoint auth
+  is **designed and deferred** to the native-endpoint task ([player-auth.md](player-auth.md)).
+- [x] Document the recommended deployment for reaching remote services (MPD, SMB) over
+  untrusted networks — an SSH tunnel or WireGuard/Tailscale VPN — since those protocols carry
+  credentials in clear text and MPD has no native TLS. Done: [deployment.md](deployment.md)
+  "Remote access" + "Stored secrets at rest". **Decision on encrypting plaintext secrets
+  (SMB/MPD/Subsonic passwords + the cleartext Subsonic API token): not now** — without an OS
+  keyring the key sits next to the DB and encryption is decorative; the LAN-first mitigation is
+  filesystem permissions (the systemd unit's locked-down user + `0750` state dir). Revisited if
+  an OS-keyring integration lands. See [decisions.md](decisions.md).
+- [x] Add backup/restore documentation for database and config. Done:
+  [deployment.md](deployment.md) "Backup & restore" — cold-copy the state dir (DB + `artwork/`),
+  or use the in-product library export/import for migration.
+- [x] Add diagnostics for scan, metadata, provider, and playback failures. The **activity log**
+  (`GET /api/activity` + `/api/activity/ws`) records every background job with a
+  `running`/`ok`/`error` status + message; failures surface there (and in the `/admin` activity
+  view) rather than stalling silently. `GET /api/health` gives a liveness/version check.
+  Documented in [deployment.md](deployment.md) "Diagnostics". Deeper per-subsystem diagnostics
+  remain a follow-up.
 
 Done when:
 
@@ -860,12 +875,14 @@ Done when:
 Milestones 0–6 and 8 are complete (M5's server-owned queue model now covers all player
 kinds: the browser player, **per-zone queues** (`ZonePlayer`, migration v18), and
 **MPD's queue is server-owned** — Musicata owns content/order, MPD owns the cursor;
-restored paused on startup, re-asserted over external edits). Milestones 7, 9, 10, 11,
-and 12 are in progress.
+restored paused on startup, re-asserted over external edits). **M12 is complete** (LAN-first
+scope; see its note). Milestones 7, 9, 10, and 11 are in progress.
 
 The remaining work lives in those in-progress milestones: **M7** — optional ListenBrainz
-scrobbling, richer playback events, and session/streak stats views; **M9** — podcasts /
-commercial providers and plugin isolation; **M10** — the `PlayerProvider` trait, a native
-endpoint, and a Squeezelite bridge; **M11** — the CamillaDSP/DAC tier plus signal-path and
-leveling polish; **M12** — release builds, systemd/Docker packaging, backup/restore docs,
-and diagnostics.
+scrobbling, richer playback events (loved/disliked/rated), and a web view for the stats
+endpoint (session/streak + favorites stats now ship as `GET /api/history/stats`); **M9** —
+Internet Archive / Jamendo / commercial providers and a metadata review-override UI (podcasts
+and the plugin-isolation decision are done); **M10** — a self-registering native endpoint (and
+the per-player auth that lands with it) plus a Squeezelite bridge (player capabilities are now
+advertised per backend); **M11** — the CamillaDSP/DAC tier plus signal-path and leveling
+polish.
