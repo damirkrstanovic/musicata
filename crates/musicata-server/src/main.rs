@@ -7755,6 +7755,98 @@ mod tests {
         assert_eq!(other.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// A native endpoint (M10) registers itself, gets a token, and that token authenticates
+    /// both the player channels and the audio streams it must fetch to play.
+    #[tokio::test]
+    async fn native_endpoint_registers_and_streams_with_its_token() {
+        let fixture = TestFixture::new("native-endpoint");
+        let app = fixture.app().await;
+
+        // Admin exists → auth is enforced. Keep the session cookie for setup-side calls.
+        let setup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/setup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"password123"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = setup
+            .headers()
+            .get("set-cookie")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|raw| raw.split(';').next())
+            .expect("session cookie")
+            .to_string();
+
+        // Self-register a native endpoint with a token.
+        let registered = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/players")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        r#"{"kind":"native","address":"living-room","name":"Living Room","issue_token":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text(registered.into_body()).await).unwrap();
+        assert_eq!(body["kind"], "native");
+        let token = body["auth_token"].as_str().expect("token issued").to_string();
+
+        // A real track id from the fixture library (via the admin session).
+        let tracks: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/tracks")
+                            .header("cookie", &cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        let track_id = tracks["items"][0]["id"].as_str().expect("a track id").to_string();
+        let stream_path = format!("/api/tracks/{track_id}/stream");
+
+        let stream = |auth: Option<String>| {
+            let mut builder = Request::builder().uri(&stream_path);
+            if let Some(value) = auth {
+                builder = builder.header("authorization", value);
+            }
+            app.clone().oneshot(builder.body(Body::empty()).unwrap())
+        };
+
+        // The endpoint token authenticates the stream (auth passes — not 401).
+        assert_ne!(
+            stream(Some(format!("Bearer {token}"))).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // No credential and a wrong token are both rejected.
+        assert_eq!(stream(None).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            stream(Some("Bearer nope".to_string())).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
     /// DSP profile CRUD + room-IR impulse round-trip over the HTTP API (gap #3).
     #[tokio::test]
     async fn dsp_profile_crud_and_impulse_round_trip() {

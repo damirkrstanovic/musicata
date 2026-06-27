@@ -2868,6 +2868,18 @@ impl Database {
         Ok(())
     }
 
+    /// Whether any player has this exact endpoint-token hash. Used to let an authenticated
+    /// endpoint fetch the audio streams it needs to play (it presents its player token; the
+    /// token isn't tied to a track, so any valid endpoint token authorizes a stream — LAN-first).
+    pub async fn player_token_exists(&self, token_hash: &str) -> Result<bool> {
+        let found: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM players WHERE auth_token_hash = ?1 LIMIT 1")
+                .bind(token_hash)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(found.is_some())
+    }
+
     /// The stored sha256 of a player's endpoint auth token, or `None` if it has none (the
     /// common case — server-initiated players carry no token).
     pub async fn player_auth_token_hash(&self, player_id: &str) -> Result<Option<String>> {

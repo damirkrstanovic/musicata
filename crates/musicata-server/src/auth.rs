@@ -188,6 +188,14 @@ fn player_channel_id(path: &str) -> Option<&str> {
     matches!(tail, "state" | "commands" | "ws").then_some(id)
 }
 
+/// Whether `path` is a track audio stream — `/api/tracks/{id}/stream`. A native endpoint
+/// must fetch these to play, so a valid endpoint token authorizes them (M10).
+fn is_stream_path(path: &str) -> bool {
+    path.strip_prefix("/api/tracks/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, tail)| tail == "stream")
+}
+
 /// Mint a per-player endpoint auth token (M10): returns `(cleartext, sha256_hash)`. The
 /// cleartext is shown to the registrant once; only the hash is stored.
 pub fn issue_player_token() -> (String, String) {
@@ -219,15 +227,23 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
         return next.run(request).await;
     }
     let Some(user) = resolve_user(&state, cookie, api_token.clone()).await else {
-        // Fall back to per-player endpoint auth (M10): a self-registered endpoint may reach
-        // *its own* channels with just its player token, no user session. Only for players
-        // that actually have a token; everything else stays user-gated.
-        if let Some(player_id) = player_channel_id(&path)
-            && let Some(token) = api_token
-            && let Ok(Some(stored)) = state.database.player_auth_token_hash(player_id).await
-            && stored == hash_token(&token)
-        {
-            return next.run(request).await;
+        // Fall back to per-player endpoint auth (M10): a self-registered endpoint authenticates
+        // with just its player token (no user session) for (a) its own channels and (b) the
+        // audio streams it must fetch to play. Only for players that actually have a token;
+        // everything else stays user-gated.
+        if let Some(token) = api_token {
+            let hashed = hash_token(&token);
+            if let Some(player_id) = player_channel_id(&path)
+                && let Ok(Some(stored)) = state.database.player_auth_token_hash(player_id).await
+                && stored == hashed
+            {
+                return next.run(request).await;
+            }
+            if is_stream_path(&path)
+                && state.database.player_token_exists(&hashed).await.unwrap_or(false)
+            {
+                return next.run(request).await;
+            }
         }
         return AppError::unauthorized("sign in to continue").into_response();
     };
@@ -618,6 +634,14 @@ mod tests {
         assert_eq!(player_channel_id("/api/players"), None);
         assert_eq!(player_channel_id("/api/players/mpd/rename"), None);
         assert_eq!(player_channel_id("/api/tracks"), None);
+    }
+
+    #[test]
+    fn stream_path_classification() {
+        assert!(is_stream_path("/api/tracks/abc-1/stream"));
+        assert!(!is_stream_path("/api/tracks/abc-1"));
+        assert!(!is_stream_path("/api/tracks"));
+        assert!(!is_stream_path("/api/players/mpd/stream"));
     }
 
     #[test]

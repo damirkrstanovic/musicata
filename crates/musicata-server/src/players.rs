@@ -520,7 +520,12 @@ impl PlayerManager {
     /// Bring up the runtime entry for a persisted player record.
     async fn bring_up(&self, record: &PlayerRecord) {
         let (handle, task, poll) = match record.kind.as_str() {
-            "browser" => {
+            // The browser tab and a self-registered native endpoint are the same server-side
+            // player: a queue-output driven over the bidirectional WS (server owns the queue +
+            // hands out stream URLs; the client plays them and reports progress/ended back). The
+            // only difference is identity — the browser is the always-present singleton, a
+            // native endpoint is a registered, removable, token-authenticated player.
+            "browser" | "native" => {
                 let player = Arc::new(BrowserPlayer::new(self.database.clone(), record.id.clone()));
                 // Reload any queue persisted before the last shutdown so it survives a
                 // server restart, not just a page refresh.
@@ -580,7 +585,10 @@ impl PlayerManager {
     /// Register a player (idempotent by kind+address); persists it and brings it
     /// up. Re-registering the same address just updates the display name.
     pub async fn register(&self, kind: &str, address: &str, name: &str) -> Result<Player> {
-        if kind != "mpd" {
+        // `mpd` is a server-dialled backend (we connect to `address`); `native` is a
+        // self-registering endpoint (it connects back to us over the player WS — see
+        // crates/musicata-endpoint), driven by the same server-owned queue as the browser.
+        if kind != "mpd" && kind != "native" {
             return Err(anyhow!("unsupported player kind: {kind}"));
         }
         let id = player_id(kind, address);
