@@ -485,7 +485,14 @@ Tasks:
   ListenBrainz Labs API (both algorithm strings valid, response shapes parse) via an
   `#[ignore]`d smoke test (`listenbrainz_live_path`; run with `--ignored`). Slice complete.
 - Add optional ListenBrainz scrobbling and recommendation import.
-- Design an optional `musicata-ml` service for future audio embeddings, genre/mood inference, and similarity search.
+- **Building `musicata-ml`** (the experiment): an optional service for audio embeddings + tags.
+  **Phase 1 shipped & verified** — `crates/musicata-ml` runs PANNs CNN14 (ONNX, via `ort`) on a
+  raw 16 kHz waveform and serves a 2048-d embedding + AudioSet tags over HTTP (`/analyze`).
+  Real-track verified (a dub track → Music/Drum/Bass/Percussion tags). Decisions: a Rust/ONNX
+  model (not Python), **raw-waveform-in** model so no Rust spectrogram code, model fetched at
+  runtime, crate excluded from the default build. Remaining: sqlite-vec storage + a scheduled
+  worker (default 02:00 local), recommendation integration, separate packaging. See
+  [musicata-ml.md](musicata-ml.md) + [decisions.md](decisions.md).
 
 Done when:
 

@@ -3,6 +3,32 @@
 Short, dated records of non-obvious choices made while building Musicata — the "why" behind
 work that isn't self-evident from the code. Newest first. Referenced from `roadmap.md`.
 
+## 2026-06-27 — musicata-ml Phase 1 (audio embeddings, the experiment)
+
+Building the optional audio-ML service (`crates/musicata-ml`). Design + run guide in
+`musicata-ml.md`; the choices:
+
+- **Rust + ONNX (`ort`), not Python/Essentia** — per the brief ("keep the model in Rust"). `ort`
+  with `download-binaries` fetches ONNX Runtime, so there's no system install and no Python at
+  runtime. Validated `ort` builds + runs here before writing the service.
+- **Picked a raw-waveform model (PANNs CNN14 16 kHz) on purpose.** Its ONNX graph contains the
+  mel-spectrogram, so the input is the raw audio samples. This **eliminates the biggest risk** —
+  hand-writing a model-exact mel-spectrogram in Rust — leaving only decode → mono → resample to
+  16 kHz (symphonia + rubato, already in the tree). It outputs both a 2048-d embedding *and* 527
+  AudioSet tags from one pass, so similarity + tagging come together. Verified against a real
+  track (a dub track scored Music/Drum/Bass/Percussion — correct).
+- **Model is fetched + cached at runtime, never committed** (~327 MB). The 527 AudioSet display
+  names *are* bundled (8 KB) so tags are human-readable without a download.
+- **Excluded from the default workspace build** (like the endpoint) — `ort`/ONNX Runtime is heavy
+  and network-fetched; the server's build/test/release path must not depend on it. Build with
+  `cargo build -p musicata-ml`.
+- **HTTP boundary, POST raw bytes to `/analyze`.** Keeps the ML service stateless and fully
+  decoupled — the server fetches a track's bytes and posts them; the ML service knows nothing
+  about the library. The model runs inside `spawn_blocking` behind a mutex (one inference at a
+  time; ONNX Runtime parallelizes internally) — fine for a background batch service.
+- **Deferred to later phases:** sqlite-vec storage + the **scheduled** worker (default 02:00
+  local), recommendation integration, and packaging. Phase 1 is just the verified service.
+
 ## 2026-06-27 — Native endpoint prototype (M10)
 
 A native playback endpoint (`crates/musicata-endpoint`). Design + usage in `native-endpoint.md`;

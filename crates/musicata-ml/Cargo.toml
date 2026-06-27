@@ -1,0 +1,28 @@
+[package]
+name = "musicata-ml"
+version = "0.9.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optional Musicata audio-ML service: ONNX-model audio embeddings + tags over HTTP (M7)."
+
+[[bin]]
+name = "musicata-ml"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# ONNX Runtime binding. `download-binaries` (default) fetches the ORT shared library, so no
+# system install is needed. This is why the crate is excluded from the default workspace build.
+ort = "2.0.0-rc.10"
+# Decode any library format to PCM, then resample to the model's 16 kHz — same crates the
+# server's Snapcast path uses.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "alac", "isomp4", "ogg", "vorbis", "flac", "pcm", "wav"] }
+rubato = "3"
