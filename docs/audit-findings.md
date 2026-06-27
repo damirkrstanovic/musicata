@@ -209,16 +209,11 @@ Security-sensitive bugs are marked **[security]**.
 
 ### Frontend
 
-- [ ] **ISS-38 Favorite toggle is optimistic with no rollback on failure** — `favorites.svelte.ts:21`
-  UI silently lies vs server on a failed star/unstar (`autoplay.svelte.ts` rolls back; this doesn't).
-- [ ] **ISS-39 `VuMeter` 60 fps rAF loop runs even when the drawer is closed** — `VuMeter.svelte:22`
-  Mounted unconditionally (`App.svelte:293`); the loop isn't gated on `meter.open`.
-- [ ] **ISS-40 Detail views stuck on "Loading…" on fetch failure** — `AlbumDetail.svelte:21`, `ArtistDetail.svelte:20`, `PlaylistView.svelte:20`, `SmartPlaylistView.svelte:20`
-  `$effect` does `.catch(()=>{})`; no error state, nothing logged.
-- [ ] **ISS-41 Sidebar search debounce timer not cleared on destroy** — `Sidebar.svelte:30`
-  A pending 220 ms timer can fire after the component is gone (low impact).
-- [ ] **ISS-42 `session.init` registers the unauthorized listener inside `init()`** — `session.svelte.ts:31`
-  Listeners stack if `init()` runs more than once; also registered only after the `await` chain.
+- [x] **ISS-38 Favorite toggle is optimistic with no rollback on failure** — `favorites.svelte.ts:21` ✅ reverts the heart on a failed star/unstar (mirrors `autoplay.svelte.ts`). Verified by typecheck + smoke.
+- [x] **ISS-39 `VuMeter` 60 fps rAF loop runs even when the drawer is closed** — `VuMeter.svelte:22` ✅ the rAF loop now runs inside a `$effect` gated on `meter.open`, cancelled when closed. Verified by typecheck + smoke (vu meter opens with L/R meters).
+- [x] **ISS-40 Detail views stuck on "Loading…" on fetch failure** — Album/Artist/Playlist/SmartPlaylist ✅ each tracks a `failed` state and renders an error branch instead of a perpetual spinner.
+- [x] **ISS-41 Sidebar search debounce timer not cleared on destroy** — `Sidebar.svelte:30` ✅ `onDestroy(() => clearTimeout(searchTimer))`.
+- [x] **ISS-42 `session.init` registers the unauthorized listener inside `init()`** — `session.svelte.ts:31` ✅ moved to the constructor (registered once for the singleton; catches a 401 during init).
 
 ### Endpoint
 

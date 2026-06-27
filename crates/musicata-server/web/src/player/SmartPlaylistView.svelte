@@ -5,17 +5,21 @@
 
   let { id }: { id: string } = $props();
   let detail = $state<SmartPlaylistDetail | null>(null);
+  let failed = $state(false);
 
   $effect(() => {
     const pid = id;
     let alive = true;
     detail = null;
+    failed = false;
     api
       .smartPlaylistDetail(pid)
       .then((d) => {
         if (alive) detail = d;
       })
-      .catch(() => {});
+      .catch(() => {
+        if (alive) failed = true;
+      });
     return () => {
       alive = false;
     };
@@ -35,6 +39,8 @@
     </div>
   </section>
   <TrackList tracks={detail.tracks} />
+{:else if failed}
+  <p class="admin-hint">Couldn't load this playlist. Try again.</p>
 {:else}
   <p class="admin-hint">Loading…</p>
 {/if}

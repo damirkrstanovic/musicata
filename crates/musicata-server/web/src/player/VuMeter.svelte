@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onMount, onDestroy } from "svelte";
   import { getAudio } from "../lib/playback";
   import { meter } from "../lib/meter.svelte";
 
@@ -27,10 +26,14 @@
     posR = ballistic(posR, lv ? posFromRms(lv.r) : 0, dt);
     raf = requestAnimationFrame(frame);
   }
-  onMount(() => {
+  // Only run the 60fps loop while the meter drawer is open; the work is wasted (and the
+  // analyser untouched) when it's closed.
+  $effect(() => {
+    if (!meter.open) return;
+    prevT = 0;
     raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
   });
-  onDestroy(() => cancelAnimationFrame(raf));
 
   // Geometry: needle pivots at the bottom-centre and swings ±SWING° around vertical.
   const CX = 130;

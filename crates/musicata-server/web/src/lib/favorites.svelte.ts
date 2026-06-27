@@ -19,15 +19,20 @@ class Favorites {
   }
 
   toggleTrack(id: string): void {
+    const wasFavorite = this.trackIds.has(id);
     const next = new Set(this.trackIds);
-    if (next.has(id)) {
-      next.delete(id);
-      api.unstar("track", id).catch(() => {});
-    } else {
-      next.add(id);
-      api.star("track", id).catch(() => {});
-    }
+    if (wasFavorite) next.delete(id);
+    else next.add(id);
     this.trackIds = next;
+
+    // Optimistic, but reconcile on failure so the heart doesn't lie about saved state.
+    const request = wasFavorite ? api.unstar("track", id) : api.star("track", id);
+    request.catch(() => {
+      const reverted = new Set(this.trackIds);
+      if (wasFavorite) reverted.add(id);
+      else reverted.delete(id);
+      this.trackIds = reverted;
+    });
   }
 }
 

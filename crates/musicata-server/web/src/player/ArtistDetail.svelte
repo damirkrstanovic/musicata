@@ -7,17 +7,21 @@
 
   let { id }: { id: string } = $props();
   let detail = $state<ArtistDetail | null>(null);
+  let failed = $state(false);
 
   $effect(() => {
     const artistId = id;
     let alive = true;
     detail = null;
+    failed = false;
     api
       .artistDetail(artistId)
       .then((d) => {
         if (alive) detail = d;
       })
-      .catch(() => {});
+      .catch(() => {
+        if (alive) failed = true;
+      });
     return () => {
       alive = false;
     };
@@ -53,6 +57,8 @@
   {#if detail.tracks.length}
     <TrackList tracks={detail.tracks} />
   {/if}
+{:else if failed}
+  <p class="admin-hint">Couldn't load this artist. Try again.</p>
 {:else}
   <p class="admin-hint">Loading…</p>
 {/if}

@@ -9,6 +9,14 @@ class Session {
   /** The initial status/me probe has completed (so the gate can stop showing a blank). */
   ready = $state(false);
 
+  constructor() {
+    // Registered once (this is a module singleton), so a 401 from any request — including
+    // during init — drops us to login, and the listener never stacks across init() calls.
+    window.addEventListener("musicata:unauthorized", () => {
+      this.user = null;
+    });
+  }
+
   get isAdmin(): boolean {
     return this.user?.role === "admin";
   }
@@ -28,9 +36,6 @@ class Session {
       // Network/feature error — leave defaults; the gate will show login.
     }
     this.ready = true;
-    window.addEventListener("musicata:unauthorized", () => {
-      this.user = null;
-    });
   }
 
   async login(username: string, password: string): Promise<void> {

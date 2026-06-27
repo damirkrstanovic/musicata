@@ -6,18 +6,22 @@
 
   let { id }: { id: string } = $props();
   let detail = $state<AlbumDetail | null>(null);
+  let failed = $state(false);
 
   // Refetch when navigating between albums.
   $effect(() => {
     const albumId = id;
     let alive = true;
     detail = null;
+    failed = false;
     api
       .albumDetail(albumId)
       .then((d) => {
         if (alive) detail = d;
       })
-      .catch(() => {});
+      .catch(() => {
+        if (alive) failed = true;
+      });
     return () => {
       alive = false;
     };
@@ -48,6 +52,8 @@
     </div>
   </section>
   <TrackList tracks={detail.tracks} />
+{:else if failed}
+  <p class="admin-hint">Couldn't load this album. Try again.</p>
 {:else}
   <p class="admin-hint">Loading…</p>
 {/if}

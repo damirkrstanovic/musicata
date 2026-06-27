@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import { api, type Playlist, type SmartPlaylist } from "../lib/api";
   import type { RadioStation } from "../types/RadioStation";
   import { nav } from "../lib/nav.svelte";
@@ -32,6 +33,7 @@
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => (search.query = value), 220);
   }
+  onDestroy(() => clearTimeout(searchTimer));
 
   async function newPlaylist() {
     const name = await promptText({ title: "New playlist", label: "Name", confirmLabel: "Create" });
