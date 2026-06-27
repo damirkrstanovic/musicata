@@ -898,9 +898,11 @@ scope; see its note). Milestones 7, 9, 10, and 11 are in progress.
 
 The remaining work lives in those in-progress milestones: **M7** — optional ListenBrainz
 scrobbling, richer playback events (loved/disliked/rated), and a web view for the stats
-endpoint (session/streak + favorites stats now ship as `GET /api/history/stats`); **M9** —
-Internet Archive / Jamendo / commercial providers and a metadata review-override UI (podcasts
-and the plugin-isolation decision are done); **M10** — a self-registering native endpoint (and
-the per-player auth that lands with it) plus a Squeezelite bridge (player capabilities are now
-advertised per backend); **M11** — the CamillaDSP/DAC tier plus signal-path and leveling
-polish.
+endpoint (session/streak + favorites stats ship as `GET /api/history/stats`); **M9** —
+collection/search browse for Internet Archive, Jamendo, commercial providers, and a metadata
+review-override UI (podcasts, the **Internet Archive** item provider, and the plugin-isolation
+decision are done); **M10** — the self-registering native endpoint *kind* that presents the
+shipped per-player token, plus a Squeezelite bridge (player capabilities are advertised per
+backend and **per-player endpoint auth is in**); **M11** — the CamillaDSP/DAC tier, the
+signal-path badge, an explicit Track/Album leveling selector, and Snapcast album-mode apply
+(**album/Auto leveling now ships**).
