@@ -267,15 +267,22 @@ const eqTitleBefore = await js(`document.querySelector('#now-title')?.textConten
 await js(`[...document.querySelectorAll('.eq-btn')].find(b=>/equalizer/i.test(b.title))?.click()`);
 await sleep(400);
 check("eq panel opens", await js(`!!document.querySelector('.eq-drawer')`));
-// Volume leveling: a quiet track (-20 LUFS, -10 dBTP) is boosted toward the -14 target when
-// leveling is on (the leveling gain goes above 1.0). The toggle is the first .eq-toggle.
-await js(`window.__audio?.setTrackLoudness(-20, -10)`);
-await js(`[...document.querySelectorAll('.eq-toggle input')][0]?.click()`);
+// Volume leveling. Track quiet (-20 LUFS) but album louder (-8 LUFS): track mode boosts the
+// quiet track (gain > 1), album mode uses the album aggregate instead (here → attenuation),
+// proving the mode selector picks the right LUFS.
+const setLeveling = (m) =>
+  js(`(()=>{const s=document.querySelector('.leveling-select'); if(s){s.value=${JSON.stringify(m)}; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
+await js(`window.__audio?.setTrackLoudness(-20, -10, -8, -2)`);
+await setLeveling("track");
 await sleep(200);
 check("volume leveling boosts a quiet track", (await js(`window.__audio?.levelingGain?.gain?.value ?? 0`)) > 1.5);
-await js(`[...document.querySelectorAll('.eq-toggle input')][0]?.click()`);
+await setLeveling("album");
+await sleep(200);
+check("album leveling uses the album loudness", (await js(`window.__audio?.levelingGain?.gain?.value ?? 1`)) < 1);
+await setLeveling("off");
 await js(`window.__audio?.setTrackLoudness(null, null)`);
-await js(`(()=>{const s=document.querySelector('.eq-field select'); if(s){s.value='demo-bass'; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
+// The Preset picker is a separate .eq-field select (not the leveling one).
+await js(`(()=>{const s=document.querySelector('.eq-field select:not(.leveling-select)'); if(s){s.value='demo-bass'; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
 await sleep(500);
 check("eq preset applies bands", (await js(`document.querySelectorAll('.eq-band').length`)) > 0);
 check("eq response curve renders", await js(`!!document.querySelector('.eq-curve-line')?.getAttribute('d')`));

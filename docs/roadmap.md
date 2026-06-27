@@ -817,9 +817,13 @@ polish remain.
   — i.e. the design's *Auto* mode — so an album's internal dynamics survive normalization, with
   no new UI control. Aggregation + storage are unit-tested; the web typecheck passes. An
   explicit Track-vs-Album selector is a follow-up. See [decisions.md](decisions.md).
+- [x] **Explicit Off/Track/Album leveling selector.** The EQ panel's leveling control is now a
+  three-way selector (`dsp.levelingMode`, persisted; migrates the legacy boolean → `album`), and
+  `audio.ts` applies the chosen mode (`setLevelingMode`). Smoke-tested (track mode boosts a quiet
+  track; album mode uses the album aggregate).
 - [ ] **Phase 6 (cont.) — remaining polish.** A Roon-style signal-path badge over the
-  WebSocket; phone-app filter export (GraphicEQ.txt / IR WAV for JamesDSP / Wavelet); an
-  explicit Track/Album leveling selector; server-side album-mode apply for Snapcast.
+  WebSocket; phone-app filter export (GraphicEQ.txt / IR WAV for JamesDSP / Wavelet); server-side
+  album-mode apply for Snapcast.
 
 Explicitly out of scope: a measurement suite (no sweep/RTA/mic capture), and any Dirac
 ingestion (its filters are locked to its own processor — non-exportable).

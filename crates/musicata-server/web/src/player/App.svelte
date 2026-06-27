@@ -105,8 +105,8 @@
 
   // Volume leveling toggle → graph (read the reactive dep first; see the note above).
   $effect(() => {
-    const leveling = dsp.leveling;
-    audio?.setLeveling(leveling);
+    const mode = dsp.levelingMode;
+    audio?.setLevelingMode(mode);
   });
 
   onMount(async () => {
@@ -114,7 +114,7 @@
     setAudio(audio);
     (window as unknown as { __audio?: unknown }).__audio = audio; // debug hook
     audio.setEq(dsp.enabled ? dsp.active : null); // apply persisted profile on load
-    audio.setLeveling(dsp.leveling);
+    audio.setLevelingMode(dsp.levelingMode);
     audio.onProgress((msg) => ws?.send(msg));
     audio.onEnded(() => ws?.send({ type: "ended" }));
     audio.start();

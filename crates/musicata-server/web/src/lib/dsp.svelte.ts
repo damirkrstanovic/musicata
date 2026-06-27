@@ -8,14 +8,23 @@ import { api } from "./api";
 
 const LS_KEY = "musicata-dsp"; // client prefs (+ legacy `custom`, migrated to the server once)
 
+/** Volume-leveling mode: off, per-track, or per-album (EBU R128 normalization).
+ *  Album uses the track's album aggregate (falling back to per-track), so an album's
+ *  internal dynamics survive normalization. */
+export type LevelingMode = "off" | "track" | "album";
+
+function isLevelingMode(value: unknown): value is LevelingMode {
+  return value === "off" || value === "track" || value === "album";
+}
+
 class Dsp {
   enabled = $state(false);
   activeId = $state<string | null>(null);
   /** The server-stored profile library (built-ins live in `dsp.ts` and are merged in). */
   custom = $state<EqProfile[]>([]);
   panelOpen = $state(false);
-  /** Volume leveling (EBU R128 normalization across tracks). */
-  leveling = $state(false);
+  /** Volume leveling (EBU R128 normalization across tracks / albums). */
+  levelingMode = $state<LevelingMode>("off");
   loaded = $state(false);
 
   constructor() {
@@ -23,14 +32,28 @@ class Dsp {
     try {
       const raw = localStorage.getItem(LS_KEY);
       if (raw) {
-        const p = JSON.parse(raw) as { enabled?: boolean; activeId?: string | null; leveling?: boolean };
+        const p = JSON.parse(raw) as {
+          enabled?: boolean;
+          activeId?: string | null;
+          levelingMode?: unknown;
+          leveling?: boolean; // legacy boolean toggle (pre-album mode)
+        };
         this.enabled = !!p.enabled;
         this.activeId = p.activeId ?? null;
-        this.leveling = !!p.leveling;
+        // Prefer the new mode; fall back to the legacy boolean (on → album, the Auto behavior).
+        this.levelingMode = isLevelingMode(p.levelingMode)
+          ? p.levelingMode
+          : p.leveling
+            ? "album"
+            : "off";
       }
     } catch {
       // private mode / corrupt — start empty
     }
+  }
+
+  get leveling(): boolean {
+    return this.levelingMode !== "off";
   }
 
   /** Fetch the server profile library; one-time migrate any legacy localStorage presets. */
@@ -68,8 +91,8 @@ class Dsp {
     this.enabled = v;
     this.saveLocal();
   }
-  setLeveling(v: boolean): void {
-    this.leveling = v;
+  setLevelingMode(mode: LevelingMode): void {
+    this.levelingMode = mode;
     this.saveLocal();
   }
   setActive(id: string | null): void {
@@ -106,7 +129,11 @@ class Dsp {
     try {
       localStorage.setItem(
         LS_KEY,
-        JSON.stringify({ enabled: this.enabled, activeId: this.activeId, leveling: this.leveling }),
+        JSON.stringify({
+          enabled: this.enabled,
+          activeId: this.activeId,
+          levelingMode: this.levelingMode,
+        }),
       );
     } catch {
       // private mode — fine

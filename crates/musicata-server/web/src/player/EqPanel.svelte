@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { dsp } from "../lib/dsp.svelte";
+  import { dsp, type LevelingMode } from "../lib/dsp.svelte";
   import { audioDevices } from "../lib/audioDevices.svelte";
   import { api } from "../lib/api";
   import { parseParametricEq } from "../lib/dsp";
@@ -111,17 +111,22 @@
       <button class="ghost-button" type="button" onclick={() => (dsp.panelOpen = false)}>Close</button>
     </header>
 
-    <label class="eq-toggle">
-      <input
-        type="checkbox"
-        checked={dsp.leveling}
-        onchange={(e) => dsp.setLeveling((e.currentTarget as HTMLInputElement).checked)}
-      />
+    <label class="eq-field">
       <span>Volume leveling</span>
+      <select
+        class="leveling-select"
+        value={dsp.levelingMode}
+        onchange={(e) => dsp.setLevelingMode((e.currentTarget as HTMLSelectElement).value as LevelingMode)}
+      >
+        <option value="off">Off</option>
+        <option value="track">Per track</option>
+        <option value="album">Per album</option>
+      </select>
     </label>
     <p class="eq-note">
-      Normalizes loudness across tracks (EBU R128) so quiet and loud songs play at the same
-      level — great for shuffle and radio.
+      Normalizes loudness (EBU R128) so songs play at an even level. <strong>Per track</strong>
+      evens out every song — great for shuffle and radio; <strong>per album</strong> keeps an
+      album's own quiet and loud moments, falling back to per-track until the album is analyzed.
     </p>
 
     <div class="eq-divider"></div>
