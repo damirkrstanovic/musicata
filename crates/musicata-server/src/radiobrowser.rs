@@ -57,7 +57,12 @@ impl Default for RadioBrowserClient {
 impl RadioBrowserClient {
     pub fn new(base: &str) -> Self {
         let user_agent = format!("Musicata/{}", env!("CARGO_PKG_VERSION"));
-        let http = ureq::AgentBuilder::new().user_agent(&user_agent).build();
+        // Bound the request: a stalled directory mirror must not tie up the blocking
+        // thread indefinitely (the archive/podcast providers cap at 20s too).
+        let http = ureq::AgentBuilder::new()
+            .user_agent(&user_agent)
+            .timeout(std::time::Duration::from_secs(20))
+            .build();
         Self {
             http,
             base: base.to_string(),

@@ -206,8 +206,16 @@ impl SmbConfig {
 /// Join a source base path with a source-relative path into one share-relative
 /// path (forward slashes; the `smb` crate normalizes separators).
 fn join_smb_path(base_path: &str, relative: &str) -> String {
-    let base = base_path.trim_matches(['/', '\\']);
-    let relative = relative.trim_matches(['/', '\\']).replace('\\', "/");
+    let base = base_path.replace('\\', "/");
+    let base = base.trim_matches('/');
+    // Drop `.`/`..`/empty segments from the untrusted relative path so an item id can't
+    // traverse above the configured base.
+    let relative = relative
+        .replace('\\', "/")
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+        .collect::<Vec<_>>()
+        .join("/");
     match (base.is_empty(), relative.is_empty()) {
         (true, true) => String::new(),
         (true, false) => relative,
@@ -436,11 +444,17 @@ impl SmbProvider {
     ) -> anyhow::Result<impl futures::Stream<Item = io::Result<Vec<u8>>> + Send + 'static> {
         let client = self.client().await?;
         let unc = self.config.item_unc(item_id)?;
-        let file = client
-            .create_file(&unc, &open_read_args())
-            .await
-            .map_err(|error| anyhow!("open {item_id}: {error}"))?
-            .unwrap_file();
+        let resource = match client.create_file(&unc, &open_read_args()).await {
+            Ok(resource) => resource,
+            Err(error) => {
+                // The cached connection may be dead — drop it so the next call reconnects.
+                self.invalidate_client().await;
+                return Err(anyhow!("open {item_id}: {error}"));
+            }
+        };
+        let Resource::File(file) = resource else {
+            return Err(anyhow!("{item_id} is not a file"));
+        };
 
         // A small bounded channel gives backpressure: at most a few chunks buffered.
         let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(4);
@@ -479,11 +493,16 @@ impl SmbProvider {
     pub async fn read_file(&self, item_id: &str) -> anyhow::Result<Vec<u8>> {
         let client = self.client().await?;
         let unc = self.config.item_unc(item_id)?;
-        let file = client
-            .create_file(&unc, &open_read_args())
-            .await
-            .map_err(|error| anyhow!("open {item_id}: {error}"))?
-            .unwrap_file();
+        let resource = match client.create_file(&unc, &open_read_args()).await {
+            Ok(resource) => resource,
+            Err(error) => {
+                self.invalidate_client().await;
+                return Err(anyhow!("open {item_id}: {error}"));
+            }
+        };
+        let Resource::File(file) = resource else {
+            return Err(anyhow!("{item_id} is not a file"));
+        };
 
         const CHUNK: usize = 256 * 1024;
         // Cap total read so a mis-pointed huge file can't exhaust memory.
@@ -516,6 +535,13 @@ impl SmbProvider {
         connect_share(&client, &self.config).await?;
         *guard = Some(client.clone());
         Ok(client)
+    }
+
+    /// Drop the cached connection so the next [`client`](Self::client) reconnects. Called
+    /// when an operation fails (e.g. the NAS rebooted and the cached client is dead),
+    /// otherwise every later request would reuse the dead connection until restart.
+    async fn invalidate_client(&self) {
+        *self.client.lock().await = None;
     }
 
     /// Verify the source is reachable: connect and enumerate the root directory.
@@ -623,7 +649,13 @@ impl SmbFs {
             .handle
             .block_on(self.client().create_file(&unc, &open_read_args()))
             .map_err(|error| self.io_err(error))?;
-        Ok(resource.unwrap_file())
+        match resource {
+            Resource::File(file) => Ok(file),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not a file",
+            )),
+        }
     }
 }
 
@@ -636,7 +668,13 @@ impl SourceFs for SmbFs {
                 .create_file(&unc, &open_read_args())
                 .await
                 .map_err(|error| self.io_err(error))?;
-            let directory: Arc<Directory> = Arc::new(resource.unwrap_dir());
+            let Resource::Directory(directory) = resource else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path is not a directory",
+                ));
+            };
+            let directory: Arc<Directory> = Arc::new(directory);
             let mut stream = Directory::query::<FileDirectoryInformation>(&directory, "*")
                 .await
                 .map_err(|error| self.io_err(error))?;
@@ -844,6 +882,16 @@ mod tests {
             join_smb_path("Music", "Artist\\Album\\x.flac"),
             "Music/Artist/Album/x.flac"
         );
+    }
+
+    #[test]
+    fn join_smb_path_neutralizes_traversal() {
+        // ISS-22: a `..` in the (untrusted) relative item id must not escape the base.
+        assert_eq!(join_smb_path("Music", "../secret"), "Music/secret");
+        assert_eq!(join_smb_path("Music", "a/../../b"), "Music/a/b");
+        assert_eq!(join_smb_path("Music", "./x.flac"), "Music/x.flac");
+        // Backslashes in the base are normalized too (consistent with smb_provider_id).
+        assert_eq!(join_smb_path("Music\\Sub", "x.flac"), "Music/Sub/x.flac");
     }
 
     /// In-memory positioned reader that counts how many `read_at` calls it serves.

@@ -182,20 +182,12 @@ Security-sensitive bugs are marked **[security]**.
 
 ### Providers / sources
 
-- [ ] **ISS-20 SMB cached client never invalidated on failure (no reconnect)** — `smb.rs:510`
-  After a NAS reboot/blip all later requests fail until process restart. *Bug-class; needs a
-  live/mock SMB server to repro.*
-- [ ] **ISS-21 SMB `unwrap_file`/`unwrap_dir` panic on wrong resource type** — `smb.rs:443,486,626,639`
-  Panics the request task if an id resolves to a dir (file op) or file (`read_dir`); `validate()`
-  handles the same case gracefully. *Needs mock SMB.*
-- [ ] **ISS-22 `join_smb_path` doesn't neutralize `..` or normalize backslashes in `base`** — `smb.rs:208`
-  Possible escape above `base_path`; also inconsistent with `smb_provider_id` (`providers.rs:74`).
-- [ ] **ISS-23 `scan_all` scans sources sequentially** — `providers.rs:360`
-  One slow/offline SMB source stalls every other source's refresh (against the decoupling convention).
-- [ ] **ISS-24 Radio Browser `ureq::Agent` has no timeout** — `radiobrowser.rs:60`
-  A hung mirror ties up a `spawn_blocking` thread indefinitely; other providers set a 20 s timeout.
-- [ ] **ISS-25 Podcast channel image ignores `itunes:image`** — `podcast.rs:88`
-  Feeds that supply art only via `<itunes:image href=...>` return `image_url == None`.
+- [x] **ISS-20 SMB cached client never invalidated on failure (no reconnect)** — `smb.rs:510` ✅ `invalidate_client` drops the cached connection when `create_file` fails in `read_range_stream`/`read_file`, so the next request reconnects (self-heals after a NAS reboot). Verified by compile (needs a live SMB server to exercise).
+- [x] **ISS-21 SMB `unwrap_file`/`unwrap_dir` panic on wrong resource type** — `smb.rs:443,486,626,639` ✅ all four now `match` the `Resource` and return an error (like `validate`) instead of panicking. Verified by compile.
+- [x] **ISS-22 `join_smb_path` doesn't neutralize `..` or normalize backslashes in `base`** — `smb.rs:208` ✅ drops `.`/`..`/empty segments from the relative path and normalizes base backslashes. Test `join_smb_path_neutralizes_traversal`.
+- [ ] **ISS-23 `scan_all` scans sources sequentially** — `providers.rs:360` ⏸️ DEFERRED — concurrency needs `futures::join_all` (gated behind `provider-smb`, so it would break `--no-default-features`) or a dependency-policy change; the providers borrow `&self` so they can't be spawned. Beneficiary is multi-SMB setups.
+- [x] **ISS-24 Radio Browser `ureq::Agent` has no timeout** — `radiobrowser.rs:60` ✅ 20 s agent timeout (matches archive/podcast). Verified by compile.
+- [x] **ISS-25 Podcast channel image ignores `itunes:image`** — `podcast.rs:88` ✅ `RssImage` also reads `@href` (quick-xml collapses the namespace), used as the artwork fallback. Test `channel_image_falls_back_to_itunes_image`.
 
 ### Metadata / enrichment
 

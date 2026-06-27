@@ -85,6 +85,8 @@ struct Rss {
 struct Channel {
     #[serde(default)]
     title: Option<String>,
+    // quick-xml strips namespace prefixes, so both `<image><url>` and the iTunes
+    // `<itunes:image href="...">` deserialize into this one field.
     #[serde(default)]
     image: Option<RssImage>,
     #[serde(rename = "item", default)]
@@ -93,8 +95,12 @@ struct Channel {
 
 #[derive(Debug, Deserialize)]
 struct RssImage {
+    /// RSS 2.0 `<image><url>...</url></image>`.
     #[serde(default)]
     url: Option<String>,
+    /// iTunes `<itunes:image href="..."/>` (artwork as an attribute).
+    #[serde(rename = "@href", default)]
+    href: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,9 +160,10 @@ pub fn parse_feed(xml: &str) -> anyhow::Result<PodcastFeed> {
             })
         })
         .collect();
+    let image_url = cleaned(channel.image.and_then(|image| image.url.or(image.href)));
     Ok(PodcastFeed {
         title: cleaned(channel.title),
-        image_url: cleaned(channel.image.and_then(|image| image.url)),
+        image_url,
         episodes,
     })
 }
@@ -291,6 +298,23 @@ mod tests {
 
         // No <guid> → the id falls back to the enclosure URL.
         assert_eq!(feed.episodes[1].id, "https://cdn.example.com/ep2.mp3");
+    }
+
+    #[test]
+    fn channel_image_falls_back_to_itunes_image() {
+        // ISS-25: feeds that supply art only via <itunes:image href="..."> still get it.
+        let feed_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <rss version="2.0">
+              <channel>
+                <title>Show</title>
+                <itunes:image href="https://cdn.example.com/cover.jpg"/>
+              </channel>
+            </rss>"#;
+        let feed = parse_feed(feed_xml).expect("parse");
+        assert_eq!(
+            feed.image_url.as_deref(),
+            Some("https://cdn.example.com/cover.jpg")
+        );
     }
 
     #[test]
