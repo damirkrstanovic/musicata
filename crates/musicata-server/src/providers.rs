@@ -16,6 +16,8 @@ use musicata_storage::{Database, SourceRecord};
 
 #[cfg(feature = "provider-opensubsonic")]
 use crate::opensubsonic::OpenSubsonicProvider;
+#[cfg(feature = "provider-podcast")]
+use crate::podcast::PodcastProvider;
 #[cfg(feature = "provider-smb")]
 use crate::smb::SmbProvider;
 
@@ -39,6 +41,14 @@ pub fn provider_from_record(record: &SourceRecord) -> anyhow::Result<ProviderHan
         #[cfg(not(feature = "provider-opensubsonic"))]
         "opensubsonic" => anyhow::bail!(
             "OpenSubsonic support is not compiled into this build (enable the `provider-opensubsonic` feature)"
+        ),
+        #[cfg(feature = "provider-podcast")]
+        "podcast" => Ok(ProviderHandle::Podcast(std::sync::Arc::new(
+            PodcastProvider::from_record(record)?,
+        ))),
+        #[cfg(not(feature = "provider-podcast"))]
+        "podcast" => anyhow::bail!(
+            "podcast support is not compiled into this build (enable the `provider-podcast` feature)"
         ),
         other => anyhow::bail!("unknown source kind: {other}"),
     }
@@ -135,6 +145,8 @@ pub enum ProviderHandle {
     Smb(Arc<SmbProvider>),
     #[cfg(feature = "provider-opensubsonic")]
     OpenSubsonic(Arc<OpenSubsonicProvider>),
+    #[cfg(feature = "provider-podcast")]
+    Podcast(Arc<PodcastProvider>),
 }
 
 impl ProviderHandle {
@@ -154,6 +166,8 @@ impl ProviderHandle {
             ProviderHandle::Smb(provider) => provider.provider_id().clone(),
             #[cfg(feature = "provider-opensubsonic")]
             ProviderHandle::OpenSubsonic(provider) => provider.provider_id().clone(),
+            #[cfg(feature = "provider-podcast")]
+            ProviderHandle::Podcast(provider) => provider.provider_id().clone(),
         }
     }
 
@@ -165,6 +179,8 @@ impl ProviderHandle {
             ProviderHandle::Smb(_) => ProviderCapabilities::DISK,
             #[cfg(feature = "provider-opensubsonic")]
             ProviderHandle::OpenSubsonic(_) => ProviderCapabilities::DISK,
+            #[cfg(feature = "provider-podcast")]
+            ProviderHandle::Podcast(provider) => provider.capabilities(),
         }
     }
 
@@ -178,6 +194,8 @@ impl ProviderHandle {
             ProviderHandle::Smb(provider) => provider.validate().await,
             #[cfg(feature = "provider-opensubsonic")]
             ProviderHandle::OpenSubsonic(provider) => provider.validate().await,
+            #[cfg(feature = "provider-podcast")]
+            ProviderHandle::Podcast(provider) => provider.validate().await,
         }
     }
 
@@ -198,6 +216,8 @@ impl ProviderHandle {
             ProviderHandle::OpenSubsonic(_) => {
                 anyhow::bail!("OpenSubsonic sources are browsed through the library endpoints")
             }
+            #[cfg(feature = "provider-podcast")]
+            ProviderHandle::Podcast(provider) => provider.browse().await,
         }
     }
 
@@ -218,6 +238,8 @@ impl ProviderHandle {
             ProviderHandle::OpenSubsonic(_) => {
                 anyhow::bail!("OpenSubsonic tracks are streamed through /api/tracks/{{id}}/stream")
             }
+            #[cfg(feature = "provider-podcast")]
+            ProviderHandle::Podcast(provider) => provider.resolve(item_id).await,
         }
     }
 
@@ -258,6 +280,11 @@ impl ProviderHandle {
             #[cfg(feature = "provider-opensubsonic")]
             ProviderHandle::OpenSubsonic(provider) => {
                 provider.scan_with_progress(prior, progress).await
+            }
+            // A podcast feed has no scannable catalogue; it's browsed + resolved like radio.
+            #[cfg(feature = "provider-podcast")]
+            ProviderHandle::Podcast(_) => {
+                anyhow::bail!("a podcast source has no scannable catalogue")
             }
         }
     }

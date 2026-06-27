@@ -92,7 +92,7 @@ network sources are added at runtime and persisted.
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
 | GET | `/api/sources` | List sources: `{ id, kind, display_name, enabled, capabilities }`. |
-| POST | `/api/sources` | Add a network source. SMB: `{ "kind":"smb", "host", "share", "base_path"?, "display_name"?, "username"?, "password"? }`. Builds + scans it. Requires the `provider-smb` build feature. |
+| POST | `/api/sources` | Add a network source. SMB: `{ "kind":"smb", "host", "share", "base_path"?, "display_name"?, "username"?, "password"? }`. OpenSubsonic: `{ "kind":"opensubsonic", "host", "username", "password" }`. Podcast: `{ "kind":"podcast", "host":"<feed-url>", "display_name"? }` (browse-only; episodes are streams, not scanned — requires the `provider-podcast` build feature). Builds + scans/validates it. |
 | DELETE | `/api/sources/{id}` | Remove a source and re-merge the library (not the local source). |
 | POST | `/api/sources/{id}/rescan` | Rescan all sources and persist the merged library. |
 | GET | `/api/sources/{id}/browse` | Browse a source's hierarchy (for browse-only providers like radio). |

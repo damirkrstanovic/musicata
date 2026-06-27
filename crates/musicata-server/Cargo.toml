@@ -11,13 +11,17 @@ repository.workspace = true
 # multi-room playout; build with `--no-default-features` for a minimal binary without the
 # `smb` dependency, the OpenSubsonic client, or the Snapcast decode path (the last also
 # needs the `snapserver`/`snapclient` binaries installed at runtime).
-default = ["provider-smb", "provider-opensubsonic", "snapcast"]
+default = ["provider-smb", "provider-opensubsonic", "provider-podcast", "snapcast"]
 # Read music from an SMB/CIFS network share directly (pure Rust, no mount). Pulls
 # in the `smb` crate; see crate::smb.
 provider-smb = ["dep:smb", "dep:futures"]
 # Consume a remote OpenSubsonic/Navidrome/Funkwhale server as a music source (pure ureq +
 # serde; no extra deps — the feature gates code only). See crate::opensubsonic.
 provider-opensubsonic = []
+# Subscribe to a podcast RSS feed as a browse-only (STREAM_ONLY) source: episodes are
+# streams, never scanned into the library. Pulls in `quick-xml` for feed parsing. See
+# crate::podcast.
+provider-podcast = ["dep:quick-xml"]
 # Generate TypeScript types for the web client from the server's response structs (the
 # admin DTOs). Off by default; see scripts/gen-web-types.sh.
 ts = ["dep:ts-rs", "musicata-core/ts"]
@@ -68,6 +72,9 @@ rubato = { version = "3", optional = true }
 libc = { version = "0.2", optional = true }
 # Library export/import archive (DB snapshot + artwork). Deflate only; MIT (AGPL-compatible).
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Podcast RSS feed parsing (the `provider-podcast` feature). serde-based deserialization
+# of the small RSS subset we need. MIT (AGPL-compatible).
+quick-xml = { version = "0.37", features = ["serialize"], optional = true }
 
 [dev-dependencies]
 tower.workspace = true

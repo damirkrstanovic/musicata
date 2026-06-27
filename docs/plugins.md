@@ -92,6 +92,27 @@ plugins matter). This matches the existing `PlayerHandle` enum pattern (an enum,
 transport; explicit auth/pairing for networked endpoints (the M10 server↔player auth
 task); endpoint tiering native vs bridged.
 
+## Plugin isolation — decision (2026-06-27)
+
+The standing M9 item "evaluate plugin isolation: in-process Rust modules, subprocesses,
+WebAssembly, or external services" is now **resolved**:
+
+- **First-party providers stay in-process, enum-dispatched, cargo-feature-gated.** This is
+  what every provider so far is (local disk, SMB, OpenSubsonic, internet radio, podcasts).
+  It is the simplest thing that works, has no IPC/serialization overhead, and the trait
+  boundary is kept stable so a future host can wrap it. There is **no need** and no plan to
+  isolate code Musicata itself ships.
+- **Isolation is a question only for *untrusted, third-party* plugins — which Musicata does
+  not load today, and won't until there's a real ecosystem need.** When that day comes, the
+  target is the **WebAssembly component model** (capability-based sandboxing, a stable ABI,
+  no native-ABI lock-in), with an **out-of-process subprocess** (the model `snapserver` and
+  CamillaDSP already use) as the pragmatic fallback for plugins that need native libraries
+  WASM can't reach. In-process dynamic loading of untrusted native code is explicitly
+  rejected (no sandbox, ABI-fragile).
+- **Consequence:** adding a provider remains "one enum variant + match arms + a cargo
+  feature." No plugin-host machinery is built speculatively. See
+  [decisions.md](decisions.md).
+
 ## Rollout
 
 - **M9 (sources):** ① **Internet radio** — the first non-library provider (no scan;

@@ -11,6 +11,8 @@ mod musicbrainz;
 #[cfg(feature = "provider-opensubsonic")]
 mod opensubsonic;
 mod players;
+#[cfg(feature = "provider-podcast")]
+mod podcast;
 mod providers;
 mod radiobrowser;
 mod recommendations;
@@ -4498,13 +4500,19 @@ async fn list_sources(State(state): State<AppState>) -> Result<Json<Vec<SourceVi
 }
 
 fn source_view(record: &musicata_storage::SourceRecord) -> SourceView {
+    // Most persisted sources are scannable disk-like sources; a podcast feed is a
+    // browse-only stream source, so report its capabilities honestly (the UI uses this
+    // to decide whether to offer a rescan, etc.).
+    let capabilities = match record.kind.as_str() {
+        "podcast" => musicata_core::ProviderCapabilities::STREAM_ONLY,
+        _ => musicata_core::ProviderCapabilities::DISK,
+    };
     SourceView {
         id: record.id.clone(),
         kind: record.kind.clone(),
         display_name: record.display_name.clone(),
         enabled: record.enabled,
-        // Every source kind we persist today is a scannable disk-like source.
-        capabilities: musicata_core::ProviderCapabilities::DISK,
+        capabilities,
     }
 }
 
@@ -4605,6 +4613,45 @@ async fn create_source(
                 base_path: None,
                 username: Some(username.to_string()),
                 password: Some(password.to_string()),
+                domain: None,
+                created_at_unix_seconds: now_unix_seconds(),
+            }
+        }
+        #[cfg(feature = "provider-podcast")]
+        "podcast" => {
+            // `host` carries the feed URL; no credentials. The episodes are streamed, not
+            // scanned, so this is a browse-only (STREAM_ONLY) source like internet radio.
+            let url = request
+                .host
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::bad_request("feed URL is required for a podcast source")
+                })?;
+            let display_name = request
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    url.split_once("://")
+                        .map(|(_, rest)| rest)
+                        .unwrap_or(url)
+                        .trim_end_matches('/')
+                        .to_string()
+                });
+            musicata_storage::SourceRecord {
+                id: crate::podcast::podcast_provider_id(url),
+                kind: "podcast".to_string(),
+                display_name,
+                enabled: true,
+                host: Some(url.to_string()),
+                share: None,
+                base_path: None,
+                username: None,
+                password: None,
                 domain: None,
                 created_at_unix_seconds: now_unix_seconds(),
             }

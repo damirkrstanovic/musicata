@@ -582,7 +582,11 @@ Tasks:
   feature-gated as `provider-smb`. Scanning runs the shared scanner over an SMB
   `SourceFs` (a `Read+Seek`-over-`read_at` adapter with a read-ahead cache feeds
   lofty); streaming fetches only the requested byte range.
-- Evaluate plugin isolation: in-process Rust modules, subprocesses, WebAssembly, or external services.
+- [x] Evaluate plugin isolation: in-process Rust modules, subprocesses, WebAssembly, or
+  external services. **Decided** ([plugins.md](plugins.md#plugin-isolation--decision-2026-06-27)):
+  first-party providers stay **in-process enum-dispatch**; untrusted third-party plugins (none
+  today) would target the **WASM component model**, subprocess as fallback. No plugin-host
+  machinery is built speculatively.
 - [x] Document legal/API constraints for Spotify, Tidal, Qobuz, and similar services
   before implementation. Done (see prior-art §9; two fact-checked research passes).
   **Verdict:** every commercial service needs an unofficial, ToS-violating
@@ -609,7 +613,17 @@ Tasks:
     the provider registry, so an upstream instance must serve local/SMB tracks (not OpenSubsonic
     ones) — routing that through the registry is a later milestone. Cover art from upstream is a
     follow-up (the artwork pass fills album art meanwhile).
-  - [ ] **Podcasts (RSS / Podcast Index) + Internet Archive** — DRM-free, public APIs.
+  - [x] **Podcasts (RSS)** — DRM-free, no API key. Shipped as `ProviderHandle::Podcast`
+    (`crate::podcast`, feature `provider-podcast`, default-on; new dep `quick-xml`, MIT). A
+    podcast source is **browse-only (`STREAM_ONLY`)**, never scanned into the library: the feed
+    URL lives in the source's `host` column; `browse()` fetches + parses the feed into episode
+    `BrowseEntry`s (enclosure URLs inline) and `resolve()` maps an episode id → its stream —
+    the same source-vs-transport path internet radio uses. Added via `POST /api/sources`
+    (`{"kind":"podcast","host":"<feed-url>"}`); reachable at `/api/sources/{id}/browse`+`/resolve`.
+    Parser + config + provider-id are unit-tested; a `#[ignore]`d `podcast_live_browse` covers
+    the network path. *Follow-ups:* an `/admin` add-podcast UI, Podcast Index search, and
+    Internet Archive. See [decisions.md](decisions.md).
+  - [ ] **Internet Archive** — DRM-free, public API (follow-up to podcasts).
   - [ ] **Jamendo** (Creative Commons) — public REST API (free `client_id`),
     FLAC/OGG/MP3; `jamendo-rs` crate.
   - [ ] Commercial services, if ever: **opt-in, cargo-feature-gated, user-supplies-own
