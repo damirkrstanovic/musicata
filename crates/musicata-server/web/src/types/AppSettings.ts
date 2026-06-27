@@ -23,4 +23,16 @@ fingerprint_enabled: boolean,
  * Apply real MusicBrainz metadata (title/artist/album/track number) to fingerprinted
  * tracks, without overwriting embedded tags. DB-only; files are never modified.
  */
-musicbrainz_enrich_enabled: boolean, };
+musicbrainz_enrich_enabled: boolean, 
+/**
+ * Audio-ML analysis (embeddings + tags via the `musicata-ml` service). Off by default.
+ */
+ml_enabled: boolean, 
+/**
+ * Base URL of the `musicata-ml` service (empty = unset).
+ */
+ml_service_url: string, 
+/**
+ * Daily local run time for ML analysis, "HH:MM" (default 02:00).
+ */
+ml_schedule: string, };

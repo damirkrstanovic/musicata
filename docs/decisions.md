@@ -29,6 +29,23 @@ Building the optional audio-ML service (`crates/musicata-ml`). Design + run guid
 - **Deferred to later phases:** sqlite-vec storage + the **scheduled** worker (default 02:00
   local), recommendation integration, and packaging. Phase 1 is just the verified service.
 
+### Phase 2b — scheduled worker, settings
+
+- **The ML worker is scheduled, not always-draining** (unlike the other workers): off by default,
+  it runs at a user-set daily **local** time (default 02:00), or on demand via `POST
+  /api/ml/analyze`. Local time is computed with `libc::localtime_r` (no datetime dep — the project
+  avoids chrono); `seconds_until` is pure + unit-tested. Settings (`ml_enabled`/`ml_service_url`/
+  `ml_schedule`) live in the DB + `/api/settings`, per the in-product-config convention. `libc`
+  became a non-optional server dep (was snapcast-only).
+- **The service analyzes a centered ~15 s excerpt, not the whole track.** PANNs is trained on
+  ~10 s AudioSet clips, so a short centered window is both faster and more model-appropriate.
+- **CPU only — GPU was investigated and dropped.** A release build does ~1 s/track on CPU; the
+  cost is the audio decode, not inference, so GPU offers no speedup. I trialled the ONNX Runtime
+  GPU execution providers (CUDA/ROCm/MIGraphX/WebGPU) on the dev box — WebGPU/Vulkan and MIGraphX
+  did engage the AMD GPU, but neither beat release CPU for this model, so they weren't worth the
+  build/deploy complexity. The lesson that mattered: **always measure release** — debug-build
+  timings were decode-dominated and made GPU look necessary when it wasn't.
+
 ### Phase 2a — sqlite-vec as standard storage (not ML-gated)
 
 - **sqlite-vec is loaded on every Musicata connection, unconditionally** (per the directive:

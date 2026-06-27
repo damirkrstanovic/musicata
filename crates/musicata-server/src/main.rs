@@ -12,6 +12,7 @@ mod mpd;
 mod musicbrainz;
 #[cfg(feature = "provider-opensubsonic")]
 mod opensubsonic;
+mod ml;
 mod players;
 #[cfg(feature = "provider-podcast")]
 mod podcast;
@@ -103,6 +104,8 @@ struct AppState {
     db_path: PathBuf,
     artwork_dir: PathBuf,
     export_status: Arc<std::sync::Mutex<backup::ExportStatus>>,
+    // "Run audio analysis now" signal for the scheduled ML worker (`ml::ml_loop`).
+    ml_trigger: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +220,8 @@ async fn main() -> Result<()> {
     // than before binding) is what keeps the web port available even while a large
     // or offline source is being scanned.
     let rescan_lock = Arc::new(Mutex::new(()));
+    // "Run audio analysis now" signal, shared between the API and the scheduled ML worker.
+    let ml_trigger = Arc::new(tokio::sync::Notify::new());
     // Cache fetched cover art next to the database (e.g. `.musicata/artwork/`).
     let artwork_cache = Arc::new(artwork::ArtworkCache::new(
         config
@@ -282,6 +287,13 @@ async fn main() -> Result<()> {
                 Arc::new(recommendations::ListenBrainzClient::new()),
                 ready_rx.clone(),
             ));
+            tokio::spawn(ml::ml_loop(
+                database.clone(),
+                providers.clone(),
+                activity.clone(),
+                ml_trigger.clone(),
+                ready_rx.clone(),
+            ));
         }
     }
 
@@ -331,6 +343,7 @@ async fn main() -> Result<()> {
             subsonic_auth,
             artwork_cache,
             config.database.clone(),
+            ml_trigger,
         ),
     )
     .await
@@ -2080,6 +2093,7 @@ fn app(
     subsonic_auth: subsonic::SubsonicAuth,
     artwork_cache: Arc<artwork::ArtworkCache>,
     db_path: PathBuf,
+    ml_trigger: Arc<tokio::sync::Notify>,
 ) -> Router {
     let artwork_dir = db_path
         .parent()
@@ -2102,6 +2116,7 @@ fn app(
         db_path,
         artwork_dir,
         export_status: Arc::new(std::sync::Mutex::new(backup::ExportStatus::default())),
+        ml_trigger,
     };
     Router::new()
         .merge(subsonic::routes())
@@ -2192,6 +2207,8 @@ fn app(
         .route("/api/activity", get(list_activity))
         .route("/api/activity/ws", get(activity_ws))
         .route("/api/settings", get(get_settings).patch(update_settings))
+        .route("/api/ml/status", get(ml_status))
+        .route("/api/ml/analyze", post(ml_analyze))
         .merge(snapcast_routes())
         .route(
             "/api/albums/{id}/metadata/musicbrainz/candidates",
@@ -4051,6 +4068,12 @@ struct AppSettings {
     /// Apply real MusicBrainz metadata (title/artist/album/track number) to fingerprinted
     /// tracks, without overwriting embedded tags. DB-only; files are never modified.
     musicbrainz_enrich_enabled: bool,
+    /// Audio-ML analysis (embeddings + tags via the `musicata-ml` service). Off by default.
+    ml_enabled: bool,
+    /// Base URL of the `musicata-ml` service (empty = unset).
+    ml_service_url: String,
+    /// Daily local run time for ML analysis, "HH:MM" (default 02:00).
+    ml_schedule: String,
 }
 
 async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>, AppError> {
@@ -4063,11 +4086,27 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
         .await
         .map_err(db_error)?
         .unwrap_or_default();
+    let ml_enabled = ml::enabled(&state.database).await;
+    let ml_service_url = state
+        .database
+        .get_setting(ml::SETTING_ML_SERVICE_URL)
+        .await
+        .map_err(db_error)?
+        .unwrap_or_default();
+    let ml_schedule = state
+        .database
+        .get_setting(ml::SETTING_ML_SCHEDULE)
+        .await
+        .map_err(db_error)?
+        .unwrap_or_else(|| "02:00".to_string());
     Ok(Json(AppSettings {
         artwork_fetch,
         fanart_tv_key,
         fingerprint_enabled,
         musicbrainz_enrich_enabled,
+        ml_enabled,
+        ml_service_url,
+        ml_schedule,
     }))
 }
 
@@ -4077,6 +4116,9 @@ struct SettingsUpdate {
     fanart_tv_key: Option<String>,
     fingerprint_enabled: Option<bool>,
     musicbrainz_enrich_enabled: Option<bool>,
+    ml_enabled: Option<bool>,
+    ml_service_url: Option<String>,
+    ml_schedule: Option<String>,
 }
 
 async fn update_settings(
@@ -4114,7 +4156,51 @@ async fn update_settings(
             .await
             .map_err(db_error)?;
     }
+    if let Some(enabled) = update.ml_enabled {
+        state
+            .database
+            .set_setting(ml::SETTING_ML_ENABLED, if enabled { "true" } else { "false" })
+            .await
+            .map_err(db_error)?;
+    }
+    if let Some(url) = update.ml_service_url {
+        state
+            .database
+            .set_setting(ml::SETTING_ML_SERVICE_URL, url.trim())
+            .await
+            .map_err(db_error)?;
+    }
+    if let Some(schedule) = update.ml_schedule {
+        state
+            .database
+            .set_setting(ml::SETTING_ML_SCHEDULE, schedule.trim())
+            .await
+            .map_err(db_error)?;
+    }
     get_settings(State(state)).await
+}
+
+/// Audio-ML status for `/admin`: whether it's on, how many tracks are analyzed, and the total.
+async fn ml_status(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
+    let analyzed = state.database.embedding_count().await.map_err(db_error)?;
+    let total = state
+        .database
+        .summary()
+        .await
+        .map_err(db_error)?
+        .map(|summary| summary.track_count as i64)
+        .unwrap_or(0);
+    Ok(Json(json!({
+        "enabled": ml::enabled(&state.database).await,
+        "analyzed": analyzed,
+        "total": total,
+    })))
+}
+
+/// Trigger an audio-analysis run now (the scheduled worker otherwise runs at the daily time).
+async fn ml_analyze(State(state): State<AppState>) -> StatusCode {
+    state.ml_trigger.notify_one();
+    StatusCode::ACCEPTED
 }
 
 // ---- Snapcast multi-room control (configuration lives in the product) ----
@@ -9688,6 +9774,7 @@ mod tests {
                 },
                 std::sync::Arc::new(crate::artwork::ArtworkCache::new(self.root.join("artwork"))),
                 self.root.join("musicata.db"),
+                std::sync::Arc::new(tokio::sync::Notify::new()),
             );
             (router, database)
         }

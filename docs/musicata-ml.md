@@ -45,6 +45,15 @@ MUSICATA_ML_DATA_URL=https://huggingface.co/pranjal-pravesh/PANNs_CNN14_ONNX/res
   musicata-ml            # listens on 127.0.0.1:3091 (set MUSICATA_ML_ADDR to change)
 ```
 
+## Performance
+
+**CPU only — no GPU.** A **release** build does **~1 s per track** (the whole `testdata` library,
+123 tracks, in ~110 s); inference is sub-second and the cost is mostly the audio decode. GPU
+acceleration was investigated (CUDA/ROCm/MIGraphX/WebGPU execution providers) and **dropped** — on
+the test hardware it gave no speedup over release CPU for this model, so it wasn't worth the
+build/deploy complexity. **Build the service in release** (`cargo build -p musicata-ml --release`);
+a debug build is much slower because the audio *decode* is unoptimized.
+
 ## HTTP API
 
 | Method | Path | Purpose |
@@ -57,10 +66,13 @@ MUSICATA_ML_DATA_URL=https://huggingface.co/pranjal-pravesh/PANNs_CNN14_ONNX/res
 
 - **Phase 1 — the service. ✅ Done** (this). Decode + ONNX inference + HTTP; decode unit-tested,
   inference verified against real tracks.
-- **Phase 2 — server integration.** A `track_embedding` store via **sqlite-vec** (vector index
-  from the start), and a **scheduled** `ml_loop` (off by default; user-set daily time, default
-  **02:00 local**) that sends un-analyzed tracks to the service and stores embeddings + tags.
-  Settings + service URL in `/admin`.
+- **Phase 2 — server integration. ✅ Done.** sqlite-vec is **standard storage** (loaded on every
+  connection); the `track_embedding` `vec0` index + `track_features` table hold embeddings + tags.
+  A **scheduled** `ml_loop` (off by default; user-set daily time, default **02:00 local**; manual
+  `POST /api/ml/analyze` to run now) posts un-analyzed tracks to the service and stores the
+  results. Settings (`ml_enabled` / `ml_service_url` / `ml_schedule`) are in `/api/settings`;
+  status at `/api/ml/status`. The service analyzes a centered ~15 s excerpt per track. Verified
+  end-to-end on the real library (correct embeddings + tags stored, KNN similarity works).
 - **Phase 3 — consume it.** KNN "sounds-like" similarity feeding recommendations/radio; tags as
   browse facets / smart-playlist criteria.
 - **Phase 4 — packaging.** A separate optional container image for `musicata-ml` (not in the

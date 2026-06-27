@@ -31,7 +31,7 @@ ts = ["dep:ts-rs", "musicata-core/ts"]
 # Synchronized multi-room playback via Snapcast: decode the zone/player queue to PCM
 # server-side and feed a managed `snapserver` over a FIFO, controlled by JSON-RPC.
 # Requires the `snapserver`/`snapclient` binaries installed; see crate::snapcast.
-snapcast = ["dep:rubato", "dep:libc"]
+snapcast = ["dep:rubato"]
 
 [dependencies]
 anyhow.workspace = true
@@ -69,10 +69,10 @@ ts-rs = { version = "10", optional = true }
 # 44.1/48/96 kHz; snapserver runs at one fixed rate). Pulled in under `snapcast`;
 # MIT (AGPL-compatible).
 rubato = { version = "3", optional = true }
-# Used by the `snapcast` feature only: PR_SET_PDEATHSIG so a managed snapserver dies with us
-# even on SIGKILL (prevents an orphan that would fight a restarted instance for the FIFO).
+# Local-time scheduling for the ML worker (`localtime_r`, no datetime dep) and, under the
+# `snapcast` feature, PR_SET_PDEATHSIG so a managed snapserver dies with us even on SIGKILL.
 # MIT/Apache-2.0 (AGPL-compatible).
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 # Library export/import archive (DB snapshot + artwork). Deflate only; MIT (AGPL-compatible).
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Podcast RSS feed parsing (the `provider-podcast` feature). serde-based deserialization

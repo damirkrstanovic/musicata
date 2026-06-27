@@ -29,6 +29,10 @@ use crate::model::{Analysis, AudioModel};
 /// The model's fixed input sample rate (PANNs CNN14 16 kHz variant).
 const SAMPLE_RATE: u32 = 16_000;
 const MODEL_ID: &str = "panns-cnn14-16k";
+/// Analyze a centered excerpt of at most this many seconds. PANNs is trained on ~10 s AudioSet
+/// clips, so a short window is both representative *and* far faster than a whole multi-minute
+/// track (inference cost scales with length). The centered window skips quiet intros/outros.
+const MAX_ANALYZE_SECONDS: usize = 15;
 
 #[derive(Clone)]
 struct AppState {
@@ -77,6 +81,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// A centered window of at most `max` samples (the whole signal if it's already shorter).
+fn center_excerpt(samples: &[f32], max: usize) -> &[f32] {
+    if samples.len() <= max {
+        return samples;
+    }
+    let start = (samples.len() - max) / 2;
+    &samples[start..start + max]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::center_excerpt;
+
+    #[test]
+    fn center_excerpt_caps_and_centers() {
+        let signal: Vec<f32> = (0..100).map(|n| n as f32).collect();
+        // Shorter than the cap → unchanged.
+        assert_eq!(center_excerpt(&signal, 200).len(), 100);
+        // Longer → a centered window of exactly `max`.
+        let excerpt = center_excerpt(&signal, 40);
+        assert_eq!(excerpt.len(), 40);
+        assert_eq!(excerpt[0], 30.0); // (100-40)/2 = 30
+    }
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "model": MODEL_ID }))
 }
@@ -98,8 +127,9 @@ async fn analyze(
 ) -> Result<Json<Analysis>, (StatusCode, String)> {
     let result = tokio::task::spawn_blocking(move || -> Result<Analysis, String> {
         let samples = decode::decode_to_mono(&body, SAMPLE_RATE).map_err(|e| e.to_string())?;
+        let excerpt = center_excerpt(&samples, MAX_ANALYZE_SECONDS * SAMPLE_RATE as usize);
         let mut model = state.model.lock().map_err(|_| "model lock poisoned".to_string())?;
-        model.analyze(&samples, 12).map_err(|e| e.to_string())
+        model.analyze(excerpt, 12).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

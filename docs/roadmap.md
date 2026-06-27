@@ -490,9 +490,13 @@ Tasks:
   raw 16 kHz waveform and serves a 2048-d embedding + AudioSet tags over HTTP (`/analyze`).
   Real-track verified (a dub track → Music/Drum/Bass/Percussion tags). Decisions: a Rust/ONNX
   model (not Python), **raw-waveform-in** model so no Rust spectrogram code, model fetched at
-  runtime, crate excluded from the default build. Remaining: sqlite-vec storage + a scheduled
-  worker (default 02:00 local), recommendation integration, separate packaging. See
-  [musicata-ml.md](musicata-ml.md) + [decisions.md](decisions.md).
+  runtime, crate excluded from the default build. **Phase 2 shipped** too: sqlite-vec is standard
+  storage, a `track_embedding` vec0 index + a **scheduled** `ml_loop` (off by default, default
+  02:00 local, manual `POST /api/ml/analyze`) post tracks to the service and store embeddings +
+  tags; settings in `/api/settings`. **CPU only** (~1 s/track in a release build; GPU was trialled
+  and dropped — no speedup for this model). Remaining: recommendation integration (KNN
+  "sounds-like") and separate packaging. See [musicata-ml.md](musicata-ml.md) +
+  [decisions.md](decisions.md).
 
 Done when:
 

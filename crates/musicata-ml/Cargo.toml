@@ -20,7 +20,8 @@ ureq.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # ONNX Runtime binding. `download-binaries` (default) fetches the ORT shared library, so no
-# system install is needed. This is why the crate is excluded from the default workspace build.
+# system install is needed. CPU inference is fast (~1 s per track in release); no GPU provider.
+# Excluded from the default workspace build (heavy native dep).
 ort = "2.0.0-rc.10"
 # Decode any library format to PCM, then resample to the model's 16 kHz — same crates the
 # server's Snapcast path uses.
