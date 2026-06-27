@@ -426,7 +426,11 @@ Done when:
 
 ## Milestone 7: Listening History And Recommendations
 
-Status: in progress.
+Status: core complete; follow-ups open. All four "done when" criteria are met — durable
+history, **disable/delete history**, useful local smart playlists without external services, and
+ML documented as optional. Remaining are enhancements, not gaps: richer event kinds
+(loved/disliked/rated), recommendation **import** from ListenBrainz, audio as an autoplay source,
+and per-user history (deliberately deferred — see below).
 
 Goal: turn playback behavior into useful local discovery without compromising privacy.
 
@@ -513,8 +517,10 @@ Tasks:
   and dropped — no speedup for this model). **Phase 3 shipped:** `GET /api/tracks/{id}/similar`
   ("sounds like this" — cosine KNN), the diverse **`/audio-radio`** station (artist-interleaved)
   with a per-track "≈" UI action, and **tags as a browse facet** (`/api/browse` `tags` + a `tag`
-  filter on tracks/albums + a "Sounds" dropdown). Remaining: audio as an autoplay source, and the
-  Phase 4 separate packaging. See [musicata-ml.md](musicata-ml.md) + [decisions.md](decisions.md).
+  filter on tracks/albums + a "Sounds" dropdown). **Phase 4 packaging shipped:** a separate
+  optional `Dockerfile.ml` image (trixie-based, model cached on a volume), verified to build and
+  serve. Remaining: audio as an autoplay source. See [musicata-ml.md](musicata-ml.md) +
+  [decisions.md](decisions.md).
 
 Done when:
 
@@ -941,11 +947,15 @@ Milestones 0–6 and 8 are complete (M5's server-owned queue model now covers al
 kinds: the browser player, **per-zone queues** (`ZonePlayer`, migration v18), and
 **MPD's queue is server-owned** — Musicata owns content/order, MPD owns the cursor;
 restored paused on startup, re-asserted over external edits). **M12 is complete** (LAN-first
-scope; see its note). Milestones 7, 9, 10, and 11 are in progress.
+scope; see its note). **M7's "done when" is now met** (core complete; see its note) — durable
+history, disable/delete history, local smart playlists, and ML optional all ship. Milestones 9,
+10, and 11 are in progress; M7 has only enhancement follow-ups left.
 
-The remaining work lives in those in-progress milestones: **M7** — optional ListenBrainz
-scrobbling and richer playback events (loved/disliked/rated); the stats endpoint **and its web
-view** now ship; **M9** — collection/search browse for Internet Archive, Jamendo, commercial
+The remaining work lives in those milestones: **M7** (follow-ups only) — richer playback events
+(loved/disliked/rated), recommendation *import* from ListenBrainz, and audio as an autoplay
+source (audio similarity + the diverse `/audio-radio`, tags-as-facet, ListenBrainz scrobbling,
+and the separate `musicata-ml` image all ship); **M9** — collection/search browse for Internet
+Archive, Jamendo, commercial
 providers, and a metadata review-override UI (podcasts + the Internet Archive item provider —
 both with **/admin source forms** — and the plugin-isolation decision are done); **M10** — the
 self-registering native endpoint *kind* that presents the shipped per-player token, plus a

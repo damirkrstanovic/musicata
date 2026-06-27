@@ -83,5 +83,11 @@ a debug build is much slower because the audio *decode* is unoptimized.
   AudioSet tags surface in `/api/browse` (`tags`, most-common first) and as a `tag` filter on
   `/api/tracks`+`/api/albums` and a "Sounds" dropdown in the web browse bar — a content-based
   facet that works even for files with no genre tag. *Follow-ups:* audio as an autoplay source.
-- **Phase 4 — packaging.** A separate optional container image for `musicata-ml` (not in the
-  slim server image).
+- **Phase 4 — packaging. ✅ Done.** A separate optional container image, **`Dockerfile.ml`**
+  (kept out of the slim server image so the server never links the ONNX stack):
+  `docker build -f Dockerfile.ml -t musicata-ml .`. The model (~327 MB) is fetched on first run
+  and cached on a `/data` volume; the server reaches the service via the `ml_service_url`
+  setting. **Built on Debian *trixie*, not bookworm** — the ONNX Runtime that `ort` downloads is
+  linked against glibc ≥ 2.38 (`__isoc23_*`), so it won't link/run on bookworm's 2.36. Verified
+  end-to-end: image builds (108 MB), boots, downloads the model, and serves `/health` + `/info`
+  (2048-d embedding, 527 tags, 16 kHz).
