@@ -1063,6 +1063,13 @@ async fn loudness_pass(
     } else {
         activity.remove(task);
     }
+    // New per-track loudness changes the album aggregates; recompute them so album-mode
+    // leveling stays in step. Cheap, and only when this pass produced data.
+    if durable > 0
+        && let Err(error) = database.recompute_album_loudness(now_unix_seconds()).await
+    {
+        tracing::warn!(%error, "recompute album loudness failed");
+    }
     durable
 }
 

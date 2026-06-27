@@ -615,6 +615,11 @@ pub struct QueueItem {
     /// player uses these to apply per-track volume leveling (see web `lib/audio.ts`).
     pub integrated_loudness_lufs: Option<f64>,
     pub true_peak_dbtp: Option<f64>,
+    /// The track's **album** aggregate loudness + true-peak, when computed. With leveling on,
+    /// the browser prefers these (album mode) so an album's internal dynamics survive,
+    /// falling back to the per-track values above.
+    pub album_integrated_loudness_lufs: Option<f64>,
+    pub album_true_peak_dbtp: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

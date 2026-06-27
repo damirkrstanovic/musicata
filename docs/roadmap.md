@@ -808,9 +808,17 @@ polish remain.
   with the clip check combined with the EQ preamp; Off/Track toggle. Design + remaining work
   (Album/Auto, tag bootstrap, server-side apply for Snapcast, an `/admin` analysis toggle) in
   **`docs/loudness.md`**. The key dependency for smooth **continuous play** + even **multiroom**.
-- [ ] **Phase 6 (cont.) — polish.** A Roon-style signal-path badge over the WebSocket;
-  phone-app filter export (GraphicEQ.txt / IR WAV for JamesDSP / Wavelet); Volume Leveling
-  Album/Auto modes.
+- [x] **Phase 6 (cont.) — Album/Auto volume leveling.** Album loudness ships: an
+  `album_loudness` table (migration v29) holds the **duration-weighted mean** of each album's
+  per-track integrated loudness (`Database::recompute_album_loudness`, refreshed after every
+  loudness pass), surfaced on `QueueItem.album_integrated_loudness_lufs`/`album_true_peak_dbtp`.
+  With leveling on, the browser now **prefers the album aggregate** and falls back to per-track
+  — i.e. the design's *Auto* mode — so an album's internal dynamics survive normalization, with
+  no new UI control. Aggregation + storage are unit-tested; the web typecheck passes. An
+  explicit Track-vs-Album selector is a follow-up. See [decisions.md](decisions.md).
+- [ ] **Phase 6 (cont.) — remaining polish.** A Roon-style signal-path badge over the
+  WebSocket; phone-app filter export (GraphicEQ.txt / IR WAV for JamesDSP / Wavelet); an
+  explicit Track/Album leveling selector; server-side album-mode apply for Snapcast.
 
 Explicitly out of scope: a measurement suite (no sweep/RTA/mic capture), and any Dirac
 ingestion (its filters are locked to its own processor — non-exportable).

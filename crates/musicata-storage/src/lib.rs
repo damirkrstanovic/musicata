@@ -291,6 +291,13 @@ impl Database {
             set_user_version(&self.pool, 28).await?;
         }
 
+        if version < 29 {
+            for statement in MIGRATION_029_ALBUM_LOUDNESS {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 29).await?;
+        }
+
         Ok(())
     }
 
@@ -1985,15 +1992,115 @@ impl Database {
         }
     }
 
-    /// Re-attach per-track loudness to queue items loaded from the persisted snapshot (the
-    /// queue tables don't store it). Keeps a restored queue's volume leveling working.
+    /// An album's aggregate (integrated LUFS, true-peak dBTP), if computed. Feeds the
+    /// browser's album-mode volume leveling.
+    pub async fn album_loudness(&self, album_id: &str) -> Result<Option<(f64, f64)>> {
+        let row = sqlx::query(
+            "SELECT integrated_lufs, true_peak_dbtp FROM album_loudness
+             WHERE album_id = ?1 AND integrated_lufs IS NOT NULL",
+        )
+        .bind(album_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => {
+                let lufs: f64 = row.try_get("integrated_lufs")?;
+                let peak: Option<f64> = row.try_get("true_peak_dbtp")?;
+                Ok(Some((lufs, peak.unwrap_or(0.0))))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Recompute every album's aggregate loudness from the per-track measurements and store
+    /// it in `album_loudness`. Album loudness is the **duration-weighted mean** of the tracks'
+    /// integrated loudness (mean in the linear domain, converted back to LUFS — see
+    /// [`album_loudness_from_tracks`]); the album true-peak is the max across its tracks.
+    /// Returns how many albums were written. Cheap and only run after a loudness pass that
+    /// produced new data.
+    pub async fn recompute_album_loudness(&self, now_unix_seconds: i64) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT t.album_id AS album_id, l.integrated_lufs AS lufs,
+                    l.true_peak_dbtp AS peak, t.duration_seconds AS duration
+             FROM track_loudness l JOIN tracks t ON t.id = l.track_id
+             WHERE l.integrated_lufs IS NOT NULL
+             ORDER BY t.album_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Fold consecutive rows per album (ordered by album_id).
+        let mut written = 0;
+        let mut current: Option<String> = None;
+        let mut batch: Vec<(f64, Option<f64>, Option<f64>)> = Vec::new();
+        for row in &rows {
+            let album_id: String = row.try_get("album_id")?;
+            let lufs: f64 = row.try_get("lufs")?;
+            let peak: Option<f64> = row.try_get("peak")?;
+            let duration: Option<f64> = row.try_get("duration")?;
+            if current.as_deref() != Some(album_id.as_str()) {
+                if let Some(id) = current.take() {
+                    self.store_album_loudness(&id, &batch, now_unix_seconds).await?;
+                    written += 1;
+                }
+                current = Some(album_id);
+                batch.clear();
+            }
+            batch.push((lufs, duration, peak));
+        }
+        if let Some(id) = current.take() {
+            self.store_album_loudness(&id, &batch, now_unix_seconds).await?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    async fn store_album_loudness(
+        &self,
+        album_id: &str,
+        tracks: &[(f64, Option<f64>, Option<f64>)],
+        now_unix_seconds: i64,
+    ) -> Result<()> {
+        let (lufs, peak) = album_loudness_from_tracks(tracks);
+        sqlx::query(
+            "INSERT INTO album_loudness
+                (album_id, integrated_lufs, true_peak_dbtp, analyzed_at_unix_seconds)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(album_id) DO UPDATE SET
+                integrated_lufs = ?2, true_peak_dbtp = ?3, analyzed_at_unix_seconds = ?4",
+        )
+        .bind(album_id)
+        .bind(lufs)
+        .bind(peak)
+        .bind(now_unix_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Re-attach per-track *and* per-album loudness to queue items loaded from the persisted
+    /// snapshot (the queue tables don't store it). Keeps a restored queue's volume leveling
+    /// (track and album mode) working.
     async fn fill_queue_loudness(&self, items: &mut [QueueItem]) -> Result<()> {
         for item in items.iter_mut() {
-            if let Some(id) = item.track_id.clone()
-                && let Some((lufs, peak)) = self.track_loudness(&id).await? {
-                    item.integrated_loudness_lufs = Some(lufs);
-                    item.true_peak_dbtp = Some(peak);
-                }
+            let Some(id) = item.track_id.clone() else {
+                continue;
+            };
+            if let Some((lufs, peak)) = self.track_loudness(&id).await? {
+                item.integrated_loudness_lufs = Some(lufs);
+                item.true_peak_dbtp = Some(peak);
+            }
+            let album_id: Option<String> =
+                sqlx::query_scalar("SELECT album_id FROM tracks WHERE id = ?1")
+                    .bind(&id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            if let Some(album_id) = album_id
+                && let Some((lufs, peak)) = self.album_loudness(&album_id).await?
+            {
+                item.album_integrated_loudness_lufs = Some(lufs);
+                item.album_true_peak_dbtp = Some(peak);
+            }
         }
         Ok(())
     }
@@ -3948,6 +4055,33 @@ fn listening_sessions(times: &[i64], gap: i64) -> (i64, i64) {
     (count, longest)
 }
 
+/// Aggregate per-track loudness into one album figure. Each entry is `(integrated_lufs,
+/// duration_seconds, true_peak_dbtp)`. The album loudness is the **duration-weighted mean**
+/// of the tracks' loudness, computed in the linear domain and converted back to LUFS — the
+/// standard approximation, since exact album-integrated R128 can't be recovered from
+/// per-track values. The album true-peak is the max across its tracks. Empty input yields
+/// `(None, None)`; a track with no/zero duration is weighted as 1.
+fn album_loudness_from_tracks(
+    tracks: &[(f64, Option<f64>, Option<f64>)],
+) -> (Option<f64>, Option<f64>) {
+    if tracks.is_empty() {
+        return (None, None);
+    }
+    let mut energy_sum = 0.0f64;
+    let mut weight_sum = 0.0f64;
+    let mut peak: Option<f64> = None;
+    for &(lufs, duration, track_peak) in tracks {
+        let weight = duration.filter(|d| *d > 0.0).unwrap_or(1.0);
+        energy_sum += weight * 10f64.powf(lufs / 10.0);
+        weight_sum += weight;
+        if let Some(p) = track_peak {
+            peak = Some(peak.map_or(p, |existing: f64| existing.max(p)));
+        }
+    }
+    let lufs = (weight_sum > 0.0).then(|| 10.0 * (energy_sum / weight_sum).log10());
+    (lufs, peak)
+}
+
 /// The lightweight, persisted playback row for a player's server-owned queue —
 /// everything except the queue items themselves.
 #[derive(Clone, Debug, PartialEq)]
@@ -4992,6 +5126,17 @@ const MIGRATION_028_USERS_AND_SESSIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
 ];
 
+// Per-album aggregate loudness, derived from `track_loudness` (energy-weighted by track
+// duration). Lets the browser apply album-mode volume leveling so an album's internal
+// dynamics survive normalization. Recomputed after each loudness pass; FK-less so an album
+// rewrite during a rescan can't cascade-delete it (it's re-derived anyway).
+const MIGRATION_029_ALBUM_LOUDNESS: &[&str] = &["CREATE TABLE IF NOT EXISTS album_loudness (
+        album_id TEXT PRIMARY KEY,
+        integrated_lufs REAL,
+        true_peak_dbtp REAL,
+        analyzed_at_unix_seconds INTEGER NOT NULL
+    )"];
+
 // MusicBrainz metadata fetched for a track via its (fingerprinted) recording MBID —
 // real title/artist/album/track-number, applied to the canonical library so an untagged
 // track stops showing folder-derived junk. Like track_fingerprint / acquired_album_artwork,
@@ -5931,6 +6076,71 @@ mod tests {
         assert_eq!(stats.favorite_albums, 1);
         assert_eq!(stats.favorite_artists, 1);
 
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn album_loudness_weights_by_duration() {
+        // Equal weights: -10 LUFS + -20 LUFS → linear mean (0.1+0.01)/2 = 0.055 →
+        // 10·log10(0.055) ≈ -12.596. The album peak is the max of the track peaks.
+        let (lufs, peak) = super::album_loudness_from_tracks(&[
+            (-10.0, Some(100.0), Some(-1.5)),
+            (-20.0, Some(100.0), Some(-2.0)),
+        ]);
+        assert!((lufs.unwrap() - (-12.596)).abs() < 0.01, "{lufs:?}");
+        assert_eq!(peak, Some(-1.5));
+
+        // A long quiet track dominates the duration-weighted mean.
+        let (weighted, _) = super::album_loudness_from_tracks(&[
+            (-10.0, Some(10.0), None),
+            (-20.0, Some(1000.0), None),
+        ]);
+        assert!(weighted.unwrap() < -18.0, "{weighted:?}");
+
+        assert_eq!(super::album_loudness_from_tracks(&[]), (None, None));
+    }
+
+    #[tokio::test]
+    async fn album_loudness_recomputed_from_track_loudness() {
+        let db_path = temp_db_path("album-loudness");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        for (id, album, duration) in
+            [("t1", "al_1", 100.0), ("t2", "al_1", 100.0), ("t3", "al_2", 60.0)]
+        {
+            sqlx::query(
+                "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id,
+                    artist_name, album_id, album_title, extension, relative_path, stream_url,
+                    path, added_at_unix_seconds, duration_seconds)
+                 VALUES (?1, 'local-disk', ?2, ?1, 'ar', 'Artist', ?3, 'Album', 'mp3', ?2,
+                    ?4, ?5, 10, ?6)",
+            )
+            .bind(id)
+            .bind(format!("a/{id}.mp3"))
+            .bind(album)
+            .bind(format!("/api/tracks/{id}/stream"))
+            .bind(format!("/m/{id}.mp3"))
+            .bind(duration)
+            .execute(&database.pool)
+            .await
+            .expect("insert track");
+        }
+        database.upsert_track_loudness("t1", Some(-10.0), Some(-1.5), 1).await.unwrap();
+        database.upsert_track_loudness("t2", Some(-20.0), Some(-2.0), 1).await.unwrap();
+        database.upsert_track_loudness("t3", Some(-14.0), Some(-1.0), 1).await.unwrap();
+
+        let written = database.recompute_album_loudness(2).await.expect("recompute");
+        assert_eq!(written, 2);
+
+        let (lufs, peak) = database.album_loudness("al_1").await.unwrap().expect("al_1");
+        assert!((lufs - (-12.596)).abs() < 0.01, "{lufs}");
+        assert_eq!(peak, -1.5);
+
+        // A single-track album equals that track's loudness.
+        let (lufs2, _) = database.album_loudness("al_2").await.unwrap().expect("al_2");
+        assert!((lufs2 - (-14.0)).abs() < 0.001, "{lufs2}");
+
+        assert!(database.album_loudness("missing").await.unwrap().is_none());
         let _ = std::fs::remove_file(db_path);
     }
 

@@ -54,6 +54,10 @@ export class BrowserAudio {
   private levelingEnabled = false;
   private trackLufs: number | null = null;
   private trackTruePeak: number | null = null;
+  // The now-playing track's *album* aggregate loudness. Preferred over the per-track values
+  // when present ("album mode"), so an album's internal dynamics survive normalization.
+  private albumLufs: number | null = null;
+  private albumTruePeak: number | null = null;
 
   constructor(el: HTMLAudioElement) {
     this.el = el;
@@ -259,23 +263,35 @@ export class BrowserAudio {
     this.applyLeveling();
   }
 
-  /** The now-playing track's measured loudness (LUFS) + true-peak (dBTP), or nulls if unknown. */
-  setTrackLoudness(lufs: number | null, truePeak: number | null): void {
+  /** The now-playing track's measured loudness (LUFS) + true-peak (dBTP), and its album
+   *  aggregate when known. Nulls mean unknown. */
+  setTrackLoudness(
+    lufs: number | null,
+    truePeak: number | null,
+    albumLufs: number | null = null,
+    albumTruePeak: number | null = null,
+  ): void {
     this.trackLufs = lufs;
     this.trackTruePeak = truePeak;
+    this.albumLufs = albumLufs;
+    this.albumTruePeak = albumTruePeak;
     this.applyLeveling();
   }
 
-  /** Compute the leveling gain (target − track LUFS), then attenuate it so the *combined* gain
+  /** Compute the leveling gain (target − loudness), then attenuate it so the *combined* gain
    *  with the EQ preamp keeps true-peak ≤ the ceiling — the two gains sum, so they must be
-   *  clip-checked together or they double-clip. */
+   *  clip-checked together or they double-clip. Prefers the album aggregate when available
+   *  (album mode) so tracks within an album keep their relative loudness, falling back to the
+   *  per-track measurement. */
   private applyLeveling(): void {
     if (!this.levelingGain) return;
+    const lufs = this.albumLufs ?? this.trackLufs;
+    const truePeak = this.albumLufs != null ? this.albumTruePeak : this.trackTruePeak;
     let db = 0;
-    if (this.levelingEnabled && this.trackLufs != null && Number.isFinite(this.trackLufs)) {
-      db = LEVELING_TARGET_LUFS - this.trackLufs;
-      if (this.trackTruePeak != null) {
-        const maxLeveling = TRUE_PEAK_CEILING_DBTP - this.trackTruePeak - this.eqPreampDb;
+    if (this.levelingEnabled && lufs != null && Number.isFinite(lufs)) {
+      db = LEVELING_TARGET_LUFS - lufs;
+      if (truePeak != null) {
+        const maxLeveling = TRUE_PEAK_CEILING_DBTP - truePeak - this.eqPreampDb;
         if (db > maxLeveling) db = maxLeveling;
       }
     }

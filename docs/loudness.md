@@ -136,7 +136,15 @@ on a playback hot path. Reuses Musicata's existing **symphonia** decode
    against the EQ preamp (`maxLeveling = −1 − truePeak − eqPreampDb`). Off/Track toggle in the
    EQ panel (`dsp.leveling`, persisted). Verified by a ui-smoke check (a −20 LUFS track boosts
    above unity) + storage/`ebur128` unit tests.
-3. **Album mode + Auto.** (Next — needs per-album LUFS aggregation + boundary detection.)
+3. **[DONE] Album mode (delivered as Auto).** Per-album LUFS is the **duration-weighted mean**
+   of the album's per-track integrated loudness, stored in `album_loudness` (migration v29,
+   `Database::recompute_album_loudness`, refreshed after each loudness pass) and surfaced on
+   `QueueItem.album_integrated_loudness_lufs`/`album_true_peak_dbtp`. With leveling on, the
+   browser **prefers the album aggregate, falling back to per-track** (`audio.ts`
+   `applyLeveling`) — the Auto behaviour, with no new UI control. The duration-weighted linear
+   mean is the standard approximation; exact album-integrated R128 can't be recovered from
+   per-track values. Unit-tested (aggregation + storage). An explicit Track-vs-Album selector
+   and server-side album apply for Snapcast remain follow-ups.
 4. **Tag bootstrap** (RG/R128 with reference correction) — fills in before scans complete.
 5. **Server-side apply in the Snapcast decode loop** — when that tier lands; identical math.
 6. **`/admin` toggle** for the analysis pass + a configurable target (currently default-on /

@@ -83,7 +83,12 @@
     if (player.isBrowserOutput) audio?.drive(next);
     if (trackChanged) {
       const np = next.now_playing;
-      audio?.setTrackLoudness(np?.integrated_loudness_lufs ?? null, np?.true_peak_dbtp ?? null);
+      audio?.setTrackLoudness(
+        np?.integrated_loudness_lufs ?? null,
+        np?.true_peak_dbtp ?? null,
+        np?.album_integrated_loudness_lufs ?? null,
+        np?.album_true_peak_dbtp ?? null,
+      );
     }
     if (trackChanged || statusChanged) setMediaMetadata(next.now_playing, next.status);
     setMediaPosition(player.elapsed, player.duration);

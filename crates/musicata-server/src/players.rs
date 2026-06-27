@@ -1898,6 +1898,7 @@ async fn resolve_queue_items(database: &Database, track_ids: &[String]) -> Resul
         if let Some(track) = database.track(id).await? {
             let artwork_url = database.album_artwork_url(&track.album_id).await?;
             let loudness = database.track_loudness(&track.id).await?;
+            let album_loudness = database.album_loudness(&track.album_id).await?;
             items.push(QueueItem {
                 track_id: Some(track.id),
                 title: track.title,
@@ -1907,6 +1908,8 @@ async fn resolve_queue_items(database: &Database, track_ids: &[String]) -> Resul
                 artwork_url,
                 integrated_loudness_lufs: loudness.map(|(lufs, _)| lufs),
                 true_peak_dbtp: loudness.map(|(_, peak)| peak),
+                album_integrated_loudness_lufs: album_loudness.map(|(lufs, _)| lufs),
+                album_true_peak_dbtp: album_loudness.map(|(_, peak)| peak),
             });
         }
     }
