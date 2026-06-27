@@ -6,7 +6,9 @@ become a regression test. Check the box when resolved; note the fixing commit/PR
 
 Severity legend: 🔴 bug (wrong/unsafe behavior) · 🟡 issue (suboptimal/fragile) · 🔵 overcomplicated.
 
-**Status summary:** 15 bugs (✅ all 15 fixed with tests) · 38 issues (open) · 9 overcomplicated (open).
+**Status summary:** 15 bugs (✅ all 15 fixed with tests) · issues ISS-01..44 (✅ 39 fixed, 5 deferred: ISS-05/06 MPD race+poll, ISS-09 jsonp, ISS-23 concurrent scan, ISS-43 endpoint async download) · 9 overcomplicated (open).
+
+Deferred items each carry a one-line rationale inline. (The "38 issues" headline from the original audit corresponds to this ISS-01..44 list.)
 
 Verified clean (audited, no defect): browser playback hot path (now-title never re-renders on a
 progress tick); all background `*_loop` workers (own queue, idle sleep, no coupling, no busy-spin,
@@ -217,11 +219,8 @@ Security-sensitive bugs are marked **[security]**.
 
 ### Endpoint
 
-- [ ] **ISS-43 Whole-track HTTP download runs on the single control-loop thread** — `endpoint/main.rs:185`
-  Blocks pings/pause/stop/progress for the duration of the fetch; the server can see the channel as
-  stalled.
-- [ ] **ISS-44 Dropped session rebuilds `AudioPlayer`, restarting the track from 0** — `endpoint/main.rs:49`
-  A transient blip stops audio and reloads from byte 0 instead of resuming.
+- [ ] **ISS-43 Whole-track HTTP download runs on the single control-loop thread** — `endpoint/main.rs:185` ⏸️ DEFERRED — fixing this means making the fetch async/off-thread, which is a real redesign of the endpoint's single-threaded control loop (the rodio `Sink` isn't trivially `Send`). Endpoint is opt-in/non-default.
+- [x] **ISS-44 Dropped session rebuilds `AudioPlayer`, restarting the track from 0** — `endpoint/main.rs:49` ✅ `AudioPlayer`/`EndpointView` are owned by `main` and passed into `run_session`, so a reconnect keeps the current track playing (and the preserved view avoids a reload-from-0). Verified by build/tests.
 
 ---
 

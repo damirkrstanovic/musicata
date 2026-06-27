@@ -45,9 +45,14 @@ fn main() -> Result<()> {
         "musicata-endpoint: player {} on {} — Ctrl-C to quit",
         creds.id, creds.server
     );
-    // Reconnect forever; a dropped connection (server restart, network blip) just reconnects.
+    // The audio player and our view of what's playing outlive individual sessions, so a
+    // reconnect (server restart, network blip) keeps the current track playing rather than
+    // tearing down the output and reloading from the start.
+    let mut audio = AudioPlayer::new(creds.server.clone(), creds.token.clone())?;
+    let mut view = EndpointView::default();
+    // Reconnect forever; a dropped connection just reconnects.
     loop {
-        match run_session(&creds) {
+        match run_session(&creds, &mut audio, &mut view) {
             Ok(()) => eprintln!("connection closed; reconnecting in 2s…"),
             Err(error) => eprintln!("error: {error}; reconnecting in 2s…"),
         }
@@ -113,7 +118,9 @@ fn register(server: &str, user_token: &str, name: &str, address: &str) -> Result
 }
 
 /// One connected session: handshake, then the read/play/report loop until the socket drops.
-fn run_session(creds: &Creds) -> Result<()> {
+/// `audio`/`view` are owned by the caller so they survive a reconnect — a transient blip
+/// must not stop playback or reload the current track from the start.
+fn run_session(creds: &Creds, audio: &mut AudioPlayer, view: &mut EndpointView) -> Result<()> {
     let (tcp_addr, ws_url) = ws_target(&creds.server, &creds.id, &creds.token)?;
     let stream = TcpStream::connect(&tcp_addr).with_context(|| format!("connect {tcp_addr}"))?;
     let (mut socket, _response) = tungstenite::client(ws_url.as_str(), stream)
@@ -125,8 +132,6 @@ fn run_session(creds: &Creds) -> Result<()> {
         .context("set read timeout")?;
     eprintln!("connected.");
 
-    let mut audio = AudioPlayer::new(creds.server.clone(), creds.token.clone())?;
-    let mut view = EndpointView::default();
     let mut last_tick = Instant::now();
 
     loop {
@@ -141,7 +146,7 @@ fn run_session(creds: &Creds) -> Result<()> {
                 if !is_event
                     && let Ok(state) = serde_json::from_str::<PlaybackState>(body)
                 {
-                    apply(&mut audio, &mut view, &state);
+                    apply(audio, view, &state);
                 }
             }
             Ok(Message::Ping(payload)) => {
