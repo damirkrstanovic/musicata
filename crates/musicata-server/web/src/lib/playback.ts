@@ -61,6 +61,26 @@ export async function startRadio(seedTrackId: string): Promise<void> {
   await playTrackIds(ids);
 }
 
+/**
+ * Start an audio "radio" from a seed track: a diverse station of tracks that *sound like* the
+ * seed (musicata-ml embedding, artist-interleaved). Empty when the seed hasn't been analyzed —
+ * no-op then, just like {@link startRadio}. Call from a click handler.
+ */
+export async function startAudioRadio(seedTrackId: string): Promise<void> {
+  if (player.isBrowserOutput) audio?.claim();
+  const res = await api.trackAudioRadio(seedTrackId, 25);
+  const ids = res?.track_ids ?? [];
+  if (!ids.length) return;
+  // If the seed is already playing, keep it going and queue the station after it (the list
+  // includes the seed at index 0).
+  if (player.nowPlaying?.track_id === seedTrackId && player.status !== "stopped") {
+    const rest = ids.filter((id) => id !== seedTrackId);
+    if (rest.length) await sendCommand(player.target, { command: "enqueue", track_ids: rest });
+    return;
+  }
+  await playTrackIds(ids);
+}
+
 /** Play an internet-radio stream on the active target. Call from a click handler. */
 export async function playStream(url: string, title: string): Promise<void> {
   if (!player.target) return;

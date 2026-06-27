@@ -328,6 +328,11 @@ export const api = {
     getJson<{ track_ids: string[] }>(`/api/tracks/${encodeURIComponent(id)}/radio`, {
       limit: String(limit),
     }),
+  // Audio "radio": a diverse station from the musicata-ml embedding (sounds-like, artist-interleaved).
+  trackAudioRadio: (id: string, limit = 25) =>
+    getJson<{ track_ids: string[] }>(`/api/tracks/${encodeURIComponent(id)}/audio-radio`, {
+      limit: String(limit),
+    }),
   autoplay: () => getJson<{ enabled: boolean }>("/api/autoplay"),
   setAutoplay: (enabled: boolean) => sendJson("/api/autoplay", "PUT", { enabled }),
 

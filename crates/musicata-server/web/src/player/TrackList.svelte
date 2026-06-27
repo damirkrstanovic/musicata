@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { TrackRow } from "../lib/api";
   import { formatTime } from "../lib/format";
-  import { playTracks } from "../lib/playback";
+  import { playTracks, startAudioRadio } from "../lib/playback";
   import { player } from "../lib/player.svelte";
   import { nav } from "../lib/nav.svelte";
   import { favorites } from "../lib/favorites.svelte";
@@ -57,6 +57,12 @@
           title="Favorite"
           aria-pressed={favorites.has(track.id)}
           onclick={() => favorites.toggleTrack(track.id)}>{favorites.has(track.id) ? "♥" : "♡"}</button
+        >
+        <button
+          class="icon-button track-audio-radio"
+          type="button"
+          title="Start audio radio — tracks that sound like this"
+          onclick={() => startAudioRadio(track.id)}>≈</button
         >
         <button
           class="icon-button track-meta"
