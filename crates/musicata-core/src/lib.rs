@@ -550,6 +550,9 @@ pub enum RepeatMode {
     One,
 }
 
+/// What transport features a player backend supports, advertised per player so a
+/// controller skips controls a backend can't honour (e.g. a future bridged endpoint
+/// that can't edit its queue). Mirrors [`ProviderCapabilities`] for sources.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct PlayerCapabilities {
@@ -558,6 +561,19 @@ pub struct PlayerCapabilities {
     pub repeat: bool,
     pub shuffle: bool,
     pub queue: bool,
+}
+
+impl PlayerCapabilities {
+    /// A backend that supports the full transport command set — seek, volume, repeat,
+    /// shuffle, and queue editing. The current backends (browser, MPD, Snapcast) are all
+    /// full-capability; reduced sets exist for future bridged endpoints.
+    pub const FULL: PlayerCapabilities = PlayerCapabilities {
+        seek: true,
+        volume: true,
+        repeat: true,
+        shuffle: true,
+        queue: true,
+    };
 }
 
 #[derive(Clone, Debug, Serialize)]

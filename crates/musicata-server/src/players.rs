@@ -83,6 +83,20 @@ impl PlayerHandle {
         }
     }
 
+    /// The transport features this backend supports, advertised on the player
+    /// descriptor. All current backends support the full command set (their
+    /// [`PlayerCommand`] handling is uniform); the per-variant match is the seam where a
+    /// future bridged endpoint (Chromecast/UPnP/Squeezelite — "later" in M10) declares a
+    /// reduced set in one place rather than callers probing.
+    pub fn capabilities(&self) -> PlayerCapabilities {
+        match self {
+            PlayerHandle::Mpd(_) => PlayerCapabilities::FULL,
+            PlayerHandle::Browser(_) => PlayerCapabilities::FULL,
+            #[cfg(feature = "snapcast")]
+            PlayerHandle::Snapcast(_) => PlayerCapabilities::FULL,
+        }
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<PlaybackState> {
         match self {
             PlayerHandle::Mpd(player) => player.subscribe(),
@@ -631,9 +645,12 @@ impl PlayerManager {
     }
 
     async fn descriptor(&self, record: &PlayerRecord) -> Result<Player> {
-        let online = match self.players.read().await.get(&record.id) {
-            Some(entry) => entry.handle.is_online(),
-            None => false,
+        // Advertise the live backend's own capabilities. An offline player has no live
+        // handle; all current backends are full-capability, so report that (a future
+        // reduced-capability backend would key this off `record.kind` when offline).
+        let (online, capabilities) = match self.players.read().await.get(&record.id) {
+            Some(entry) => (entry.handle.is_online(), entry.handle.capabilities()),
+            None => (false, PlayerCapabilities::FULL),
         };
         Ok(Player {
             id: record.id.clone(),
@@ -642,13 +659,7 @@ impl PlayerManager {
             address: record.address.clone(),
             zone_id: record.zone_id.clone(),
             online,
-            capabilities: PlayerCapabilities {
-                seek: true,
-                volume: true,
-                repeat: true,
-                shuffle: true,
-                queue: true,
-            },
+            capabilities,
         })
     }
 
@@ -2793,6 +2804,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("track_1 was never recorded as a skip");
+    }
+
+    // A player handle advertises its transport capabilities (M10), so the descriptor
+    // reports the backend's own set instead of a hardcoded constant.
+    #[tokio::test]
+    async fn browser_handle_advertises_full_capabilities() {
+        let db_path = temp_db("capabilities");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let player = Arc::new(BrowserPlayer::new(database, BROWSER_PLAYER_ID.to_string()));
+        let handle = PlayerHandle::Browser(player);
+        assert_eq!(handle.capabilities(), PlayerCapabilities::FULL);
+        assert!(PlayerCapabilities::FULL.seek);
+        assert!(PlayerCapabilities::FULL.queue);
+        let _ = std::fs::remove_file(db_path);
     }
 
     // A position tick (the ~1×/second report from the output tab) must go out as a

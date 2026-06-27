@@ -697,17 +697,24 @@ Goal: support playback outside the browser.
 
 Tasks:
 
-- Define `PlayerProvider` and endpoint capabilities.
+- [x] Define `PlayerProvider` and endpoint capabilities. The `PlayerHandle` enum is the
+  player-provider dispatch (mirrors `ProviderHandle`); **`PlayerCapabilities` is now advertised
+  per backend** off `PlayerHandle::capabilities()` (seek/volume/repeat/shuffle/queue) and
+  surfaced on the `GET /api/players` descriptor, instead of a hardcoded constant. All current
+  backends are full-capability; the per-variant seam is where a future bridged endpoint declares
+  a reduced set. Unit-tested.
 - Add a lightweight native endpoint prototype.
-- Introduce authentication between the server and players/endpoints. Today any device
-  on the network can register itself as a player and any client can control one; the
-  player-provider plugin interface should define how an endpoint proves its identity
-  to the server (and the server to the endpoint) — e.g. a per-player token or shared
-  key issued at registration and presented on the command/state channels — so players
-  can't be spoofed or hijacked. (Distinct from user↔server auth in Milestone 12.) This
-  is the *endpoint→server* direction; the *server→upstream-player* direction (e.g.
-  authenticating to a password-protected/TLS MPD) is scoped under Milestone 5's "MPD
-  authentication + secure transport" item.
+- Introduce authentication between the server and players/endpoints. **Designed; enforcement
+  deferred until the native endpoint exists** — see [player-auth.md](player-auth.md). Plan: a
+  per-player bearer token issued at registration, SHA-256-hashed at rest, presented on the
+  endpoint's command/state/WS channels *in addition to* user auth, and enforced only for players
+  that have one — so the current server-initiated backends (browser/MPD/Snapcast, already
+  covered by `require_auth`) are unaffected. It ships **with** the self-registering native
+  endpoint prototype (above), since nothing presents a token until then; adding it now would be
+  unenforced scaffolding. (Distinct from user↔server auth in Milestone 12.) This is the
+  *endpoint→server* direction; the *server→upstream-player* direction (e.g. authenticating to a
+  password-protected/TLS MPD) is scoped under Milestone 5's "MPD authentication + secure
+  transport" item.
 - Research and prototype Squeezelite/LMS bridge behavior.
 - [x] **Research Snapcast for synchronized transport.** Done — see **`docs/snapcast.md`**.
   Verdict: the right tool for reliable + sample-accurate network playback to non-browser
