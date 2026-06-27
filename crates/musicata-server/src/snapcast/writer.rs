@@ -162,18 +162,26 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
                     scratch.extend_from_slice(&q(r).to_le_bytes());
                 }
             }
-            loaded.cursor_frames = end;
             if let Err(error) = file.write_all(&scratch) {
-                // snapserver likely restarted; try to reopen the FIFO once.
+                // snapserver likely restarted; try to reopen the FIFO once, then re-write
+                // this chunk so we don't silently drop ~20 ms of audio.
                 tracing::warn!(%error, "snapcast: FIFO write failed; reopening");
                 match OpenOptions::new().write(true).open(&fifo_path) {
-                    Ok(reopened) => file = reopened,
+                    Ok(mut reopened) => {
+                        if let Err(error) = reopened.write_all(&scratch) {
+                            tracing::error!(%error, "snapcast: FIFO write failed after reopen; writer stopping");
+                            return;
+                        }
+                        file = reopened;
+                    }
                     Err(error) => {
                         tracing::error!(%error, "snapcast: FIFO reopen failed; writer stopping");
                         return;
                     }
                 }
             }
+            // Advance only after the chunk is actually written.
+            loaded.cursor_frames = end;
             (end >= total, end - start, loaded.track.sample_rate)
         };
 

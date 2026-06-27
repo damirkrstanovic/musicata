@@ -52,7 +52,14 @@ fn random_bytes<const N: usize>() -> [u8; N] {
 }
 
 /// Argon2id hash of a password as a PHC string.
+/// Upper bound on a password, so an unauthenticated request can't make argon2 chew on a
+/// multi-megabyte string. Generous — far above any real passphrase.
+const MAX_PASSWORD_BYTES: usize = 1024;
+
 fn hash_password(password: &str) -> Result<String, AppError> {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(AppError::bad_request("password is too long"));
+    }
     let salt = SaltString::encode_b64(&random_bytes::<16>())
         .map_err(|error| AppError::internal(format!("salt: {error}")))?;
     Argon2::default()
@@ -62,6 +69,10 @@ fn hash_password(password: &str) -> Result<String, AppError> {
 }
 
 fn verify_password(password: &str, hash: &str) -> bool {
+    // Reject an oversized password before running the (deliberately slow) argon2 verify.
+    if password.len() > MAX_PASSWORD_BYTES {
+        return false;
+    }
     match PasswordHash::new(hash) {
         Ok(parsed) => Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
@@ -70,9 +81,33 @@ fn verify_password(password: &str, hash: &str) -> bool {
     }
 }
 
+/// A real argon2 hash of a throwaway secret, computed once. Verified against on a login
+/// for an unknown user so the request spends the same argon2 time as a wrong password —
+/// otherwise the timing difference would let an attacker enumerate valid usernames.
+fn decoy_password_hash() -> &'static str {
+    static DECOY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DECOY.get_or_init(|| {
+        hash_password("musicata-decoy-password-for-constant-time-login").unwrap_or_default()
+    })
+}
+
 /// A fresh 256-bit random secret as hex (session cookie value or API token).
 fn generate_token() -> String {
     to_hex(&random_bytes::<32>())
+}
+
+/// Constant-time equality for equal-length secrets (e.g. token hashes), so a match can't
+/// be discovered byte-by-byte via timing. Length isn't secret here (both are sha256 hex).
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// sha256 of a session token — what we store, so a DB leak yields no live sessions.
@@ -236,7 +271,7 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
             let hashed = hash_token(&token);
             if let Some(player_id) = player_channel_id(&path)
                 && let Ok(Some(stored)) = state.database.player_auth_token_hash(player_id).await
-                && stored == hashed
+                && constant_time_eq(&stored, &hashed)
             {
                 return next.run(request).await;
             }
@@ -329,6 +364,9 @@ fn validate_credentials(username: &str, password: &str) -> Result<(), AppError> 
     if password.len() < 8 {
         return Err(AppError::bad_request("password must be at least 8 characters"));
     }
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(AppError::bad_request("password is too long"));
+    }
     Ok(())
 }
 
@@ -382,7 +420,13 @@ pub async fn login(
         .map_err(internal)?;
     let user = match user {
         Some(user) if verify_password(&body.password, &user.password_hash) => user,
-        _ => return Err(AppError::unauthorized("wrong username or password")),
+        Some(_) => return Err(AppError::unauthorized("wrong username or password")),
+        None => {
+            // Spend the same argon2 time as a real (wrong-password) attempt so a missing
+            // username isn't distinguishable by timing.
+            let _ = verify_password(&body.password, decoy_password_hash());
+            return Err(AppError::unauthorized("wrong username or password"));
+        }
     };
     let token = start_session(&state, &user.id, &headers).await?;
     Ok((
@@ -602,6 +646,35 @@ mod tests {
         let hash = hash_password("correct horse battery staple").unwrap();
         assert!(verify_password("correct horse battery staple", &hash));
         assert!(!verify_password("wrong", &hash));
+    }
+
+    #[test]
+    fn oversized_password_is_rejected_before_argon2() {
+        // ISS-32: an unauthenticated request must not make argon2 hash a huge string.
+        let huge = "a".repeat(MAX_PASSWORD_BYTES + 1);
+        assert!(hash_password(&huge).is_err());
+        let hash = hash_password("correct horse battery staple").unwrap();
+        assert!(!verify_password(&huge, &hash));
+        assert!(validate_credentials("user", &huge).is_err());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_equality() {
+        // ISS-37: equivalent to ==, but without an early-exit timing side channel.
+        assert!(constant_time_eq("abc123", "abc123"));
+        assert!(!constant_time_eq("abc123", "abc124"));
+        assert!(!constant_time_eq("abc", "abcd"));
+    }
+
+    #[test]
+    fn decoy_hash_is_a_valid_verifiable_argon2_hash() {
+        // ISS-31: the decoy must be a real hash so verifying it spends real argon2 time.
+        let hash = decoy_password_hash();
+        assert!(!hash.is_empty());
+        assert!(verify_password(
+            "musicata-decoy-password-for-constant-time-login",
+            hash
+        ));
     }
 
     #[test]

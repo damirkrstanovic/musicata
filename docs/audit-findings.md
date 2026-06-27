@@ -199,21 +199,13 @@ Security-sensitive bugs are marked **[security]**.
 
 ### Infra / audio
 
-- [ ] **ISS-31 Login leaks valid usernames via timing** — `auth.rs:378`
-  argon2 runs only for known users; unknown usernames return early (measurable difference).
-- [ ] **ISS-32 No max password length → unbounded argon2 input** — `auth.rs:325`
-  A multi-MB password on open `login`/`setup` burns CPU (cheap DoS lever).
-- [ ] **ISS-33 AIMD limiter does non-atomic read-modify-write** — `scan_concurrency.rs:93`
-  `limit` store + semaphore permit mutation aren't atomic under concurrency → drift between logical
-  limit and actual permits.
-- [ ] **ISS-34 `apply_staged_import` deletes the live DB before the replacing rename** — `backup.rs:123`
-  `rename` already replaces atomically; if it then fails the live DB is gone and errors are only logged.
-- [ ] **ISS-35 `wav_sample_rate` assumes `fmt ` at fixed offset 24** — `dsp.rs:140`
-  Wrong for WAVs with `JUNK`/`LIST`/`bext` before `fmt `; bad rate stored as the IR sample rate.
-- [ ] **ISS-36 Snapcast FIFO write failure drops the failed chunk after reopen** — `writer.rs:165`
-  `cursor_frames` advances before `write_all`; ~20 ms of PCM lost on every reopen.
-- [ ] **ISS-37 Player/endpoint token compared non-constant-time** — `auth.rs:238`
-  Plain `==`/SQL `=` on sha256 hex; diverges from the password path (not practically exploitable).
+- [x] **ISS-31 Login leaks valid usernames via timing** — `auth.rs:378` ✅ a login for an unknown user now verifies against a cached decoy argon2 hash, spending the same time as a wrong password. Test `decoy_hash_is_a_valid_verifiable_argon2_hash`.
+- [x] **ISS-32 No max password length → unbounded argon2 input** — `auth.rs:325` ✅ `MAX_PASSWORD_BYTES` (1024) rejected at `hash_password`/`verify_password`/`validate_credentials`. Test `oversized_password_is_rejected_before_argon2`.
+- [x] **ISS-33 AIMD limiter does non-atomic read-modify-write** — `scan_concurrency.rs:93` ✅ an `adjust` mutex serializes the limit/permit read-modify-write in `increase`/`decrease`.
+- [x] **ISS-34 `apply_staged_import` deletes the live DB before the replacing rename** — `backup.rs:123` ✅ dropped the pre-delete (rename replaces atomically); only the stale WAL/SHM are cleared. Test `apply_staged_import_replaces_db_and_clears_stale_wal`.
+- [x] **ISS-35 `wav_sample_rate` assumes `fmt ` at fixed offset 24** — `dsp.rs:140` ✅ walks the RIFF chunks to find `fmt `. Test `wav_sample_rate_finds_fmt_after_a_junk_chunk`.
+- [x] **ISS-36 Snapcast FIFO write failure drops the failed chunk after reopen** — `writer.rs:165` ✅ re-writes the chunk after reopen and advances `cursor_frames` only on a successful write. Verified by snapcast-feature build.
+- [x] **ISS-37 Player/endpoint token compared non-constant-time** — `auth.rs:238` ✅ in-process token-hash compare uses `constant_time_eq`. Test `constant_time_eq_matches_equality`. (The SQL `player_token_exists` lookup is left as-is — a hash lookup, not timing-exploitable.)
 
 ### Frontend
 

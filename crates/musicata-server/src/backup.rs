@@ -148,7 +148,10 @@ pub fn extract_import(zip_bytes: &[u8], db_import: &Path, artwork_import: &Path)
 pub fn apply_staged_import(db_path: &Path, artwork_dir: &Path) {
     let db_import = staged_db(db_path);
     if db_import.exists() {
-        let _ = std::fs::remove_file(db_path);
+        // Drop the stale WAL/SHM of the old database (they don't belong to the import),
+        // then rename the import over the live DB. `rename` replaces the destination
+        // atomically, so we must NOT delete the live DB first — if the rename then failed
+        // we'd be left with no database at all.
         let _ = std::fs::remove_file(with_suffix(db_path, "-wal"));
         let _ = std::fs::remove_file(with_suffix(db_path, "-shm"));
         match std::fs::rename(&db_import, db_path) {
@@ -214,6 +217,29 @@ mod tests {
             !root.join("escaped.txt").exists(),
             "zip-slip entry escaped the artwork staging dir"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_staged_import_replaces_db_and_clears_stale_wal() {
+        // ISS-34: the import is applied via an atomic rename over the live DB (no risky
+        // pre-delete), and the old WAL/SHM are cleared.
+        let root = temp_dir("apply");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("musicata.db");
+        let artwork_dir = root.join("artwork");
+        std::fs::write(&db_path, b"old-db").unwrap();
+        std::fs::write(with_suffix(&db_path, "-wal"), b"stale-wal").unwrap();
+        std::fs::write(with_suffix(&db_path, "-shm"), b"stale-shm").unwrap();
+        std::fs::write(staged_db(&db_path), b"imported-db").unwrap();
+
+        apply_staged_import(&db_path, &artwork_dir);
+
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"imported-db");
+        assert!(!staged_db(&db_path).exists(), "staged import consumed");
+        assert!(!with_suffix(&db_path, "-wal").exists(), "stale wal cleared");
+        assert!(!with_suffix(&db_path, "-shm").exists(), "stale shm cleared");
 
         let _ = std::fs::remove_dir_all(&root);
     }

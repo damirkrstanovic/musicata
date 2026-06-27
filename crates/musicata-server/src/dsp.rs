@@ -136,13 +136,39 @@ fn impulse_path(state: &AppState, id: &str) -> PathBuf {
     dsp_dir(state).join(format!("{safe}.wav"))
 }
 
-/// Sample rate from a WAV header (fmt chunk, offset 24, little-endian u32), or 0 if not parseable.
+/// Sample rate from a WAV header, or 0 if not parseable. Walks the RIFF chunks to find
+/// `fmt ` rather than assuming a fixed offset — files may carry `JUNK`/`LIST`/`bext`
+/// chunks before it.
 fn wav_sample_rate(bytes: &[u8]) -> u32 {
-    if bytes.len() >= 28 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
-        u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]])
-    } else {
-        0
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return 0;
     }
+    let mut offset = 12;
+    while offset + 8 <= bytes.len() {
+        let chunk_id = &bytes[offset..offset + 4];
+        let chunk_size = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        let data_start = offset + 8;
+        if chunk_id == b"fmt " {
+            // fmt body: audioFormat(2) numChannels(2) sampleRate(4) ...
+            if data_start + 8 <= bytes.len() {
+                return u32::from_le_bytes([
+                    bytes[data_start + 4],
+                    bytes[data_start + 5],
+                    bytes[data_start + 6],
+                    bytes[data_start + 7],
+                ]);
+            }
+            return 0;
+        }
+        // RIFF chunks are word-aligned: an odd size is padded with one byte.
+        offset = data_start + chunk_size + (chunk_size & 1);
+    }
+    0
 }
 
 /// Upload a WAV impulse response for a profile (raw body). Stores the file + records `roomIr`.
@@ -233,5 +259,25 @@ mod tests {
         wav.extend_from_slice(&48_000u32.to_le_bytes()); // sample rate @ offset 24
         assert_eq!(wav_sample_rate(&wav), 48_000);
         assert_eq!(wav_sample_rate(b"not a wav"), 0);
+    }
+
+    #[test]
+    fn wav_sample_rate_finds_fmt_after_a_junk_chunk() {
+        // ISS-35: a JUNK/LIST/bext chunk before `fmt ` must not throw off the sample rate.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&[0; 4]);
+        wav.extend_from_slice(b"WAVE");
+        // A 6-byte JUNK chunk (odd → padded to even) before fmt.
+        wav.extend_from_slice(b"JUNK");
+        wav.extend_from_slice(&6u32.to_le_bytes());
+        wav.extend_from_slice(&[0u8; 6]);
+        // Now the real fmt chunk.
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&44_100u32.to_le_bytes());
+        assert_eq!(wav_sample_rate(&wav), 44_100);
     }
 }

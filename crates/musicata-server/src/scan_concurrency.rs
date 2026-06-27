@@ -29,6 +29,9 @@ pub struct AdaptiveLimiter {
     successes: AtomicUsize,
     /// Smallest per-file latency seen (ms), the healthy baseline. `u64::MAX` until set.
     min_latency_ms: AtomicU64,
+    /// Serializes the limit/semaphore read-modify-write so concurrent `increase`/`decrease`
+    /// calls can't lose an update and drift the logical limit from the actual permit count.
+    adjust: std::sync::Mutex<()>,
 }
 
 impl AdaptiveLimiter {
@@ -46,6 +49,7 @@ impl AdaptiveLimiter {
             io_errors,
             successes: AtomicUsize::new(0),
             min_latency_ms: AtomicU64::new(u64::MAX),
+            adjust: std::sync::Mutex::new(()),
         })
     }
 
@@ -91,6 +95,7 @@ impl AdaptiveLimiter {
     }
 
     fn increase(&self) {
+        let _guard = self.adjust.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.limit.load(Ordering::Relaxed);
         if current < self.max {
             self.sem.add_permits(1);
@@ -99,6 +104,7 @@ impl AdaptiveLimiter {
     }
 
     fn decrease(&self) {
+        let _guard = self.adjust.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.limit.load(Ordering::Relaxed);
         let target = (current / 2).max(self.min);
         if target < current {
