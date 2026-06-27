@@ -207,6 +207,15 @@ A batch of milestone work was done autonomously; the judgement calls are recorde
   user-session `require_auth` middleware. Adding an unenforced token now would be security
   theatre. The design is committed so it lands with the native endpoint (the M10 "native endpoint
   prototype" task).
+- **The self-registering `native` endpoint is the finished M10 endpoint; no more bridges
+  (2026-06-27).** `musicata-endpoint` self-registers (`issue_token`), persists its scoped token,
+  and reuses the same player identity across restarts — now service-ready (env-var config +
+  `packaging/musicata-endpoint.service`) and verified end-to-end. The other transports are
+  **deliberately not planned**: **Squeezelite/LMS** — out of scope; **Chromecast** — no open
+  self-contained sender (proprietary); **UPnP/DLNA** — aging and low-value (its only draw is
+  pushing to an existing AV receiver, which a native endpoint or **Snapcast** already covers,
+  without UPnP's no-auth / flaky-discovery / no-sync drawbacks). Snapcast remains our
+  sync-transport answer. This closes M10.
 
 ### M12 — Packaging, security & operations
 

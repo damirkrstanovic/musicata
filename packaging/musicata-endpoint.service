@@ -1,0 +1,50 @@
+# systemd unit for a Musicata native endpoint — a device (e.g. a Raspberry Pi wired to an
+# amp) that joins the server as a real player and plays the server-owned queue over ALSA.
+#
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin -G audio musicata
+#   sudo cp musicata-endpoint /usr/local/bin/
+#   sudo cp musicata-endpoint.service /etc/systemd/system/
+#   # Register ONCE (creates the player + its scoped token, saved under StateDirectory):
+#   sudo -u musicata MUSICATA_ENDPOINT_STATE=/var/lib/musicata-endpoint/creds.json \
+#       musicata-endpoint --server http://<server>:3030 --register \
+#       --user-token <YOUR_API_TOKEN> --name "Living Room"
+#   # Then run it as a service (reuses the saved creds — no user token needed again):
+#   sudo systemctl daemon-reload && sudo systemctl enable --now musicata-endpoint
+#
+# The endpoint holds only its own scoped player token (not your account). Get your API
+# token from the web app's account menu. Remove the player anytime from /admin.
+
+[Unit]
+Description=Musicata native playback endpoint
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+# A system account in the `audio` group so it can open the ALSA device.
+User=musicata
+Group=musicata
+SupplementaryGroups=audio
+
+ExecStart=/usr/local/bin/musicata-endpoint
+Restart=on-failure
+RestartSec=5
+
+# Credentials (player id + scoped token) live in /var/lib/musicata-endpoint.
+StateDirectory=musicata-endpoint
+Environment=MUSICATA_ENDPOINT_STATE=/var/lib/musicata-endpoint/creds.json
+# EDIT: the Musicata server this endpoint plays for.
+Environment=MUSICATA_ENDPOINT_SERVER=http://127.0.0.1:3030
+
+# Hardening. NOTE: no PrivateDevices — the endpoint needs the sound device (/dev/snd).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,8 +1,8 @@
 # Player endpoint authentication (M10)
 
-Status: **shipped** (2026-06-27) — the per-player token mechanism is implemented and enforced.
-A self-registering *native endpoint* (a distinct player kind) is still future work, but the
-auth primitive it needs now exists and is tested. See `decisions.md`.
+Status: **shipped** (2026-06-27) — the per-player token mechanism is implemented and enforced,
+**and the self-registering `native` endpoint kind that consumes it is complete and verified**
+(`crates/musicata-endpoint`; see [native-endpoint.md](native-endpoint.md)). See `decisions.md`.
 
 ## The problem
 
@@ -75,8 +75,9 @@ WS channel and on each stream fetch — holding no user account. See
 
 ## Still future work
 
-The **server → endpoint** direction (the endpoint pinning the server URL it registered with,
-and an optional server-issued nonce) is specified but not built — the prototype trusts the LAN.
+The endpoint already **pins the server URL** it registered with (saved in its creds and the only
+host it talks to). A stronger **server → endpoint** challenge (an optional server-issued nonce)
+is specified but not built — on the LAN the pinned URL + scoped token suffice.
 
 ## What also shipped for M10
 

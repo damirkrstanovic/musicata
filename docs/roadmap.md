@@ -737,10 +737,15 @@ Done when:
 
 ## Milestone 10: Player Providers And Endpoints
 
-Status: core complete; bridges open. The "done when" is met — a non-browser endpoint (the
-native endpoint, plus Snapcast) is controllable and shares the queue/zone command model; player
-capabilities are advertised; endpoint→server auth is enforced. Remaining: a Squeezelite/LMS
-bridge and, later, Chromecast / UPnP / DLNA.
+Status: complete. The "done when" is met — non-browser endpoints (the **self-registering
+`native` endpoint**, plus Snapcast) are controllable and share the queue/zone command model;
+player capabilities are advertised; endpoint→server auth is enforced. The native endpoint is now
+service-ready (env-var config + a systemd unit) and verified end-to-end. The remaining bridges
+are **deliberately not planned** (decision 2026-06-27): **Squeezelite/LMS** — out of scope;
+**Chromecast** — infeasible (proprietary, no open self-contained sender); **UPnP/DLNA** — low
+value and aging (its only draw is pushing to existing AV receivers, which Snapcast or a native
+endpoint already covers without UPnP's no-auth/flaky-discovery/no-sync drawbacks). AirPlay/
+Chromecast *receiving* stays out; Snapcast is our sync-transport answer.
 
 Goal: support playback outside the browser.
 
@@ -770,11 +775,12 @@ Tasks:
   place of* a user session. It's additive and opt-in: consulted only when user auth fails, only
   for those channels, only for a player that has a token — so the server-initiated backends
   (browser/MPD/Snapcast) are unaffected. HTTP + unit tested (token authenticates its own channel,
-  wrong/absent token 401s, the token doesn't open another player's channel). A self-registering
-  native endpoint *kind* that presents this token is the remaining piece (with the native
-  endpoint prototype above). The *server→upstream-player* direction (authenticating to a
-  password-protected/TLS MPD) stays under Milestone 5.
-- Research and prototype Squeezelite/LMS bridge behavior.
+  wrong/absent token 401s, the token doesn't open another player's channel). **The
+  self-registering `native` endpoint kind that presents this token now ships** (`musicata-endpoint`
+  registers with `issue_token`, persists its scoped token, and reuses the same identity across
+  restarts; env-var + systemd configurable; verified end-to-end). The *server→upstream-player*
+  direction (authenticating to a password-protected/TLS MPD) stays under Milestone 5.
+- **Squeezelite/LMS bridge — not planned** (decision 2026-06-27; out of scope).
 - [x] **Research Snapcast for synchronized transport.** Done — see **`docs/snapcast.md`**.
   Verdict: the right tool for reliable + sample-accurate network playback to non-browser
   endpoints (and the cleanest path to real zone sync). Use the real **snapserver** (managed
@@ -795,7 +801,9 @@ Tasks:
   sample-identical (sub-ms offset). MVP scope: one synced stream to N rooms (independent
   per-room streams are a future extension). **Note:** the loudness analysis loop can spin on
   certain malformed tracks — a *pre-existing* issue surfaced during testing, tracked separately.
-- Later evaluate Chromecast and UPnP/DLNA.
+- **Chromecast and UPnP/DLNA — not planned** (decision 2026-06-27). Chromecast has no open
+  self-contained sender; UPnP/DLNA is aging and low-value (existing-AV-receiver push only, no
+  auth/sync) — Snapcast and the native endpoint cover the real cases.
 
 Done when:
 
@@ -948,8 +956,10 @@ kinds: the browser player, **per-zone queues** (`ZonePlayer`, migration v18), an
 **MPD's queue is server-owned** — Musicata owns content/order, MPD owns the cursor;
 restored paused on startup, re-asserted over external edits). **M12 is complete** (LAN-first
 scope; see its note). **M7's "done when" is now met** (core complete; see its note) — durable
-history, disable/delete history, local smart playlists, and ML optional all ship. Milestones 9,
-10, and 11 are in progress; M7 has only enhancement follow-ups left.
+history, disable/delete history, local smart playlists, and ML optional all ship. **M10 is now
+complete** (the self-registering native endpoint ships, service-ready and verified; the
+Squeezelite/Chromecast/UPnP/DLNA bridges are deliberately not planned). Milestones 9 and 11 are
+in progress; M7 has only enhancement follow-ups left.
 
 The remaining work lives in those milestones: **M7** (follow-ups only) — richer playback events
 (loved/disliked/rated), recommendation *import* from ListenBrainz, and audio as an autoplay
@@ -957,8 +967,6 @@ source (audio similarity + the diverse `/audio-radio`, tags-as-facet, ListenBrai
 and the separate `musicata-ml` image all ship); **M9** — collection/search browse for Internet
 Archive, Jamendo, commercial
 providers, and a metadata review-override UI (podcasts + the Internet Archive item provider —
-both with **/admin source forms** — and the plugin-isolation decision are done); **M10** — the
-self-registering native endpoint *kind* that presents the shipped per-player token, plus a
-Squeezelite bridge (player capabilities + per-player endpoint auth are in); **M11** — the
+both with **/admin source forms** — and the plugin-isolation decision are done); **M11** — the
 CamillaDSP/DAC tier, the signal-path badge, and Snapcast album-mode apply (album/Auto leveling
 **and the explicit Off/Track/Album selector** now ship).

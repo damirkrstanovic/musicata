@@ -1,6 +1,8 @@
 # Native playback endpoint (M10)
 
-Status: **prototype shipped** (2026-06-27). `crates/musicata-endpoint`.
+Status: **shipped** — the self-registering `native` player kind is complete and verified.
+`crates/musicata-endpoint`. (The audio path's *refinements* — `wss`, gapless, seek-following —
+remain; see Scope below.)
 
 A native endpoint is a small program a device (a Raspberry Pi by the speakers, a spare desktop)
 runs to become a real Musicata player — not a browser tab, not MPD. The server drives it from
@@ -57,7 +59,8 @@ musicata-endpoint --server http://musicata.local:3030 --register \
     --user-token <YOUR_API_TOKEN> --name "Living Room"
 ```
 
-Later runs reuse the saved `musicata-endpoint.json`:
+Later runs reuse the saved `musicata-endpoint.json` (a stable id + scoped token, so a relaunch
+re-attaches to the *same* server-side player — it never creates a duplicate):
 
 ```sh
 musicata-endpoint --server http://musicata.local:3030
@@ -67,7 +70,22 @@ Then pick "Living Room" as the output/zone in the web app and play — audio com
 device. Transport (play/pause/next), queue changes, and autoplay all flow through because the
 endpoint follows the server-owned queue and reports track-ends back.
 
-## Scope / limits (it's a prototype)
+### Run it as a service (headless device)
+
+For a Raspberry Pi by the amp, configure it with environment variables instead of a long
+command line (CLI flags still override): `MUSICATA_ENDPOINT_SERVER`,
+`MUSICATA_ENDPOINT_USER_TOKEN`, `MUSICATA_ENDPOINT_NAME`, `MUSICATA_ENDPOINT_STATE` (the
+credentials path). Ship **`packaging/musicata-endpoint.service`**: register once by hand
+(creating the player + token under the unit's `StateDirectory`), then `systemctl enable --now`
+runs it reusing those creds — no user token in the unit. The service user must be in the `audio`
+group, and the unit deliberately omits `PrivateDevices` so it can open `/dev/snd`.
+
+**Verified end-to-end** (server + the actual `musicata-endpoint` binary): `--register` creates
+the `native` player and saves creds; a second launch with no `--register` reuses the same id
+(the server player count stays 1 — no duplicate); and its scoped token authenticates its own
+channel (`/api/players/{id}/state` → 200) while a wrong/absent token is rejected (401).
+
+## Scope / limits (audio-path refinements)
 
 - **`ws://` only** (LAN). Put it behind a TLS reverse proxy for `wss://`.
 - **Whole-track buffering:** each track is downloaded to memory then decoded — simple, fine for

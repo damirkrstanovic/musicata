@@ -266,14 +266,19 @@ struct Args {
 
 impl Args {
     fn parse(mut argv: impl Iterator<Item = String>) -> Result<Self> {
-        let mut server = None;
+        // Env vars seed the defaults; CLI flags below override them. This lets a systemd unit
+        // (packaging/musicata-endpoint.service) configure the endpoint with `Environment=`
+        // lines instead of a long command line.
+        let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+        let mut server = env("MUSICATA_ENDPOINT_SERVER");
         let mut register = false;
-        let mut user_token = None;
-        let mut name = None;
+        let mut user_token = env("MUSICATA_ENDPOINT_USER_TOKEN");
+        let mut name = env("MUSICATA_ENDPOINT_NAME");
         let mut address = None;
         let mut id = None;
         let mut token = None;
-        let mut state = "musicata-endpoint.json".to_string();
+        let mut state =
+            env("MUSICATA_ENDPOINT_STATE").unwrap_or_else(|| "musicata-endpoint.json".to_string());
         while let Some(arg) = argv.next() {
             let mut value = || argv.next().ok_or_else(|| anyhow!("{arg} needs a value"));
             match arg.as_str() {
@@ -313,7 +318,10 @@ const HELP: &str = "musicata-endpoint — a native Musicata playback endpoint\n\
   --address <id>        stable address for the registration (default: slug of --name)\n\
   --id <id>             use an existing player id (instead of --register)\n\
   --token <tok>         use an existing player token\n\
-  --state <path>        credentials file (default: musicata-endpoint.json)\n";
+  --state <path>        credentials file (default: musicata-endpoint.json)\n\
+\n\
+Env vars (CLI flags override): MUSICATA_ENDPOINT_SERVER, MUSICATA_ENDPOINT_USER_TOKEN,\n\
+  MUSICATA_ENDPOINT_NAME, MUSICATA_ENDPOINT_STATE.\n";
 
 #[cfg(test)]
 mod tests {
