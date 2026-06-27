@@ -6,7 +6,7 @@ become a regression test. Check the box when resolved; note the fixing commit/PR
 
 Severity legend: 🔴 bug (wrong/unsafe behavior) · 🟡 issue (suboptimal/fragile) · 🔵 overcomplicated.
 
-**Status summary:** 15 bugs (✅ all 15 fixed with tests) · issues ISS-01..44 (✅ 39 fixed, 5 deferred: ISS-05/06 MPD race+poll, ISS-09 jsonp, ISS-23 concurrent scan, ISS-43 endpoint async download) · 9 overcomplicated (open).
+**Status summary:** 15 bugs (✅ all 15 fixed with tests) · issues ISS-01..44 (✅ 39 fixed, 5 deferred: ISS-05/06 MPD race+poll, ISS-09 jsonp, ISS-23 concurrent scan, ISS-43 endpoint async download) · overcomplicated CPX-01..10 (✅ 4 fixed: CPX-02/03/07/08; 6 deferred/won't-fix with rationale: CPX-01 scanner hot path, CPX-04 needs fingerprint column, CPX-05 migration de-dup risk, CPX-06 needs streaming dep, CPX-09 embedding stability, CPX-10 index keying is correct).
 
 Deferred items each carry a one-line rationale inline. (The "38 issues" headline from the original audit corresponds to this ISS-01..44 list.)
 
@@ -226,29 +226,13 @@ Security-sensitive bugs are marked **[security]**.
 
 ## 🔵 Overcomplicated
 
-- [ ] **CPX-01 First scan re-`read_dir`s each album folder once per track for artwork** — `core/src/lib.rs:989`
-  N listings for N tracks; the discovery listing could be reused (bad for SMB).
-- [ ] **CPX-02 `clean_optional_tag_value` rewrites `_`→space on embedded tag text** — `core/src/lib.rs:2078`
-  Corrupts legitimate values ("AC_DC", "hip_hop"); underscore handling belongs only on the
-  filename/folder inference path.
-- [ ] **CPX-03 `StableHasher` conflates a `0` accumulator with "uninitialized"** — `core/src/lib.rs:2474`
-  Re-seeds mid-chain when an intermediate hash is exactly 0 (rare collision smell in id generation).
-- [ ] **CPX-04 `detect_library_changes` materializes whole observation tables for 3 counts** — `storage/lib.rs:741`
-  Unbounded per-scan materialization growing with library size; empty-table early return also reports
-  the wrong count.
-- [ ] **CPX-05 MIGRATION_001 duplicates ~80 lines of DDL that 002–012 also build** — `storage/lib.rs:5074`
-  Must be kept byte-compatible by hand or fresh-vs-upgraded schemas diverge (`duration_seconds` already
-  inconsistent).
-- [ ] **CPX-06 `stream`/`download` buffers the whole file in memory before ranging** — `subsonic.rs:711`
-  `tokio::fs::read` then slices the range instead of seeking; the client side already streams in
-  64 KiB chunks.
-- [ ] **CPX-07 Snapshot-restore status-remap block copy-pasted across all four `restore` impls** — `players.rs:896/1429/1621/2125`
-  A fix to the remap must be made in four places.
-- [ ] **CPX-08 archive.org per-stem dedup is O(n²); `resolve` re-fetches the whole feed** — `archive_org.rs:170`/`:280`, `podcast.rs:232`
-  A `HashMap` keyed by stem expresses the intent linearly; `resolve` downloads a full feed to find one id.
-- [ ] **CPX-09 ML decodes+resamples the whole track, then keeps a 15 s excerpt** — `musicata-ml/main.rs:130`, `decode.rs:19`
-  The cost the comment claims to avoid is paid before `center_excerpt` trims; decode could be bounded
-  to the window.
-
-- [ ] **CPX-10 `QueueDrawer` keys rows by array index, not item identity** — `web/src/player/QueueDrawer.svelte:36`
-  Defeats per-item DOM reuse on reorder/remove. (Listed under overcomplicated; no correctness bug.)
+- [ ] **CPX-01 First scan re-`read_dir`s each album folder once per track for artwork** — `core/src/lib.rs:989` ⏸️ DEFERRED — the clean fix threads folder-image candidates from discovery (`list_dir_audio`) into `build_track`, a coordinated change across the concurrent scanner hot path (`build_track` is deliberately pure/concurrent). Risk to a critical well-tested path outweighs a first-scan-only perf win.
+- [x] **CPX-02 `clean_optional_tag_value` rewrites `_`→space on embedded tag text** — `core/src/lib.rs:2078` ✅ embedded tag text keeps underscores; `clean_title` still normalizes the filename/folder path. Test `embedded_tag_values_preserve_underscores`.
+- [x] **CPX-03 `StableHasher` conflates a `0` accumulator with "uninitialized"** — `core/src/lib.rs:2474` ✅ seeds the FNV offset basis at construction; output identical for all practical inputs.
+- [ ] **CPX-04 `detect_library_changes` materializes whole observation tables for 3 counts** — `storage/lib.rs:741` ⏸️ DEFERRED — the observations are genuinely needed for accurate "modified" detection (the comparison fingerprints them). Avoiding materialization needs a stored per-track observation-fingerprint column — a schema + write-path change disproportionate to a count optimization.
+- [ ] **CPX-05 MIGRATION_001 duplicates ~80 lines of DDL that 002–012 also build** — `storage/lib.rs:5074` ⏸️ DEFERRED — the duplication is deliberate (a fresh DB gets the full current schema in v1, avoiding a chain of ALTERs). De-duplicating risks fresh-vs-upgraded divergence; not worth the migration risk.
+- [ ] **CPX-06 `stream`/`download` buffers the whole file in memory before ranging** — `subsonic.rs:711` ⏸️ DEFERRED — the proper fix streams the body, which needs a streaming adapter (`tokio-util::ReaderStream`) as a new direct dependency (the project ties deps to milestones, not cleanups). Without it, a no-dep partial-range read only helps mid-file seeks — most players send `bytes=0-` (the whole file).
+- [x] **CPX-07 Snapshot-restore status-remap block copy-pasted across all four `restore` impls** — `players.rs:896/1429/1621/2125` ✅ extracted `apply_restored_snapshot`, used by all four. (The `resolve` re-fetch part of CPX-08 is design — clients play the inline `stream_url` and rarely call `resolve` — left as-is.)
+- [x] **CPX-08 archive.org per-stem dedup is O(n²)** — `archive_org.rs:170` ✅ stem→slot `HashMap` index, O(n), order preserved. Test asserts first-seen order.
+- [ ] **CPX-09 ML decodes+resamples the whole track, then keeps a 15 s excerpt** — `musicata-ml/main.rs:130`, `decode.rs:19` ⏸️ DEFERRED — bounding decode to the centered window means seeking by metadata duration, and seek-approximation in compressed audio would shift the excerpt and therefore the embeddings. Changing the "sounds-like" vectors for an opt-in service isn't worth the perf win.
+- [ ] **CPX-10 `QueueDrawer` keys rows by array index, not item identity** — `web/src/player/QueueDrawer.svelte:36` ⏸️ WON'T FIX — index keying is correct and safe for a server-authoritative list. Keying by item id would break on a duplicate track in the queue (non-unique keys). The audit itself notes no correctness bug; leaving as-is is the safer choice.
