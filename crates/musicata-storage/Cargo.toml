@@ -11,6 +11,11 @@ musicata-core = { path = "../musicata-core" }
 serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
+# Vector search (sqlite-vec), loaded as a standard SQLite extension on every connection — used
+# for audio-embedding similarity, but always available regardless of ML. `libsqlite3-sys` (the
+# same bundled SQLite sqlx links) registers it as an auto-extension. MIT/Apache-2.0.
+sqlite-vec = "0.1"
+libsqlite3-sys = "0.30"
 
 [dev-dependencies]
 tokio.workspace = true

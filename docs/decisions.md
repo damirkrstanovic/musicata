@@ -29,6 +29,21 @@ Building the optional audio-ML service (`crates/musicata-ml`). Design + run guid
 - **Deferred to later phases:** sqlite-vec storage + the **scheduled** worker (default 02:00
   local), recommendation integration, and packaging. Phase 1 is just the verified service.
 
+### Phase 2a — sqlite-vec as standard storage (not ML-gated)
+
+- **sqlite-vec is loaded on every Musicata connection, unconditionally** (per the directive:
+  "make it standard for musicata without ml also"). `register_sqlite_vec()` registers
+  `sqlite3_vec_init` as a global SQLite **auto-extension** once per process, before the sqlx pool
+  opens — so the shared bundled SQLite (sqlx + a direct `libsqlite3-sys` dep at the same version)
+  has `vec0` available on every connection. Cheap, and it removes the conditional/wiring risk:
+  vector search is just ordinary storage now.
+- **The embedding index is a `vec0` virtual table** (`track_embedding`, `float[2048]`,
+  `distance_metric=cosine` — cosine is the right metric for these embeddings), with a companion
+  `track_features` table for model provenance + AudioSet tags JSON. vec0 has no UPSERT, so a
+  re-analysis deletes+reinserts the vector row. KNN similarity (`similar_by_embedding`) fetches
+  the seed vector and `ORDER BY distance LIMIT k+1`, dropping the seed. Validated end-to-end (a
+  vec0 KNN test + a 2048-d store/similarity test).
+
 ## 2026-06-27 — Native endpoint prototype (M10)
 
 A native playback endpoint (`crates/musicata-endpoint`). Design + usage in `native-endpoint.md`;

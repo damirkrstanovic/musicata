@@ -21,8 +21,23 @@ pub struct Database {
     pool: SqlitePool,
 }
 
+/// Register the sqlite-vec extension as a global SQLite auto-extension, once per process, so
+/// every connection this process opens (sqlx shares the bundled SQLite) gets the `vec0` virtual
+/// table. Standard for all Musicata instances, not gated behind ML — the audio-embedding index
+/// uses it, but loading it is cheap and unconditional. See `docs/decisions.md`.
+fn register_sqlite_vec() {
+    use std::sync::Once;
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| unsafe {
+        libsqlite3_sys::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
+}
+
 impl Database {
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self> {
+        register_sqlite_vec();
         let path = path.as_ref();
 
         if let Some(parent) = path.parent()
@@ -303,6 +318,13 @@ impl Database {
                 sqlx::query(statement).execute(&self.pool).await?;
             }
             set_user_version(&self.pool, 30).await?;
+        }
+
+        if version < 31 {
+            for statement in MIGRATION_031_AUDIO_EMBEDDING {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 31).await?;
         }
 
         Ok(())
@@ -1952,6 +1974,118 @@ impl Database {
                 })
             })
             .collect()
+    }
+
+    // ---- Audio embeddings (musicata-ml) ----------------------------------------
+
+    /// Library tracks with no audio-ML analysis yet — the embedding worker's backlog.
+    pub async fn tracks_missing_embedding(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<TrackFingerprintTarget>> {
+        let rows = sqlx::query(
+            "SELECT t.id, t.title, t.artist_name, t.extension, t.provider_id,
+                    t.provider_item_id, t.path, t.duration_seconds
+             FROM tracks t
+             LEFT JOIN track_features f ON f.track_id = t.id
+             WHERE f.track_id IS NULL
+             ORDER BY t.artist_name, t.title
+             LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(TrackFingerprintTarget {
+                    track_id: row.try_get("id")?,
+                    title: row.try_get("title")?,
+                    artist_name: row.try_get("artist_name")?,
+                    extension: row.try_get("extension")?,
+                    provider_id: row.try_get("provider_id")?,
+                    provider_item_id: row.try_get("provider_item_id")?,
+                    path: row.try_get("path")?,
+                    duration_seconds: row.try_get("duration_seconds")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Store a track's audio embedding (in the `vec0` index) plus its model provenance + tags.
+    /// vec0 has no UPSERT, so the vector row is replaced; the feature row is upserted.
+    pub async fn upsert_track_embedding(
+        &self,
+        track_id: &str,
+        embedding: &[f32],
+        model: &str,
+        version: Option<&str>,
+        tags_json: &str,
+        now_unix_seconds: i64,
+    ) -> Result<()> {
+        let blob = embedding_to_blob(embedding);
+        sqlx::query("DELETE FROM track_embedding WHERE track_id = ?1")
+            .bind(track_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("INSERT INTO track_embedding (track_id, embedding) VALUES (?1, ?2)")
+            .bind(track_id)
+            .bind(&blob[..])
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO track_features (track_id, model, version, tags_json, analyzed_at_unix_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(track_id) DO UPDATE SET
+                model = ?2, version = ?3, tags_json = ?4, analyzed_at_unix_seconds = ?5",
+        )
+        .bind(track_id)
+        .bind(model)
+        .bind(version)
+        .bind(tags_json)
+        .bind(now_unix_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// How many tracks have an embedding (for `/admin` status).
+    pub async fn embedding_count(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM track_features").fetch_one(&self.pool).await?)
+    }
+
+    /// The `k` tracks most similar to `seed_track_id` by audio embedding (KNN over the vec0
+    /// index), nearest first, excluding the seed itself. Empty if the seed has no embedding.
+    pub async fn similar_by_embedding(
+        &self,
+        seed_track_id: &str,
+        k: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        let seed: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT embedding FROM track_embedding WHERE track_id = ?1")
+                .bind(seed_track_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(seed) = seed else {
+            return Ok(Vec::new());
+        };
+        // Fetch k+1 so dropping the seed (distance 0 to itself) still leaves k.
+        let rows = sqlx::query(
+            "SELECT track_id, distance FROM track_embedding
+             WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+        )
+        .bind(&seed[..])
+        .bind((k + 1) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let id: String = row.try_get("track_id").ok()?;
+                let distance: f64 = row.try_get("distance").ok()?;
+                (id != seed_track_id).then_some((id, distance))
+            })
+            .take(k)
+            .collect())
     }
 
     /// Store a track's measured loudness (integrated LUFS + true-peak dBTP). A NULL `lufs`
@@ -4124,6 +4258,14 @@ fn album_loudness_from_tracks(
     (lufs, peak)
 }
 
+/// The audio embedding dimension (PANNs CNN14) — matches the `track_embedding` vec0 column.
+pub const AUDIO_EMBEDDING_DIM: usize = 2048;
+
+/// Serialize an embedding to the little-endian f32 blob that `vec0` stores.
+fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
+    embedding.iter().flat_map(|value| value.to_le_bytes()).collect()
+}
+
 /// The lightweight, persisted playback row for a player's server-owned queue —
 /// everything except the queue items themselves.
 #[derive(Clone, Debug, PartialEq)]
@@ -5185,6 +5327,24 @@ const MIGRATION_029_ALBUM_LOUDNESS: &[&str] = &["CREATE TABLE IF NOT EXISTS albu
 const MIGRATION_030_PLAYER_AUTH_TOKEN: &[&str] =
     &["ALTER TABLE players ADD COLUMN auth_token_hash TEXT"];
 
+/// Audio-ML (musicata-ml): a `vec0` virtual table holds each track's embedding for KNN
+/// "sounds-like" similarity (sqlite-vec is loaded as standard — see `register_sqlite_vec`); a
+/// companion table holds the model provenance + AudioSet tags JSON. Both FK-less and
+/// re-derivable. The embedding dim ([`AUDIO_EMBEDDING_DIM`]) is the PANNs CNN14 model's 2048.
+const MIGRATION_031_AUDIO_EMBEDDING: &[&str] = &[
+    "CREATE VIRTUAL TABLE IF NOT EXISTS track_embedding USING vec0(
+        track_id TEXT PRIMARY KEY,
+        embedding float[2048] distance_metric=cosine
+    )",
+    "CREATE TABLE IF NOT EXISTS track_features (
+        track_id TEXT PRIMARY KEY,
+        model TEXT NOT NULL,
+        version TEXT,
+        tags_json TEXT,
+        analyzed_at_unix_seconds INTEGER NOT NULL
+    )",
+];
+
 // MusicBrainz metadata fetched for a track via its (fingerprinted) recording MBID —
 // real title/artist/album/track-number, applied to the canonical library so an untagged
 // track stops showing folder-derived junk. Like track_fingerprint / acquired_album_artwork,
@@ -6189,6 +6349,77 @@ mod tests {
         assert!((lufs2 - (-14.0)).abs() < 0.001, "{lufs2}");
 
         assert!(database.album_loudness("missing").await.unwrap().is_none());
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn sqlite_vec_extension_is_loaded() {
+        use sqlx::Row;
+        let db_path = temp_db_path("vec-loaded");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        // A vec0 virtual table only exists if the sqlite-vec extension loaded on this connection.
+        sqlx::query("CREATE VIRTUAL TABLE vtest USING vec0(embedding float[3])")
+            .execute(&database.pool)
+            .await
+            .expect("create vec0 table (sqlite-vec not loaded?)");
+        for (id, vector) in [(1_i64, "[1,0,0]"), (2, "[0,1,0]"), (3, "[0.9,0.1,0]")] {
+            sqlx::query("INSERT INTO vtest(rowid, embedding) VALUES (?1, ?2)")
+                .bind(id)
+                .bind(vector)
+                .execute(&database.pool)
+                .await
+                .expect("insert vector");
+        }
+        // KNN: the two nearest to [1,0,0] are rowid 1 (itself) then 3 (close), not 2 (orthogonal).
+        let rows = sqlx::query(
+            "SELECT rowid FROM vtest WHERE embedding MATCH ?1 ORDER BY distance LIMIT 2",
+        )
+        .bind("[1,0,0]")
+        .fetch_all(&database.pool)
+        .await
+        .expect("knn query");
+        let ids: Vec<i64> = rows
+            .iter()
+            .map(|row| row.try_get::<i64, _>("rowid").unwrap())
+            .collect();
+        assert_eq!(ids, vec![1, 3]);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn audio_embedding_store_and_similarity() {
+        let db_path = temp_db_path("embedding-sim");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        // 2048-d vectors (the model dim): a and c point similarly; b is orthogonal.
+        let dim = super::AUDIO_EMBEDDING_DIM;
+        let mut a = vec![0.0f32; dim];
+        a[0] = 1.0;
+        let mut b = vec![0.0f32; dim];
+        b[1] = 1.0;
+        let mut c = vec![0.0f32; dim];
+        c[0] = 0.9;
+        c[1] = 0.1;
+
+        database.upsert_track_embedding("a", &a, "panns", Some("1"), "[]", 1).await.unwrap();
+        database.upsert_track_embedding("b", &b, "panns", None, "[]", 1).await.unwrap();
+        database.upsert_track_embedding("c", &c, "panns", None, "[]", 1).await.unwrap();
+        assert_eq!(database.embedding_count().await.unwrap(), 3);
+
+        // Nearest to a (excluding itself): c (similar) before b (orthogonal).
+        let similar = database.similar_by_embedding("a", 2).await.unwrap();
+        let ids: Vec<&str> = similar.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "b"]);
+
+        // Re-analyzing replaces, doesn't duplicate.
+        database.upsert_track_embedding("a", &a, "panns", None, "[\"Music\"]", 2).await.unwrap();
+        assert_eq!(database.embedding_count().await.unwrap(), 3);
+
+        // A track with no embedding yields nothing.
+        assert!(database.similar_by_embedding("missing", 5).await.unwrap().is_empty());
+
         let _ = std::fs::remove_file(db_path);
     }
 
