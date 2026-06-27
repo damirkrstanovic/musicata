@@ -171,7 +171,7 @@ export type BrowseParams = ListParams & {
 export type { SourceView, AppSettings, ArtistAliasGroup, Activity, Player, Zone };
 
 export interface CreateSourceRequest {
-  kind: "smb" | "opensubsonic";
+  kind: "smb" | "opensubsonic" | "podcast" | "archive";
   host?: string;
   share?: string;
   base_path?: string;

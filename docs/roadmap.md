@@ -622,8 +622,8 @@ Tasks:
     the same source-vs-transport path internet radio uses. Added via `POST /api/sources`
     (`{"kind":"podcast","host":"<feed-url>"}`); reachable at `/api/sources/{id}/browse`+`/resolve`.
     Parser + config + provider-id are unit-tested; a `#[ignore]`d `podcast_live_browse` covers
-    the network path. *Follow-ups:* an `/admin` add-podcast UI, Podcast Index search, and
-    Internet Archive. See [decisions.md](decisions.md).
+    the network path. Added from the **/admin → Music sources** form (a Podcast option). *Follow-ups:*
+    Podcast Index search. See [decisions.md](decisions.md).
   - [x] **Internet Archive** — DRM-free, no API key. Shipped as `ProviderHandle::Archive`
     (`crate::archive_org`, feature `provider-archive`, default-on; no new deps — the JSON
     metadata + download endpoints are public). Browse-only (`STREAM_ONLY`) over **one item's
@@ -633,7 +633,8 @@ Tasks:
     id → its stream. Added via `POST /api/sources` (`{"kind":"archive","host":"<id>"}`). Parser
     (incl. array-valued titles + format dedup), identifier extraction, path-encoding, and
     provider-id are unit-tested; a `#[ignore]`d `archive_live_browse` covers the network path.
-    *Follow-up:* collection/search browse (multi-item) and Jamendo.
+    Added from the **/admin → Music sources** form (an Internet Archive option). *Follow-up:*
+    collection/search browse (multi-item) and Jamendo.
   - [ ] **Jamendo** (Creative Commons) — public REST API (free `client_id`),
     FLAC/OGG/MP3; `jamendo-rs` crate.
   - [ ] Commercial services, if ever: **opt-in, cargo-feature-gated, user-supplies-own

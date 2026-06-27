@@ -6,7 +6,7 @@
   let status = $state("");
   let error = $state(false);
   let busy = $state(false);
-  let kind = $state<"smb" | "opensubsonic">("smb");
+  let kind = $state<"smb" | "opensubsonic" | "podcast" | "archive">("smb");
 
   const CAPS: [keyof SourceView["capabilities"], string][] = [
     ["can_scan", "Scan"],
@@ -47,12 +47,20 @@
           username: text("username") || undefined,
           password: text("password") || undefined,
         });
-      } else {
+      } else if (kind === "opensubsonic") {
         await api.createSource({
           kind: "opensubsonic",
           host: text("host"),
           username: text("username") || undefined,
           password: text("password") || undefined,
+          display_name: text("display_name") || undefined,
+        });
+      } else {
+        // Podcast (feed URL) and Internet Archive (item id / details URL) both carry a single
+        // location in `host`; episodes/files are streamed, not scanned.
+        await api.createSource({
+          kind,
+          host: text("host"),
           display_name: text("display_name") || undefined,
         });
       }
@@ -128,6 +136,8 @@
       <select bind:value={kind}>
         <option value="smb">SMB / network share</option>
         <option value="opensubsonic">OpenSubsonic server</option>
+        <option value="podcast">Podcast (RSS feed)</option>
+        <option value="archive">Internet Archive item</option>
       </select>
     </label>
     {#if kind === "smb"}
@@ -139,12 +149,22 @@
         <label class="field"><span>User (optional)</span><input name="username" /></label>
         <label class="field"><span>Password (optional)</span><input name="password" type="password" /></label>
       </div>
-    {:else}
+    {:else if kind === "opensubsonic"}
       <div class="field-grid">
         <label class="field"><span>Server URL</span><input name="host" placeholder="https://navidrome.example.com" required /></label>
         <label class="field"><span>User</span><input name="username" required /></label>
         <label class="field"><span>Password</span><input name="password" type="password" required /></label>
         <label class="field"><span>Name (optional)</span><input name="display_name" placeholder="My server" /></label>
+      </div>
+    {:else if kind === "podcast"}
+      <div class="field-grid">
+        <label class="field"><span>Feed URL</span><input name="host" placeholder="https://feeds.example.com/show.xml" required /></label>
+        <label class="field"><span>Name (optional)</span><input name="display_name" placeholder="My podcast" /></label>
+      </div>
+    {:else}
+      <div class="field-grid">
+        <label class="field"><span>Item</span><input name="host" placeholder="gd1977-05-08 or an archive.org/details/… URL" required /></label>
+        <label class="field"><span>Name (optional)</span><input name="display_name" placeholder="Concert" /></label>
       </div>
     {/if}
     <div class="field-actions">
