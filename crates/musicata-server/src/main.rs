@@ -2248,6 +2248,7 @@ fn app(
         .route("/api/tracks/{id}/stream", get(stream_track))
         .route("/api/tracks/{id}/radio", get(track_radio))
         .route("/api/tracks/{id}/similar", get(track_similar))
+        .route("/api/tracks/{id}/audio-radio", get(track_audio_radio))
         .route("/api/autoplay", get(get_autoplay).put(set_autoplay))
         // DSP profile library (EQ + room correction). Authenticated, not admin-only — EQ is a
         // playback preference; see crate::dsp + docs/dsp.md.
@@ -2914,6 +2915,26 @@ async fn track_similar(
         .await
         .map_err(db_error)?;
     let track_ids = similar.into_iter().map(|(track_id, _distance)| track_id).collect();
+    Ok(Json(RadioResponse { track_ids }))
+}
+
+/// An audio "radio" seeded from a track: the seed, then sonically-similar tracks **interleaved
+/// across artists** so the station varies instead of repeating one artist (a good DJ switches it
+/// up). Built on the embedding KNN plus a diversity pass — distinct from `/similar` (raw nearest)
+/// and `/radio` (ListenBrainz). Empty beyond the seed if it hasn't been analyzed.
+async fn track_audio_radio(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<RadioQuery>,
+) -> Result<Json<RadioResponse>, AppError> {
+    if state.database.track(&id).await.map_err(db_error)?.is_none() {
+        return Err(AppError::not_found(format!("unknown track: {id}")));
+    }
+    let limit = query.limit.unwrap_or(25).clamp(1, 100);
+    let similar = state.database.audio_radio(&id, limit).await.map_err(db_error)?;
+    let mut track_ids = Vec::with_capacity(similar.len() + 1);
+    track_ids.push(id);
+    track_ids.extend(similar);
     Ok(Json(RadioResponse { track_ids }))
 }
 
@@ -8285,6 +8306,16 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(ids, vec![b.as_str()]);
+
+        // The audio "radio" leads with the seed, then the diversified similar tracks.
+        let radio = get(&app, &format!("/api/tracks/{a}/audio-radio")).await;
+        let radio_ids: Vec<&str> = radio["track_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(radio_ids, vec![a.as_str(), b.as_str()]);
 
         // An un-analyzed track yields no neighbors.
         let empty = get(&app, &format!("/api/tracks/{c}/similar")).await;
