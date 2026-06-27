@@ -73,7 +73,9 @@ a debug build is much slower because the audio *decode* is unoptimized.
   results. Settings (`ml_enabled` / `ml_service_url` / `ml_schedule`) are in `/api/settings`;
   status at `/api/ml/status`. The service analyzes a centered ~15 s excerpt per track. Verified
   end-to-end on the real library (correct embeddings + tags stored, KNN similarity works).
-- **Phase 3 — consume it.** KNN "sounds-like" similarity feeding recommendations/radio; tags as
-  browse facets / smart-playlist criteria.
+- **Phase 3 — consume it.** *Started:* `GET /api/tracks/{id}/similar` returns the audio-nearest
+  neighbors (cosine KNN over the `vec0` index) — "sounds like this," distinct from the
+  ListenBrainz `/radio`. Route-tested. *Follow-ups:* a UI "find similar" action, audio similarity
+  as an autoplay/radio source, and tags as browse facets / smart-playlist criteria.
 - **Phase 4 — packaging.** A separate optional container image for `musicata-ml` (not in the
   slim server image).
