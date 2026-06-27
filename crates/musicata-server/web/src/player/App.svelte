@@ -26,6 +26,7 @@
   import QueueDrawer from "./QueueDrawer.svelte";
   import EqPanel from "./EqPanel.svelte";
   import VuMeter from "./VuMeter.svelte";
+  import StatsPanel from "./StatsPanel.svelte";
   import MetadataPanel from "./MetadataPanel.svelte";
   import FavoritesView from "./FavoritesView.svelte";
   import PlaylistView from "./PlaylistView.svelte";
@@ -290,6 +291,7 @@
       <QueueDrawer />
       <EqPanel />
       <VuMeter />
+      <StatsPanel />
     </div>
     <Footer />
   </aside>

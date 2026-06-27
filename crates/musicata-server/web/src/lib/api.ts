@@ -243,9 +243,26 @@ async function sendJson<T>(path: string, method: string, body?: unknown): Promis
   return (await response.json().catch(() => null)) as T | null;
 }
 
+/** GET /api/history/stats — hand-typed (the server serializes it without ts-rs). */
+export interface HistoryStats {
+  total_plays: number;
+  total_skips: number;
+  distinct_tracks_played: number;
+  plays_last_7_days: number;
+  plays_last_30_days: number;
+  current_streak_days: number;
+  longest_streak_days: number;
+  listening_sessions: number;
+  longest_session_plays: number;
+  favorite_tracks: number;
+  favorite_albums: number;
+  favorite_artists: number;
+}
+
 export const api = {
   // Library
   librarySummary: () => getJson<LibrarySummary>("/api/library/summary"),
+  historyStats: () => getJson<HistoryStats>("/api/history/stats"),
   artists: (params?: ListParams) => getJson<Page<Artist>>("/api/artists", params),
   albums: (params?: BrowseParams) => getJson<Page<Album>>("/api/albums", params),
   tracks: (params?: BrowseParams) => getJson<Page<TrackRow>>("/api/tracks", params),

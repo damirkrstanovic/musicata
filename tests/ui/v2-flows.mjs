@@ -295,6 +295,16 @@ check(
   eqTitleBefore === (await js(`document.querySelector('#now-title')?.textContent`)),
   `${eqTitleBefore}`,
 );
+// Listening stats view: open it from the footer and confirm it renders figures from
+// /api/history/stats (12 stat rows, even when history is empty → zeros).
+await js(`[...document.querySelectorAll('button')].find(b=>/listening stats/i.test(b.title))?.click()`);
+await sleep(400);
+check("stats panel opens", await js(`!!document.querySelector('section[aria-label="Listening stats"]')`));
+check(
+  "stats panel shows figures",
+  (await js(`document.querySelectorAll('section[aria-label="Listening stats"] .stat-row').length`)) >= 12,
+);
+await js(`document.querySelector('section[aria-label="Listening stats"] .ghost-button')?.click()`);
 // AutoEq picker: search the bundled curated set + pick a real model → it becomes a saved profile.
 await js(`(()=>{
   const d=[...document.querySelectorAll('details.eq-import')].find(x=>x.querySelector('summary')?.textContent.includes('Pick your headphone'));

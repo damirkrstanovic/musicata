@@ -3,6 +3,7 @@
   import { dsp } from "../lib/dsp.svelte";
   import { audioDevices } from "../lib/audioDevices.svelte";
   import { meter } from "../lib/meter.svelte";
+  import { statsPanel } from "../lib/statsPanel.svelte";
   import { startRadio } from "../lib/playback";
   import { sendCommand, type PlayerCommand } from "../lib/commands";
   import type { RepeatMode } from "../types/RepeatMode";
@@ -134,6 +135,16 @@
       onclick={() => meter.toggle()}
     >
       ▮▮
+    </button>
+    <button
+      class="eq-btn"
+      class:active={statsPanel.open}
+      type="button"
+      title="Listening stats"
+      aria-pressed={statsPanel.open}
+      onclick={() => statsPanel.toggle()}
+    >
+      ◔
     </button>
     <button
       class="eq-btn"

@@ -459,7 +459,8 @@ Tasks:
   play/skip totals, distinct tracks, last-7/30-day plays, the daily UTC **streak**
   (current + longest), **listening sessions** (runs of plays < 30 min apart, count +
   longest), and favorite track/album/artist counts. Pure-function streak/session helpers
-  are unit-tested; the endpoint has a route test. A web view for it is a follow-up. See
+  are unit-tested; the endpoint has a route test. A **web view** ships too — a footer
+  "Listening stats" panel (`StatsPanel.svelte`) that renders the figures, smoke-tested. See
   [decisions.md](decisions.md).
 - [x] **Add deterministic smart playlists before adding ML.** A fixed, computed catalog
   (`/api/smart-playlists`, no stored rows — each is a live query): **Top: last 30 days**

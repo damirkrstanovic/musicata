@@ -3,6 +3,22 @@
 Short, dated records of non-obvious choices made while building Musicata — the "why" behind
 work that isn't self-evident from the code. Newest first. Referenced from `roadmap.md`.
 
+## 2026-06-27 — Roadmap sweep #3: UI surfacing (M7 stats view, M11 leveling selector)
+
+Surface two already-shipped backends in the web player.
+
+- **M11 leveling selector.** The boolean leveling toggle became an explicit Off/Track/Album
+  selector (`dsp.levelingMode`). The legacy persisted boolean migrates to `album` (the Auto
+  behavior shipped last round), so existing users keep album-aware leveling. `audio.ts` applies
+  the mode; the smoke test now drives the `<select>` and checks track-mode boost vs album-mode
+  using-the-album-LUFS.
+- **M7 stats view.** A footer "Listening stats" panel (`StatsPanel.svelte` + a tiny
+  `statsPanel` store) fetches `GET /api/history/stats` on open and renders the figures. The
+  `HistoryStats` type is **hand-typed in `api.ts`** rather than ts-rs-generated, because the
+  server serializes that response without a ts-rs derive (it's a plain `Serialize` struct);
+  this matches the existing convention for the few non-ts-rs endpoints. The panel reuses the
+  shared `.eq-drawer`/`.eq-head` rail-overlay classes. Smoke-tested (panel opens, renders rows).
+
 ## 2026-06-27 — Roadmap sweep #2: M9 (Internet Archive), M11 (album leveling), M10 (player auth)
 
 ### M9 — Internet Archive provider
