@@ -260,7 +260,7 @@ event stream keeps it alive.
 | ------ | ---- | ------- |
 | GET | `/api/activity` | Recent background-work activity log. |
 | GET | `/api/activity/ws` | WebSocket of live activity entries. |
-| GET/PATCH | `/api/settings` | Read / update product settings. |
+| GET/PATCH | `/api/settings` | Read / update product settings (artwork, identification, ML, `history_enabled`, `scrobble_enabled` + `listenbrainz_token`, …). Admin-only. |
 
 ### DSP profiles
 

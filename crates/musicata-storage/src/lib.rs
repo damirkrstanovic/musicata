@@ -327,6 +327,13 @@ impl Database {
             set_user_version(&self.pool, 31).await?;
         }
 
+        if version < 32 {
+            for statement in MIGRATION_032_SCROBBLE_QUEUE {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 32).await?;
+        }
+
         Ok(())
     }
 
@@ -3547,6 +3554,48 @@ impl Database {
         Ok(result.rows_affected())
     }
 
+    /// Queue a confirmed listen for outbound scrobbling (e.g. to ListenBrainz). The submit
+    /// loop ([`pending_scrobbles`](Self::pending_scrobbles)) drains it independently.
+    pub async fn enqueue_scrobble(&self, track_id: &str, listened_at: i64) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO scrobble_queue (track_id, listened_at_unix_seconds) VALUES (?1, ?2)",
+        )
+        .bind(track_id)
+        .bind(listened_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Oldest-first pending scrobbles `(queue_id, track_id, listened_at)`, up to `limit`.
+    pub async fn pending_scrobbles(&self, limit: i64) -> Result<Vec<(i64, String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT id, track_id, listened_at_unix_seconds FROM scrobble_queue
+             ORDER BY id ASC LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("id")?,
+                    row.try_get("track_id")?,
+                    row.try_get("listened_at_unix_seconds")?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Remove a scrobble from the queue once it's been accepted upstream.
+    pub async fn delete_scrobble(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM scrobble_queue WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Tracks paired with their listen count, most played first. Ties break on recency.
     /// Counts confirmed listens only (skips are excluded).
     pub async fn most_played(&self, limit: usize) -> Result<Vec<(Track, i64)>> {
@@ -5475,6 +5524,18 @@ const MIGRATION_030_PLAYER_AUTH_TOKEN: &[&str] =
 /// "sounds-like" similarity (sqlite-vec is loaded as standard — see `register_sqlite_vec`); a
 /// companion table holds the model provenance + AudioSet tags JSON. Both FK-less and
 /// re-derivable. The embedding dim ([`AUDIO_EMBEDDING_DIM`]) is the PANNs CNN14 model's 2048.
+// Outbound scrobble queue: confirmed `played` listens awaiting submission to an external
+// service (ListenBrainz). A decoupled queue so the submit loop drains at its own pace and a
+// network outage never stalls playback/recording. No FK (`track_id` is stable; the row carries
+// enough to resolve the track at submit time). Rows are deleted once accepted upstream.
+const MIGRATION_032_SCROBBLE_QUEUE: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS scrobble_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        track_id TEXT NOT NULL,
+        listened_at_unix_seconds INTEGER NOT NULL
+    )",
+];
+
 const MIGRATION_031_AUDIO_EMBEDDING: &[&str] = &[
     "CREATE VIRTUAL TABLE IF NOT EXISTS track_embedding USING vec0(
         track_id TEXT PRIMARY KEY,
@@ -6958,6 +7019,30 @@ mod tests {
             .expect("list albums");
         assert_eq!(total, 0);
         assert!(albums.is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn scrobble_queue_roundtrips() {
+        let db_path = temp_db_path("scrobble-queue");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        assert!(database.pending_scrobbles(10).await.unwrap().is_empty());
+        database.enqueue_scrobble("t1", 100).await.unwrap();
+        database.enqueue_scrobble("t2", 200).await.unwrap();
+
+        // Oldest-first, carrying track id + listened-at.
+        let pending = database.pending_scrobbles(10).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!((pending[0].1.as_str(), pending[0].2), ("t1", 100));
+        assert_eq!((pending[1].1.as_str(), pending[1].2), ("t2", 200));
+
+        // Deleting the submitted row drains it.
+        database.delete_scrobble(pending[0].0).await.unwrap();
+        let pending = database.pending_scrobbles(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, "t2");
 
         let _ = std::fs::remove_file(db_path);
     }

@@ -302,9 +302,22 @@ async fn record_action(database: &Database, player_id: &str, action: ListenActio
         ],
     };
     let now = now_unix();
-    for (track_id, kind) in writes {
-        if let Err(error) = database.record_listen(track_id, player_id, now, kind).await {
+    let mut played: Vec<&str> = Vec::new();
+    for (track_id, kind) in &writes {
+        if let Err(error) = database.record_listen(track_id, player_id, now, *kind).await {
             tracing::warn!(%player_id, %track_id, ?kind, %error, "failed to record listen");
+            continue;
+        }
+        if matches!(kind, ListenKind::Played) {
+            played.push(track_id);
+        }
+    }
+    // Queue confirmed plays for outbound scrobbling (drained by `scrobble::scrobble_loop`).
+    if !played.is_empty() && crate::scrobble::enabled(database).await {
+        for track_id in played {
+            if let Err(error) = database.enqueue_scrobble(track_id, now).await {
+                tracing::warn!(%player_id, %track_id, %error, "failed to enqueue scrobble");
+            }
         }
     }
 }

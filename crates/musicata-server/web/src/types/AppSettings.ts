@@ -39,4 +39,12 @@ ml_schedule: string,
 /**
  * Record listening history (plays/skips). Default on; off stops new recording.
  */
-history_enabled: boolean, };
+history_enabled: boolean, 
+/**
+ * Submit confirmed listens to ListenBrainz. Off by default; needs a token.
+ */
+scrobble_enabled: boolean, 
+/**
+ * ListenBrainz user token for scrobbling (empty = unset).
+ */
+listenbrainz_token: string, };

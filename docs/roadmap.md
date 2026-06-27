@@ -493,7 +493,14 @@ Tasks:
   leans away from them without banning them). **Live path verified** against the production
   ListenBrainz Labs API (both algorithm strings valid, response shapes parse) via an
   `#[ignore]`d smoke test (`listenbrainz_live_path`; run with `--ignored`). Slice complete.
-- Add optional ListenBrainz scrobbling and recommendation import.
+- [x] **Optional ListenBrainz scrobbling.** A decoupled, queue-draining `scrobble_loop`
+  (`crate::scrobble`) submits confirmed `played` listens to ListenBrainz
+  (`POST /1/submit-listens`, token auth). The per-player recorder enqueues into a
+  `scrobble_queue` table (migration v32) when scrobbling is on; the loop drains it at its own
+  pace, so a network outage never stalls playback/recording, and resolves track metadata at
+  submit time. Off by default; the token + toggle live in `/admin` Settings. Payload-shape +
+  queue roundtrip tested. *(Recommendation **import** from ListenBrainz is still open; we already
+  source `similar-recordings`/`similar-artists` for radio.)*
 - **Building `musicata-ml`** (the experiment): an optional service for audio embeddings + tags.
   **Phase 1 shipped & verified** — `crates/musicata-ml` runs PANNs CNN14 (ONNX, via `ort`) on a
   raw 16 kHz waveform and serves a 2048-d embedding + AudioSet tags over HTTP (`/analyze`).

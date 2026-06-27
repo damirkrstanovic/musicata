@@ -21,6 +21,7 @@ mod radiobrowser;
 mod recommendations;
 #[cfg(feature = "provider-smb")]
 mod scan_concurrency;
+mod scrobble;
 #[cfg(feature = "provider-smb")]
 mod smb;
 #[cfg(feature = "snapcast")]
@@ -294,6 +295,7 @@ async fn main() -> Result<()> {
                 ml_trigger.clone(),
                 ready_rx.clone(),
             ));
+            tokio::spawn(scrobble::scrobble_loop(database.clone(), ready_rx.clone()));
         }
     }
 
@@ -4125,6 +4127,10 @@ struct AppSettings {
     ml_schedule: String,
     /// Record listening history (plays/skips). Default on; off stops new recording.
     history_enabled: bool,
+    /// Submit confirmed listens to ListenBrainz. Off by default; needs a token.
+    scrobble_enabled: bool,
+    /// ListenBrainz user token for scrobbling (empty = unset).
+    listenbrainz_token: String,
 }
 
 async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>, AppError> {
@@ -4151,6 +4157,13 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
         .map_err(db_error)?
         .unwrap_or_else(|| "02:00".to_string());
     let history_enabled = setting_enabled(&state.database, SETTING_HISTORY_ENABLED).await;
+    let scrobble_enabled = scrobble::enabled(&state.database).await;
+    let listenbrainz_token = state
+        .database
+        .get_setting(scrobble::SETTING_LISTENBRAINZ_TOKEN)
+        .await
+        .map_err(db_error)?
+        .unwrap_or_default();
     Ok(Json(AppSettings {
         artwork_fetch,
         fanart_tv_key,
@@ -4160,6 +4173,8 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
         ml_service_url,
         ml_schedule,
         history_enabled,
+        scrobble_enabled,
+        listenbrainz_token,
     }))
 }
 
@@ -4173,6 +4188,8 @@ struct SettingsUpdate {
     ml_service_url: Option<String>,
     ml_schedule: Option<String>,
     history_enabled: Option<bool>,
+    scrobble_enabled: Option<bool>,
+    listenbrainz_token: Option<String>,
 }
 
 async fn update_settings(
@@ -4235,6 +4252,23 @@ async fn update_settings(
         state
             .database
             .set_setting(SETTING_HISTORY_ENABLED, if enabled { "true" } else { "false" })
+            .await
+            .map_err(db_error)?;
+    }
+    if let Some(enabled) = update.scrobble_enabled {
+        state
+            .database
+            .set_setting(
+                scrobble::SETTING_SCROBBLE_ENABLED,
+                if enabled { "true" } else { "false" },
+            )
+            .await
+            .map_err(db_error)?;
+    }
+    if let Some(token) = update.listenbrainz_token {
+        state
+            .database
+            .set_setting(scrobble::SETTING_LISTENBRAINZ_TOKEN, token.trim())
             .await
             .map_err(db_error)?;
     }

@@ -10,6 +10,8 @@
     ml_service_url: "",
     ml_schedule: "02:00",
     history_enabled: true,
+    scrobble_enabled: false,
+    listenbrainz_token: "",
   });
   let status = $state("");
   let error = $state(false);
@@ -104,6 +106,26 @@
       <span class="form-status">{historyStatus}</span>
     </div>
   </div>
+
+  <div class="admin-panel-head"><h2>Scrobbling</h2></div>
+  <p class="admin-hint">
+    Optionally submit your plays to <a href="https://listenbrainz.org" target="_blank" rel="noreferrer">ListenBrainz</a>.
+    Paste your token from listenbrainz.org → Settings. Submitted in the background; needs history on.
+  </p>
+  <form class="field-form" onsubmit={save}>
+    <label class="toggle-row">
+      <input type="checkbox" bind:checked={settings.scrobble_enabled} />
+      <span>Scrobble my listens to ListenBrainz</span>
+    </label>
+    <label class="field">
+      <span>ListenBrainz token</span>
+      <input bind:value={settings.listenbrainz_token} placeholder="user token" />
+    </label>
+    <div class="field-actions">
+      <button type="submit" class="primary-button" disabled={busy}>Save</button>
+      <span class="form-status" class:error>{status}</span>
+    </div>
+  </form>
 </section>
 
 <style>
