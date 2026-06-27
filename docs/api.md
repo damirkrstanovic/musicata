@@ -107,6 +107,7 @@ streaming fetches only the requested byte range.
 | ------ | ---- | ------- |
 | GET | `/api/history/recent?limit=` | Distinct tracks, most-recently-played first; each has `last_listened_at`. |
 | GET | `/api/history/most-played?limit=` | Tracks with a `play_count`. |
+| GET | `/api/history/stats` | Aggregate listening stats: `total_plays`, `total_skips`, `distinct_tracks_played`, `plays_last_7_days`, `plays_last_30_days`, `current_streak_days`, `longest_streak_days`, `listening_sessions`, `longest_session_plays`, `favorite_tracks`/`favorite_albums`/`favorite_artists`. A session is a run of plays < 30 min apart; a streak is consecutive UTC days with a play. Counts are over the retained history window. |
 
 ### Playlists and favorites
 

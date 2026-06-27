@@ -6,6 +6,8 @@ This roadmap starts from the current working prototype: a Rust workspace that sc
 
 The main rule is architectural: local disk is the first provider, not the core model. Every milestone should keep music providers, metadata, playback, players, and controllers separated.
 
+Non-obvious choices made along the way are recorded in [decisions.md](decisions.md).
+
 ## Milestone 0: Prototype Baseline
 
 Status: complete.
@@ -451,9 +453,14 @@ Tasks:
 - Record richer playback events: started, progress, paused, resumed, loved, disliked,
   rated, queued, and playlist changes. (Completed/skipped are done — see above.)
 - Persist history per user, track, player/zone, session, and playback source.
-- Add remaining stats views: most played and recently played exist; **never played,
-  most skipped, and rediscovery** now ship as smart playlists (below). Still open:
-  favorites stats, session/streak views.
+- [x] Add remaining stats views: most played and recently played exist; **never played,
+  most skipped, and rediscovery** ship as smart playlists (below). **Session/streak +
+  favorites stats** now ship as `GET /api/history/stats` (`Database::listening_stats`):
+  play/skip totals, distinct tracks, last-7/30-day plays, the daily UTC **streak**
+  (current + longest), **listening sessions** (runs of plays < 30 min apart, count +
+  longest), and favorite track/album/artist counts. Pure-function streak/session helpers
+  are unit-tested; the endpoint has a route test. A web view for it is a follow-up. See
+  [decisions.md](decisions.md).
 - [x] **Add deterministic smart playlists before adding ML.** A fixed, computed catalog
   (`/api/smart-playlists`, no stored rows — each is a live query): **Top: last 30 days**
   (`most_played_since`), **Never played** (`never_played` anti-join), **Forgotten
@@ -793,9 +800,13 @@ Goal: make Musicata installable and safe enough for real users.
 
 Tasks:
 
-- Add release builds for Linux first.
-- Add systemd service examples.
-- Add Docker or container image if useful.
+- [x] **Add release builds for Linux first.** A tagged-release GitHub Actions workflow
+  (`.github/workflows/release.yml`) builds static musl binaries for x86_64 and aarch64 and
+  attaches them to the release. See [deployment.md](deployment.md).
+- [x] **Add systemd service examples.** `packaging/musicata.service` (shipped in the release
+  archive) runs the server as a locked-down system user with state in `/var/lib/musicata`.
+- [x] **Add Docker or container image.** A `Dockerfile` builds a slim image (snapserver is not
+  bundled — add it in a derived image; see [snapcast.md](snapcast.md)).
 - [x] **User authentication (multi-user)** — brought forward for phone/PWA use.
   `crate::auth` + migration v28 (`users` + `sessions`): argon2-hashed passwords, opaque
   **cookie sessions** (sha256-hashed at rest, 30-day TTL), and a per-user **API token**

@@ -2152,6 +2152,7 @@ fn app(
         .route("/api/browse/recently-added", get(recently_added))
         .route("/api/history/recent", get(recently_played))
         .route("/api/history/most-played", get(most_played))
+        .route("/api/history/stats", get(history_stats))
         .route("/api/smart-playlists", get(list_smart_playlists))
         .route("/api/smart-playlists/{id}", get(smart_playlist_detail))
         .route(
@@ -3463,6 +3464,48 @@ async fn recently_played(
         })
         .collect();
     Ok(Json(items))
+}
+
+/// Aggregate listening statistics for the history "stats" view — totals, recent-window
+/// play counts, the daily listening streak, listening-session figures, and favorite
+/// counts. A serde mirror of [`musicata_storage::ListeningStats`]; computed fresh (a few
+/// cheap counts plus an in-Rust pass over played times).
+#[derive(Clone, Debug, Serialize)]
+struct HistoryStats {
+    total_plays: i64,
+    total_skips: i64,
+    distinct_tracks_played: i64,
+    plays_last_7_days: i64,
+    plays_last_30_days: i64,
+    current_streak_days: i64,
+    longest_streak_days: i64,
+    listening_sessions: i64,
+    longest_session_plays: i64,
+    favorite_tracks: i64,
+    favorite_albums: i64,
+    favorite_artists: i64,
+}
+
+async fn history_stats(State(state): State<AppState>) -> Result<Json<HistoryStats>, AppError> {
+    let stats = state
+        .database
+        .listening_stats(now_unix_seconds())
+        .await
+        .map_err(db_error)?;
+    Ok(Json(HistoryStats {
+        total_plays: stats.total_plays,
+        total_skips: stats.total_skips,
+        distinct_tracks_played: stats.distinct_tracks_played,
+        plays_last_7_days: stats.plays_last_7_days,
+        plays_last_30_days: stats.plays_last_30_days,
+        current_streak_days: stats.current_streak_days,
+        longest_streak_days: stats.longest_streak_days,
+        listening_sessions: stats.listening_sessions,
+        longest_session_plays: stats.longest_session_plays,
+        favorite_tracks: stats.favorite_tracks,
+        favorite_albums: stats.favorite_albums,
+        favorite_artists: stats.favorite_artists,
+    }))
 }
 
 /// A track paired with how many times it has been listened to.
@@ -7759,6 +7802,16 @@ mod tests {
             .find(|item| item["id"] == track_id)
             .expect("most-played should list the played track");
         assert_eq!(most_item["play_count"], 1);
+
+        // /api/history/stats aggregates the same listens: one play, no skips, one
+        // distinct track, and a one-day streak/session.
+        let stats = history(&app, "/api/history/stats").await;
+        assert_eq!(stats["total_plays"], 1);
+        assert_eq!(stats["total_skips"], 0);
+        assert_eq!(stats["distinct_tracks_played"], 1);
+        assert_eq!(stats["listening_sessions"], 1);
+        assert_eq!(stats["longest_session_plays"], 1);
+        assert_eq!(stats["favorite_tracks"], 0);
     }
 
     #[tokio::test]

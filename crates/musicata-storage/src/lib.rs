@@ -3272,6 +3272,92 @@ impl Database {
         rows.iter().map(track_from_row).collect()
     }
 
+    /// Aggregate listening statistics as of `now_unix` (Unix seconds). `now_unix` is
+    /// passed in rather than read from the clock so the result is deterministic for
+    /// callers and tests. Totals come from cheap indexed counts; the daily streak and
+    /// listening-session figures are derived in Rust from the ordered played-listen
+    /// times (see [`streak_days`] and [`listening_sessions`]).
+    pub async fn listening_stats(&self, now_unix: i64) -> Result<ListeningStats> {
+        const DAY: i64 = 86_400;
+        const SESSION_GAP_SECONDS: i64 = 30 * 60;
+
+        let total_plays: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM listens WHERE event_kind = 'played'")
+                .fetch_one(&self.pool)
+                .await?;
+        let total_skips: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM listens WHERE event_kind = 'skipped'")
+                .fetch_one(&self.pool)
+                .await?;
+        let distinct_tracks_played: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT track_id) FROM listens WHERE event_kind = 'played'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let plays_last_7_days: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM listens
+             WHERE event_kind = 'played' AND listened_at_unix_seconds >= ?1",
+        )
+        .bind(now_unix - 7 * DAY)
+        .fetch_one(&self.pool)
+        .await?;
+        let plays_last_30_days: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM listens
+             WHERE event_kind = 'played' AND listened_at_unix_seconds >= ?1",
+        )
+        .bind(now_unix - 30 * DAY)
+        .fetch_one(&self.pool)
+        .await?;
+
+        // Ordered played times feed the streak + session derivations below.
+        let times: Vec<i64> = sqlx::query_scalar(
+            "SELECT listened_at_unix_seconds FROM listens
+             WHERE event_kind = 'played' ORDER BY listened_at_unix_seconds ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Unique UTC day indices (times are sorted, so adjacent-dedup yields unique).
+        let mut days: Vec<i64> = times.iter().map(|t| t.div_euclid(DAY)).collect();
+        days.dedup();
+        let (current_streak_days, longest_streak_days) =
+            streak_days(&days, now_unix.div_euclid(DAY));
+        let (sessions, longest_session_plays) = listening_sessions(&times, SESSION_GAP_SECONDS);
+
+        let mut favorite_tracks = 0;
+        let mut favorite_albums = 0;
+        let mut favorite_artists = 0;
+        let fav_rows =
+            sqlx::query("SELECT item_type, COUNT(*) AS n FROM favorites GROUP BY item_type")
+                .fetch_all(&self.pool)
+                .await?;
+        for row in &fav_rows {
+            let item_type: String = row.try_get("item_type")?;
+            let n: i64 = row.try_get("n")?;
+            match item_type.as_str() {
+                "track" => favorite_tracks = n,
+                "album" => favorite_albums = n,
+                "artist" => favorite_artists = n,
+                _ => {}
+            }
+        }
+
+        Ok(ListeningStats {
+            total_plays,
+            total_skips,
+            distinct_tracks_played,
+            plays_last_7_days,
+            plays_last_30_days,
+            current_streak_days,
+            longest_streak_days,
+            listening_sessions: sessions,
+            longest_session_plays,
+            favorite_tracks,
+            favorite_albums,
+            favorite_artists,
+        })
+    }
+
     // ---- Playlists ----
 
     /// Create a playlist (with optional initial tracks) and return its generated id.
@@ -3775,6 +3861,91 @@ impl ListenKind {
             ListenKind::Skipped => "skipped",
         }
     }
+}
+
+/// Aggregate listening statistics for the history "stats" view. Produced by
+/// [`Database::listening_stats`]. All counts are over the retained history window
+/// (history is pruned), so totals are "recent", not lifetime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListeningStats {
+    /// Confirmed listens (`played` events) in history.
+    pub total_plays: i64,
+    /// Skip events in history.
+    pub total_skips: i64,
+    /// Distinct tracks with at least one confirmed listen.
+    pub distinct_tracks_played: i64,
+    pub plays_last_7_days: i64,
+    pub plays_last_30_days: i64,
+    /// Consecutive UTC days, ending today (or yesterday, until today logs a play),
+    /// each with at least one confirmed listen.
+    pub current_streak_days: i64,
+    /// Longest run of consecutive UTC days with a confirmed listen, ever in history.
+    pub longest_streak_days: i64,
+    /// Number of listening sessions — runs of plays each within 30 minutes of the
+    /// previous one.
+    pub listening_sessions: i64,
+    /// The most plays in any single session.
+    pub longest_session_plays: i64,
+    pub favorite_tracks: i64,
+    pub favorite_albums: i64,
+    pub favorite_artists: i64,
+}
+
+/// Given ascending, unique UTC day indices and the index of "today", returns
+/// `(current_streak, longest_streak)` in days. The current streak counts back from
+/// the most recent active day **only if** that day is today or yesterday (so a streak
+/// isn't reported broken until a whole day passes with no play); otherwise it is 0.
+fn streak_days(days: &[i64], today: i64) -> (i64, i64) {
+    if days.is_empty() {
+        return (0, 0);
+    }
+    let mut longest = 1i64;
+    let mut run = 1i64;
+    for window in days.windows(2) {
+        if window[1] == window[0] + 1 {
+            run += 1;
+        } else {
+            run = 1;
+        }
+        longest = longest.max(run);
+    }
+
+    let last = *days.last().expect("non-empty");
+    let mut current = 0i64;
+    if last == today || last == today - 1 {
+        let mut expected = last;
+        for &day in days.iter().rev() {
+            if day == expected {
+                current += 1;
+                expected -= 1;
+            } else if day < expected {
+                break;
+            }
+        }
+    }
+    (current, longest)
+}
+
+/// Given ascending play times (Unix seconds) and a max inter-play `gap`, returns
+/// `(session_count, max_plays_in_a_session)`. A session is a maximal run of plays each
+/// within `gap` seconds of the previous one.
+fn listening_sessions(times: &[i64], gap: i64) -> (i64, i64) {
+    if times.is_empty() {
+        return (0, 0);
+    }
+    let mut count = 1i64;
+    let mut run = 1i64;
+    let mut longest = 1i64;
+    for window in times.windows(2) {
+        if window[1] - window[0] <= gap {
+            run += 1;
+        } else {
+            count += 1;
+            run = 1;
+        }
+        longest = longest.max(run);
+    }
+    (count, longest)
 }
 
 /// The lightweight, persisted playback row for a player's server-owned queue —
@@ -5673,6 +5844,92 @@ mod tests {
         assert_eq!(most.len(), 1);
         assert_eq!(most[0].0.id, "track_1");
         assert_eq!(most[0].1, 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn streak_days_counts_current_and_longest() {
+        // Active days 96, 98, 99, 100 with today = 100: the current streak is the
+        // 98-99-100 run (3); 96 is isolated. Longest is also 3.
+        assert_eq!(super::streak_days(&[96, 98, 99, 100], 100), (3, 3));
+        // The latest active day is yesterday (99) — still a live streak counted from 99.
+        assert_eq!(super::streak_days(&[97, 98, 99], 100), (3, 3));
+        // Latest active day is older than yesterday: the streak is broken (0), but the
+        // 90-91 run is still the longest ever (2).
+        assert_eq!(super::streak_days(&[90, 91, 95], 100), (0, 2));
+        assert_eq!(super::streak_days(&[], 100), (0, 0));
+        assert_eq!(super::streak_days(&[100], 100), (1, 1));
+    }
+
+    #[test]
+    fn listening_sessions_group_by_gap() {
+        let gap = 1800;
+        // Two bursts within 30 min, far apart from each other: 2 sessions, longest 3.
+        assert_eq!(
+            super::listening_sessions(&[0, 300, 600, 10_000, 10_100], gap),
+            (2, 3)
+        );
+        // Every play more than the gap apart: each is its own one-play session.
+        assert_eq!(super::listening_sessions(&[0, 5_000, 10_000], gap), (3, 1));
+        assert_eq!(super::listening_sessions(&[], gap), (0, 0));
+        assert_eq!(super::listening_sessions(&[42], gap), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn listening_stats_aggregates_streaks_sessions_and_favorites() {
+        const DAY: i64 = 86_400;
+        let db_path = temp_db_path("listening-stats");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        for (id, title) in [("t_a", "Alpha"), ("t_b", "Beta")] {
+            sqlx::query(
+                "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id,
+                    artist_name, album_id, album_title, extension, relative_path, stream_url,
+                    path, added_at_unix_seconds)
+                 VALUES (?1, 'local-disk', ?2, ?3, 'ar_1', 'Artist', 'al_1', 'Album',
+                    'mp3', ?2, ?4, ?5, 10)",
+            )
+            .bind(id)
+            .bind(format!("album/{id}.mp3"))
+            .bind(title)
+            .bind(format!("/api/tracks/{id}/stream"))
+            .bind(format!("/music/album/{id}.mp3"))
+            .execute(&database.pool)
+            .await
+            .expect("insert track");
+        }
+
+        let now = 100 * DAY + 50_000; // sometime on day index 100
+        let played = ListenKind::Played;
+        let skipped = ListenKind::Skipped;
+        // Plays on days 100 (x2, one session), 99, 98 (a 3-day current streak), and an
+        // isolated day 96. One skip on day 97 (excluded from plays + streak).
+        database.record_listen("t_a", "p", 100 * DAY + 1_000, played).await.unwrap();
+        database.record_listen("t_a", "p", 100 * DAY + 1_300, played).await.unwrap();
+        database.record_listen("t_a", "p", 99 * DAY + 500, played).await.unwrap();
+        database.record_listen("t_a", "p", 98 * DAY + 500, played).await.unwrap();
+        database.record_listen("t_b", "p", 96 * DAY + 500, played).await.unwrap();
+        database.record_listen("t_b", "p", 97 * DAY + 500, skipped).await.unwrap();
+
+        database.set_favorite("track", "t_a", 1).await.unwrap();
+        database.set_favorite("track", "t_b", 2).await.unwrap();
+        database.set_favorite("album", "al_1", 3).await.unwrap();
+        database.set_favorite("artist", "ar_1", 4).await.unwrap();
+
+        let stats = database.listening_stats(now).await.expect("stats");
+        assert_eq!(stats.total_plays, 5);
+        assert_eq!(stats.total_skips, 1);
+        assert_eq!(stats.distinct_tracks_played, 2);
+        assert_eq!(stats.plays_last_7_days, 5);
+        assert_eq!(stats.plays_last_30_days, 5);
+        assert_eq!(stats.current_streak_days, 3); // days 98-99-100
+        assert_eq!(stats.longest_streak_days, 3);
+        assert_eq!(stats.listening_sessions, 4); // 96 | 98 | 99 | 100(x2)
+        assert_eq!(stats.longest_session_plays, 2);
+        assert_eq!(stats.favorite_tracks, 2);
+        assert_eq!(stats.favorite_albums, 1);
+        assert_eq!(stats.favorite_artists, 1);
 
         let _ = std::fs::remove_file(db_path);
     }
