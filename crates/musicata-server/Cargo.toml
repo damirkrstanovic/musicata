@@ -11,7 +11,7 @@ repository.workspace = true
 # multi-room playout; build with `--no-default-features` for a minimal binary without the
 # `smb` dependency, the OpenSubsonic client, or the Snapcast decode path (the last also
 # needs the `snapserver`/`snapclient` binaries installed at runtime).
-default = ["provider-smb", "provider-opensubsonic", "provider-podcast", "snapcast"]
+default = ["provider-smb", "provider-opensubsonic", "provider-podcast", "provider-archive", "snapcast"]
 # Read music from an SMB/CIFS network share directly (pure Rust, no mount). Pulls
 # in the `smb` crate; see crate::smb.
 provider-smb = ["dep:smb", "dep:futures"]
@@ -22,6 +22,9 @@ provider-opensubsonic = []
 # streams, never scanned into the library. Pulls in `quick-xml` for feed parsing. See
 # crate::podcast.
 provider-podcast = ["dep:quick-xml"]
+# Play an Internet Archive item's audio files as a browse-only (STREAM_ONLY) source. No
+# API key (public JSON metadata + download endpoints); no extra deps. See crate::archive_org.
+provider-archive = []
 # Generate TypeScript types for the web client from the server's response structs (the
 # admin DTOs). Off by default; see scripts/gen-web-types.sh.
 ts = ["dep:ts-rs", "musicata-core/ts"]

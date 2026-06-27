@@ -623,7 +623,16 @@ Tasks:
     Parser + config + provider-id are unit-tested; a `#[ignore]`d `podcast_live_browse` covers
     the network path. *Follow-ups:* an `/admin` add-podcast UI, Podcast Index search, and
     Internet Archive. See [decisions.md](decisions.md).
-  - [ ] **Internet Archive** — DRM-free, public API (follow-up to podcasts).
+  - [x] **Internet Archive** — DRM-free, no API key. Shipped as `ProviderHandle::Archive`
+    (`crate::archive_org`, feature `provider-archive`, default-on; no new deps — the JSON
+    metadata + download endpoints are public). Browse-only (`STREAM_ONLY`) over **one item's
+    audio files**: the item identifier (a bare id or a `details/`/`download/` URL it's extracted
+    from) lives in the source `host`; `browse()` fetches `archive.org/metadata/<id>` and lists
+    the audio files (best format kept per track, download URLs inline), `resolve()` maps a file
+    id → its stream. Added via `POST /api/sources` (`{"kind":"archive","host":"<id>"}`). Parser
+    (incl. array-valued titles + format dedup), identifier extraction, path-encoding, and
+    provider-id are unit-tested; a `#[ignore]`d `archive_live_browse` covers the network path.
+    *Follow-up:* collection/search browse (multi-item) and Jamendo.
   - [ ] **Jamendo** (Creative Commons) — public REST API (free `client_id`),
     FLAC/OGG/MP3; `jamendo-rs` crate.
   - [ ] Commercial services, if ever: **opt-in, cargo-feature-gated, user-supplies-own

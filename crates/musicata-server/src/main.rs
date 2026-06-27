@@ -1,4 +1,6 @@
 mod activity;
+#[cfg(feature = "provider-archive")]
+mod archive_org;
 mod artwork;
 mod artwork_providers;
 mod auth;
@@ -4504,7 +4506,7 @@ fn source_view(record: &musicata_storage::SourceRecord) -> SourceView {
     // browse-only stream source, so report its capabilities honestly (the UI uses this
     // to decide whether to offer a rescan, etc.).
     let capabilities = match record.kind.as_str() {
-        "podcast" => musicata_core::ProviderCapabilities::STREAM_ONLY,
+        "podcast" | "archive" => musicata_core::ProviderCapabilities::STREAM_ONLY,
         _ => musicata_core::ProviderCapabilities::DISK,
     };
     SourceView {
@@ -4648,6 +4650,54 @@ async fn create_source(
                 display_name,
                 enabled: true,
                 host: Some(url.to_string()),
+                share: None,
+                base_path: None,
+                username: None,
+                password: None,
+                domain: None,
+                created_at_unix_seconds: now_unix_seconds(),
+            }
+        }
+        #[cfg(feature = "provider-archive")]
+        "archive" => {
+            // `host` carries an Internet Archive item identifier (or a details URL we
+            // extract it from); audio files are streamed, not scanned (STREAM_ONLY).
+            let raw = request
+                .host
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::bad_request("an item identifier is required for an Internet Archive source")
+                })?;
+            let identifier = crate::archive_org::ArchiveConfig::from_record(&musicata_storage::SourceRecord {
+                id: String::new(),
+                kind: "archive".to_string(),
+                display_name: String::new(),
+                enabled: true,
+                host: Some(raw.to_string()),
+                share: None,
+                base_path: None,
+                username: None,
+                password: None,
+                domain: None,
+                created_at_unix_seconds: 0,
+            })
+            .map_err(|error| AppError::bad_request(error.to_string()))?
+            .identifier;
+            let display_name = request
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| identifier.clone());
+            musicata_storage::SourceRecord {
+                id: crate::archive_org::archive_provider_id(&identifier),
+                kind: "archive".to_string(),
+                display_name,
+                enabled: true,
+                host: Some(identifier),
                 share: None,
                 base_path: None,
                 username: None,

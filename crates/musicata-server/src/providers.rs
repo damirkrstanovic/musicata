@@ -14,6 +14,8 @@ use musicata_core::{
 };
 use musicata_storage::{Database, SourceRecord};
 
+#[cfg(feature = "provider-archive")]
+use crate::archive_org::ArchiveProvider;
 #[cfg(feature = "provider-opensubsonic")]
 use crate::opensubsonic::OpenSubsonicProvider;
 #[cfg(feature = "provider-podcast")]
@@ -49,6 +51,14 @@ pub fn provider_from_record(record: &SourceRecord) -> anyhow::Result<ProviderHan
         #[cfg(not(feature = "provider-podcast"))]
         "podcast" => anyhow::bail!(
             "podcast support is not compiled into this build (enable the `provider-podcast` feature)"
+        ),
+        #[cfg(feature = "provider-archive")]
+        "archive" => Ok(ProviderHandle::Archive(std::sync::Arc::new(
+            ArchiveProvider::from_record(record)?,
+        ))),
+        #[cfg(not(feature = "provider-archive"))]
+        "archive" => anyhow::bail!(
+            "Internet Archive support is not compiled into this build (enable the `provider-archive` feature)"
         ),
         other => anyhow::bail!("unknown source kind: {other}"),
     }
@@ -147,6 +157,8 @@ pub enum ProviderHandle {
     OpenSubsonic(Arc<OpenSubsonicProvider>),
     #[cfg(feature = "provider-podcast")]
     Podcast(Arc<PodcastProvider>),
+    #[cfg(feature = "provider-archive")]
+    Archive(Arc<ArchiveProvider>),
 }
 
 impl ProviderHandle {
@@ -168,6 +180,8 @@ impl ProviderHandle {
             ProviderHandle::OpenSubsonic(provider) => provider.provider_id().clone(),
             #[cfg(feature = "provider-podcast")]
             ProviderHandle::Podcast(provider) => provider.provider_id().clone(),
+            #[cfg(feature = "provider-archive")]
+            ProviderHandle::Archive(provider) => provider.provider_id().clone(),
         }
     }
 
@@ -181,6 +195,8 @@ impl ProviderHandle {
             ProviderHandle::OpenSubsonic(_) => ProviderCapabilities::DISK,
             #[cfg(feature = "provider-podcast")]
             ProviderHandle::Podcast(provider) => provider.capabilities(),
+            #[cfg(feature = "provider-archive")]
+            ProviderHandle::Archive(provider) => provider.capabilities(),
         }
     }
 
@@ -196,6 +212,8 @@ impl ProviderHandle {
             ProviderHandle::OpenSubsonic(provider) => provider.validate().await,
             #[cfg(feature = "provider-podcast")]
             ProviderHandle::Podcast(provider) => provider.validate().await,
+            #[cfg(feature = "provider-archive")]
+            ProviderHandle::Archive(provider) => provider.validate().await,
         }
     }
 
@@ -218,6 +236,8 @@ impl ProviderHandle {
             }
             #[cfg(feature = "provider-podcast")]
             ProviderHandle::Podcast(provider) => provider.browse().await,
+            #[cfg(feature = "provider-archive")]
+            ProviderHandle::Archive(provider) => provider.browse().await,
         }
     }
 
@@ -240,6 +260,8 @@ impl ProviderHandle {
             }
             #[cfg(feature = "provider-podcast")]
             ProviderHandle::Podcast(provider) => provider.resolve(item_id).await,
+            #[cfg(feature = "provider-archive")]
+            ProviderHandle::Archive(provider) => provider.resolve(item_id).await,
         }
     }
 
@@ -285,6 +307,10 @@ impl ProviderHandle {
             #[cfg(feature = "provider-podcast")]
             ProviderHandle::Podcast(_) => {
                 anyhow::bail!("a podcast source has no scannable catalogue")
+            }
+            #[cfg(feature = "provider-archive")]
+            ProviderHandle::Archive(_) => {
+                anyhow::bail!("an Internet Archive source has no scannable catalogue")
             }
         }
     }

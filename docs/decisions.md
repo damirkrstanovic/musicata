@@ -3,6 +3,41 @@
 Short, dated records of non-obvious choices made while building Musicata — the "why" behind
 work that isn't self-evident from the code. Newest first. Referenced from `roadmap.md`.
 
+## 2026-06-27 — Roadmap sweep #2: M9 (Internet Archive), M11 (album leveling), M10 (player auth)
+
+### M9 — Internet Archive provider
+
+- **Built an Internet Archive source, modelled on the podcast provider.** Browse-only
+  (`STREAM_ONLY`), no API key, no new deps (the JSON metadata + download endpoints are public).
+  Feature `provider-archive`, default-on.
+- **A source is one IA *item*, not a collection/search.** The flat `/api/sources/{id}/browse`
+  shape (no path param) can't drill collection → item → files, so a source maps to a single
+  item identifier and `browse()` lists that item's audio files — clean and useful for the
+  live-music/netlabel case. Multi-item collection/search browse is a documented follow-up.
+- **One file per track.** IA carries the same track in several formats (FLAC + MP3 + Ogg);
+  `parse_item` groups by file stem and keeps the best-ranked format, so the track list isn't
+  triplicated. The stream URL is the canonical `archive.org/download/<id>/<file>` (range-capable),
+  with the path percent-encoded in-house (no url-encoding dep).
+
+### M11 — Album volume leveling
+
+- **"Album mode" is delivered as smarter behaviour of the existing leveling toggle, not a new
+  UI control.** When leveling is on, the browser now prefers the track's **album** integrated
+  loudness when it's available, falling back to per-track — i.e. the design's *Auto* mode. This
+  keeps an album's internal dynamics intact (quiet interludes stay quiet) without adding a
+  Track-vs-Album selector that would also churn the smoke suite. An explicit selector is a
+  documented follow-up.
+- **Album loudness is an energy-weighted, duration-weighted mean of the per-track measurements**,
+  not a fresh R128 pass over concatenated audio. True album-integrated R128 can't be derived
+  exactly from per-track values (the gating is non-linear), but the duration-weighted linear mean
+  is the standard, well-defined approximation (what ReplayGain-style tools use) and needs no
+  re-decode. Stored in a new `album_loudness` table (migration), recomputed from `track_loudness`
+  after each loudness pass that did work.
+
+### M10 — Player endpoint auth
+
+- See the dedicated entry below / `player-auth.md` for the final call on what shipped.
+
 ## 2026-06-27 — Roadmap sweep: M7, M9, M10, M12
 
 A batch of milestone work was done autonomously; the judgement calls are recorded here.
