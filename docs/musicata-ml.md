@@ -78,7 +78,10 @@ a debug build is much slower because the audio *decode* is unoptimized.
   tracks **interleaved across artists** (no artist back-to-back, capped share) so it doesn't just
   repeat one artist. Both route-tested; the diversity pass is unit-tested. Verified on a real
   105-track, 2-artist slice: raw `/similar` ran up to 10 same-artist in a row, `/audio-radio` cut
-  the longest same-artist run to 1 (perfect interleave). *Follow-ups:* a UI "find similar / start
-  audio radio" action, audio as an autoplay source, and tags as browse facets.
+  the longest same-artist run to 1 (perfect interleave). **UI shipped:** every track row has an
+  "≈" action that starts the diverse audio station. **Tags as a browse facet shipped:** the
+  AudioSet tags surface in `/api/browse` (`tags`, most-common first) and as a `tag` filter on
+  `/api/tracks`+`/api/albums` and a "Sounds" dropdown in the web browse bar — a content-based
+  facet that works even for files with no genre tag. *Follow-ups:* audio as an autoplay source.
 - **Phase 4 — packaging.** A separate optional container image for `musicata-ml` (not in the
   slim server image).

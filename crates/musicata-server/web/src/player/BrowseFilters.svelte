@@ -26,6 +26,12 @@
       <option value="">All composers</option>
       {#each browse.index.composers as c (c.value)}<option value={c.value}>{c.value}</option>{/each}
     </select>
+    {#if browse.index.tags.length}
+      <select bind:value={browse.tag} aria-label="Sound">
+        <option value="">All sounds</option>
+        {#each browse.index.tags as t (t.value)}<option value={t.value}>{t.value}</option>{/each}
+      </select>
+    {/if}
     {#if browse.active}
       <button class="ghost-button" type="button" onclick={() => browse.reset()}>Clear</button>
     {/if}

@@ -503,10 +503,11 @@ Tasks:
   storage, a `track_embedding` vec0 index + a **scheduled** `ml_loop` (off by default, default
   02:00 local, manual `POST /api/ml/analyze`) post tracks to the service and store embeddings +
   tags; settings in `/api/settings`. **CPU only** (~1 s/track in a release build; GPU was trialled
-  and dropped — no speedup for this model). **Phase 3 started:** `GET /api/tracks/{id}/similar`
-  ("sounds like this" — cosine KNN over the embeddings). Remaining: surface similarity in the UI /
-  as a radio source, tags as browse facets, and separate packaging. See
-  [musicata-ml.md](musicata-ml.md) + [decisions.md](decisions.md).
+  and dropped — no speedup for this model). **Phase 3 shipped:** `GET /api/tracks/{id}/similar`
+  ("sounds like this" — cosine KNN), the diverse **`/audio-radio`** station (artist-interleaved)
+  with a per-track "≈" UI action, and **tags as a browse facet** (`/api/browse` `tags` + a `tag`
+  filter on tracks/albums + a "Sounds" dropdown). Remaining: audio as an autoplay source, and the
+  Phase 4 separate packaging. See [musicata-ml.md](musicata-ml.md) + [decisions.md](decisions.md).
 
 Done when:
 

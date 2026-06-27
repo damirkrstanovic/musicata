@@ -7,6 +7,7 @@ class Browse {
   genre = $state("");
   year = $state<number | null>(null);
   composer = $state("");
+  tag = $state("");
 
   async load(): Promise<void> {
     try {
@@ -17,13 +18,14 @@ class Browse {
   }
 
   get active(): boolean {
-    return !!this.genre || this.year !== null || !!this.composer;
+    return !!this.genre || this.year !== null || !!this.composer || !!this.tag;
   }
 
   reset(): void {
     this.genre = "";
     this.year = null;
     this.composer = "";
+    this.tag = "";
   }
 }
 

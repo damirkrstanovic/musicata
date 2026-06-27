@@ -1110,6 +1110,11 @@ impl Database {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|folder| format!("{}/", folder.trim_end_matches('/')));
+        let tag = filter
+            .tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         // An album is in the result iff it has a track matching the filter.
         const MATCH: &str = "EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id
@@ -1118,7 +1123,9 @@ impl Database {
                   WHERE o.track_id = t.id AND json_each.value = ?2 COLLATE NOCASE))
              AND (?3 IS NULL OR EXISTS (SELECT 1 FROM track_metadata_observations o, json_each(o.composers)
                   WHERE o.track_id = t.id AND json_each.value = ?3 COLLATE NOCASE))
-             AND (?4 IS NULL OR substr(t.relative_path, 1, length(?4)) = ?4))";
+             AND (?4 IS NULL OR substr(t.relative_path, 1, length(?4)) = ?4)
+             AND (?5 IS NULL OR EXISTS (SELECT 1 FROM track_features f, json_each(f.tags_json) je
+                  WHERE f.track_id = t.id AND json_extract(je.value, '$.label') = ?5 COLLATE NOCASE)))";
 
         let count_sql = format!("SELECT COUNT(*) AS n FROM albums a WHERE {MATCH}");
         let total = i64_to_usize(
@@ -1127,6 +1134,7 @@ impl Database {
                 .bind(genre)
                 .bind(composer)
                 .bind(&folder_prefix)
+                .bind(tag)
                 .fetch_one(&self.pool)
                 .await?
                 .try_get("n")?,
@@ -1134,7 +1142,7 @@ impl Database {
         )?;
 
         let sql = format!(
-            "SELECT {ALBUM_COLUMNS} FROM albums a WHERE {MATCH} ORDER BY {} LIMIT ?5 OFFSET ?6",
+            "SELECT {ALBUM_COLUMNS} FROM albums a WHERE {MATCH} ORDER BY {} LIMIT ?6 OFFSET ?7",
             album_order_clause(sort)
         );
         let rows = sqlx::query(&sql)
@@ -1142,6 +1150,7 @@ impl Database {
             .bind(genre)
             .bind(composer)
             .bind(&folder_prefix)
+            .bind(tag)
             .bind(limit)
             .bind(offset)
             .fetch_all(&self.pool)
@@ -1181,13 +1190,20 @@ impl Database {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|folder| format!("{}/", folder.trim_end_matches('/')));
+        let tag = filter
+            .tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         const FILTER: &str = "(?1 IS NULL OR t.year = ?1)
              AND (?2 IS NULL OR EXISTS (SELECT 1 FROM track_metadata_observations o, json_each(o.genres)
                   WHERE o.track_id = t.id AND json_each.value = ?2 COLLATE NOCASE))
              AND (?3 IS NULL OR EXISTS (SELECT 1 FROM track_metadata_observations o, json_each(o.composers)
                   WHERE o.track_id = t.id AND json_each.value = ?3 COLLATE NOCASE))
-             AND (?4 IS NULL OR substr(t.relative_path, 1, length(?4)) = ?4)";
+             AND (?4 IS NULL OR substr(t.relative_path, 1, length(?4)) = ?4)
+             AND (?5 IS NULL OR EXISTS (SELECT 1 FROM track_features f, json_each(f.tags_json) je
+                  WHERE f.track_id = t.id AND json_extract(je.value, '$.label') = ?5 COLLATE NOCASE))";
 
         let count_sql = format!("SELECT COUNT(*) AS n FROM tracks t WHERE {FILTER}");
         let total = i64_to_usize(
@@ -1196,6 +1212,7 @@ impl Database {
                 .bind(genre)
                 .bind(composer)
                 .bind(&folder_prefix)
+                .bind(tag)
                 .fetch_one(&self.pool)
                 .await?
                 .try_get("n")?,
@@ -1203,7 +1220,7 @@ impl Database {
         )?;
 
         let sql = format!(
-            "SELECT {} FROM tracks t WHERE {FILTER} ORDER BY {} LIMIT ?5 OFFSET ?6",
+            "SELECT {} FROM tracks t WHERE {FILTER} ORDER BY {} LIMIT ?6 OFFSET ?7",
             track_columns("t"),
             track_order_clause(sort)
         );
@@ -1212,6 +1229,7 @@ impl Database {
             .bind(genre)
             .bind(composer)
             .bind(&folder_prefix)
+            .bind(tag)
             .bind(limit)
             .bind(offset)
             .fetch_all(&self.pool)
@@ -1377,12 +1395,40 @@ impl Database {
             .map(|(value, track_count)| BrowseTextFacet { value, track_count })
             .collect();
 
+        let tags = self.tag_facet().await?;
+
         Ok(BrowseIndex {
             genres,
             years,
             composers,
             folders,
+            tags,
         })
+    }
+
+    /// Distinct-track counts per musicata-ml audio tag, most-common first. Reads the
+    /// `track_features.tags_json` array (`[{label, score}, …]`), counting a track once
+    /// per distinct label it carries. Empty until tracks have been analysed.
+    async fn tag_facet(&self) -> Result<Vec<BrowseTextFacet>> {
+        // Alias the label as `label` (not `value` — `json_each` already exposes a `value`
+        // column, and grouping on that would split identical labels by their differing score).
+        let rows = sqlx::query(
+            "SELECT json_extract(je.value, '$.label') AS label, COUNT(DISTINCT f.track_id) AS n
+             FROM track_features f, json_each(f.tags_json) je
+             WHERE json_extract(je.value, '$.label') IS NOT NULL
+               AND trim(json_extract(je.value, '$.label')) <> ''
+             GROUP BY label ORDER BY n DESC, label",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut facets = Vec::with_capacity(rows.len());
+        for row in rows {
+            facets.push(BrowseTextFacet {
+                value: row.try_get("label")?,
+                track_count: i64_to_usize(row.try_get("n")?, "track_count")?,
+            });
+        }
+        Ok(facets)
     }
 
     /// Distinct-track counts per value of a JSON-array observation column.
@@ -6912,6 +6958,73 @@ mod tests {
             .expect("list albums");
         assert_eq!(total, 0);
         assert!(albums.is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn tag_facet_and_filter_match_audio_tags() {
+        let db_path = temp_db_path("tag-facet");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let dim = super::AUDIO_EMBEDDING_DIM;
+        let embedding = vec![0.0f32; dim];
+        // Two tracks with overlapping musicata-ml tags (objects, as production stores them).
+        let data = [
+            (
+                "t1",
+                r#"[{"label":"Rock music","score":0.8},{"label":"Music","score":0.95}]"#,
+            ),
+            (
+                "t2",
+                r#"[{"label":"Jazz","score":0.7},{"label":"Music","score":0.9}]"#,
+            ),
+        ];
+        for (id, tags) in data {
+            sqlx::query(
+                "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id,
+                    artist_name, album_id, album_title, extension, relative_path, stream_url,
+                    path, added_at_unix_seconds)
+                 VALUES (?1, 'local-disk', ?2, ?1, 'ar', 'Artist', 'al', 'Album', 'mp3', ?2, ?3, ?4, 10)",
+            )
+            .bind(id)
+            .bind(format!("a/{id}.mp3"))
+            .bind(format!("/api/tracks/{id}/stream"))
+            .bind(format!("/m/{id}.mp3"))
+            .execute(&database.pool)
+            .await
+            .expect("insert track");
+            database
+                .upsert_track_embedding(id, &embedding, "m", None, tags, 1)
+                .await
+                .unwrap();
+        }
+
+        // Facet: most-common tag first; "Music" on both, the genres on one each.
+        let tags = database.browse_index().await.unwrap().tags;
+        let counts: std::collections::HashMap<_, _> =
+            tags.iter().map(|t| (t.value.as_str(), t.track_count)).collect();
+        assert_eq!(counts.get("Music"), Some(&2));
+        assert_eq!(counts.get("Rock music"), Some(&1));
+        assert_eq!(counts.get("Jazz"), Some(&1));
+        assert_eq!(tags.first().map(|t| t.value.as_str()), Some("Music")); // count-desc ordering
+
+        // Filter: a tag narrows the track list (case-insensitive); an absent tag returns nothing.
+        let filtered = |tag: &str| {
+            let f = BrowseFilter {
+                tag: Some(tag.to_string()),
+                ..BrowseFilter::default()
+            };
+            let database = &database;
+            async move { database.list_tracks(&f, None, -1, 0).await.unwrap() }
+        };
+        let (rock, total) = filtered("rock music").await;
+        assert_eq!(total, 1);
+        assert_eq!(rock[0].id, "t1");
+        let (music, total) = filtered("Music").await;
+        assert_eq!(total, 2);
+        assert_eq!(music.len(), 2);
+        let (_, total) = filtered("Reggae").await;
+        assert_eq!(total, 0);
 
         let _ = std::fs::remove_file(db_path);
     }

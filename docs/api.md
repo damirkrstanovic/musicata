@@ -74,8 +74,8 @@ Authenticate with any of:
 | POST | `/api/library/import` | Import a previously exported library archive. |
 | GET | `/api/artists`, `/api/artists/{id}` | List artists / artist detail. |
 | GET | `/api/albums`, `/api/albums/{id}` | List albums / album detail (with tracks). |
-| GET | `/api/tracks` | List tracks. Filters: `genre`, `year`, `composer`, `folder`; paging: `limit`, `offset`, `sort`. |
-| GET | `/api/browse` | Facets for genre/year/composer. |
+| GET | `/api/tracks` | List tracks. Filters: `genre`, `year`, `composer`, `folder`, `tag` (a musicata-ml audio tag); paging: `limit`, `offset`, `sort`. `/api/albums` takes the same filters. |
+| GET | `/api/browse` | Facets for genre/year/composer/folder, plus `tags` (musicata-ml audio tags, most-common first; empty until tracks are analysed). |
 | GET | `/api/browse/recently-added` | Newest tracks first. |
 | GET | `/api/search?query=…` | Full-text search; returns `{ artists, albums, tracks }`. |
 | GET | `/api/tracks/{id}/stream` | Stream a track (supports HTTP `Range`). |

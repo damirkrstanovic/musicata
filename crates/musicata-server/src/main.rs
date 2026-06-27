@@ -2718,6 +2718,7 @@ async fn albums(
         year: query.year,
         composer: query.composer,
         folder: query.folder,
+        tag: query.tag,
     };
     let page = ListQuery {
         limit: query.limit,
@@ -5030,6 +5031,7 @@ struct TrackListQuery {
     year: Option<u16>,
     composer: Option<String>,
     folder: Option<String>,
+    tag: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
     sort: Option<String>,
@@ -5044,6 +5046,7 @@ async fn tracks(
         year: query.year,
         composer: query.composer,
         folder: query.folder,
+        tag: query.tag,
     };
     let page = ListQuery {
         limit: query.limit,

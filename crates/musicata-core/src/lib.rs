@@ -300,6 +300,8 @@ impl Library {
                 .into_iter()
                 .map(|(value, track_count)| BrowseTextFacet { value, track_count })
                 .collect(),
+            // Audio tags live in storage (musicata-ml), not the in-memory core library.
+            tags: Vec::new(),
         }
     }
 
@@ -500,6 +502,9 @@ pub struct BrowseFilter {
     pub year: Option<u16>,
     pub composer: Option<String>,
     pub folder: Option<String>,
+    /// An AudioSet "sound" tag from musicata-ml (e.g. "Rock music", "Piano") — a
+    /// content-based facet that works even when files carry no genre tag.
+    pub tag: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -508,6 +513,8 @@ pub struct BrowseIndex {
     pub years: Vec<BrowseYearFacet>,
     pub composers: Vec<BrowseTextFacet>,
     pub folders: Vec<BrowseTextFacet>,
+    /// musicata-ml audio tags, most-common first (empty until tracks are analysed).
+    pub tags: Vec<BrowseTextFacet>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

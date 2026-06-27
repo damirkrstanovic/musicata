@@ -33,6 +33,7 @@
           genre: browse.genre || undefined,
           year: browse.year ?? undefined,
           composer: browse.composer || undefined,
+          tag: browse.tag || undefined,
         });
         if (mine !== token) return; // filter changed mid-flight
         albums = [...albums, ...page.items];
@@ -54,6 +55,7 @@
     void browse.genre;
     void browse.year;
     void browse.composer;
+    void browse.tag;
     untrack(() => {
       token++;
       albums = [];
