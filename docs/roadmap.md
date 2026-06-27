@@ -713,17 +713,18 @@ Tasks:
   backends are full-capability; the per-variant seam is where a future bridged endpoint declares
   a reduced set. Unit-tested.
 - Add a lightweight native endpoint prototype.
-- Introduce authentication between the server and players/endpoints. **Designed; enforcement
-  deferred until the native endpoint exists** — see [player-auth.md](player-auth.md). Plan: a
-  per-player bearer token issued at registration, SHA-256-hashed at rest, presented on the
-  endpoint's command/state/WS channels *in addition to* user auth, and enforced only for players
-  that have one — so the current server-initiated backends (browser/MPD/Snapcast, already
-  covered by `require_auth`) are unaffected. It ships **with** the self-registering native
-  endpoint prototype (above), since nothing presents a token until then; adding it now would be
-  unenforced scaffolding. (Distinct from user↔server auth in Milestone 12.) This is the
-  *endpoint→server* direction; the *server→upstream-player* direction (e.g. authenticating to a
-  password-protected/TLS MPD) is scoped under Milestone 5's "MPD authentication + secure
-  transport" item.
+- [x] Introduce authentication between the server and players/endpoints (the
+  *endpoint→server* direction). **Shipped** — see [player-auth.md](player-auth.md). A per-player
+  bearer token is issued at registration (`POST /api/players {"issue_token":true}` → `auth_token`
+  returned once), **SHA-256-hashed at rest** (`players.auth_token_hash`, migration v30), and
+  accepted by `require_auth` on that player's own channels (`/state`, `/commands`, `/ws`) *in
+  place of* a user session. It's additive and opt-in: consulted only when user auth fails, only
+  for those channels, only for a player that has a token — so the server-initiated backends
+  (browser/MPD/Snapcast) are unaffected. HTTP + unit tested (token authenticates its own channel,
+  wrong/absent token 401s, the token doesn't open another player's channel). A self-registering
+  native endpoint *kind* that presents this token is the remaining piece (with the native
+  endpoint prototype above). The *server→upstream-player* direction (authenticating to a
+  password-protected/TLS MPD) stays under Milestone 5.
 - Research and prototype Squeezelite/LMS bridge behavior.
 - [x] **Research Snapcast for synchronized transport.** Done — see **`docs/snapcast.md`**.
   Verdict: the right tool for reliable + sample-accurate network playback to non-browser

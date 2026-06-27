@@ -298,6 +298,13 @@ impl Database {
             set_user_version(&self.pool, 29).await?;
         }
 
+        if version < 30 {
+            for statement in MIGRATION_030_PLAYER_AUTH_TOKEN {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 30).await?;
+        }
+
         Ok(())
     }
 
@@ -2850,6 +2857,29 @@ impl Database {
         Ok(())
     }
 
+    /// Store the sha256 of a player's endpoint auth token (M10). Set once at registration;
+    /// `upsert_player` leaves this column alone, so a re-register keeps the token.
+    pub async fn set_player_auth_token_hash(&self, player_id: &str, token_hash: &str) -> Result<()> {
+        sqlx::query("UPDATE players SET auth_token_hash = ?2 WHERE id = ?1")
+            .bind(player_id)
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The stored sha256 of a player's endpoint auth token, or `None` if it has none (the
+    /// common case — server-initiated players carry no token).
+    pub async fn player_auth_token_hash(&self, player_id: &str) -> Result<Option<String>> {
+        let hash: Option<String> =
+            sqlx::query_scalar::<_, Option<String>>("SELECT auth_token_hash FROM players WHERE id = ?1")
+                .bind(player_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+        Ok(hash)
+    }
+
     pub async fn update_player_name(&self, id: &str, name: &str) -> Result<()> {
         sqlx::query("UPDATE players SET name = ?2 WHERE id = ?1")
             .bind(id)
@@ -5136,6 +5166,12 @@ const MIGRATION_029_ALBUM_LOUDNESS: &[&str] = &["CREATE TABLE IF NOT EXISTS albu
         true_peak_dbtp REAL,
         analyzed_at_unix_seconds INTEGER NOT NULL
     )"];
+
+// Per-player endpoint auth token (M10): the sha256 of a token issued at registration to a
+// self-registering endpoint, so it can authenticate on its own channels without a user
+// session. NULL for server-initiated players (browser/MPD/Snapcast), which carry no token.
+const MIGRATION_030_PLAYER_AUTH_TOKEN: &[&str] =
+    &["ALTER TABLE players ADD COLUMN auth_token_hash TEXT"];
 
 // MusicBrainz metadata fetched for a track via its (fingerprinted) recording MBID —
 // real title/artist/album/track-number, applied to the canonical library so an untagged

@@ -128,13 +128,13 @@ streaming fetches only the requested byte range.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
-| GET | `/api/players` | List registered players. |
-| POST | `/api/players` | Register a player: `{ "kind": "mpd", "address": "host:port", "name": "…" }`. |
-| PATCH | `/api/players/{id}` | Rename (`{"name"}`) or set zone (`{"zone_id"}`/`null`). |
-| DELETE | `/api/players/{id}` | Remove a player. |
-| GET | `/api/players/{id}/state` | Current `PlaybackState` snapshot. |
-| POST | `/api/players/{id}/commands` | Send a `PlayerCommand` (see below). |
-| GET | `/api/players/{id}/ws` | WebSocket of live `PlaybackState`. |
+| GET | `/api/players` | List registered players. Each carries `capabilities` (`seek`/`volume`/`repeat`/`shuffle`/`queue`) advertised by the backend. |
+| POST | `/api/players` | Register a player: `{ "kind": "mpd", "address": "host:port", "name": "…", "issue_token"?: bool }`. With `issue_token`, the response also carries `auth_token` **once** — a per-player endpoint token (only its hash is stored). |
+| PATCH | `/api/players/{id}` | Rename (`{"name"}`) or set zone (`{"zone_id"}`/`null`). User-gated. |
+| DELETE | `/api/players/{id}` | Remove a player. User-gated. |
+| GET | `/api/players/{id}/state` | Current `PlaybackState` snapshot. A player's own endpoint token authenticates this channel (Bearer/`?token=`) in place of a user session. |
+| POST | `/api/players/{id}/commands` | Send a `PlayerCommand` (see below). Endpoint-token auth as for `/state`. |
+| GET | `/api/players/{id}/ws` | WebSocket of live `PlaybackState`. Endpoint-token auth via `?token=`. |
 | GET/POST | `/api/zones` | List zones / create a zone (named groups of players). |
 | PATCH/DELETE | `/api/zones/{id}` | Rename / remove a zone. |
 | GET | `/api/zones/{id}/state` | Current `PlaybackState` for the zone. |

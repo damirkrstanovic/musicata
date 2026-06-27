@@ -36,7 +36,19 @@ work that isn't self-evident from the code. Newest first. Referenced from `roadm
 
 ### M10 — Player endpoint auth
 
-- See the dedicated entry below / `player-auth.md` for the final call on what shipped.
+- **Implemented the per-player token mechanism now (not deferred).** Last round it was designed
+  but deferred "until something presents a token." This round, the user asked for M10, so the
+  mechanism shipped: token issuance (`issue_token` at registration), SHA-256 storage
+  (`players.auth_token_hash`, migration v30), and `require_auth` accepting a player token on that
+  player's `/state`/`/commands`/`/ws` channels in place of a user session.
+- **It is additive and opt-in, so it changes nothing for existing players.** The token is
+  consulted only when user auth fails, only for those three channel paths, and only for a player
+  that has a token. Server-initiated backends (browser/MPD/Snapcast) carry no token and stay
+  user-gated — the web app keeps working unchanged. This is why it was safe to enforce now even
+  though the self-registering native-endpoint *kind* (which would actually present the token)
+  doesn't exist yet; that endpoint program + its player variant remain the open M10 piece.
+- Tested end to end over HTTP (tokened channel reachable token-only; wrong/absent token 401;
+  token scoped to its own player) plus unit tests. See `player-auth.md`.
 
 ## 2026-06-27 — Roadmap sweep: M7, M9, M10, M12
 

@@ -2743,12 +2743,26 @@ struct RegisterPlayerRequest {
     kind: Option<String>,
     address: String,
     name: Option<String>,
+    /// Issue a per-player endpoint auth token (M10) so a self-registered endpoint can reach
+    /// its own channels without a user session. The token is returned once, here.
+    #[serde(default)]
+    issue_token: bool,
+}
+
+/// A registered player, plus the endpoint auth token when one was just issued (shown once —
+/// only its hash is stored).
+#[derive(Serialize)]
+struct RegisteredPlayer {
+    #[serde(flatten)]
+    player: Player,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_token: Option<String>,
 }
 
 async fn register_player(
     State(state): State<AppState>,
     Json(request): Json<RegisterPlayerRequest>,
-) -> Result<Json<Player>, AppError> {
+) -> Result<Json<RegisteredPlayer>, AppError> {
     let kind = request.kind.as_deref().unwrap_or("mpd");
     let name = request
         .name
@@ -2759,7 +2773,18 @@ async fn register_player(
         .register(kind, &request.address, &name)
         .await
         .map_err(|error| AppError::bad_request(error.to_string()))?;
-    Ok(Json(player))
+    let auth_token = if request.issue_token {
+        let (token, hash) = auth::issue_player_token();
+        state
+            .database
+            .set_player_auth_token_hash(&player.id, &hash)
+            .await
+            .map_err(db_error)?;
+        Some(token)
+    } else {
+        None
+    };
+    Ok(Json(RegisteredPlayer { player, auth_token }))
 }
 
 async fn update_player(
@@ -7632,6 +7657,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(users_denied.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A per-player endpoint token (M10) authenticates that player's own channels without a
+    /// user session — but only that player's, and only with the right token.
+    #[tokio::test]
+    async fn player_endpoint_token_authenticates_its_channels() {
+        let fixture = TestFixture::new("player-token");
+        let app = fixture.app().await;
+
+        // Create the first admin so auth enforcement is on, and keep the session cookie.
+        let setup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/setup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"password123"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(setup.status(), StatusCode::OK);
+        let cookie = setup
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|raw| raw.split(';').next())
+            .expect("session cookie")
+            .to_string();
+
+        // Register a player and issue it an endpoint token (using the admin session).
+        let registered = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/players")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        r#"{"address":"127.0.0.1:6600","issue_token":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text(registered.into_body()).await).unwrap();
+        let player_id = body["id"].as_str().expect("player id").to_string();
+        let token = body["auth_token"].as_str().expect("token issued").to_string();
+
+        let state_path = format!("/api/players/{player_id}/state");
+        let get = |creds: Option<(&'static str, String)>| {
+            let mut builder = Request::builder().uri(&state_path);
+            if let Some((header, value)) = creds {
+                builder = builder.header(header, value);
+            }
+            app.clone().oneshot(builder.body(Body::empty()).unwrap())
+        };
+
+        // No credentials → 401 (a user exists, so the gate is closed).
+        assert_eq!(get(None).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+        // The player token authenticates its own /state channel — auth passes (not 401/403);
+        // whatever the handler then returns for an offline player is beside the point.
+        let authed = get(Some(("authorization", format!("Bearer {token}"))))
+            .await
+            .unwrap()
+            .status();
+        assert_ne!(authed, StatusCode::UNAUTHORIZED);
+        assert_ne!(authed, StatusCode::FORBIDDEN);
+
+        // A wrong token is rejected.
+        assert_eq!(
+            get(Some(("authorization", "Bearer deadbeef".to_string())))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // The token does NOT open a different player's channel.
+        let other = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/players/someone-else/state")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// DSP profile CRUD + room-IR impulse round-trip over the HTTP API (gap #3).

@@ -1,6 +1,8 @@
-# Player endpoint authentication — design (M10)
+# Player endpoint authentication (M10)
 
-Status: **designed, enforcement deferred** (2026-06-27). See `decisions.md`.
+Status: **shipped** (2026-06-27) — the per-player token mechanism is implemented and enforced.
+A self-registering *native endpoint* (a distinct player kind) is still future work, but the
+auth primitive it needs now exists and is tested. See `decisions.md`.
 
 ## The problem
 
@@ -42,16 +44,36 @@ posture Snapcast already uses (write the auth config now, enforce when the movin
   it registered with and can carry a server-issued nonce); it's specified alongside that
   prototype, not bolted onto the current HTTP handlers.
 
-## Why enforcement is deferred
+## What shipped
 
-There is nothing to present a token yet: every current backend is server-initiated and already
-covered by user auth. Adding the column + issuance now, with no client that sends the token,
-would be unenforced scaffolding — security theatre that still has to be revisited when the
-native endpoint lands. So the **mechanism is specified here** and ships **with** the native
-endpoint prototype (the same M10 task), as one coherent change with a real client on the other
-end and tests that exercise a rejected/forged token.
+The mechanism above is implemented:
 
-## What did ship for M10 now
+- **Storage:** `players.auth_token_hash` (migration v30, NULL for the server-initiated
+  backends). `set_player_auth_token_hash` / `player_auth_token_hash`.
+- **Issuance:** `POST /api/players` accepts `"issue_token": true`; the response then carries
+  `auth_token` **once** (only its sha-256 is stored). `auth::issue_player_token()` mints it.
+- **Enforcement:** `require_auth` accepts a valid player token (Bearer or `?token=`) for that
+  player's own channels — `/api/players/{id}/{state,commands,ws}` — *in place of* a user session.
+  It is additive: tokens are only consulted when user auth fails, only for those three channel
+  paths, and only for a player that actually has a token. Management paths
+  (PATCH/DELETE `/api/players/{id}`) and every other player stay user-gated.
+- **Tested:** an HTTP test proves a tokened player's `/state` is reachable with the token and no
+  cookie, that a wrong token and the no-credential case 401, and that the token does **not** open
+  a different player's channel. Plus unit tests for the channel classification and the
+  issue/hash round-trip.
+
+Because it's additive and opt-in (`issue_token`), the server-initiated backends
+(browser/MPD/Snapcast) are unaffected — they carry no token and are still covered by user auth.
+
+## Still future work
+
+A **self-registering native endpoint** as a first-class player kind (the device registers
+*itself* and runs a lightweight client that presents the token on its WS channel) — the M10
+"native endpoint prototype". The auth primitive is now in place for it; what remains is the
+endpoint program + its player-kind variant, and the **server → endpoint** direction (the
+endpoint pinning the server URL / a server nonce).
+
+## What also shipped for M10
 
 `PlayerCapabilities` is advertised **per player** off the `PlayerHandle` (like
 `ProviderCapabilities` for sources) rather than hardcoded on the descriptor, so a controller can

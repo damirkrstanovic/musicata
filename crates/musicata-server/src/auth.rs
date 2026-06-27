@@ -178,6 +178,24 @@ fn is_open_path(path: &str) -> bool {
     )
 }
 
+/// If `path` is a player's own endpoint channel — `/api/players/{id}/{state,commands,ws}` —
+/// return its player id. These are the channels a self-registered endpoint authenticates on
+/// with its per-player token (M10); player *management* paths (PATCH/DELETE `/api/players/{id}`)
+/// are excluded and still require a user.
+fn player_channel_id(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/api/players/")?;
+    let (id, tail) = rest.split_once('/')?;
+    matches!(tail, "state" | "commands" | "ws").then_some(id)
+}
+
+/// Mint a per-player endpoint auth token (M10): returns `(cleartext, sha256_hash)`. The
+/// cleartext is shown to the registrant once; only the hash is stored.
+pub fn issue_player_token() -> (String, String) {
+    let token = generate_token();
+    let hash = hash_token(&token);
+    (token, hash)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Middleware
 // ---------------------------------------------------------------------------------------------
@@ -200,7 +218,17 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
     if matches!(state.database.count_users().await, Ok(0)) {
         return next.run(request).await;
     }
-    let Some(user) = resolve_user(&state, cookie, api_token).await else {
+    let Some(user) = resolve_user(&state, cookie, api_token.clone()).await else {
+        // Fall back to per-player endpoint auth (M10): a self-registered endpoint may reach
+        // *its own* channels with just its player token, no user session. Only for players
+        // that actually have a token; everything else stays user-gated.
+        if let Some(player_id) = player_channel_id(&path)
+            && let Some(token) = api_token
+            && let Ok(Some(stored)) = state.database.player_auth_token_hash(player_id).await
+            && stored == hash_token(&token)
+        {
+            return next.run(request).await;
+        }
         return AppError::unauthorized("sign in to continue").into_response();
     };
     if is_admin_path(&path) && !user.is_admin() {
@@ -578,6 +606,26 @@ mod tests {
         assert!(!is_admin_path("/api/playlists"));
         assert!(is_open_path("/api/auth/login"));
         assert!(!is_open_path("/api/auth/me"));
+    }
+
+    #[test]
+    fn player_channel_classification() {
+        assert_eq!(player_channel_id("/api/players/mpd/state"), Some("mpd"));
+        assert_eq!(player_channel_id("/api/players/mpd/commands"), Some("mpd"));
+        assert_eq!(player_channel_id("/api/players/abc-1/ws"), Some("abc-1"));
+        // Management paths and unknown tails are NOT endpoint channels (stay user-gated).
+        assert_eq!(player_channel_id("/api/players/mpd"), None);
+        assert_eq!(player_channel_id("/api/players"), None);
+        assert_eq!(player_channel_id("/api/players/mpd/rename"), None);
+        assert_eq!(player_channel_id("/api/tracks"), None);
+    }
+
+    #[test]
+    fn issued_player_token_hash_matches() {
+        let (token, hash) = issue_player_token();
+        assert_eq!(token.len(), 64);
+        assert_eq!(hash, hash_token(&token));
+        assert_ne!(token, hash);
     }
 
     #[test]
