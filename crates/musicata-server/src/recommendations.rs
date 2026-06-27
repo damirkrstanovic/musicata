@@ -400,7 +400,10 @@ pub async fn similar_track_ids(
                 let mut by_artist: std::collections::HashMap<String, Vec<String>> =
                     std::collections::HashMap::new();
                 for (name, track_id) in pairs {
-                    by_artist.entry(name).or_default().push(track_id);
+                    // Key by lowercase explicitly so the lookup in
+                    // `weighted_artist_track_order` (also lowercased) matches regardless of
+                    // the case the storage query returns.
+                    by_artist.entry(name.to_lowercase()).or_default().push(track_id);
                 }
                 let seed = (now_unix as u64) ^ fnv1a(seed_track_id);
                 for id in weighted_artist_track_order(&artists, &by_artist, seed, PER_ARTIST) {

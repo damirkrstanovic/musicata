@@ -2,7 +2,8 @@ use musicata_core::{Album, Track};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const DEFAULT_MUSICBRAINZ_BASE_URL: &str = "https://musicbrainz.org/ws/2";
 const DEFAULT_COVER_ART_ARCHIVE_BASE_URL: &str = "https://coverartarchive.org";
@@ -14,6 +15,9 @@ pub struct MusicBrainzClient {
     base_url: String,
     cover_art_archive_base_url: String,
     http: ureq::Agent,
+    /// Shared across clones (Arc) so the 1 req/s MusicBrainz budget is enforced across
+    /// every call and thread, not just within a single multi-request method.
+    next_slot: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Default for MusicBrainzClient {
@@ -38,6 +42,59 @@ impl MusicBrainzClient {
             base_url: base_url.into(),
             cover_art_archive_base_url: DEFAULT_COVER_ART_ARCHIVE_BASE_URL.to_string(),
             http,
+            next_slot: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Block until this thread may start the next MusicBrainz request, spacing request
+    /// starts by [`MUSICBRAINZ_REQUEST_INTERVAL`] across all clones/threads.
+    fn reserve_slot(&self) {
+        let start = {
+            let mut slot = self.next_slot.lock().unwrap_or_else(|p| p.into_inner());
+            let now = Instant::now();
+            let start = match *slot {
+                Some(next) if next > now => next,
+                _ => now,
+            };
+            *slot = Some(start + MUSICBRAINZ_REQUEST_INTERVAL);
+            start
+        };
+        let now = Instant::now();
+        if start > now {
+            std::thread::sleep(start - now);
+        }
+    }
+
+    /// Push the next allowed request out by `delay` (a 503 Retry-After) so subsequent
+    /// calls back off rather than hammering the service.
+    fn back_off(&self, delay: Duration) {
+        let mut slot = self.next_slot.lock().unwrap_or_else(|p| p.into_inner());
+        let resume = Instant::now() + delay;
+        *slot = Some(match *slot {
+            Some(next) if next > resume => next,
+            _ => resume,
+        });
+    }
+
+    /// Issue a rate-limited MusicBrainz request and decode the JSON body. Honors a 503
+    /// `Retry-After` by backing the limiter off; other non-2xx map to an error string.
+    fn execute(&self, request: ureq::Request) -> Result<Value, String> {
+        self.reserve_slot();
+        match request.call() {
+            Ok(response) => response.into_json::<Value>().map_err(|error| error.to_string()),
+            Err(ureq::Error::Status(503, response)) => {
+                let retry_after = response
+                    .header("Retry-After")
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs)
+                    .unwrap_or(MUSICBRAINZ_REQUEST_INTERVAL);
+                self.back_off(retry_after);
+                Err(format!(
+                    "MusicBrainz rate-limited (503); retry after {}s",
+                    retry_after.as_secs()
+                ))
+            }
+            Err(error) => Err(musicbrainz_request_error(error)),
         }
     }
 
@@ -54,11 +111,8 @@ impl MusicBrainzClient {
             issues: Vec::new(),
         };
 
-        for (index, target) in targets.into_iter().enumerate() {
-            if index > 0 {
-                std::thread::sleep(MUSICBRAINZ_REQUEST_INTERVAL);
-            }
-
+        for target in targets.into_iter() {
+            // Spacing is handled by the shared limiter inside `fetch_target`.
             match self.fetch_target(&target) {
                 Ok(document) => lookup.push_document(document),
                 Err(message) => lookup.issues.push(MusicBrainzLookupIssue {
@@ -229,10 +283,7 @@ impl MusicBrainzClient {
             request = request.query("inc", include);
         }
 
-        let response = request.call().map_err(musicbrainz_request_error)?;
-        let value = response
-            .into_json::<Value>()
-            .map_err(|error| error.to_string())?;
+        let value = self.execute(request)?;
         normalize_musicbrainz_document(target, &value)
     }
 
@@ -290,18 +341,13 @@ impl MusicBrainzClient {
         limit: usize,
     ) -> Result<Value, String> {
         let url = musicbrainz_search_endpoint(&self.base_url, entity_type);
-        let response = self
+        let request = self
             .http
             .get(&url)
             .query("fmt", "json")
             .query("query", query)
-            .query("limit", &limit.to_string())
-            .call()
-            .map_err(musicbrainz_request_error)?;
-
-        response
-            .into_json::<Value>()
-            .map_err(|error| error.to_string())
+            .query("limit", &limit.to_string());
+        self.execute(request)
     }
 
     fn fetch_cover_art_archive(
@@ -333,30 +379,24 @@ impl MusicBrainzClient {
     ) -> Result<MusicBrainzEnrichment, String> {
         let recording_url =
             musicbrainz_entity_url(&self.base_url, MusicBrainzEntityType::Recording, recording_mbid);
-        let recording = self
-            .http
-            .get(&recording_url)
-            .query("fmt", "json")
-            .query("inc", "artist-credits")
-            .call()
-            .map_err(musicbrainz_request_error)?
-            .into_json::<Value>()
-            .map_err(|error| error.to_string())?;
+        let recording = self.execute(
+            self.http
+                .get(&recording_url)
+                .query("fmt", "json")
+                .query("inc", "artist-credits"),
+        )?;
         let mut enrichment = parse_recording_enrichment(&recording);
 
         if let Some(release_mbid) = release_mbid {
-            std::thread::sleep(MUSICBRAINZ_REQUEST_INTERVAL);
+            // No manual sleep: the shared limiter already spaces this from the first call.
             let release_url =
                 musicbrainz_entity_url(&self.base_url, MusicBrainzEntityType::Release, release_mbid);
-            let release = self
-                .http
-                .get(&release_url)
-                .query("fmt", "json")
-                .query("inc", "artist-credits+release-groups+media+recordings")
-                .call()
-                .map_err(musicbrainz_request_error)?
-                .into_json::<Value>()
-                .map_err(|error| error.to_string())?;
+            let release = self.execute(
+                self.http
+                    .get(&release_url)
+                    .query("fmt", "json")
+                    .query("inc", "artist-credits+release-groups+media+recordings"),
+            )?;
             merge_release_enrichment(&mut enrichment, &release, recording_mbid);
         }
         Ok(enrichment)
@@ -1349,6 +1389,36 @@ mod tests {
         Album, MetadataApprovalState, ProviderMapping, Track, TrackMetadataObservation,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn reserve_slot_spaces_request_starts_across_calls() {
+        // ISS-26: the shared limiter must space request starts even across separate calls
+        // (a cloned client shares the same clock).
+        let client = MusicBrainzClient::new(DEFAULT_MUSICBRAINZ_BASE_URL);
+        let clone = client.clone();
+        let start = Instant::now();
+        client.reserve_slot();
+        clone.reserve_slot(); // a clone shares the slot
+        client.reserve_slot();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= MUSICBRAINZ_REQUEST_INTERVAL * 2,
+            "3 request starts span >= 2 intervals, got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn back_off_delays_the_next_slot() {
+        // ISS-27: a 503 Retry-After pushes the next allowed request out.
+        let client = MusicBrainzClient::new(DEFAULT_MUSICBRAINZ_BASE_URL);
+        client.back_off(Duration::from_millis(300));
+        let start = Instant::now();
+        client.reserve_slot();
+        assert!(
+            start.elapsed() >= Duration::from_millis(250),
+            "reserve_slot waits out the back-off"
+        );
+    }
 
     const RECORDING_ID: &str = "e3e2ace1-1312-4f76-94b8-e6c7d969b730";
     const TRACK_ID: &str = "0fbc8678-c5a5-3f7b-a46a-ac92f61f6bed";

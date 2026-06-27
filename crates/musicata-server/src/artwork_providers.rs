@@ -19,17 +19,28 @@ use serde_json::Value;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Identify an image format from its magic bytes, returning the file extension. `None`
+/// for anything that isn't a recognized image (e.g. an HTML/JSON error page).
+fn image_extension_from_magic(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some("png")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
 /// Download a cover image, returning its bytes and a file extension derived from the
-/// `Content-Type`. Bounded so a mis-sized response can't exhaust memory.
+/// actual content (magic bytes). Bounded so a mis-sized response can't exhaust memory;
+/// a non-image body (an HTML/JSON error page) is rejected rather than cached as `.jpg`.
 pub fn download_image(url: &str) -> Result<(Vec<u8>, &'static str), String> {
     const MAX_BYTES: u64 = 16 * 1024 * 1024;
     let response = agent().get(url).call().map_err(http_error)?;
-    let ext = match response.content_type() {
-        "image/png" => "png",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        _ => "jpg",
-    };
     let mut bytes = Vec::new();
     response
         .into_reader()
@@ -39,6 +50,8 @@ pub fn download_image(url: &str) -> Result<(Vec<u8>, &'static str), String> {
     if bytes.is_empty() {
         return Err("empty image response".to_string());
     }
+    let ext = image_extension_from_magic(&bytes)
+        .ok_or_else(|| "response is not a recognized image".to_string())?;
     Ok((bytes, ext))
 }
 
@@ -245,12 +258,18 @@ fn parse_itunes(value: &Value, query: &ArtworkQuery) -> Option<ArtworkResult> {
         )
     })?;
     let art = chosen.get("artworkUrl100").and_then(Value::as_str)?;
-    // Apple's thumbnail URLs embed the size; swap to a larger render.
-    let image_url = art.replace("100x100bb", "600x600bb");
+    // Apple's thumbnail URLs usually embed the size; swap to a larger render when the
+    // token is present, and only then claim the larger width. Otherwise keep the URL as-is
+    // (artworkUrl100 is a 100px render by Apple's API contract).
+    let (image_url, width) = if art.contains("100x100bb") {
+        (art.replace("100x100bb", "600x600bb"), Some(600))
+    } else {
+        (art.to_string(), Some(100))
+    };
     Some(ArtworkResult {
         provider: "itunes",
         image_url,
-        width: Some(600),
+        width,
     })
 }
 
@@ -589,6 +608,36 @@ mod tests {
         assert_eq!(result.provider, "itunes");
         assert_eq!(result.image_url, "https://is/y/600x600bb.jpg");
         assert_eq!(result.width, Some(600));
+    }
+
+    #[test]
+    fn image_magic_bytes_accept_images_reject_others() {
+        // ISS-28: validate by content, so an HTML/JSON error page isn't cached as art.
+        assert_eq!(image_extension_from_magic(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
+        assert_eq!(
+            image_extension_from_magic(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A]),
+            Some("png")
+        );
+        assert_eq!(image_extension_from_magic(b"GIF89a..."), Some("gif"));
+        assert_eq!(image_extension_from_magic(b"RIFF\0\0\0\0WEBPVP8 "), Some("webp"));
+        assert_eq!(image_extension_from_magic(b"<!DOCTYPE html><html>"), None);
+        assert_eq!(image_extension_from_magic(b"{\"error\":\"nope\"}"), None);
+        assert_eq!(image_extension_from_magic(b""), None);
+    }
+
+    #[test]
+    fn itunes_does_not_claim_600_when_no_upgrade_happened() {
+        // ISS-29: when the artworkUrl100 doesn't carry the 100x100bb size token the URL
+        // can't be upgraded, so width must not falsely claim 600.
+        let value = serde_json::json!({
+            "results": [
+                { "artistName": "Darkwood Dub", "collectionName": "Paramparčad",
+                  "artworkUrl100": "https://is/y/source.jpg" }
+            ]
+        });
+        let result = parse_itunes(&value, &query()).expect("match");
+        assert_eq!(result.image_url, "https://is/y/source.jpg", "URL unchanged");
+        assert_eq!(result.width, Some(100), "reports the actual 100px size, not 600");
     }
 
     #[test]

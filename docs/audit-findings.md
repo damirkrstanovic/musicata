@@ -191,18 +191,11 @@ Security-sensitive bugs are marked **[security]**.
 
 ### Metadata / enrichment
 
-- [ ] **ISS-26 MusicBrainz has no shared cross-call/cross-thread rate limiter** — `musicbrainz.rs:12`
-  Throttles only *within* a single multi-request call; the radio path + enrichment pass can exceed
-  1 req/s and draw 503s (unlike AcoustID/ListenBrainz which carry a shared `next_slot`).
-- [ ] **ISS-27 No backoff / `Retry-After` on MusicBrainz 503** — `musicbrainz.rs:366`
-  All HTTP errors collapse to one string; callers retry immediately.
-- [ ] **ISS-28 `download_image` trusts Content-Type, no magic-byte check** — `artwork_providers.rs:24`
-  An HTML/JSON error page can be cached as `.jpg`.
-- [ ] **ISS-29 iTunes art "upgrade" is a brittle string replace, always claims width 600** — `artwork_providers.rs:247`
-  `replace("100x100bb","600x600bb")` no-ops when the token is absent, but still reports `width:600`.
-- [ ] **ISS-30 Radio `by_artist` keyed by raw name but looked up lowercased** — `recommendations.rs:399`/`:314`
-  Silent zero-contribution if `tracks_for_artist_names` isn't lowercased (test helper masks it). Verify
-  the storage-layer behavior.
+- [x] **ISS-26 MusicBrainz has no shared cross-call/cross-thread rate limiter** — `musicbrainz.rs:12` ✅ added an `Arc<Mutex<Option<Instant>>>` shared limiter + `reserve_slot` applied via a central `execute`; removed the ad-hoc inter-call sleeps. Test `reserve_slot_spaces_request_starts_across_calls`.
+- [x] **ISS-27 No backoff / `Retry-After` on MusicBrainz 503** — `musicbrainz.rs:366` ✅ `execute` detects 503, reads `Retry-After`, and `back_off`s the limiter. Test `back_off_delays_the_next_slot`.
+- [x] **ISS-28 `download_image` trusts Content-Type, no magic-byte check** — `artwork_providers.rs:24` ✅ `image_extension_from_magic` derives the ext from content and rejects non-images. Test `image_magic_bytes_accept_images_reject_others`.
+- [x] **ISS-29 iTunes art "upgrade" is a brittle string replace, always claims width 600** — `artwork_providers.rs:247` ✅ only claims 600 when the `100x100bb` token was actually swapped, else reports 100. Test `itunes_does_not_claim_600_when_no_upgrade_happened`.
+- [x] **ISS-30 Radio `by_artist` keyed by raw name but looked up lowercased** — `recommendations.rs:399`/`:314` ✅ verified `tracks_for_artist_names` returns `lower(artist_name)` (so it already worked); hardened the build side to lowercase the key explicitly, removing the implicit cross-module contract.
 
 ### Infra / audio
 
