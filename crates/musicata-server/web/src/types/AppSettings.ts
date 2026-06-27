@@ -35,4 +35,8 @@ ml_service_url: string,
 /**
  * Daily local run time for ML analysis, "HH:MM" (default 02:00).
  */
-ml_schedule: string, };
+ml_schedule: string, 
+/**
+ * Record listening history (plays/skips). Default on; off stops new recording.
+ */
+history_enabled: boolean, };

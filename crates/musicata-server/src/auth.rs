@@ -168,6 +168,7 @@ fn is_admin_path(path: &str) -> bool {
     path.starts_with("/api/users")
         || path.starts_with("/api/sources")
         || path == "/api/settings"
+        || path == "/api/history"
 }
 
 /// Always-open endpoints (the SPA must reach these before a session exists).

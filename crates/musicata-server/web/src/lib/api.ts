@@ -296,6 +296,7 @@ export const api = {
   // Settings
   settings: () => getJson<AppSettings>("/api/settings"),
   saveSettings: (body: AppSettings) => sendJson("/api/settings", "PATCH", body),
+  clearHistory: () => sendJson<{ removed: number }>("/api/history", "DELETE"),
 
   // Snapcast multi-room (synchronized playback across rooms)
   snapcastStatus: () => getJson<SnapcastStatus>("/api/snapcast/status"),

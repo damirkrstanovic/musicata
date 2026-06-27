@@ -6,10 +6,33 @@
     fingerprint_enabled: false,
     musicbrainz_enrich_enabled: false,
     fanart_tv_key: "",
+    ml_enabled: false,
+    ml_service_url: "",
+    ml_schedule: "02:00",
+    history_enabled: true,
   });
   let status = $state("");
   let error = $state(false);
   let busy = $state(false);
+
+  // Two-step confirm for the destructive clear (no native confirm() — see project conventions).
+  let confirmClear = $state(false);
+  let historyStatus = $state("");
+
+  async function clearHistory() {
+    if (!confirmClear) {
+      confirmClear = true;
+      return;
+    }
+    confirmClear = false;
+    historyStatus = "Clearing…";
+    try {
+      const res = await api.clearHistory();
+      historyStatus = `Cleared ${res?.removed ?? 0} listens.`;
+    } catch (e) {
+      historyStatus = e instanceof ApiError ? e.message : String(e);
+    }
+  }
 
   async function load() {
     try {
@@ -63,4 +86,33 @@
       <span class="form-status" class:error>{status}</span>
     </div>
   </form>
+
+  <div class="admin-panel-head"><h2>Listening history</h2></div>
+  <p class="admin-hint">
+    History stays on this device and powers your stats, recently/most played, and recommendations.
+  </p>
+  <div class="field-form">
+    <label class="toggle-row">
+      <input type="checkbox" bind:checked={settings.history_enabled} />
+      <span>Record what I play (turn off for private listening)</span>
+    </label>
+    <p class="admin-hint">Saved with the settings above. Turning it off keeps existing history until you clear it.</p>
+    <div class="field-actions">
+      <button type="button" class="ghost-button danger" class:confirming={confirmClear} onclick={clearHistory}>
+        {confirmClear ? "Confirm — clear all history?" : "Clear listening history"}
+      </button>
+      <span class="form-status">{historyStatus}</span>
+    </div>
+  </div>
 </section>
+
+<style>
+  .ghost-button.danger {
+    color: var(--danger);
+    border-color: var(--danger);
+  }
+  .ghost-button.danger.confirming {
+    background: var(--danger);
+    color: #fff;
+  }
+</style>

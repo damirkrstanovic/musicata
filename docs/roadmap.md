@@ -452,7 +452,16 @@ Tasks:
   2-second skip counted as a listen.)
 - Record richer playback events: started, progress, paused, resumed, loved, disliked,
   rated, queued, and playlist changes. (Completed/skipped are done — see above.)
-- Persist history per user, track, player/zone, session, and playback source.
+- [x] **Disable or delete history (the privacy switch).** A default-on `history_enabled`
+  setting gates the per-player recorder (`players::record_action` drops every event — plays
+  and skips — when it's off), and `DELETE /api/history` (admin-gated, `Database::clear_listens`)
+  wipes all stored listens. Both surfaced in the `/admin` Settings "Listening history" section
+  (toggle + a two-step-confirm "Clear" button — no native dialog). Storage + route tested.
+- Persist history per user, track, player/zone, session, and playback source. *(Deferred:
+  the recorder is per-**player** with no user context, and Musicata is LAN-first / single shared
+  library — the privacy "done when" is met by the disable/delete switch above. Adding a
+  `user_id` column would require threading the authenticated user into the per-player recorder;
+  revisit if multi-tenant history is wanted.)*
 - [x] Add remaining stats views: most played and recently played exist; **never played,
   most skipped, and rediscovery** ship as smart playlists (below). **Session/streak +
   favorites stats** now ship as `GET /api/history/stats` (`Database::listening_stats`):

@@ -1125,9 +1125,12 @@ const SETTING_MB_ENRICH: &str = "musicbrainz_enrich_enabled";
 /// Gates the scan-time EBU R128 loudness analysis pass (default on). The *apply* side (whether
 /// to actually level playback) is a client-side toggle in the browser player.
 const SETTING_LOUDNESS: &str = "loudness_analysis_enabled";
+/// Records listening history (plays/skips). Default on; turning it off stops recording new
+/// listens (existing ones stay until cleared). The privacy switch (see `players::record_action`).
+pub(crate) const SETTING_HISTORY_ENABLED: &str = "history_enabled";
 
 /// Read a default-on boolean setting (toggling it in the UI takes effect next pass).
-async fn setting_enabled(database: &Database, key: &str) -> bool {
+pub(crate) async fn setting_enabled(database: &Database, key: &str) -> bool {
     database
         .get_setting(key)
         .await
@@ -2176,6 +2179,7 @@ fn app(
         .route("/api/albums/{id}", get(album_detail))
         .route("/api/browse", get(browse))
         .route("/api/browse/recently-added", get(recently_added))
+        .route("/api/history", delete(clear_history))
         .route("/api/history/recent", get(recently_played))
         .route("/api/history/most-played", get(most_played))
         .route("/api/history/stats", get(history_stats))
@@ -4118,6 +4122,8 @@ struct AppSettings {
     ml_service_url: String,
     /// Daily local run time for ML analysis, "HH:MM" (default 02:00).
     ml_schedule: String,
+    /// Record listening history (plays/skips). Default on; off stops new recording.
+    history_enabled: bool,
 }
 
 async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>, AppError> {
@@ -4143,6 +4149,7 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
         .await
         .map_err(db_error)?
         .unwrap_or_else(|| "02:00".to_string());
+    let history_enabled = setting_enabled(&state.database, SETTING_HISTORY_ENABLED).await;
     Ok(Json(AppSettings {
         artwork_fetch,
         fanart_tv_key,
@@ -4151,6 +4158,7 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
         ml_enabled,
         ml_service_url,
         ml_schedule,
+        history_enabled,
     }))
 }
 
@@ -4163,6 +4171,7 @@ struct SettingsUpdate {
     ml_enabled: Option<bool>,
     ml_service_url: Option<String>,
     ml_schedule: Option<String>,
+    history_enabled: Option<bool>,
 }
 
 async fn update_settings(
@@ -4221,7 +4230,21 @@ async fn update_settings(
             .await
             .map_err(db_error)?;
     }
+    if let Some(enabled) = update.history_enabled {
+        state
+            .database
+            .set_setting(SETTING_HISTORY_ENABLED, if enabled { "true" } else { "false" })
+            .await
+            .map_err(db_error)?;
+    }
     get_settings(State(state)).await
+}
+
+/// Clears all listening history (the user-facing privacy action). Admin-gated like the
+/// other settings mutations.
+async fn clear_history(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
+    let removed = state.database.clear_listens().await.map_err(db_error)?;
+    Ok(Json(serde_json::json!({ "removed": removed })))
 }
 
 /// Audio-ML status for `/admin`: whether it's on, how many tracks are analyzed, and the total.
@@ -8259,6 +8282,27 @@ mod tests {
         assert_eq!(stats["listening_sessions"], 1);
         assert_eq!(stats["longest_session_plays"], 1);
         assert_eq!(stats["favorite_tracks"], 0);
+
+        // DELETE /api/history clears it: the removed count is reported and the rankings empty out.
+        let cleared = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/history")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let cleared: serde_json::Value =
+            serde_json::from_str(&body_text(cleared.into_body()).await).unwrap();
+        assert_eq!(cleared["removed"], 1);
+        assert_eq!(
+            history(&app, "/api/history/recent").await.as_array().unwrap().len(),
+            0
+        );
     }
 
     /// `/api/tracks/{id}/similar` returns the audio-nearest neighbors (the musicata-ml KNN).

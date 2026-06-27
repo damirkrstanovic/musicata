@@ -3494,6 +3494,13 @@ impl Database {
         Ok(result.rows_affected())
     }
 
+    /// Deletes the entire listening history, returning the number of rows removed.
+    /// Used by the user-facing "clear history" action (distinct from the rolling prune).
+    pub async fn clear_listens(&self) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM listens").execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
     /// Tracks paired with their listen count, most played first. Ties break on recency.
     /// Counts confirmed listens only (skips are excluded).
     pub async fn most_played(&self, limit: usize) -> Result<Vec<(Track, i64)>> {
@@ -6288,6 +6295,12 @@ mod tests {
         assert_eq!(most.len(), 1);
         assert_eq!(most[0].0.id, "track_1");
         assert_eq!(most[0].1, 1);
+
+        // The user-facing "clear history" wipes every remaining listen.
+        let cleared = database.clear_listens().await.expect("clear");
+        assert_eq!(cleared, 2); // track_1@300 and the ghost@400
+        assert!(database.most_played(10).await.expect("most after clear").is_empty());
+        assert!(database.clear_listens().await.expect("clear again") == 0);
 
         let _ = std::fs::remove_file(db_path);
     }

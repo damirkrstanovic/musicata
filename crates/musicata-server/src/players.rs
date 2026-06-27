@@ -285,6 +285,13 @@ impl ListenTracker {
 /// Persist whatever a tick decided. The event time is stamped here (`now_unix`), so a
 /// listen confirmed mid-track is timestamped when it crossed the threshold.
 async fn record_action(database: &Database, player_id: &str, action: ListenAction) {
+    if matches!(action, ListenAction::None) {
+        return;
+    }
+    // Privacy switch: when history recording is off, drop the event (plays and skips alike).
+    if !crate::setting_enabled(database, crate::SETTING_HISTORY_ENABLED).await {
+        return;
+    }
     let writes: Vec<(&str, ListenKind)> = match &action {
         ListenAction::None => return,
         ListenAction::RecordListen(id) => vec![(id.as_str(), ListenKind::Played)],
