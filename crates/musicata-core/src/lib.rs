@@ -2101,8 +2101,11 @@ fn clean_title(value: &str) -> String {
 }
 
 fn clean_optional_tag_value(value: Option<&str>) -> Option<String> {
+    // Embedded tag text is authoritative — keep underscores verbatim (they're real
+    // characters, e.g. "AC_DC"). Underscore→space normalization is only for names derived
+    // from file/folder paths (see `clean_title`).
     value
-        .map(|value| value.trim().replace('_', " "))
+        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
@@ -2493,22 +2496,24 @@ fn derive_ids(
     (artist_id, album_artist_id, album_id)
 }
 
-#[derive(Default)]
+/// FNV-1a 64-bit. The state is seeded with the offset basis at construction, so a `0`
+/// intermediate value is treated as a legitimate hash (not as "uninitialized") — which
+/// keeps the FNV chain intact. Output is identical to a plain FNV-1a for every input.
 struct StableHasher(u64);
+
+impl Default for StableHasher {
+    fn default() -> Self {
+        StableHasher(0xcbf29ce484222325) // FNV-1a 64-bit offset basis
+    }
+}
 
 impl Hasher for StableHasher {
     fn write(&mut self, bytes: &[u8]) {
-        let mut hash = if self.0 == 0 {
-            0xcbf29ce484222325
-        } else {
-            self.0
-        };
-
+        let mut hash = self.0;
         for byte in bytes {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x100000001b3);
         }
-
         self.0 = hash;
     }
 
@@ -2527,6 +2532,23 @@ mod tests {
         tag::{ItemKey, ItemValue, Tag, TagItem, TagType},
     };
     use std::{cell::Cell, collections::BTreeSet, fs, io::Cursor, time::SystemTime};
+
+    #[test]
+    fn embedded_tag_values_preserve_underscores() {
+        // CPX-02: embedded tag text is authoritative — an underscore is a real character
+        // ("AC_DC", "lo_fi"), not a filename separator to turn into a space.
+        assert_eq!(
+            clean_optional_tag_value(Some("AC_DC")),
+            Some("AC_DC".to_string())
+        );
+        assert_eq!(
+            clean_optional_tag_value(Some("  hip_hop  ")),
+            Some("hip_hop".to_string())
+        );
+        assert_eq!(clean_optional_tag_value(Some("   ")), None);
+        // Filename/folder inference still normalizes underscores to spaces.
+        assert_eq!(clean_title("Some_Title"), "Some Title");
+    }
 
     // Two names share an artist iff their normalized keys match.
     fn same_artist(a: &str, b: &str) -> bool {

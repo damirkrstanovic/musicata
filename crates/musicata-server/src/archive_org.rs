@@ -166,23 +166,29 @@ pub fn parse_item(json: &str, identifier: &str) -> anyhow::Result<ArchiveItem> {
     let doc: MetadataDoc = serde_json::from_str(json)
         .map_err(|error| anyhow::anyhow!("parse Internet Archive metadata: {error}"))?;
 
-    // Keep the best-ranked audio file per stem.
-    let mut best: Vec<(String, u8, RawFile)> = Vec::new();
+    // Keep the best-ranked audio file per stem, in first-seen order. A stem→slot index
+    // keeps this O(n) instead of an O(n²) linear scan per file.
+    let mut best: Vec<(u8, RawFile)> = Vec::new();
+    let mut slot_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for file in doc.files {
         let Some(rank) = audio_rank(&file) else {
             continue;
         };
         let key = stem(&file.name).to_string();
-        match best.iter_mut().find(|(existing, _, _)| *existing == key) {
-            Some(slot) if slot.1 >= rank => {}
-            Some(slot) => *slot = (key, rank, file),
-            None => best.push((key, rank, file)),
+        match slot_of.get(&key) {
+            // Existing wins ties (>=), matching the previous behavior.
+            Some(&slot) if best[slot].0 >= rank => {}
+            Some(&slot) => best[slot] = (rank, file),
+            None => {
+                slot_of.insert(key, best.len());
+                best.push((rank, file));
+            }
         }
     }
 
     let tracks = best
         .into_iter()
-        .map(|(_, _, file)| {
+        .map(|(_, file)| {
             let title = file
                 .title
                 .map(|t| t.trim().to_string())
@@ -321,6 +327,9 @@ mod tests {
             opener.stream_url,
             "https://archive.org/download/test-item/gd77-d1t01.flac"
         );
+        // First-seen order is preserved (track 1 before track 2).
+        assert_eq!(item.tracks[0].title, "Opener");
+        assert_eq!(item.tracks[1].title, "Second");
     }
 
     #[test]

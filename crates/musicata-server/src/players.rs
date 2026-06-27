@@ -24,7 +24,7 @@ use musicata_core::{
     PlaybackState, PlaybackStatus, Player, PlayerCapabilities, PlayerCommand, QueueItem,
     RepeatMode, Zone,
 };
-use musicata_storage::{Database, ListenKind, PlayerPlayback, PlayerRecord};
+use musicata_storage::{Database, ListenKind, PlayerPlayback, PlayerQueueSnapshot, PlayerRecord};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
 
@@ -898,23 +898,7 @@ impl MpdPlayer {
             Ok(Some(snapshot)) => {
                 {
                     let mut state = self.state.lock().await;
-                    let playback = snapshot.playback;
-                    state.queue = snapshot.items;
-                    state.position = playback.position.filter(|&i| i < state.queue.len());
-                    // A queue we can't point into can't be paused/playing.
-                    state.status = match playback.status {
-                        PlaybackStatus::Playing => PlaybackStatus::Paused,
-                        other if state.position.is_none() => match other {
-                            PlaybackStatus::Paused => PlaybackStatus::Stopped,
-                            other => other,
-                        },
-                        other => other,
-                    };
-                    state.elapsed_seconds = playback.elapsed_seconds;
-                    state.duration_seconds = None;
-                    state.volume = playback.volume;
-                    state.repeat = playback.repeat;
-                    state.shuffle = playback.shuffle;
+                    apply_restored_snapshot(&mut state, snapshot);
                 }
                 self.restored.store(true, Ordering::Relaxed);
                 // Push the restored queue onto MPD without playing (resumed on first Play).
@@ -1441,25 +1425,7 @@ impl BrowserPlayer {
             }
         };
         let mut state = self.state.lock().await;
-        let playback = snapshot.playback;
-        state.queue = snapshot.items;
-        // Guard against a position that no longer indexes the queue.
-        state.position = playback.position.filter(|&index| index < state.queue.len());
-        state.status = match playback.status {
-            PlaybackStatus::Playing => PlaybackStatus::Paused,
-            other if state.position.is_none() => match other {
-                // A queue we can't point into can't be paused/playing.
-                PlaybackStatus::Paused => PlaybackStatus::Stopped,
-                other => other,
-            },
-            other => other,
-        };
-        state.elapsed_seconds = playback.elapsed_seconds;
-        state.duration_seconds = None;
-        state.volume = playback.volume;
-        state.repeat = playback.repeat;
-        state.shuffle = playback.shuffle;
-        state.shuffle_order = playback.shuffle_order;
+        apply_restored_snapshot(&mut state, snapshot);
     }
 
     /// Write a queue change back to the database. Failures are logged, never
@@ -1634,23 +1600,7 @@ impl ZonePlayer {
             }
         };
         let mut state = self.state.lock().await;
-        let playback = snapshot.playback;
-        state.queue = snapshot.items;
-        state.position = playback.position.filter(|&index| index < state.queue.len());
-        state.status = match playback.status {
-            PlaybackStatus::Playing => PlaybackStatus::Paused,
-            other if state.position.is_none() => match other {
-                PlaybackStatus::Paused => PlaybackStatus::Stopped,
-                other => other,
-            },
-            other => other,
-        };
-        state.elapsed_seconds = playback.elapsed_seconds;
-        state.duration_seconds = None;
-        state.volume = playback.volume;
-        state.repeat = playback.repeat;
-        state.shuffle = playback.shuffle;
-        state.shuffle_order = playback.shuffle_order;
+        apply_restored_snapshot(&mut state, snapshot);
     }
 
     async fn persist(&self, persist: QueuePersist) {
@@ -1908,6 +1858,31 @@ async fn apply_to_queue_state(
         }
     }
     Ok(())
+}
+
+/// Populate a freshly-locked `QueueState` from a persisted snapshot, applying the
+/// "restore as paused; drop a status the queue can't support" remap shared by every
+/// server-owned player's `restore`.
+fn apply_restored_snapshot(state: &mut QueueState, snapshot: PlayerQueueSnapshot) {
+    let playback = snapshot.playback;
+    state.queue = snapshot.items;
+    // Guard against a position that no longer indexes the queue.
+    state.position = playback.position.filter(|&index| index < state.queue.len());
+    state.status = match playback.status {
+        PlaybackStatus::Playing => PlaybackStatus::Paused,
+        // A queue we can't point into can't be paused/playing.
+        other if state.position.is_none() => match other {
+            PlaybackStatus::Paused => PlaybackStatus::Stopped,
+            other => other,
+        },
+        other => other,
+    };
+    state.elapsed_seconds = playback.elapsed_seconds;
+    state.duration_seconds = None;
+    state.volume = playback.volume;
+    state.repeat = playback.repeat;
+    state.shuffle = playback.shuffle;
+    state.shuffle_order = playback.shuffle_order;
 }
 
 /// Advance to the next queue item. When `stop_at_end` is set (a track finished),
@@ -2309,23 +2284,7 @@ impl SnapcastPlayer {
             }
         };
         let mut state = self.state.lock().await;
-        let playback = snapshot.playback;
-        state.queue = snapshot.items;
-        state.position = playback.position.filter(|&index| index < state.queue.len());
-        state.status = match playback.status {
-            PlaybackStatus::Playing => PlaybackStatus::Paused,
-            other if state.position.is_none() => match other {
-                PlaybackStatus::Paused => PlaybackStatus::Stopped,
-                other => other,
-            },
-            other => other,
-        };
-        state.elapsed_seconds = playback.elapsed_seconds;
-        state.duration_seconds = None;
-        state.volume = playback.volume;
-        state.repeat = playback.repeat;
-        state.shuffle = playback.shuffle;
-        state.shuffle_order = playback.shuffle_order;
+        apply_restored_snapshot(&mut state, snapshot);
     }
 
     async fn persist(&self, persist: QueuePersist) {
