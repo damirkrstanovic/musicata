@@ -3,6 +3,33 @@
 Short, dated records of non-obvious choices made while building Musicata — the "why" behind
 work that isn't self-evident from the code. Newest first. Referenced from `roadmap.md`.
 
+## 2026-06-27 — Native endpoint prototype (M10)
+
+A native playback endpoint (`crates/musicata-endpoint`). Design + usage in `native-endpoint.md`;
+the key calls:
+
+- **Reuse the browser player server-side.** A native endpoint and a browser tab are the same
+  server-side thing — a queue-output driven over the bidirectional WS. So `bring_up` maps the
+  `native` kind to a `BrowserPlayer`; no new player variant, no duplicated queue logic. The only
+  difference is identity (registered + tokened vs. the singleton browser). This kept the server
+  change tiny and the endpoint automatically inherits zones, leveling, and the command model.
+- **The endpoint holds only its scoped player token, never a user account.** That token already
+  authenticated the WS channel (shipped earlier); this round it was **extended to authorize the
+  audio streams** the endpoint fetches (`GET /api/tracks/{id}/stream`, via `player_token_exists`).
+  Without that, a tokenless-but-userless device couldn't fetch what it plays. Bootstrap
+  registration still needs a one-time **user** API token (registration is user-gated — the player
+  token doesn't exist yet at that point); after that the device uses only its player token.
+- **Blocking client (tungstenite + rodio), not async.** rodio is sync and the control loop is
+  simple; a single-threaded blocking design (WS read with a short socket timeout as a ~2 Hz tick
+  for progress/ended) is far less code than an async runtime. `ws://`-only (LAN); whole-track
+  buffering; no seek-follow/gapless — all acceptable prototype limits, documented.
+- **Excluded from the default workspace build.** rodio pulls cpal → ALSA, which the server build
+  must not require. `default-members` lists the three server crates only, so the pre-commit's
+  plain `cargo test` and the `-p musicata-server` release/Docker builds never touch the endpoint;
+  it builds on demand (`cargo build -p musicata-endpoint`).
+- **Control logic is a pure `decide()` function** separate from audio/IO, so the state machine is
+  unit-tested without a sound device; the audio path itself is a manual run (like `live_mpd`).
+
 ## 2026-06-27 — Roadmap sweep #3: UI surfacing (M7 stats view, M11 leveling selector)
 
 Surface two already-shipped backends in the web player.

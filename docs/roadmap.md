@@ -702,7 +702,10 @@ Done when:
 
 ## Milestone 10: Player Providers And Endpoints
 
-Status: in progress.
+Status: core complete; bridges open. The "done when" is met — a non-browser endpoint (the
+native endpoint, plus Snapcast) is controllable and shares the queue/zone command model; player
+capabilities are advertised; endpoint→server auth is enforced. Remaining: a Squeezelite/LMS
+bridge and, later, Chromecast / UPnP / DLNA.
 
 Goal: support playback outside the browser.
 
@@ -714,7 +717,16 @@ Tasks:
   surfaced on the `GET /api/players` descriptor, instead of a hardcoded constant. All current
   backends are full-capability; the per-variant seam is where a future bridged endpoint declares
   a reduced set. Unit-tested.
-- Add a lightweight native endpoint prototype.
+- [x] Add a lightweight native endpoint prototype. Shipped: `crates/musicata-endpoint`, a
+  native player a device runs to join as a real player — it registers (`kind:native`,
+  `issue_token`), connects to its control WS, and plays the **server-owned queue** with rodio,
+  reporting `progress`/`ended` back. Server-side it reuses `BrowserPlayer` (`bring_up` maps
+  `native`→`BrowserPlayer`), so it shares the queue/zone/command model. It holds only its scoped
+  player token (no user account), which authenticates its WS channel *and* the audio streams it
+  fetches. Excluded from the default workspace build (audio libs); `decide()` + helpers are
+  unit-tested, the audio path is a manual run. See [native-endpoint.md](native-endpoint.md).
+  This makes M10's "done when" true generically (a non-browser endpoint controllable, sharing
+  the queue model) beyond the Snapcast case.
 - [x] Introduce authentication between the server and players/endpoints (the
   *endpoint→server* direction). **Shipped** — see [player-auth.md](player-auth.md). A per-player
   bearer token is issued at registration (`POST /api/players {"issue_token":true}` → `auth_token`

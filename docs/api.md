@@ -129,7 +129,7 @@ streaming fetches only the requested byte range.
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
 | GET | `/api/players` | List registered players. Each carries `capabilities` (`seek`/`volume`/`repeat`/`shuffle`/`queue`) advertised by the backend. |
-| POST | `/api/players` | Register a player: `{ "kind": "mpd", "address": "host:port", "name": "…", "issue_token"?: bool }`. With `issue_token`, the response also carries `auth_token` **once** — a per-player endpoint token (only its hash is stored). |
+| POST | `/api/players` | Register a player: `{ "kind": "mpd"\|"native", "address", "name", "issue_token"?: bool }`. `native` is a self-registering endpoint (see [native-endpoint.md](native-endpoint.md)). With `issue_token`, the response also carries `auth_token` **once** — a per-player endpoint token (only its hash is stored). |
 | PATCH | `/api/players/{id}` | Rename (`{"name"}`) or set zone (`{"zone_id"}`/`null`). User-gated. |
 | DELETE | `/api/players/{id}` | Remove a player. User-gated. |
 | GET | `/api/players/{id}/state` | Current `PlaybackState` snapshot. A player's own endpoint token authenticates this channel (Bearer/`?token=`) in place of a user session. |

@@ -53,10 +53,11 @@ The mechanism above is implemented:
 - **Issuance:** `POST /api/players` accepts `"issue_token": true`; the response then carries
   `auth_token` **once** (only its sha-256 is stored). `auth::issue_player_token()` mints it.
 - **Enforcement:** `require_auth` accepts a valid player token (Bearer or `?token=`) for that
-  player's own channels — `/api/players/{id}/{state,commands,ws}` — *in place of* a user session.
-  It is additive: tokens are only consulted when user auth fails, only for those three channel
-  paths, and only for a player that actually has a token. Management paths
-  (PATCH/DELETE `/api/players/{id}`) and every other player stay user-gated.
+  player's own channels — `/api/players/{id}/{state,commands,ws}` — *in place of* a user session,
+  **and** for the audio streams an endpoint must fetch to play (`GET /api/tracks/{id}/stream`,
+  authorized by any valid endpoint token via `player_token_exists`). It is additive: tokens are
+  only consulted when user auth fails. Management paths (PATCH/DELETE `/api/players/{id}`) and
+  every other path stay user-gated.
 - **Tested:** an HTTP test proves a tokened player's `/state` is reachable with the token and no
   cookie, that a wrong token and the no-credential case 401, and that the token does **not** open
   a different player's channel. Plus unit tests for the channel classification and the
@@ -65,13 +66,17 @@ The mechanism above is implemented:
 Because it's additive and opt-in (`issue_token`), the server-initiated backends
 (browser/MPD/Snapcast) are unaffected — they carry no token and are still covered by user auth.
 
+## The native endpoint uses this
+
+The **self-registering native endpoint** (`crates/musicata-endpoint`, the `native` player kind)
+is built on exactly this: it registers with `issue_token`, then presents its scoped token on the
+WS channel and on each stream fetch — holding no user account. See
+[native-endpoint.md](native-endpoint.md).
+
 ## Still future work
 
-A **self-registering native endpoint** as a first-class player kind (the device registers
-*itself* and runs a lightweight client that presents the token on its WS channel) — the M10
-"native endpoint prototype". The auth primitive is now in place for it; what remains is the
-endpoint program + its player-kind variant, and the **server → endpoint** direction (the
-endpoint pinning the server URL / a server nonce).
+The **server → endpoint** direction (the endpoint pinning the server URL it registered with,
+and an optional server-issued nonce) is specified but not built — the prototype trusts the LAN.
 
 ## What also shipped for M10
 

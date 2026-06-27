@@ -44,11 +44,16 @@ Avoid adding source files at the repository root unless they are standard projec
 ## Build, Test, and Development Commands
 
 ```
-cargo build                         # default features (incl. SMB source); runs the Vite web build
+cargo build                         # default members; runs the Vite web build
 cargo build --no-default-features   # minimal: drop the SMB `smb` dep
-cargo test                          # all crates (SMB tests run by default)
+cargo test                          # default members (SMB tests run by default)
 cargo run -p musicata-server -- --library <dir> --addr 127.0.0.1:3030
+cargo build -p musicata-endpoint    # the native audio endpoint — opt-in (needs audio dev libs)
 ```
+
+`musicata-endpoint` is a native playback client (rodio → ALSA/etc.); it's a workspace member but
+**not** a default member, so plain `cargo build`/`cargo test` skip it and the server never needs
+audio libraries. Build/test it explicitly. See `docs/native-endpoint.md`.
 
 - **Node + npm are build dependencies** — `build.rs` runs the Vite build on every `cargo
   build`. Set `MUSICATA_SKIP_WEB_BUILD=1` with a prebuilt `web/dist/` to skip (offline /

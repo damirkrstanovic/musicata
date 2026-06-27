@@ -3,6 +3,15 @@ members = [
     "crates/musicata-core",
     "crates/musicata-server",
     "crates/musicata-storage",
+    "crates/musicata-endpoint",
+]
+# The endpoint is a separate native-audio client (rodio/cpal → ALSA). It is deliberately NOT a
+# default member, so the server's `cargo build`/`cargo test`/release path never pulls in audio
+# libraries. Build it explicitly: `cargo build -p musicata-endpoint`.
+default-members = [
+    "crates/musicata-core",
+    "crates/musicata-server",
+    "crates/musicata-storage",
 ]
 resolver = "2"
 
