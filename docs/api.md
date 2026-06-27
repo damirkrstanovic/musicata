@@ -224,6 +224,8 @@ event stream keeps it alive.
 | GET | `/api/radio/directory` | Browse the Radio Browser directory. |
 | PATCH/DELETE | `/api/radio/{id}` | Edit / remove a station. |
 | GET | `/api/tracks/{id}/radio` | A track-seeded radio (similar tracks). |
+| GET | `/api/tracks/{id}/similar?limit=` | "Sounds like this" — tracks whose **audio embedding** is nearest the seed (cosine KNN over the musicata-ml `vec0` index), nearest first. `{ track_ids }`. Empty if the seed hasn't been analyzed; distinct from `/radio` (which is ListenBrainz/metadata-based). |
+| GET | `/api/tracks/{id}/audio-radio?limit=` | A **diverse** audio station from the seed: sonically-similar tracks **interleaved across artists** (no artist back-to-back, capped share) so it varies instead of repeating one artist. `{ track_ids }` with the seed first. The DJ version of `/similar`. |
 
 ### Identification & enrichment
 

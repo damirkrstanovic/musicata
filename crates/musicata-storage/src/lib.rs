@@ -2088,6 +2088,51 @@ impl Database {
             .collect())
     }
 
+    /// A diverse audio "radio" seeded from a track: the embedding nearest-neighbors, but
+    /// **interleaved across artists** so the station doesn't just repeat one artist (a good DJ
+    /// switches it up). Pulls a wider candidate pool from the index, then [`diversify`]s it down
+    /// to `limit`. Empty if the seed has no embedding.
+    pub async fn audio_radio(&self, seed_track_id: &str, limit: usize) -> Result<Vec<String>> {
+        // A wide pool so the diversifier has several artists to interleave (the raw KNN is
+        // artist-heavy: tracks by the same artist tend to cluster acoustically).
+        let pool = self
+            .similar_by_embedding(seed_track_id, limit.saturating_mul(5).max(limit))
+            .await?;
+        if pool.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<String> = pool.into_iter().map(|(id, _distance)| id).collect();
+        let artists = self.artist_names_for(&ids).await?;
+        let ranked: Vec<(String, String)> = ids
+            .into_iter()
+            .map(|id| {
+                let artist = artists.get(&id).cloned().unwrap_or_default();
+                (id, artist)
+            })
+            .collect();
+        Ok(diversify(&ranked, limit))
+    }
+
+    /// Map a set of track ids to their artist names (order not preserved).
+    async fn artist_names_for(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, artist_name FROM tracks WHERE id IN ({placeholders})");
+        let mut query = sqlx::query(&sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("id")?, row.try_get("artist_name")?)))
+            .collect()
+    }
+
     /// Store a track's measured loudness (integrated LUFS + true-peak dBTP). A NULL `lufs`
     /// marks a track analyzed but un-measurable (e.g. silent / undecodable) so it isn't retried.
     pub async fn upsert_track_loudness(
@@ -4266,6 +4311,52 @@ fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
     embedding.iter().flat_map(|value| value.to_le_bytes()).collect()
 }
 
+/// Turn similarity-ranked `(id, artist)` candidates (nearest first) into a varied station of up
+/// to `limit` ids: **round-robin across artists** so no artist plays back-to-back and no single
+/// artist dominates, while the most-similar artists still lead. The per-artist cap scales with
+/// how many distinct artists the pool has — with few artists each contributes more (so the
+/// station still fills); with many, ~one or two each (maximum variety). Within an artist the
+/// nearest tracks come first. An empty/unknown artist is treated as its own (so unknowns don't
+/// collapse together).
+fn diversify(ranked: &[(String, String)], limit: usize) -> Vec<String> {
+    use std::collections::{HashMap, VecDeque};
+    let mut order: Vec<String> = Vec::new();
+    let mut queues: HashMap<String, VecDeque<String>> = HashMap::new();
+    for (id, artist) in ranked {
+        let key = if artist.is_empty() { id.clone() } else { artist.clone() };
+        if !queues.contains_key(&key) {
+            order.push(key.clone());
+        }
+        queues.entry(key).or_default().push_back(id.clone());
+    }
+
+    let artists = order.len().max(1);
+    let per_artist = limit.div_ceil(artists).max(1);
+
+    let mut out = Vec::with_capacity(limit.min(ranked.len()));
+    let mut used: HashMap<String, usize> = HashMap::new();
+    loop {
+        let before = out.len();
+        for key in &order {
+            if out.len() >= limit {
+                return out;
+            }
+            let count = used.entry(key.clone()).or_insert(0);
+            if *count >= per_artist {
+                continue;
+            }
+            if let Some(id) = queues.get_mut(key).and_then(VecDeque::pop_front) {
+                out.push(id);
+                *count += 1;
+            }
+        }
+        if out.len() == before {
+            break; // every queue exhausted or capped
+        }
+    }
+    out
+}
+
 /// The lightweight, persisted playback row for a player's server-owned queue —
 /// everything except the queue items themselves.
 #[derive(Clone, Debug, PartialEq)]
@@ -6419,6 +6510,92 @@ mod tests {
 
         // A track with no embedding yields nothing.
         assert!(database.similar_by_embedding("missing", 5).await.unwrap().is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn diversify_interleaves_and_caps_artists() {
+        let ranked: Vec<(String, String)> = [
+            ("a1", "A"), ("a2", "A"), ("a3", "A"), ("b1", "B"), ("b2", "B"), ("b3", "B"),
+            ("c1", "C"), ("c2", "C"),
+        ]
+        .iter()
+        .map(|(id, artist)| (id.to_string(), artist.to_string()))
+        .collect();
+        let artist_of = |id: &str| ranked.iter().find(|(i, _)| i == id).unwrap().1.clone();
+
+        // 3 artists, want 6 → ~2 each, interleaved (not a1,a2,a3,…).
+        let radio = super::diversify(&ranked, 6);
+        assert_eq!(radio.len(), 6);
+        for window in radio.windows(2) {
+            assert_ne!(artist_of(&window[0]), artist_of(&window[1]), "back-to-back: {radio:?}");
+        }
+        let first_three: std::collections::HashSet<_> =
+            radio[..3].iter().map(|id| artist_of(id)).collect();
+        assert_eq!(first_three.len(), 3, "first three should be three distinct artists");
+    }
+
+    #[test]
+    fn diversify_fills_station_when_few_artists() {
+        // Only 2 artists but a 4-track station → 2 each, alternating.
+        let ranked: Vec<(String, String)> = [("a1", "A"), ("a2", "A"), ("a3", "A"), ("b1", "B"), ("b2", "B")]
+            .iter()
+            .map(|(id, artist)| (id.to_string(), artist.to_string()))
+            .collect();
+        let radio = super::diversify(&ranked, 4);
+        assert_eq!(radio, vec!["a1", "b1", "a2", "b2"]);
+    }
+
+    #[tokio::test]
+    async fn audio_radio_interleaves_artists() {
+        let db_path = temp_db_path("audio-radio");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let dim = super::AUDIO_EMBEDDING_DIM;
+        let vector = |x: f32, y: f32| {
+            let mut v = vec![0.0f32; dim];
+            v[0] = x;
+            v[1] = y;
+            v
+        };
+        // A seed plus 3 tracks by artist A (acoustically nearest) and 2 by artist B.
+        let data = [
+            ("s", "Seed", 1.0, 0.0),
+            ("a1", "A", 0.99, 0.01),
+            ("a2", "A", 0.98, 0.02),
+            ("a3", "A", 0.97, 0.03),
+            ("b1", "B", 0.90, 0.10),
+            ("b2", "B", 0.88, 0.12),
+        ];
+        for (id, artist, _, _) in data {
+            sqlx::query(
+                "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id,
+                    artist_name, album_id, album_title, extension, relative_path, stream_url,
+                    path, added_at_unix_seconds)
+                 VALUES (?1, 'local-disk', ?2, ?1, ?3, ?3, 'al', 'Album', 'mp3', ?2, ?4, ?5, 10)",
+            )
+            .bind(id)
+            .bind(format!("a/{id}.mp3"))
+            .bind(artist)
+            .bind(format!("/api/tracks/{id}/stream"))
+            .bind(format!("/m/{id}.mp3"))
+            .execute(&database.pool)
+            .await
+            .expect("insert track");
+        }
+        for (id, _, x, y) in data {
+            database.upsert_track_embedding(id, &vector(x, y), "m", None, "[]", 1).await.unwrap();
+        }
+
+        // The raw KNN would be a1,a2,a3,b1 (all A first); the radio interleaves A and B.
+        let radio = database.audio_radio("s", 4).await.unwrap();
+        assert_eq!(radio.len(), 4);
+        let artist_of = |id: &str| data.iter().find(|(i, ..)| *i == id).unwrap().1;
+        for window in radio.windows(2) {
+            assert_ne!(artist_of(&window[0]), artist_of(&window[1]), "back-to-back: {radio:?}");
+        }
+        let artists: std::collections::HashSet<_> = radio.iter().map(|id| artist_of(id)).collect();
+        assert!(artists.contains(&"A") && artists.contains(&"B"), "both artists present");
 
         let _ = std::fs::remove_file(db_path);
     }
