@@ -173,18 +173,12 @@ Security-sensitive bugs are marked **[security]**.
 
 ### Storage (`crates/musicata-storage/src/lib.rs`)
 
-- [ ] **ISS-14 Multi-table deletes without a transaction** — `:3478` (delete_zone), `:3914` (delete_playlist), `:2069` (upsert_track_embedding)
-  Crash mid-sequence orphans child rows / leaves an inconsistent embedding.
-- [ ] **ISS-15 COMMIT-failure path returns the connection without ROLLBACK** — `:3246` (save_player_queue), `:3387` (save_zone_queue)
-  Open transaction can leak back to the pool.
-- [ ] **ISS-16 Unchecked `as usize`/`as u8` narrowing on persisted position/volume** — `:3274`, `:3416`
-  Corruption → huge index / wrapped volume, bypassing the checked helpers used elsewhere.
-- [ ] **ISS-17 `try_get(...).ok()` silently drops rows on decode error** — `:2136`, `:2409`, `:2471`
-  Masks schema/type mismatches instead of propagating, unlike `try_get?` used elsewhere.
-- [ ] **ISS-18 Missing deterministic tiebreaker → unstable pagination** — `:3521`, `:3607`, `:3633`
-  `recently_played`/`most_played_since`/`most_skipped` lack a final `t.id` tiebreak (siblings have it).
-- [ ] **ISS-19 `tracks_for_recording_mbids` relies on un-ordered VALUES-CTE output** — `:2414`
-  Promises input order but has no `ORDER BY`; inner `LIMIT 1` match is also arbitrary.
+- [x] **ISS-14 Multi-table deletes without a transaction** — delete_zone, delete_playlist, upsert_track_embedding ✅ each wrapped in a `pool.begin()` transaction. Covered by existing happy-path tests + the established atomic pattern.
+- [x] **ISS-15 COMMIT-failure path returns the connection without ROLLBACK** — save_player_queue/save_zone_queue (+ save_library, replace_activities_once) ✅ all four COMMIT arms now ROLLBACK on commit failure.
+- [x] **ISS-16 Unchecked `as usize`/`as u8` narrowing on persisted position/volume** ✅ position via `usize::try_from` (negative → None), volume clamped to 0..=100. Test `load_player_queue_rejects_corrupt_position_and_volume`.
+- [x] **ISS-17 `try_get(...).ok()` silently drops rows on decode error** ✅ `similar_by_embedding`, `track_recording_mbid`, `track_artist_mbid` (and `tracks_for_recording_mbids`) now propagate with `?`.
+- [x] **ISS-18 Missing deterministic tiebreaker → unstable pagination** ✅ `t.id` appended to `recently_played`/`most_played_since`/`most_skipped`. Test `most_played_breaks_ties_deterministically_by_track_id`.
+- [x] **ISS-19 `tracks_for_recording_mbids` relies on un-ordered VALUES-CTE output** ✅ explicit ordinal + `ORDER BY s.ord`; errors propagated. Test `tracks_for_recording_mbids_follows_input_order`.
 
 ### Providers / sources
 

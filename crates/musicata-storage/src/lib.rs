@@ -569,10 +569,14 @@ impl Database {
         .await;
 
         match result {
-            Ok(()) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                Ok(())
-            }
+            Ok(()) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    // Roll back so the connection isn't returned to the pool mid-transaction.
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(error.into())
+                }
+            },
             Err(error) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                 Err(error)
@@ -2183,14 +2187,17 @@ impl Database {
         now_unix_seconds: i64,
     ) -> Result<()> {
         let blob = embedding_to_blob(embedding);
+        // One transaction so the vector and its feature row can't drift apart on a crash
+        // (a deleted embedding with no replacement, or a feature row with no vector).
+        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM track_embedding WHERE track_id = ?1")
             .bind(track_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query("INSERT INTO track_embedding (track_id, embedding) VALUES (?1, ?2)")
             .bind(track_id)
             .bind(&blob[..])
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query(
             "INSERT INTO track_features (track_id, model, version, tags_json, analyzed_at_unix_seconds)
@@ -2203,8 +2210,9 @@ impl Database {
         .bind(version)
         .bind(tags_json)
         .bind(now_unix_seconds)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2237,15 +2245,19 @@ impl Database {
         .bind((k + 1) as i64)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .iter()
-            .filter_map(|row| {
-                let id: String = row.try_get("track_id").ok()?;
-                let distance: f64 = row.try_get("distance").ok()?;
-                (id != seed_track_id).then_some((id, distance))
-            })
-            .take(k)
-            .collect())
+        // Propagate decode errors rather than silently dropping a neighbor.
+        let mut neighbors = Vec::new();
+        for row in &rows {
+            let id: String = row.try_get("track_id")?;
+            let distance: f64 = row.try_get("distance")?;
+            if id != seed_track_id {
+                neighbors.push((id, distance));
+                if neighbors.len() == k {
+                    break;
+                }
+            }
+        }
+        Ok(neighbors)
     }
 
     /// A diverse audio "radio" seeded from a track: the embedding nearest-neighbors, but
@@ -2513,7 +2525,11 @@ impl Database {
         .bind(track_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.and_then(|row| row.try_get::<Option<String>, _>("mbid").ok().flatten()))
+        // Propagate a decode error instead of masking it as "no MBID".
+        match row {
+            Some(row) => Ok(row.try_get::<Option<String>, _>("mbid")?),
+            None => Ok(None),
+        }
     }
 
     /// Resolve external recording MBIDs to local track ids (first local track per MBID, in the
@@ -2522,16 +2538,18 @@ impl Database {
         if mbids.is_empty() {
             return Ok(Vec::new());
         }
-        // SQLite VALUES preserve order; map each input MBID to its first matching local track.
+        // Carry an explicit ordinal so the result follows input order regardless of how
+        // SQLite emits the VALUES rows (declaration order is not contractually guaranteed).
+        // The ordinal is an internal integer literal, not user input.
         let values = (1..=mbids.len())
-            .map(|i| format!("(?{i})"))
+            .map(|i| format!("(?{i}, {i})"))
             .collect::<Vec<_>>()
             .join(",");
         // A local track's recording MBID can live in any of three places: file tags
         // (observations), AcoustID fingerprinting, or MusicBrainz enrichment. Match against all
         // three so LB results resolve even for libraries whose tags carry no MBIDs.
         let query = format!(
-            "WITH seeds(mbid) AS (VALUES {values}),
+            "WITH seeds(mbid, ord) AS (VALUES {values}),
                   recording_ids(track_id, mbid) AS (
                       SELECT track_id, musicbrainz_recording_id FROM track_metadata_observations
                         WHERE musicbrainz_recording_id IS NOT NULL
@@ -2546,17 +2564,21 @@ impl Database {
                     (SELECT r.track_id FROM recording_ids r
                      JOIN tracks t ON t.id = r.track_id
                      WHERE r.mbid = s.mbid LIMIT 1) AS track_id
-             FROM seeds s",
+             FROM seeds s ORDER BY s.ord",
         );
         let mut q = sqlx::query(&query);
         for mbid in mbids {
             q = q.bind(mbid);
         }
         let rows = q.fetch_all(&self.pool).await?;
-        Ok(rows
-            .iter()
-            .filter_map(|row| row.try_get::<Option<String>, _>("track_id").ok().flatten())
-            .collect())
+        // Propagate decode errors rather than silently dropping a row.
+        let mut track_ids = Vec::new();
+        for row in &rows {
+            if let Some(track_id) = row.try_get::<Option<String>, _>("track_id")? {
+                track_ids.push(track_id);
+            }
+        }
+        Ok(track_ids)
     }
 
     /// A track's MusicBrainz artist id. Seeds ListenBrainz similar-artists, which has far better
@@ -2575,7 +2597,11 @@ impl Database {
         .bind(track_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.and_then(|row| row.try_get::<Option<String>, _>("mbid").ok().flatten()))
+        // Propagate a decode error instead of masking it as "no MBID".
+        match row {
+            Some(row) => Ok(row.try_get::<Option<String>, _>("mbid")?),
+            None => Ok(None),
+        }
     }
 
     /// Local tracks for a set of artist names (case-insensitive), as `(lowercased name, track
@@ -3353,10 +3379,14 @@ impl Database {
         }
         .await;
         match result {
-            Ok(()) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                Ok(())
-            }
+            Ok(()) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    // Roll back so the connection isn't returned to the pool mid-transaction.
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(error.into())
+                }
+            },
             Err(error) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                 Err(error)
@@ -3378,11 +3408,15 @@ impl Database {
         };
         let playback = PlayerPlayback {
             status: playback_status_from_str(&row.try_get::<String, _>("status")?),
+            // Reject a corrupt negative/out-of-range stored value rather than wrapping it
+            // into a huge index or a bogus volume.
             position: row
                 .try_get::<Option<i64>, _>("position")?
-                .map(|p| p as usize),
+                .and_then(|p| usize::try_from(p).ok()),
             elapsed_seconds: row.try_get("elapsed_seconds")?,
-            volume: row.try_get::<Option<i64>, _>("volume")?.map(|v| v as u8),
+            volume: row
+                .try_get::<Option<i64>, _>("volume")?
+                .map(|v| v.clamp(0, 100) as u8),
             repeat: repeat_mode_from_str(&row.try_get::<String, _>("repeat")?),
             shuffle: row.try_get::<i64, _>("shuffle")? != 0,
             shuffle_order: decode_shuffle_order(row.try_get("shuffle_order")?),
@@ -3496,10 +3530,14 @@ impl Database {
         }
         .await;
         match result {
-            Ok(()) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                Ok(())
-            }
+            Ok(()) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    // Roll back so the connection isn't returned to the pool mid-transaction.
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(error.into())
+                }
+            },
             Err(error) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                 Err(error)
@@ -3521,11 +3559,15 @@ impl Database {
         };
         let playback = PlayerPlayback {
             status: playback_status_from_str(&row.try_get::<String, _>("status")?),
+            // Reject a corrupt negative/out-of-range stored value rather than wrapping it
+            // into a huge index or a bogus volume.
             position: row
                 .try_get::<Option<i64>, _>("position")?
-                .map(|p| p as usize),
+                .and_then(|p| usize::try_from(p).ok()),
             elapsed_seconds: row.try_get("elapsed_seconds")?,
-            volume: row.try_get::<Option<i64>, _>("volume")?.map(|v| v as u8),
+            volume: row
+                .try_get::<Option<i64>, _>("volume")?
+                .map(|v| v.clamp(0, 100) as u8),
             repeat: repeat_mode_from_str(&row.try_get::<String, _>("repeat")?),
             shuffle_order: decode_shuffle_order(row.try_get("shuffle_order")?),
             shuffle: row.try_get::<i64, _>("shuffle")? != 0,
@@ -3589,19 +3631,22 @@ impl Database {
     }
 
     pub async fn delete_zone(&self, id: &str) -> Result<()> {
+        // One transaction so a crash can't orphan queue rows under a deleted zone.
+        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM zone_queue_items WHERE zone_id = ?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM zone_queue WHERE zone_id = ?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         // `players.zone_id` FK is ON DELETE SET NULL, so members are un-zoned.
         sqlx::query("DELETE FROM zones WHERE id = ?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3638,7 +3683,7 @@ impl Database {
              FROM listens l JOIN tracks t ON t.id = l.track_id
              WHERE l.event_kind = 'played'
              GROUP BY l.track_id
-             ORDER BY last_listen DESC
+             ORDER BY last_listen DESC, t.id
              LIMIT ?1"
         );
         let rows = sqlx::query(&sql)
@@ -3728,7 +3773,7 @@ impl Database {
              FROM listens l JOIN tracks t ON t.id = l.track_id
              WHERE l.event_kind = 'played' AND l.listened_at_unix_seconds >= ?2
              GROUP BY l.track_id
-             ORDER BY plays DESC, MAX(l.listened_at_unix_seconds) DESC
+             ORDER BY plays DESC, MAX(l.listened_at_unix_seconds) DESC, t.id
              LIMIT ?1"
         );
         let rows = sqlx::query(&sql)
@@ -3750,7 +3795,7 @@ impl Database {
              FROM listens l JOIN tracks t ON t.id = l.track_id
              WHERE l.event_kind = 'skipped'
              GROUP BY l.track_id
-             ORDER BY skips DESC, MAX(l.listened_at_unix_seconds) DESC
+             ORDER BY skips DESC, MAX(l.listened_at_unix_seconds) DESC, t.id
              LIMIT ?1"
         );
         let rows = sqlx::query(&sql)
@@ -4028,14 +4073,17 @@ impl Database {
     }
 
     pub async fn delete_playlist(&self, id: &str) -> Result<()> {
+        // One transaction so a crash can't orphan playlist_tracks under a deleted playlist.
+        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM playlist_tracks WHERE playlist_id = ?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM playlists WHERE id = ?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -4295,10 +4343,14 @@ impl Database {
         }
         .await;
         match result {
-            Ok(()) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                Ok(())
-            }
+            Ok(()) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    // Roll back so the connection isn't returned to the pool mid-transaction.
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(error.into())
+                }
+            },
             Err(error) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                 Err(error)
@@ -6545,6 +6597,111 @@ mod tests {
             ["t1", "t2"],
             "a failed replace must not leave the playlist emptied or half-written"
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn load_player_queue_rejects_corrupt_position_and_volume() {
+        // ISS-16: a corrupt negative position / out-of-range volume must not wrap into a
+        // huge index or a bogus volume (e.g. 300 as u8 = 44).
+        use musicata_core::{PlaybackStatus, RepeatMode};
+        let db_path = temp_db_path("corrupt-playback");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let playback = super::PlayerPlayback {
+            status: PlaybackStatus::Paused,
+            position: Some(0),
+            elapsed_seconds: Some(0.0),
+            volume: Some(50),
+            repeat: RepeatMode::Off,
+            shuffle: false,
+            shuffle_order: Vec::new(),
+        };
+        database
+            .save_player_queue("p1", &playback, &[])
+            .await
+            .expect("save");
+        sqlx::query("UPDATE player_queue SET position = -1, volume = 300 WHERE player_id = 'p1'")
+            .execute(&database.pool)
+            .await
+            .expect("corrupt the row");
+
+        let loaded = database
+            .load_player_queue("p1")
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.playback.position, None, "negative position rejected");
+        assert_eq!(loaded.playback.volume, Some(100), "out-of-range volume clamped");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn most_played_breaks_ties_deterministically_by_track_id() {
+        // ISS-18: tracks tying on play count and recency must order by t.id so pages are
+        // stable (no arbitrary order at the LIMIT boundary).
+        let db_path = temp_db_path("most-played-tiebreak");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        database.save_library(&mut library).await.expect("save library");
+        sqlx::query(
+            "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name,
+                album_id, album_title, extension, relative_path, stream_url, path)
+             VALUES ('track_2', 'local-disk', 'album/two.mp3', 'Two', 'artist_1', 'Artist',
+                'album_1', 'Album', 'mp3', 'album/two.mp3', '/s', '/p')",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("insert track_2");
+
+        // Both played once at the same instant → a full tie on count and recency.
+        let played = ListenKind::Played;
+        database.record_listen("track_2", "p", 100, played).await.unwrap();
+        database.record_listen("track_1", "p", 100, played).await.unwrap();
+
+        let most = database.most_played(10).await.expect("most played");
+        let ids: Vec<_> = most.iter().map(|(track, _)| track.id.as_str()).collect();
+        assert_eq!(ids, ["track_1", "track_2"], "ties resolve by ascending track id");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn tracks_for_recording_mbids_follows_input_order() {
+        // ISS-19: results map to the input MBIDs in order, not whatever order SQLite
+        // happens to emit the VALUES rows.
+        let db_path = temp_db_path("recording-mbid-order");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library();
+        database.save_library(&mut library).await.expect("save library");
+        sqlx::query(
+            "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name,
+                album_id, album_title, extension, relative_path, stream_url, path)
+             VALUES ('track_2', 'local-disk', 'album/two.mp3', 'Two', 'artist_1', 'Artist',
+                'album_1', 'Album', 'mp3', 'album/two.mp3', '/s', '/p')",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("insert track_2");
+        for (track, mbid) in [("track_1", "rec-A"), ("track_2", "rec-B")] {
+            sqlx::query(
+                "INSERT INTO track_fingerprint
+                    (track_id, status, musicbrainz_recording_id, fingerprinted_at_unix_seconds)
+                 VALUES (?1, 'identified', ?2, 0)",
+            )
+            .bind(track)
+            .bind(mbid)
+            .execute(&database.pool)
+            .await
+            .expect("insert fingerprint");
+        }
+
+        let ids = database
+            .tracks_for_recording_mbids(&["rec-B".into(), "rec-A".into()])
+            .await
+            .expect("resolve mbids");
+        assert_eq!(ids, vec!["track_2", "track_1"], "output follows input order");
 
         let _ = std::fs::remove_file(db_path);
     }
