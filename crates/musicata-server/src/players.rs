@@ -1840,7 +1840,7 @@ async fn apply_to_queue_state(
         PlayerCommand::Next => advance(state, false),
         PlayerCommand::Previous => step_previous(state),
         PlayerCommand::Seek { position_seconds } => {
-            state.elapsed_seconds = Some(position_seconds);
+            state.elapsed_seconds = Some(clamp_seek(position_seconds, state.duration_seconds));
         }
         PlayerCommand::SetVolume { volume } => state.volume = Some(volume.min(100)),
         PlayerCommand::SetRepeat { mode } => state.repeat = mode,
@@ -1917,32 +1917,55 @@ fn advance(state: &mut QueueState, stop_at_end: bool) {
     let Some(index) = state.position else {
         return;
     };
-    state.elapsed_seconds = Some(0.0);
-    state.duration_seconds = None;
     let len = state.queue.len();
     if len == 0 {
         return;
     }
-    if state.shuffle {
+    // Decide the next position without mutating yet, so an explicit Next that can't move
+    // (the last track, no repeat) is a true no-op rather than a restart (elapsed reset).
+    let next = if state.shuffle {
         ensure_shuffle_order(state, index);
         let cursor = shuffle_cursor(&state.shuffle_order, index);
         if cursor + 1 < len {
-            state.position = Some(state.shuffle_order[cursor + 1]);
+            Some(state.shuffle_order[cursor + 1])
         } else if state.repeat == RepeatMode::All {
             // Exhausted the shuffled order — reshuffle for the next cycle.
             state.shuffle_order = build_shuffle_order(len, None, shuffle_seed());
-            state.position = state.shuffle_order.first().copied();
-        } else if stop_at_end {
-            state.status = PlaybackStatus::Stopped;
+            state.shuffle_order.first().copied()
+        } else {
+            None
         }
-        return;
-    }
-    if index + 1 < len {
-        state.position = Some(index + 1);
+    } else if index + 1 < len {
+        Some(index + 1)
     } else if state.repeat == RepeatMode::All {
-        state.position = Some(0);
-    } else if stop_at_end {
-        state.status = PlaybackStatus::Stopped;
+        Some(0)
+    } else {
+        None
+    };
+
+    match next {
+        Some(position) => {
+            state.position = Some(position);
+            state.elapsed_seconds = Some(0.0);
+            state.duration_seconds = None;
+        }
+        // End of the queue: a finished track stops; an explicit Next is a no-op.
+        None if stop_at_end => {
+            state.status = PlaybackStatus::Stopped;
+            state.elapsed_seconds = Some(0.0);
+            state.duration_seconds = None;
+        }
+        None => {}
+    }
+}
+
+/// Clamp a requested seek position to the playable range: never below 0, and never past
+/// the track duration when it is known.
+fn clamp_seek(position_seconds: f64, duration_seconds: Option<f64>) -> f64 {
+    let floored = position_seconds.max(0.0);
+    match duration_seconds {
+        Some(duration) => floored.min(duration),
+        None => floored,
     }
 }
 
@@ -2078,8 +2101,11 @@ fn remove_queue_item(state: &mut QueueState, index: usize) {
                 state.position = None;
                 state.status = PlaybackStatus::Stopped;
             } else {
+                // A different track now occupies this slot — clear the removed track's
+                // duration so the seek bar doesn't pair it with the new now-playing.
                 state.position = Some(pos.min(state.queue.len() - 1));
                 state.elapsed_seconds = Some(0.0);
+                state.duration_seconds = None;
             }
         }
         Some(pos) if pos > index => state.position = Some(pos - 1),
@@ -3524,6 +3550,68 @@ mod tests {
             shuffle_order_valid(&state.shuffle_order, 4, Some(pos)),
             "a fresh shuffle order is generated for the next cycle"
         );
+    }
+
+    fn sequential_state(count: usize, position: usize, repeat: RepeatMode) -> QueueState {
+        QueueState {
+            status: PlaybackStatus::Playing,
+            queue: vec![QueueItem::default(); count],
+            position: Some(position),
+            repeat,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn next_on_last_track_without_repeat_does_not_restart() {
+        // ISS-01: an explicit Next at the end (no repeat) must be a no-op, not reset elapsed.
+        let mut state = sequential_state(2, 1, RepeatMode::Off);
+        state.elapsed_seconds = Some(50.0);
+        state.duration_seconds = Some(180.0);
+        advance(&mut state, false);
+        assert_eq!(state.position, Some(1), "stays on the last track");
+        assert_eq!(state.elapsed_seconds, Some(50.0), "does not restart from 0");
+        assert_eq!(state.duration_seconds, Some(180.0));
+        assert_eq!(state.status, PlaybackStatus::Playing);
+    }
+
+    #[test]
+    fn track_end_on_last_track_without_repeat_stops() {
+        // The other advance caller (a track finished) still stops at the end.
+        let mut state = sequential_state(2, 1, RepeatMode::Off);
+        advance(&mut state, true);
+        assert_eq!(state.status, PlaybackStatus::Stopped);
+    }
+
+    #[test]
+    fn previous_wraps_to_last_with_repeat_all() {
+        // ISS-02: Previous on the first track with repeat-all wraps to the last.
+        let mut state = sequential_state(3, 0, RepeatMode::All);
+        step_previous(&mut state);
+        assert_eq!(state.position, Some(2));
+    }
+
+    #[test]
+    fn remove_current_item_clears_stale_duration() {
+        // ISS-04: removing the playing item advances onto a new track, so its old
+        // duration must be cleared (not paired with the new now-playing).
+        let mut state = sequential_state(3, 1, RepeatMode::Off);
+        state.elapsed_seconds = Some(30.0);
+        state.duration_seconds = Some(200.0);
+        remove_queue_item(&mut state, 1);
+        assert_eq!(state.position, Some(1), "the item that shifted into slot 1 now plays");
+        assert_eq!(state.duration_seconds, None, "stale duration cleared");
+        assert_eq!(state.elapsed_seconds, Some(0.0));
+    }
+
+    #[test]
+    fn seek_clamps_to_track_bounds() {
+        // ISS-03: a seek is clamped to [0, duration]; with unknown duration only floored at 0.
+        assert_eq!(clamp_seek(-10.0, Some(180.0)), 0.0);
+        assert_eq!(clamp_seek(999.0, Some(180.0)), 180.0);
+        assert_eq!(clamp_seek(42.0, Some(180.0)), 42.0);
+        assert_eq!(clamp_seek(-5.0, None), 0.0);
+        assert_eq!(clamp_seek(5000.0, None), 5000.0);
     }
 
     #[test]

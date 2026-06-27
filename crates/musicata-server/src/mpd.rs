@@ -132,9 +132,24 @@ impl MpdConnection {
     }
 
     pub async fn seek(&mut self, position_seconds: f64) -> Result<()> {
-        self.command(&format!("seekcur {position_seconds}")).await?;
+        self.command(&format!("seekcur {}", seekcur_arg(position_seconds)))
+            .await?;
         Ok(())
     }
+}
+
+/// Format an *absolute* `seekcur` argument. A leading `+`/`-` makes MPD seek relatively,
+/// and `NaN`/`inf` would draw an `ACK`, so clamp to a finite, non-negative value.
+fn seekcur_arg(position_seconds: f64) -> String {
+    let seconds = if position_seconds.is_finite() {
+        position_seconds.max(0.0)
+    } else {
+        0.0
+    };
+    format!("{seconds}")
+}
+
+impl MpdConnection {
 
     pub async fn set_volume(&mut self, volume: u8) -> Result<()> {
         self.command(&format!("setvol {}", volume.min(100))).await?;
@@ -339,6 +354,15 @@ mod tests {
             .filter_map(|line| line.split_once(": "))
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn seekcur_arg_is_absolute_finite_and_non_negative() {
+        // ISS-13: a negative arg makes MPD seek *relatively*, and NaN/inf draw an ACK.
+        assert_eq!(seekcur_arg(42.5), "42.5");
+        assert_eq!(seekcur_arg(-5.0), "0"); // not "-5" (which would be a relative seek)
+        assert_eq!(seekcur_arg(f64::NAN), "0");
+        assert_eq!(seekcur_arg(f64::INFINITY), "0");
     }
 
     #[test]

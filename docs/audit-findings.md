@@ -133,20 +133,20 @@ Security-sensitive bugs are marked **[security]**.
 
 ### Playback (`crates/musicata-server/src/players.rs`)
 
-- [ ] **ISS-01 Explicit `Next` on the last track restarts it** — `:1906`
+- [x] **ISS-01 Explicit `Next` on the last track restarts it** — `:1906` ✅ `advance` decides the next position before mutating; an unmovable explicit Next is a no-op. Test `next_on_last_track_without_repeat_does_not_restart` (+ `track_end_on_last_track_without_repeat_stops`).
   `advance` sets `elapsed=0` before checking it can move; on the last track (repeat≠All) the result is
   "same track, Playing, elapsed reset" instead of no-op/stop. *Repro:* 2-track queue, repeat Off, play
   pos 1, `report_progress(50,180)`, `Next` → snapshot shows pos 1, elapsed `Some(0.0)`.
 
-- [ ] **ISS-02 `Previous` doesn't wrap with repeat-All** — `:1834`
+- [x] **ISS-02 `Previous` doesn't wrap with repeat-All** — `:1834` ✅ fixed in the BUG-05 `step_previous` refactor (repeat-all wraps to the last item). Test `previous_wraps_to_last_with_repeat_all`.
   At index 0 with `RepeatMode::All`, `Previous` stays put; `advance` wraps in the forward direction.
   Asymmetric boundary handling.
 
-- [ ] **ISS-03 `Seek` is not clamped to `[0, duration]`** — `:1842`
+- [x] **ISS-03 `Seek` is not clamped to `[0, duration]`** — `:1842` ✅ `clamp_seek` floors at 0 and caps at duration (also bounds the Snapcast frame cast). Test `seek_clamps_to_track_bounds`.
   Negative/past-end values are stored verbatim and propagate to controllers and the Snapcast frame
   cast (`:2245`/`:2263`).
 
-- [ ] **ISS-04 Removing the current item leaves stale `duration_seconds`** — `:1949`
+- [x] **ISS-04 Removing the current item leaves stale `duration_seconds`** — `:1949` ✅ `remove_queue_item` clears `duration_seconds` when a new track shifts into the slot. Test `remove_current_item_clears_stale_duration`.
   Resets `elapsed=0` but, unlike `advance`, doesn't clear `duration_seconds`, so the new track is
   paired with the removed track's duration until an output reports a new one.
 
@@ -160,17 +160,15 @@ Security-sensitive bugs are marked **[security]**.
 
 ### Subsonic / MPD (`subsonic.rs`, `mpd.rs`)
 
-- [ ] **ISS-07 `newest`/`recent` sort by release year, not date-added** — `subsonic.rs:603`
-- [ ] **ISS-08 `getUser` returns the bootstrap single-user in multi-user mode** — `subsonic.rs:198`
-  Ignores the authenticated account.
-- [ ] **ISS-09 `f=jsonp` returns bare JSON with `application/json`, no callback wrap** — `subsonic.rs:54`
-- [ ] **ISS-10 `escape_attr` doesn't numeric-escape newline/tab/CR** — `subsonic.rs:1318`
+- [x] **ISS-07 `newest`/`recent` sort by release year, not date-added** — `subsonic.rs:603` ✅ new `albums_recently_added` orders by each album's max track add time (NULLs last); handler wires `newest`/`recent` to it. Test `albums_recently_added_orders_by_track_added_at_desc`.
+- [x] **ISS-08 `getUser` returns the bootstrap single-user in multi-user mode** — `subsonic.rs:198` ✅ `requested_username` echoes the requested `username`/authenticated `u`. Test `getuser_reports_requested_then_authenticated_username`.
+- [ ] **ISS-09 `f=jsonp` returns bare JSON with `application/json`, no callback wrap** — `subsonic.rs:54` ⏸️ DEFERRED — threading the callback string requires removing `Copy` from `Format` across ~144 sites for a niche legacy feature; disproportionate. Revisit if a JSONP client is actually needed.
+- [x] **ISS-10 `escape_attr` doesn't numeric-escape newline/tab/CR** — `subsonic.rs:1318` ✅ `escape_attr` emits `&#xA;`/`&#x9;`/`&#xD;`. Test `escape_attr_numeric_escapes_whitespace_controls`.
   XML attribute-value normalization silently collapses them; correct is `&#xA;`/`&#x9;`/`&#xD;`.
-- [ ] **ISS-11 POST form bodies > 64 KiB silently dropped** — `subsonic.rs:124`
-  Auth params lost → misleading "missing param"/auth error for large `createPlaylist`/`updatePlaylist`.
-- [ ] **ISS-12 Missing `u` with a configured password returns code 40, not 10** — `subsonic.rs:250`
+- [x] **ISS-11 POST form bodies > 64 KiB silently dropped** — `subsonic.rs:124` ✅ raised the cap to a 4 MiB `MAX_FORM_BODY_BYTES` (covers large `createPlaylist`/`updatePlaylist`). Verified by reasoning + compile (no HTTP unit harness).
+- [x] **ISS-12 Missing `u` with a configured password returns code 40, not 10** — `subsonic.rs:250` ✅ single-user `authenticate` returns 10 for a missing `u`, 40 only for a wrong one. Test `missing_username_with_configured_password_is_code_10`.
   Single-user path inconsistent with the multi-user path (which returns 10).
-- [ ] **ISS-13 MPD `seek` emits bare `seekcur N`** — `mpd.rs:134`
+- [x] **ISS-13 MPD `seek` emits bare `seekcur N`** — `mpd.rs:134` ✅ `seekcur_arg` clamps to a finite, non-negative absolute value (no relative-seek or ACK). Test `seekcur_arg_is_absolute_finite_and_non_negative`.
   A negative value becomes a *relative* seek; NaN/Inf format as `NaN`/`inf` and draw an ACK.
 
 ### Storage (`crates/musicata-storage/src/lib.rs`)

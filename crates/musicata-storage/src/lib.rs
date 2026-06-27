@@ -1128,6 +1128,36 @@ impl Database {
         Ok((albums, total))
     }
 
+    /// Albums ordered by how recently they were added — each album's most recent track
+    /// add time, descending — for the Subsonic `getAlbumList type=newest` view. Albums
+    /// with no known add time sort last.
+    pub async fn albums_recently_added(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Album>, usize)> {
+        let total = i64_to_usize(
+            sqlx::query("SELECT COUNT(*) AS n FROM albums")
+                .fetch_one(&self.pool)
+                .await?
+                .try_get("n")?,
+            "total",
+        )?;
+        let sql = format!(
+            "SELECT {ALBUM_COLUMNS} FROM albums a
+             ORDER BY (SELECT MAX(t.added_at_unix_seconds) FROM tracks t WHERE t.album_id = a.id) DESC,
+                      a.artist_name, a.title
+             LIMIT ?1 OFFSET ?2"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        let albums = rows.iter().map(album_from_row).collect::<Result<_>>()?;
+        Ok((albums, total))
+    }
+
     /// Albums whose release year falls in the inclusive range between `from_year` and
     /// `to_year`, ordered by year ascending when `from_year <= to_year` and descending
     /// otherwise (the Subsonic `getAlbumList type=byYear` direction convention).
@@ -6515,6 +6545,57 @@ mod tests {
             ["t1", "t2"],
             "a failed replace must not leave the playlist emptied or half-written"
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn albums_recently_added_orders_by_track_added_at_desc() {
+        // ISS-07: Subsonic "newest" means most-recently-added, ordered by each album's
+        // most recent track add time (albums with no known add time sort last).
+        let db_path = temp_db_path("albums-recent");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library(); // album_1, track_1 (added_at None)
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+        // save_library stamps new tracks with "now"; pin track_1 low so ordering is
+        // fully determined by the values under test.
+        sqlx::query("UPDATE tracks SET added_at_unix_seconds = 500 WHERE id = 'track_1'")
+            .execute(&database.pool)
+            .await
+            .expect("pin added_at");
+        for (album, track, added) in [
+            ("album_old", "t_old", 1000_i64),
+            ("album_new", "t_new", 2000_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO albums (id, title, artist_id, artist_name, year, track_count,
+                    artwork_url, artwork_path) VALUES (?1, ?1, 'artist_1', 'Artist', 2000, 1, NULL, NULL)",
+            )
+            .bind(album)
+            .execute(&database.pool)
+            .await
+            .expect("insert album");
+            sqlx::query(
+                "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name,
+                    album_id, album_title, extension, relative_path, stream_url, path, added_at_unix_seconds)
+                 VALUES (?1, 'local-disk', ?1, ?1, 'artist_1', 'Artist', ?2, ?2, 'mp3', ?1, ?1, ?1, ?3)",
+            )
+            .bind(track)
+            .bind(album)
+            .bind(added)
+            .execute(&database.pool)
+            .await
+            .expect("insert track");
+        }
+
+        let (albums, _) = database.albums_recently_added(10, 0).await.expect("recent");
+        let ids: Vec<_> = albums.iter().map(|a| a.id.as_str()).collect();
+        // Newest first; album_1 (no added time) sorts last.
+        assert_eq!(&ids[..2], &["album_new", "album_old"]);
+        assert_eq!(ids.last(), Some(&"album_1"));
 
         let _ = std::fs::remove_file(db_path);
     }

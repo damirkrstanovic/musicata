@@ -50,6 +50,10 @@ enum Format {
     Json,
 }
 
+/// Upper bound on a POST form body. Large enough for `createPlaylist` with thousands of
+/// `songId`s, while still bounding memory per request.
+const MAX_FORM_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 fn format_of(params: &HashMap<String, String>) -> Format {
     match params.get("f").map(String::as_str) {
         Some("json") | Some("jsonp") => Format::Json,
@@ -135,10 +139,12 @@ async fn handle(
     let (parts, body) = request.into_parts();
 
     // Subsonic clients pass parameters in the query string (GET) or a form-urlencoded
-    // body (POST); accept both.
+    // body (POST); accept both. The cap is generous because `createPlaylist`/`updatePlaylist`
+    // carry one `songId` per track — a 64 KiB limit silently dropped large playlists (and
+    // with them the auth params), surfacing as a confusing "missing parameter" error.
     let mut pairs = parse_pairs(parts.uri.query().unwrap_or(""));
     if parts.method == Method::POST && is_form_body(&parts.headers)
-        && let Ok(bytes) = to_bytes(body, 64 * 1024).await {
+        && let Ok(bytes) = to_bytes(body, MAX_FORM_BODY_BYTES).await {
             pairs.extend(parse_pairs(&String::from_utf8_lossy(&bytes)));
         }
     // `all` keeps every value per key (for repeated params); `params` is first-value.
@@ -216,7 +222,7 @@ async fn handle(
             map1(
                 "user",
                 json!({
-                    "username": state.subsonic.user,
+                    "username": requested_username(&params, &state.subsonic.user),
                     "streamRole": true,
                     "downloadRole": true,
                     "scrobblingEnabled": true
@@ -256,6 +262,16 @@ fn verify_credential(
     Err((10, "Required parameter is missing."))
 }
 
+/// The username `getUser` should report: the explicitly requested `username`, else the
+/// authenticated `u`, else the configured single-user fallback.
+fn requested_username(params: &HashMap<String, String>, fallback: &str) -> String {
+    params
+        .get("username")
+        .or_else(|| params.get("u"))
+        .map(String::clone)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 fn authenticate(
     auth: &SubsonicAuth,
     params: &HashMap<String, String>,
@@ -263,7 +279,11 @@ fn authenticate(
     let Some(expected) = auth.password.as_deref() else {
         return Ok(());
     };
-    if params.get("u").map(String::as_str) != Some(auth.user.as_str()) {
+    // A missing required parameter is code 10; a present-but-wrong username is 40.
+    let Some(username) = params.get("u") else {
+        return Err((10, "Required parameter is missing."));
+    };
+    if username != &auth.user {
         return Err((40, "Wrong username or password."));
     }
     verify_credential(params, expected)
@@ -665,10 +685,16 @@ async fn get_album_list(
                 Err(error) => return error_response(format, 0, &error.to_string()),
             }
         }
+        // "newest"/"recent" means most-recently-added (by track add time), not by year.
+        Some("newest") | Some("recent") => {
+            match state.database.albums_recently_added(size, offset).await {
+                Ok((albums, _)) => albums,
+                Err(error) => return error_response(format, 0, &error.to_string()),
+            }
+        }
         other => {
             let sort = match other {
                 Some("alphabeticalByName") => Some("title"),
-                Some("newest") | Some("recent") => Some("year"),
                 Some("random") => Some("random"),
                 _ => None, // alphabeticalByArtist / frequent -> default order
             };
@@ -1381,6 +1407,11 @@ fn escape_attr(input: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        // Numeric-escape whitespace controls: an XML parser normalizes raw newline/tab/CR
+        // in an attribute value to a space, silently losing the original character.
+        .replace('\n', "&#xA;")
+        .replace('\t', "&#x9;")
+        .replace('\r', "&#xD;")
 }
 
 fn escape_text(input: &str) -> String {
@@ -1458,6 +1489,43 @@ mod tests {
         assert!(xml.contains("<artists>"));
         assert!(xml.contains("<index name=\"A\">"));
         assert!(xml.contains("<artist id=\"1\" name=\"ABBA\"/>"));
+    }
+
+    #[test]
+    fn getuser_reports_requested_then_authenticated_username() {
+        // ISS-08: getUser must reflect the requested/authenticated account, not the
+        // hardcoded bootstrap single-user.
+        let mut params = HashMap::new();
+        assert_eq!(requested_username(&params, "admin"), "admin");
+        params.insert("u".into(), "alice".into());
+        assert_eq!(requested_username(&params, "admin"), "alice");
+        params.insert("username".into(), "bob".into());
+        assert_eq!(requested_username(&params, "admin"), "bob");
+    }
+
+    #[test]
+    fn escape_attr_numeric_escapes_whitespace_controls() {
+        // ISS-10: newline/tab/CR in an attribute must be numeric-escaped, else XML
+        // attribute-value normalization collapses them to spaces and the value is lost.
+        assert_eq!(escape_attr("a\nb\tc\rd"), "a&#xA;b&#x9;c&#xD;d");
+        assert_eq!(escape_attr("Rock & \"Roll\""), "Rock &amp; &quot;Roll&quot;");
+    }
+
+    #[test]
+    fn missing_username_with_configured_password_is_code_10() {
+        // ISS-12: a missing required parameter is code 10, not "wrong password" (40).
+        let auth = SubsonicAuth {
+            user: "u".into(),
+            password: Some("sesame".into()),
+        };
+        assert_eq!(
+            authenticate(&auth, &HashMap::new()),
+            Err((10, "Required parameter is missing."))
+        );
+        // A present-but-wrong username is still 40.
+        let mut params = HashMap::new();
+        params.insert("u".into(), "wrong".into());
+        assert_eq!(authenticate(&auth, &params).unwrap_err().0, 40);
     }
 
     #[test]
