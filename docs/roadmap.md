@@ -903,12 +903,11 @@ restored paused on startup, re-asserted over external edits). **M12 is complete*
 scope; see its note). Milestones 7, 9, 10, and 11 are in progress.
 
 The remaining work lives in those in-progress milestones: **M7** — optional ListenBrainz
-scrobbling, richer playback events (loved/disliked/rated), and a web view for the stats
-endpoint (session/streak + favorites stats ship as `GET /api/history/stats`); **M9** —
-collection/search browse for Internet Archive, Jamendo, commercial providers, and a metadata
-review-override UI (podcasts, the **Internet Archive** item provider, and the plugin-isolation
-decision are done); **M10** — the self-registering native endpoint *kind* that presents the
-shipped per-player token, plus a Squeezelite bridge (player capabilities are advertised per
-backend and **per-player endpoint auth is in**); **M11** — the CamillaDSP/DAC tier, the
-signal-path badge, an explicit Track/Album leveling selector, and Snapcast album-mode apply
-(**album/Auto leveling now ships**).
+scrobbling and richer playback events (loved/disliked/rated); the stats endpoint **and its web
+view** now ship; **M9** — collection/search browse for Internet Archive, Jamendo, commercial
+providers, and a metadata review-override UI (podcasts + the Internet Archive item provider —
+both with **/admin source forms** — and the plugin-isolation decision are done); **M10** — the
+self-registering native endpoint *kind* that presents the shipped per-player token, plus a
+Squeezelite bridge (player capabilities + per-player endpoint auth are in); **M11** — the
+CamillaDSP/DAC tier, the signal-path badge, and Snapcast album-mode apply (album/Auto leveling
+**and the explicit Off/Track/Album selector** now ship).
