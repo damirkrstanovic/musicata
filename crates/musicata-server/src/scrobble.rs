@@ -108,9 +108,18 @@ async fn scrobble_pass(database: &Database) -> usize {
             tracing::info!(count, "scrobbled to ListenBrainz");
             dropped + count
         }
-        Ok(Err(error)) => {
+        Ok(Err(SubmitError::Retryable(error))) => {
             tracing::warn!(%error, "scrobble: submit failed; will retry");
-            0 // leave the rows queued; idle-poll then retry
+            0 // leave this batch queued and back off via the idle poll
+        }
+        Ok(Err(SubmitError::Permanent(error))) => {
+            // The batch will never be accepted (e.g. a malformed listen or a bad token).
+            // Drop it so it can't wedge the queue and block every later listen behind it.
+            tracing::warn!(%error, count, "scrobble: submit permanently rejected; dropping batch");
+            for id in ids {
+                let _ = database.delete_scrobble(id).await;
+            }
+            dropped + count
         }
         Err(error) => {
             tracing::warn!(%error, "scrobble: submit task panicked");
@@ -142,8 +151,22 @@ fn listen_payload_fields(artist: &str, title: &str, album: &str, listened_at: i6
     json!({ "listened_at": listened_at, "track_metadata": metadata })
 }
 
+/// Whether an HTTP status from ListenBrainz is worth retrying. Rate-limit (429) and
+/// server errors (5xx) are transient; any other 4xx (a malformed batch, a bad token) is
+/// permanent and must not be retried forever.
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || status >= 500
+}
+
+/// Why a submission failed, so the drain loop can retry transient errors but drop a batch
+/// that will never be accepted (which would otherwise wedge the whole queue behind it).
+enum SubmitError {
+    Retryable(String),
+    Permanent(String),
+}
+
 /// Sync POST to ListenBrainz (run on `spawn_blocking`). Token auth; any non-2xx is an error.
-fn submit_listens(token: &str, body: &Value) -> Result<(), String> {
+fn submit_listens(token: &str, body: &Value) -> Result<(), SubmitError> {
     let user_agent = format!(
         "Musicata/{} ({})",
         env!("CARGO_PKG_VERSION"),
@@ -160,9 +183,14 @@ fn submit_listens(token: &str, body: &Value) -> Result<(), String> {
         .map_err(|error| match error {
             ureq::Error::Status(status, response) => {
                 let body = response.into_string().unwrap_or_else(|_| "<no body>".into());
-                format!("ListenBrainz HTTP {status}: {body}")
+                let message = format!("ListenBrainz HTTP {status}: {body}");
+                if is_retryable_status(status) {
+                    SubmitError::Retryable(message)
+                } else {
+                    SubmitError::Permanent(message)
+                }
             }
-            ureq::Error::Transport(error) => error.to_string(),
+            ureq::Error::Transport(error) => SubmitError::Retryable(error.to_string()),
         })?;
     Ok(())
 }
@@ -187,5 +215,17 @@ mod tests {
         let payload = listen_payload_fields("Artist", "Title", "", 42);
         // No release_name key when the album is unknown (ListenBrainz treats it as absent).
         assert!(payload["track_metadata"].get("release_name").is_none());
+    }
+
+    #[test]
+    fn http_status_retry_classification() {
+        // BUG-12: a permanent 4xx (e.g. 400 malformed, 401 bad token) must NOT be retried
+        // forever — only rate-limit (429) and server (5xx) errors are retryable.
+        assert!(!is_retryable_status(400), "malformed batch is permanent");
+        assert!(!is_retryable_status(401), "bad token is permanent");
+        assert!(!is_retryable_status(404));
+        assert!(is_retryable_status(429), "rate limit is retryable");
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(503));
     }
 }

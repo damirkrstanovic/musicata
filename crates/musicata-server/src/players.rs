@@ -1392,6 +1392,10 @@ struct QueueState {
     volume: Option<u8>,
     repeat: RepeatMode,
     shuffle: bool,
+    /// When shuffle is on, the play order: a permutation of the queue indices that
+    /// `advance`/`step_previous` walk so every track plays once before any repeats.
+    /// Empty when shuffle is off; rebuilt lazily when the queue changes.
+    shuffle_order: Vec<usize>,
 }
 
 impl QueueState {
@@ -1404,6 +1408,7 @@ impl QueueState {
             volume: self.volume,
             repeat: self.repeat,
             shuffle: self.shuffle,
+            shuffle_order: self.shuffle_order.clone(),
         }
     }
 }
@@ -1454,6 +1459,7 @@ impl BrowserPlayer {
         state.volume = playback.volume;
         state.repeat = playback.repeat;
         state.shuffle = playback.shuffle;
+        state.shuffle_order = playback.shuffle_order;
     }
 
     /// Write a queue change back to the database. Failures are logged, never
@@ -1644,6 +1650,7 @@ impl ZonePlayer {
         state.volume = playback.volume;
         state.repeat = playback.repeat;
         state.shuffle = playback.shuffle;
+        state.shuffle_order = playback.shuffle_order;
     }
 
     async fn persist(&self, persist: QueuePersist) {
@@ -1831,20 +1838,23 @@ async fn apply_to_queue_state(
             state.elapsed_seconds = Some(0.0);
         }
         PlayerCommand::Next => advance(state, false),
-        PlayerCommand::Previous => {
-            state.position = match state.position {
-                Some(index) if index > 0 => Some(index - 1),
-                other => other,
-            };
-            state.elapsed_seconds = Some(0.0);
-            state.duration_seconds = None;
-        }
+        PlayerCommand::Previous => step_previous(state),
         PlayerCommand::Seek { position_seconds } => {
             state.elapsed_seconds = Some(position_seconds);
         }
         PlayerCommand::SetVolume { volume } => state.volume = Some(volume.min(100)),
         PlayerCommand::SetRepeat { mode } => state.repeat = mode,
-        PlayerCommand::SetShuffle { enabled } => state.shuffle = enabled,
+        PlayerCommand::SetShuffle { enabled } => {
+            state.shuffle = enabled;
+            if enabled {
+                // Build the play order now (current track first) so it's stable and
+                // persisted; clear it when shuffle is turned off.
+                state.shuffle_order =
+                    build_shuffle_order(state.queue.len(), state.position, shuffle_seed());
+            } else {
+                state.shuffle_order.clear();
+            }
+        }
         PlayerCommand::Clear => {
             state.queue.clear();
             state.position = None;
@@ -1902,20 +1912,131 @@ async fn apply_to_queue_state(
 
 /// Advance to the next queue item. When `stop_at_end` is set (a track finished),
 /// stop after the last item unless repeat-all is on; otherwise (an explicit Next)
-/// clamp at the last item.
+/// clamp at the last item. When shuffle is on, "next" follows the shuffled play order.
 fn advance(state: &mut QueueState, stop_at_end: bool) {
     let Some(index) = state.position else {
         return;
     };
     state.elapsed_seconds = Some(0.0);
     state.duration_seconds = None;
-    if index + 1 < state.queue.len() {
+    let len = state.queue.len();
+    if len == 0 {
+        return;
+    }
+    if state.shuffle {
+        ensure_shuffle_order(state, index);
+        let cursor = shuffle_cursor(&state.shuffle_order, index);
+        if cursor + 1 < len {
+            state.position = Some(state.shuffle_order[cursor + 1]);
+        } else if state.repeat == RepeatMode::All {
+            // Exhausted the shuffled order — reshuffle for the next cycle.
+            state.shuffle_order = build_shuffle_order(len, None, shuffle_seed());
+            state.position = state.shuffle_order.first().copied();
+        } else if stop_at_end {
+            state.status = PlaybackStatus::Stopped;
+        }
+        return;
+    }
+    if index + 1 < len {
         state.position = Some(index + 1);
-    } else if state.repeat == RepeatMode::All && !state.queue.is_empty() {
+    } else if state.repeat == RepeatMode::All {
         state.position = Some(0);
     } else if stop_at_end {
         state.status = PlaybackStatus::Stopped;
     }
+}
+
+/// Step to the previous item, following the shuffled play order when shuffle is on.
+/// Repeat-all wraps from the first item to the last; otherwise the first item holds.
+fn step_previous(state: &mut QueueState) {
+    state.elapsed_seconds = Some(0.0);
+    state.duration_seconds = None;
+    let len = state.queue.len();
+    let Some(index) = state.position else {
+        return;
+    };
+    if state.shuffle && len > 0 {
+        ensure_shuffle_order(state, index);
+        let cursor = shuffle_cursor(&state.shuffle_order, index);
+        state.position = if cursor > 0 {
+            Some(state.shuffle_order[cursor - 1])
+        } else if state.repeat == RepeatMode::All {
+            state.shuffle_order.last().copied()
+        } else {
+            Some(index)
+        };
+        return;
+    }
+    state.position = match state.position {
+        Some(index) if index > 0 => Some(index - 1),
+        Some(_) if state.repeat == RepeatMode::All && len > 0 => Some(len - 1),
+        other => other,
+    };
+}
+
+/// Make sure `state.shuffle_order` is a valid play order over the current queue that still
+/// includes `current`; rebuild it (with `current` first) when it's stale (queue changed)
+/// or empty.
+fn ensure_shuffle_order(state: &mut QueueState, current: usize) {
+    if !shuffle_order_valid(&state.shuffle_order, state.queue.len(), Some(current)) {
+        state.shuffle_order = build_shuffle_order(state.queue.len(), Some(current), shuffle_seed());
+    }
+}
+
+/// The position of queue index `index` within the shuffled `order` (0 if absent).
+fn shuffle_cursor(order: &[usize], index: usize) -> usize {
+    order.iter().position(|&i| i == index).unwrap_or(0)
+}
+
+/// A seed for the shuffle PRNG, from the wall clock so each fresh shuffle differs.
+fn shuffle_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        | 1
+}
+
+/// A shuffled play order over `len` queue indices. When `first` is `Some(i)`, that index
+/// leads (so playback continues from the current track) and the rest are Fisher-Yates
+/// shuffled; otherwise the whole range is shuffled. `seed` makes it deterministic.
+fn build_shuffle_order(len: usize, first: Option<usize>, seed: u64) -> Vec<usize> {
+    let lead = first.filter(|&i| i < len);
+    let mut rest: Vec<usize> = (0..len).filter(|&i| Some(i) != lead).collect();
+    let mut rng = seed | 1; // SplitMix64 state; never 0
+    let mut next = || {
+        rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    for i in (1..rest.len()).rev() {
+        let j = (next() % (i as u64 + 1)) as usize;
+        rest.swap(i, j);
+    }
+    let mut order = Vec::with_capacity(len);
+    order.extend(lead);
+    order.extend(rest);
+    order
+}
+
+/// Whether `order` is a usable play order over a queue of `len` items that still includes
+/// `current`: a permutation of `0..len` (so every track plays once, none twice) containing
+/// the currently-playing index.
+fn shuffle_order_valid(order: &[usize], len: usize, current: Option<usize>) -> bool {
+    if order.len() != len {
+        return false;
+    }
+    let mut seen = vec![false; len];
+    for &i in order {
+        if i >= len || seen[i] {
+            return false;
+        }
+        seen[i] = true;
+    }
+    current.is_none_or(|c| c < len && order.contains(&c))
 }
 
 /// Resolve library track ids to queue items with relative stream URLs the browser
@@ -1992,12 +2113,31 @@ fn reindex_after_move(pos: usize, from: usize, to: usize) -> usize {
 }
 
 /// The queue index to play *after* `position`, honoring repeat — used to preload the next
-/// track for gapless Snapcast output. `None` means "stop after this one".
+/// track for gapless Snapcast output. `None` means "stop after this one". When `shuffle`
+/// is a valid play order it is followed instead of the sequential queue order.
 #[cfg(feature = "snapcast")]
-fn next_index(position: Option<usize>, len: usize, repeat: RepeatMode) -> Option<usize> {
+fn next_index(
+    position: Option<usize>,
+    len: usize,
+    repeat: RepeatMode,
+    shuffle: &[usize],
+) -> Option<usize> {
     let pos = position?;
     if len == 0 {
         return None;
+    }
+    if repeat == RepeatMode::One {
+        return Some(pos);
+    }
+    if shuffle_order_valid(shuffle, len, Some(pos)) {
+        let cursor = shuffle_cursor(shuffle, pos);
+        return if cursor + 1 < len {
+            Some(shuffle[cursor + 1])
+        } else if repeat == RepeatMode::All {
+            shuffle.first().copied()
+        } else {
+            None
+        };
     }
     match repeat {
         RepeatMode::One => Some(pos),
@@ -2006,6 +2146,17 @@ fn next_index(position: Option<usize>, len: usize, repeat: RepeatMode) -> Option
             let next = pos + 1;
             (next < len).then_some(next)
         }
+    }
+}
+
+/// The shuffle play order to pass to [`next_index`]: the live order when shuffle is on,
+/// otherwise empty (sequential).
+#[cfg(feature = "snapcast")]
+fn active_shuffle(state: &QueueState) -> &[usize] {
+    if state.shuffle {
+        &state.shuffle_order
+    } else {
+        &[]
     }
 }
 
@@ -2148,6 +2299,7 @@ impl SnapcastPlayer {
         state.volume = playback.volume;
         state.repeat = playback.repeat;
         state.shuffle = playback.shuffle;
+        state.shuffle_order = playback.shuffle_order;
     }
 
     async fn persist(&self, persist: QueuePersist) {
@@ -2205,7 +2357,7 @@ impl SnapcastPlayer {
             let position = state.position;
             let item = position.and_then(|index| state.queue.get(index).cloned());
             let elapsed = state.elapsed_seconds.unwrap_or(0.0);
-            let next = next_index(position, state.queue.len(), state.repeat)
+            let next = next_index(position, state.queue.len(), state.repeat, active_shuffle(&state))
                 .and_then(|index| state.queue.get(index).cloned());
             (state.status, position, item, elapsed, next)
         };
@@ -2348,15 +2500,17 @@ impl SnapcastPlayer {
     async fn on_advanced(&self) {
         let (new_position, new_track_id, next_item) = {
             let mut state = self.state.lock().await;
-            let new_position = next_index(state.position, state.queue.len(), state.repeat);
+            let new_position =
+                next_index(state.position, state.queue.len(), state.repeat, active_shuffle(&state));
             state.position = new_position;
             state.elapsed_seconds = Some(0.0);
             state.duration_seconds = None;
             let new_track_id = new_position
                 .and_then(|index| state.queue.get(index))
                 .and_then(|item| item.track_id.clone());
-            let next = next_index(new_position, state.queue.len(), state.repeat)
-                .and_then(|index| state.queue.get(index).cloned());
+            let next =
+                next_index(new_position, state.queue.len(), state.repeat, active_shuffle(&state))
+                    .and_then(|index| state.queue.get(index).cloned());
             (new_position, new_track_id, next)
         };
         {
@@ -3215,6 +3369,7 @@ mod tests {
             volume: Some(50),
             repeat: RepeatMode::Off,
             shuffle: false,
+            shuffle_order: Vec::new(),
         };
         database
             .save_player_queue("mpd-x", &playback, &items)
@@ -3304,21 +3459,111 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
     }
 
+    // ---- Shuffle helpers (pure) ----
+
+    #[test]
+    fn build_shuffle_order_is_a_permutation_with_current_first() {
+        let order = build_shuffle_order(6, Some(3), 0xC0FFEE);
+        assert_eq!(order.len(), 6);
+        assert_eq!(order[0], 3, "the current track leads so playback continues from it");
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3, 4, 5], "every index appears exactly once");
+    }
+
+    #[test]
+    fn build_shuffle_order_is_deterministic_and_not_sequential() {
+        // Same seed → same order (so it can be persisted/restored); and it actually
+        // permutes rather than returning the sequential order.
+        let a = build_shuffle_order(8, None, 42);
+        let b = build_shuffle_order(8, None, 42);
+        assert_eq!(a, b);
+        assert_ne!(a, vec![0, 1, 2, 3, 4, 5, 6, 7], "shuffle must reorder the queue");
+    }
+
+    fn shuffled_state(order: Vec<usize>, position: usize, repeat: RepeatMode) -> QueueState {
+        QueueState {
+            status: PlaybackStatus::Playing,
+            queue: vec![QueueItem::default(); order.len()],
+            position: Some(position),
+            shuffle: true,
+            shuffle_order: order,
+            repeat,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn advance_and_previous_follow_the_shuffle_order() {
+        // BUG-05: with shuffle on, next/prev must walk the shuffled order, not queue order.
+        let mut state = shuffled_state(vec![0, 2, 1, 3], 0, RepeatMode::Off);
+        advance(&mut state, false);
+        assert_eq!(state.position, Some(2), "next after 0 is the next in shuffle order");
+        advance(&mut state, false);
+        assert_eq!(state.position, Some(1));
+        step_previous(&mut state);
+        assert_eq!(state.position, Some(2), "previous walks the shuffle order backwards");
+    }
+
+    #[test]
+    fn shuffle_advance_stops_at_end_without_repeat() {
+        let mut state = shuffled_state(vec![0, 2, 1, 3], 3, RepeatMode::Off);
+        advance(&mut state, true); // last in order, track finished
+        assert_eq!(state.status, PlaybackStatus::Stopped);
+    }
+
+    #[test]
+    fn shuffle_advance_reshuffles_at_end_with_repeat_all() {
+        let mut state = shuffled_state(vec![0, 2, 1, 3], 3, RepeatMode::All);
+        advance(&mut state, true);
+        // It keeps playing (a fresh cycle) rather than stopping, and lands on a valid index.
+        assert_eq!(state.status, PlaybackStatus::Playing);
+        let pos = state.position.expect("a next track");
+        assert!(pos < 4);
+        assert!(
+            shuffle_order_valid(&state.shuffle_order, 4, Some(pos)),
+            "a fresh shuffle order is generated for the next cycle"
+        );
+    }
+
+    #[test]
+    fn shuffle_order_valid_detects_stale_orders() {
+        assert!(shuffle_order_valid(&[2, 0, 1], 3, Some(0)));
+        // Wrong length (queue changed).
+        assert!(!shuffle_order_valid(&[2, 0, 1], 4, Some(0)));
+        // Not a permutation (duplicate).
+        assert!(!shuffle_order_valid(&[2, 2, 1], 3, Some(0)));
+        // Current track no longer present (shouldn't happen, but guard).
+        assert!(!shuffle_order_valid(&[2, 0, 1], 3, Some(9)));
+    }
+
     // ---- Snapcast helpers (pure) ----
 
     #[cfg(feature = "snapcast")]
     #[test]
     fn next_index_honors_repeat_mode() {
         // Off: advance, then stop at the end.
-        assert_eq!(next_index(Some(0), 3, RepeatMode::Off), Some(1));
-        assert_eq!(next_index(Some(2), 3, RepeatMode::Off), None);
+        assert_eq!(next_index(Some(0), 3, RepeatMode::Off, &[]), Some(1));
+        assert_eq!(next_index(Some(2), 3, RepeatMode::Off, &[]), None);
         // All: wrap around.
-        assert_eq!(next_index(Some(2), 3, RepeatMode::All), Some(0));
+        assert_eq!(next_index(Some(2), 3, RepeatMode::All, &[]), Some(0));
         // One: repeat the same track.
-        assert_eq!(next_index(Some(1), 3, RepeatMode::One), Some(1));
+        assert_eq!(next_index(Some(1), 3, RepeatMode::One, &[]), Some(1));
         // No position / empty queue: nothing to play next.
-        assert_eq!(next_index(None, 3, RepeatMode::All), None);
-        assert_eq!(next_index(Some(0), 0, RepeatMode::All), None);
+        assert_eq!(next_index(None, 3, RepeatMode::All, &[]), None);
+        assert_eq!(next_index(Some(0), 0, RepeatMode::All, &[]), None);
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[test]
+    fn next_index_follows_shuffle_order() {
+        let order = [1, 0, 2];
+        // After 1 comes 0 (the next entry in the shuffled order), not 2.
+        assert_eq!(next_index(Some(1), 3, RepeatMode::Off, &order), Some(0));
+        // Off: stop at the end of the shuffled order.
+        assert_eq!(next_index(Some(2), 3, RepeatMode::Off, &order), None);
+        // All: wrap to the first of the shuffled order.
+        assert_eq!(next_index(Some(2), 3, RepeatMode::All, &order), Some(1));
     }
 
     #[cfg(feature = "snapcast")]

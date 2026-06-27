@@ -887,6 +887,16 @@ pub struct BuiltTrack {
     pub io_error: bool,
 }
 
+/// Whether the content hash permits reusing the prior parse. Reuse is blocked only when
+/// both sides carry a hash and they differ; if either hash is absent (e.g. large files
+/// aren't hashed), the size + mtime check alone governs reuse as before.
+fn content_hash_allows_reuse(current: Option<&str>, previous: Option<&str>) -> bool {
+    match (current, previous) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
 /// Build one track from a discovered file: reuse the prior parse if size + mtime are
 /// unchanged, otherwise read its tags. Pure given `fs` + `prior`, so it can run
 /// concurrently across files (the SMB provider does exactly that).
@@ -902,10 +912,14 @@ pub fn build_track(
     let relative_path = relative_display_path(root, &path);
 
     // Fast path: unchanged file → reuse its parsed track wholesale (no tag read).
+    // When a content hash is available on both sides (small files are hashed during
+    // discovery), require it to match too: this catches an in-place edit that keeps the
+    // same byte size and mtime second, which size+mtime alone would miss.
     if let Some(previous) = prior.tracks.get(&relative_path)
         && file.file_size_bytes.is_some()
         && file.file_size_bytes == previous.file_size_bytes
         && file.modified_at_unix_seconds == previous.modified_at_unix_seconds
+        && content_hash_allows_reuse(file.content_hash.as_deref(), previous.content_hash.as_deref())
     {
         let mut track = previous.clone();
         track.path = path;
@@ -1362,7 +1376,8 @@ pub fn merge_libraries(libraries: Vec<Library>) -> Library {
             artists
                 .entry(artist.id.clone())
                 .and_modify(|existing| {
-                    existing.album_count += artist.album_count;
+                    // album_count is recomputed from the deduped album set below; a
+                    // shared album must not be counted once per source.
                     existing.track_count += artist.track_count;
                 })
                 .or_insert(artist);
@@ -1399,7 +1414,17 @@ pub fn merge_libraries(libraries: Vec<Library>) -> Library {
             .then_with(|| left.title.cmp(&right.title))
     });
 
+    // Recompute album_count from the deduped album rows: the number of distinct albums
+    // owned by each artist (album.artist_id is the album-artist), mirroring assembly and
+    // avoiding the double-count when the same album exists in two sources.
+    let mut album_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for album in albums.values() {
+        *album_counts.entry(album.artist_id.as_str()).or_insert(0) += 1;
+    }
     let mut artists: Vec<_> = artists.into_values().collect();
+    for artist in &mut artists {
+        artist.album_count = album_counts.get(artist.id.as_str()).copied().unwrap_or(0);
+    }
     artists.sort_by(|left, right| left.name.cmp(&right.name));
 
     let mut albums: Vec<_> = albums.into_values().collect();
@@ -2742,6 +2767,33 @@ mod tests {
     }
 
     #[test]
+    fn merge_does_not_double_count_album_count_for_a_shared_album() {
+        // BUG-07: the same album present in two sources (a local copy + a NAS copy)
+        // dedups to one album row, but the artist's album_count summed 1+1=2.
+        let source_a = FakeFs::new(vec![(
+            PathBuf::from("/BestOf/01 - ArtistX - Song.mp3"),
+            b"a".to_vec(),
+        )]);
+        let source_b = FakeFs::new(vec![(
+            PathBuf::from("/BestOf/01 - ArtistX - Song.mp3"),
+            b"b".to_vec(),
+        )]);
+        let lib_a = scan_source(&source_a, "src-a").expect("scan a");
+        let lib_b = scan_source(&source_b, "src-b").expect("scan b");
+
+        let merged = merge_libraries(vec![lib_a, lib_b]);
+        // The shared album dedups to a single row...
+        assert_eq!(merged.albums.len(), 1);
+        // ...so album_count must reflect one distinct album, not the sum across sources.
+        let artist = merged
+            .artists
+            .iter()
+            .find(|a| a.name == "ArtistX")
+            .expect("ArtistX present");
+        assert_eq!(artist.album_count, 1);
+    }
+
+    #[test]
     fn incremental_scan_reuses_unchanged_files_and_rereads_changed() {
         // Files >1MB so the walk doesn't hash them (hashing opens small files); this
         // isolates the tag-read, which is what incremental reuse must skip.
@@ -2787,6 +2839,29 @@ mod tests {
         assert!(
             fs3.opens.get() < first_opens,
             "only the changed file is re-read"
+        );
+    }
+
+    #[test]
+    fn incremental_rereads_small_file_changed_in_place_with_same_size_and_mtime() {
+        // BUG-06: a small file (<1MB, so its content is hashed during discovery) edited
+        // in place keeping the same byte size and the same mtime second must be re-read,
+        // not reused with stale metadata — the freshly computed content hash catches it.
+        let path = PathBuf::from("/Album1/01 - ArtistA - Song.mp3");
+        let first_fs = FakeFs::new(vec![(path.clone(), b"original-".to_vec())]);
+        let first = scan_source(&first_fs, "src").expect("first scan");
+        assert_eq!(first.tracks.len(), 1);
+        let first_hash = first.tracks[0].content_hash.clone();
+        assert!(first_hash.is_some(), "a small file is hashed at discovery");
+
+        // Same path, same byte length, same (default) mtime — only the bytes differ.
+        let changed_fs = FakeFs::new(vec![(path, b"replaced!".to_vec())]);
+        let second = scan_source_incremental(&changed_fs, "src", Some(&first), &mut |_| {})
+            .expect("incremental scan");
+        assert_eq!(second.tracks.len(), 1);
+        assert_ne!(
+            second.tracks[0].content_hash, first_hash,
+            "an in-place edit with identical size+mtime must be re-read, not reused"
         );
     }
 

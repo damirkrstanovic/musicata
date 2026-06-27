@@ -84,6 +84,26 @@ fn add_dir<W: Write + std::io::Seek>(
     Ok(())
 }
 
+/// Reduce an archive entry's relative path to safe, normal segments only: any
+/// `..`, root, or drive-prefix component is dropped so the result can never escape
+/// the directory it is joined onto. Returns `None` if nothing usable remains.
+fn sanitize_relative(rel: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in Path::new(rel).components() {
+        match component {
+            Component::Normal(segment) => out.push(segment),
+            // Skip CurDir; reject ParentDir/RootDir/Prefix entirely.
+            _ => {}
+        }
+    }
+    if out.as_os_str().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// Unpack an uploaded export zip into the staging paths. Replaces any prior staging.
 pub fn extract_import(zip_bytes: &[u8], db_import: &Path, artwork_import: &Path) -> anyhow::Result<()> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
@@ -104,7 +124,12 @@ pub fn extract_import(zip_bytes: &[u8], db_import: &Path, artwork_import: &Path)
             if entry.is_dir() || rel.is_empty() {
                 continue;
             }
-            let dest = artwork_import.join(rel);
+            // Guard against zip-slip: only join plain path segments, dropping any
+            // `..`/root/prefix components so an entry can't escape the staging dir.
+            let Some(safe_rel) = sanitize_relative(rel) else {
+                continue;
+            };
+            let dest = artwork_import.join(safe_rel);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -137,5 +162,81 @@ pub fn apply_staged_import(db_path: &Path, artwork_dir: &Path) {
         if let Err(error) = std::fs::rename(&art_import, artwork_dir) {
             tracing::error!(%error, "failed to apply imported artwork");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use zip::write::SimpleFileOptions;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("musicata-backup-{name}-{nanos}"))
+    }
+
+    /// Build an export-shaped zip with the given (entry-name, contents) pairs.
+    fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options = SimpleFileOptions::default();
+            for (name, contents) in entries {
+                zip.start_file(*name, options).unwrap();
+                zip.write_all(contents).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn extract_import_rejects_zip_slip_artwork_entry() {
+        // BUG-03: an `artwork/../escaped.txt` entry must not write outside the
+        // artwork staging directory.
+        let root = temp_dir("zipslip");
+        let db_import = root.join("musicata.db.import");
+        let artwork_import = root.join("artwork.import");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let zip = build_zip(&[
+            ("musicata.db", b"db-bytes"),
+            ("artwork/../escaped.txt", b"pwned"),
+        ]);
+        extract_import(&zip, &db_import, &artwork_import).unwrap();
+
+        // The traversal target would be `root/escaped.txt` (parent of artwork.import).
+        assert!(
+            !root.join("escaped.txt").exists(),
+            "zip-slip entry escaped the artwork staging dir"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extract_import_keeps_normal_artwork_entries() {
+        let root = temp_dir("normal");
+        let db_import = root.join("musicata.db.import");
+        let artwork_import = root.join("artwork.import");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let zip = build_zip(&[
+            ("musicata.db", b"db-bytes"),
+            ("artwork/ab/abcdef.jpg", b"img"),
+        ]);
+        extract_import(&zip, &db_import, &artwork_import).unwrap();
+
+        assert_eq!(std::fs::read(&db_import).unwrap(), b"db-bytes");
+        assert_eq!(
+            std::fs::read(artwork_import.join("ab").join("abcdef.jpg")).unwrap(),
+            b"img"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

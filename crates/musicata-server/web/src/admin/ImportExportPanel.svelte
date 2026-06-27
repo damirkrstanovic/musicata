@@ -15,7 +15,12 @@
     } catch {
       // keep
     }
-    if (!status.running && poll) {
+    // Own the poll lifecycle here so an export already running when the panel mounts
+    // (a reload mid-export, or a second admin tab) starts polling too — not only when
+    // this tab is the one that kicked it off.
+    if (status.running && !poll) {
+      poll = setInterval(refresh, 2000);
+    } else if (!status.running && poll) {
       clearInterval(poll);
       poll = undefined;
     }

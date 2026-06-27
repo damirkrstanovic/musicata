@@ -118,8 +118,10 @@ struct Guid {
 
 #[derive(Debug, Deserialize)]
 struct Enclosure {
-    #[serde(rename = "@url")]
-    url: String,
+    // Optional so a malformed `<enclosure>` (no `url`) skips just that item rather than
+    // failing the whole feed deserialization.
+    #[serde(rename = "@url", default)]
+    url: Option<String>,
     #[serde(rename = "@type", default)]
     mime: Option<String>,
 }
@@ -140,7 +142,7 @@ pub fn parse_feed(xml: &str) -> anyhow::Result<PodcastFeed> {
         .into_iter()
         .filter_map(|item| {
             let enclosure = item.enclosure?;
-            let stream_url = cleaned(Some(enclosure.url))?;
+            let stream_url = cleaned(enclosure.url)?;
             let id = cleaned(item.guid.and_then(|guid| guid.value)).unwrap_or_else(|| stream_url.clone());
             let title = cleaned(item.title).unwrap_or_else(|| "Untitled episode".to_string());
             Some(PodcastEpisode {
@@ -294,6 +296,29 @@ mod tests {
     #[test]
     fn rejects_non_rss() {
         assert!(parse_feed("<html><body>not a feed</body></html>").is_err());
+    }
+
+    #[test]
+    fn malformed_enclosure_skips_only_that_item() {
+        // BUG-10: a present-but-url-less <enclosure> must not fail the whole feed —
+        // it should be skipped like any non-playable item (per the doc comment).
+        let feed_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <rss version="2.0">
+              <channel>
+                <title>Show</title>
+                <item>
+                  <title>Broken enclosure</title>
+                  <enclosure type="audio/mpeg" length="1"/>
+                </item>
+                <item>
+                  <title>Good one</title>
+                  <enclosure url="https://cdn.example.com/ok.mp3" type="audio/mpeg"/>
+                </item>
+              </channel>
+            </rss>"#;
+        let feed = parse_feed(feed_xml).expect("a malformed enclosure must not fail the feed");
+        assert_eq!(feed.episodes.len(), 1);
+        assert_eq!(feed.episodes[0].stream_url, "https://cdn.example.com/ok.mp3");
     }
 
     #[test]

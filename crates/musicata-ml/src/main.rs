@@ -92,7 +92,8 @@ fn center_excerpt(samples: &[f32], max: usize) -> &[f32] {
 
 #[cfg(test)]
 mod tests {
-    use super::center_excerpt;
+    use super::{center_excerpt, lock_recovered};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn center_excerpt_caps_and_centers() {
@@ -103,6 +104,27 @@ mod tests {
         let excerpt = center_excerpt(&signal, 40);
         assert_eq!(excerpt.len(), 40);
         assert_eq!(excerpt[0], 30.0); // (100-40)/2 = 30
+    }
+
+    #[test]
+    fn lock_recovered_survives_a_poisoned_mutex() {
+        // BUG-13: a panic while holding the model lock used to poison it, so every later
+        // request failed with "model lock poisoned". Locking must recover the guard so a
+        // single bad request can't brick the service.
+        let mutex = Arc::new(Mutex::new(7));
+        let poisoner = {
+            let mutex = Arc::clone(&mutex);
+            std::thread::spawn(move || {
+                let _guard = mutex.lock().unwrap();
+                panic!("boom while holding the lock");
+            })
+        };
+        assert!(poisoner.join().is_err(), "the thread panicked, poisoning the lock");
+        assert!(mutex.lock().is_err(), "the mutex is now poisoned");
+
+        // Recovery still yields the guard and the value.
+        let guard = lock_recovered(&mutex);
+        assert_eq!(*guard, 7);
     }
 }
 
@@ -120,6 +142,12 @@ async fn info(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
+/// Lock a mutex, recovering the guard even if a previous holder panicked. A single bad
+/// request must not poison the model and brick every later request.
+fn lock_recovered<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// `POST /analyze` — body is the raw audio file; returns the embedding + top tags.
 async fn analyze(
     State(state): State<AppState>,
@@ -128,7 +156,7 @@ async fn analyze(
     let result = tokio::task::spawn_blocking(move || -> Result<Analysis, String> {
         let samples = decode::decode_to_mono(&body, SAMPLE_RATE).map_err(|e| e.to_string())?;
         let excerpt = center_excerpt(&samples, MAX_ANALYZE_SECONDS * SAMPLE_RATE as usize);
-        let mut model = state.model.lock().map_err(|_| "model lock poisoned".to_string())?;
+        let mut model = lock_recovered(&state.model);
         model.analyze(excerpt, 12).map_err(|e| e.to_string())
     })
     .await

@@ -47,10 +47,19 @@ impl AudioModel {
         let input = Tensor::from_array(([1_usize, samples.len()], samples.to_vec()))?;
         let outputs = self.session.run(ort::inputs!["input_audio" => input])?;
 
-        let (_shape, embedding) = outputs["embedding"]
+        // Look outputs up by name rather than indexing: a model whose outputs are named
+        // differently must yield a clean error, not a panic (which, run under the lock,
+        // would poison it and brick the service).
+        let embedding_out = outputs
+            .get("embedding")
+            .ok_or_else(|| anyhow!("model is missing the 'embedding' output"))?;
+        let (_shape, embedding) = embedding_out
             .try_extract_tensor::<f32>()
             .context("extract embedding")?;
-        let (_shape, scores) = outputs["clip_scores"]
+        let scores_out = outputs
+            .get("clip_scores")
+            .ok_or_else(|| anyhow!("model is missing the 'clip_scores' output"))?;
+        let (_shape, scores) = scores_out
             .try_extract_tensor::<f32>()
             .context("extract clip_scores")?;
 

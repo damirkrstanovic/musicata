@@ -42,11 +42,18 @@ const ACOUSTID_MIN_INTERVAL: Duration = Duration::from_millis(340);
 /// bytes, plus its duration in whole seconds. Decodes up to [`FINGERPRINT_SECONDS`].
 /// `extension` (e.g. `flac`) hints the demuxer. Synchronous + CPU-heavy.
 pub fn compute_fingerprint(audio: &[u8], extension: &str) -> Result<(String, u32), String> {
-    let (samples, sample_rate, channels) = decode_samples(audio, extension)?;
+    let (samples, sample_rate, channels, full_duration_seconds) =
+        decode_samples(audio, extension)?;
     if sample_rate == 0 || channels == 0 {
         return Err("decoded audio had no sample rate / channels".to_string());
     }
-    let duration = (samples.len() as u32 / sample_rate.max(1) / channels.max(1)).max(1);
+    // AcoustID matches on the whole track's duration, so prefer the length read from the
+    // container metadata; only when that's unavailable fall back to the decoded-sample
+    // count (which is capped at the fingerprint window and would otherwise undercount).
+    let decoded_duration = (samples.len() as u32 / sample_rate.max(1) / channels.max(1)).max(1);
+    let duration = full_duration_seconds
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(decoded_duration);
 
     let config = Configuration::preset_test2();
     let mut printer = Fingerprinter::new(&config);
@@ -66,7 +73,10 @@ pub fn compute_fingerprint(audio: &[u8], extension: &str) -> Result<(String, u32
 
 /// Decode (up to [`FINGERPRINT_SECONDS`] of) an audio file's bytes into interleaved
 /// `i16` samples, returning them with the sample rate and channel count.
-fn decode_samples(audio: &[u8], extension: &str) -> Result<(Vec<i16>, u32, u32), String> {
+fn decode_samples(
+    audio: &[u8],
+    extension: &str,
+) -> Result<(Vec<i16>, u32, u32, Option<u32>), String> {
     let source = Cursor::new(audio.to_vec());
     let stream = MediaSourceStream::new(Box::new(source), Default::default());
     let mut hint = Hint::new();
@@ -87,6 +97,15 @@ fn decode_samples(audio: &[u8], extension: &str) -> Result<(Vec<i16>, u32, u32),
         .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
         .ok_or_else(|| "no decodable audio track".to_string())?;
     let track_id = track.id;
+    // The full track duration from the container, independent of how much we decode for
+    // the fingerprint (which stops at FINGERPRINT_SECONDS).
+    let full_duration_seconds = match (
+        track.codec_params.n_frames,
+        track.codec_params.sample_rate,
+    ) {
+        (Some(frames), Some(rate)) if rate > 0 => Some((frames / u64::from(rate)) as u32),
+        _ => None,
+    };
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|error| format!("decoder: {error}"))?;
@@ -133,7 +152,7 @@ fn decode_samples(audio: &[u8], extension: &str) -> Result<(Vec<i16>, u32, u32),
     if samples.is_empty() {
         return Err("no audio decoded".to_string());
     }
-    Ok((samples, sample_rate, channels))
+    Ok((samples, sample_rate, channels, full_duration_seconds))
 }
 
 /// The MusicBrainz ids AcoustID resolved for a track.
@@ -333,6 +352,15 @@ mod tests {
             "url-safe base64"
         );
         assert_eq!(duration, 10);
+    }
+
+    #[test]
+    fn duration_is_full_track_length_not_the_fingerprint_window() {
+        // BUG-11: decoding stops at FINGERPRINT_SECONDS (120 s), but AcoustID matches on
+        // the *full* track duration. A 200 s track must report 200, not the 120 s window.
+        let (_fingerprint, duration) =
+            compute_fingerprint(&silent_wav(200), "wav").expect("fingerprint");
+        assert_eq!(duration, 200);
     }
 
     #[test]

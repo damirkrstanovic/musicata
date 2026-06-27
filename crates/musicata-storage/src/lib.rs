@@ -265,6 +265,15 @@ impl Database {
         }
 
         if version < 23 {
+            // The column ADD goes through `ensure_column` so a re-run after a crash before
+            // the version bump is a no-op rather than a duplicate-column error.
+            ensure_column(
+                &self.pool,
+                "listens",
+                "event_kind",
+                "ALTER TABLE listens ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'played'",
+            )
+            .await?;
             for statement in MIGRATION_023_LISTEN_EVENT_KIND {
                 sqlx::query(statement).execute(&self.pool).await?;
             }
@@ -272,6 +281,13 @@ impl Database {
         }
 
         if version < 24 {
+            ensure_column(
+                &self.pool,
+                "artists",
+                "artwork_url",
+                "ALTER TABLE artists ADD COLUMN artwork_url TEXT",
+            )
+            .await?;
             for statement in MIGRATION_024_ARTIST_ARTWORK {
                 sqlx::query(statement).execute(&self.pool).await?;
             }
@@ -314,9 +330,13 @@ impl Database {
         }
 
         if version < 30 {
-            for statement in MIGRATION_030_PLAYER_AUTH_TOKEN {
-                sqlx::query(statement).execute(&self.pool).await?;
-            }
+            ensure_column(
+                &self.pool,
+                "players",
+                "auth_token_hash",
+                "ALTER TABLE players ADD COLUMN auth_token_hash TEXT",
+            )
+            .await?;
             set_user_version(&self.pool, 30).await?;
         }
 
@@ -332,6 +352,26 @@ impl Database {
                 sqlx::query(statement).execute(&self.pool).await?;
             }
             set_user_version(&self.pool, 32).await?;
+        }
+
+        if version < 33 {
+            // Persist the shuffle play order (JSON array of queue indices) so a shuffled
+            // queue resumes in the same order after a restart.
+            ensure_column(
+                &self.pool,
+                "player_queue",
+                "shuffle_order",
+                "ALTER TABLE player_queue ADD COLUMN shuffle_order TEXT",
+            )
+            .await?;
+            ensure_column(
+                &self.pool,
+                "zone_queue",
+                "shuffle_order",
+                "ALTER TABLE zone_queue ADD COLUMN shuffle_order TEXT",
+            )
+            .await?;
+            set_user_version(&self.pool, 33).await?;
         }
 
         Ok(())
@@ -1085,6 +1125,43 @@ impl Database {
         for row in rows {
             albums.push(album_from_row(&row)?);
         }
+        Ok((albums, total))
+    }
+
+    /// Albums whose release year falls in the inclusive range between `from_year` and
+    /// `to_year`, ordered by year ascending when `from_year <= to_year` and descending
+    /// otherwise (the Subsonic `getAlbumList type=byYear` direction convention).
+    pub async fn albums_by_year(
+        &self,
+        from_year: i64,
+        to_year: i64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Album>, usize)> {
+        let (lo, hi) = (from_year.min(to_year), from_year.max(to_year));
+        let direction = if from_year <= to_year { "ASC" } else { "DESC" };
+
+        let total = i64_to_usize(
+            sqlx::query("SELECT COUNT(*) AS n FROM albums WHERE year BETWEEN ?1 AND ?2")
+                .bind(lo)
+                .bind(hi)
+                .fetch_one(&self.pool)
+                .await?
+                .try_get("n")?,
+            "total",
+        )?;
+        let sql = format!(
+            "SELECT {ALBUM_COLUMNS} FROM albums WHERE year BETWEEN ?1 AND ?2
+             ORDER BY year {direction}, artist_name, title LIMIT ?3 OFFSET ?4"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(lo)
+            .bind(hi)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        let albums = rows.iter().map(album_from_row).collect::<Result<_>>()?;
         Ok((albums, total))
     }
 
@@ -3170,11 +3247,11 @@ impl Database {
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO player_queue
-                (player_id, status, position, elapsed_seconds, volume, repeat, shuffle, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                (player_id, status, position, elapsed_seconds, volume, repeat, shuffle, shuffle_order, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(player_id) DO UPDATE SET
                 status = ?2, position = ?3, elapsed_seconds = ?4, volume = ?5,
-                repeat = ?6, shuffle = ?7, updated_at = ?8",
+                repeat = ?6, shuffle = ?7, shuffle_order = ?8, updated_at = ?9",
         )
         .bind(player_id)
         .bind(playback_status_str(playback.status))
@@ -3183,6 +3260,7 @@ impl Database {
         .bind(playback.volume.map(|v| v as i64))
         .bind(repeat_mode_str(playback.repeat))
         .bind(playback.shuffle as i64)
+        .bind(encode_shuffle_order(&playback.shuffle_order))
         .bind(now_unix_seconds())
         .execute(&self.pool)
         .await?;
@@ -3224,11 +3302,11 @@ impl Database {
             }
             sqlx::query(
                 "INSERT INTO player_queue
-                    (player_id, status, position, elapsed_seconds, volume, repeat, shuffle, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    (player_id, status, position, elapsed_seconds, volume, repeat, shuffle, shuffle_order, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(player_id) DO UPDATE SET
                     status = ?2, position = ?3, elapsed_seconds = ?4, volume = ?5,
-                    repeat = ?6, shuffle = ?7, updated_at = ?8",
+                    repeat = ?6, shuffle = ?7, shuffle_order = ?8, updated_at = ?9",
             )
             .bind(player_id)
             .bind(playback_status_str(playback.status))
@@ -3237,6 +3315,7 @@ impl Database {
             .bind(playback.volume.map(|v| v as i64))
             .bind(repeat_mode_str(playback.repeat))
             .bind(playback.shuffle as i64)
+            .bind(encode_shuffle_order(&playback.shuffle_order))
             .bind(now_unix_seconds())
             .execute(&mut *conn)
             .await?;
@@ -3258,7 +3337,7 @@ impl Database {
     /// Load a player's persisted queue, or `None` if it has never had one saved.
     pub async fn load_player_queue(&self, player_id: &str) -> Result<Option<PlayerQueueSnapshot>> {
         let Some(row) = sqlx::query(
-            "SELECT status, position, elapsed_seconds, volume, repeat, shuffle
+            "SELECT status, position, elapsed_seconds, volume, repeat, shuffle, shuffle_order
              FROM player_queue WHERE player_id = ?1",
         )
         .bind(player_id)
@@ -3276,6 +3355,7 @@ impl Database {
             volume: row.try_get::<Option<i64>, _>("volume")?.map(|v| v as u8),
             repeat: repeat_mode_from_str(&row.try_get::<String, _>("repeat")?),
             shuffle: row.try_get::<i64, _>("shuffle")? != 0,
+            shuffle_order: decode_shuffle_order(row.try_get("shuffle_order")?),
         };
         let item_rows = sqlx::query(
             "SELECT track_id, title, artist, album, stream_url, artwork_url
@@ -3310,11 +3390,11 @@ impl Database {
     pub async fn save_zone_playback(&self, zone_id: &str, playback: &PlayerPlayback) -> Result<()> {
         sqlx::query(
             "INSERT INTO zone_queue
-                (zone_id, status, position, elapsed_seconds, volume, repeat, shuffle, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                (zone_id, status, position, elapsed_seconds, volume, repeat, shuffle, shuffle_order, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(zone_id) DO UPDATE SET
                 status = ?2, position = ?3, elapsed_seconds = ?4, volume = ?5,
-                repeat = ?6, shuffle = ?7, updated_at = ?8",
+                repeat = ?6, shuffle = ?7, shuffle_order = ?8, updated_at = ?9",
         )
         .bind(zone_id)
         .bind(playback_status_str(playback.status))
@@ -3323,6 +3403,7 @@ impl Database {
         .bind(playback.volume.map(|v| v as i64))
         .bind(repeat_mode_str(playback.repeat))
         .bind(playback.shuffle as i64)
+        .bind(encode_shuffle_order(&playback.shuffle_order))
         .bind(now_unix_seconds())
         .execute(&self.pool)
         .await?;
@@ -3364,11 +3445,11 @@ impl Database {
             }
             sqlx::query(
                 "INSERT INTO zone_queue
-                    (zone_id, status, position, elapsed_seconds, volume, repeat, shuffle, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    (zone_id, status, position, elapsed_seconds, volume, repeat, shuffle, shuffle_order, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(zone_id) DO UPDATE SET
                     status = ?2, position = ?3, elapsed_seconds = ?4, volume = ?5,
-                    repeat = ?6, shuffle = ?7, updated_at = ?8",
+                    repeat = ?6, shuffle = ?7, shuffle_order = ?8, updated_at = ?9",
             )
             .bind(zone_id)
             .bind(playback_status_str(playback.status))
@@ -3377,6 +3458,7 @@ impl Database {
             .bind(playback.volume.map(|v| v as i64))
             .bind(repeat_mode_str(playback.repeat))
             .bind(playback.shuffle as i64)
+            .bind(encode_shuffle_order(&playback.shuffle_order))
             .bind(now_unix_seconds())
             .execute(&mut *conn)
             .await?;
@@ -3398,7 +3480,7 @@ impl Database {
     /// Load a zone's persisted queue, or `None` if it has never had one saved.
     pub async fn load_zone_queue(&self, zone_id: &str) -> Result<Option<PlayerQueueSnapshot>> {
         let Some(row) = sqlx::query(
-            "SELECT status, position, elapsed_seconds, volume, repeat, shuffle
+            "SELECT status, position, elapsed_seconds, volume, repeat, shuffle, shuffle_order
              FROM zone_queue WHERE zone_id = ?1",
         )
         .bind(zone_id)
@@ -3415,6 +3497,7 @@ impl Database {
             elapsed_seconds: row.try_get("elapsed_seconds")?,
             volume: row.try_get::<Option<i64>, _>("volume")?.map(|v| v as u8),
             repeat: repeat_mode_from_str(&row.try_get::<String, _>("repeat")?),
+            shuffle_order: decode_shuffle_order(row.try_get("shuffle_order")?),
             shuffle: row.try_get::<i64, _>("shuffle")? != 0,
         };
         let item_rows = sqlx::query(
@@ -3888,10 +3971,12 @@ impl Database {
         track_ids: &[String],
         now: i64,
     ) -> Result<()> {
-        let mut conn = self.pool.acquire().await?;
+        // One transaction so the replace is atomic: a failure mid-batch rolls back, and a
+        // concurrent reader never sees the empty window between the DELETE and the INSERTs.
+        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM playlist_tracks WHERE playlist_id = ?1")
             .bind(id)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
         for (position, track_id) in track_ids.iter().enumerate() {
             sqlx::query(
@@ -3900,14 +3985,15 @@ impl Database {
             .bind(id)
             .bind(position as i64)
             .bind(track_id)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
         }
         sqlx::query("UPDATE playlists SET updated_at_unix_seconds = ?2 WHERE id = ?1")
             .bind(id)
             .bind(now)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -4469,6 +4555,9 @@ pub struct PlayerPlayback {
     pub volume: Option<u8>,
     pub repeat: RepeatMode,
     pub shuffle: bool,
+    /// The shuffle play order (queue indices), persisted so a shuffled queue resumes in
+    /// the same order after a restart. Empty when shuffle is off.
+    pub shuffle_order: Vec<usize>,
 }
 
 /// A player's full persisted queue: the playback row plus the ordered items.
@@ -4789,6 +4878,7 @@ fn album_order_clause(sort: Option<&str>) -> &'static str {
     match sort {
         Some("title") => "title",
         Some("year") => "year DESC, artist_name, title",
+        Some("random") => "RANDOM()",
         _ => "artist_name, year, title",
     }
 }
@@ -5517,8 +5607,7 @@ const MIGRATION_029_ALBUM_LOUDNESS: &[&str] = &["CREATE TABLE IF NOT EXISTS albu
 // Per-player endpoint auth token (M10): the sha256 of a token issued at registration to a
 // self-registering endpoint, so it can authenticate on its own channels without a user
 // session. NULL for server-initiated players (browser/MPD/Snapcast), which carry no token.
-const MIGRATION_030_PLAYER_AUTH_TOKEN: &[&str] =
-    &["ALTER TABLE players ADD COLUMN auth_token_hash TEXT"];
+// The `auth_token_hash` column is added idempotently via `ensure_column` in `migrate`.
 
 /// Audio-ML (musicata-ml): a `vec0` virtual table holds each track's embedding for KNN
 /// "sounds-like" similarity (sqlite-vec is loaded as standard — see `register_sqlite_vec`); a
@@ -5599,18 +5688,17 @@ const MIGRATION_011_LISTENS: &[&str] = &[
 // truth available. NOTE: the column is added only here via ALTER, never in the v11
 // CREATE TABLE, so a fresh DB (which runs both in sequence) doesn't hit a duplicate
 // column.
-const MIGRATION_023_LISTEN_EVENT_KIND: &[&str] = &[
-    "ALTER TABLE listens ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'played'",
-    "CREATE INDEX IF NOT EXISTS idx_listens_kind ON listens(event_kind)",
-];
+// The `event_kind` column is added idempotently via `ensure_column` in `migrate`.
+const MIGRATION_023_LISTEN_EVENT_KIND: &[&str] =
+    &["CREATE INDEX IF NOT EXISTS idx_listens_kind ON listens(event_kind)"];
 
 // Artist images. Like albums, artists are rebuilt by `save_library` each scan, so the
 // served `artwork_url` is re-applied after a rescan from the acquired record. Artist art
 // is *acquired-only* (no folder/embedded source) and name-based (the library carries no
 // artist MBIDs): `acquired_artist_artwork` mirrors `acquired_album_artwork` — no foreign
 // key, `artist_id` stable across rescans, `status` is `acquired` or `not_found`.
+// The `artwork_url` column is added idempotently via `ensure_column` in `migrate`.
 const MIGRATION_024_ARTIST_ARTWORK: &[&str] = &[
-    "ALTER TABLE artists ADD COLUMN artwork_url TEXT",
     "CREATE TABLE IF NOT EXISTS acquired_artist_artwork (
         artist_id TEXT PRIMARY KEY,
         provider TEXT NOT NULL,
@@ -5822,6 +5910,21 @@ fn approval_state_from_str(value: String) -> MetadataApprovalState {
     }
 }
 
+/// Encode a shuffle play order as a JSON array for storage; `None` when empty (shuffle off).
+fn encode_shuffle_order(order: &[usize]) -> Option<String> {
+    if order.is_empty() {
+        None
+    } else {
+        serde_json::to_string(order).ok()
+    }
+}
+
+/// Decode a stored shuffle play order; a missing/invalid value yields an empty order.
+fn decode_shuffle_order(raw: Option<String>) -> Vec<usize> {
+    raw.and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
 async fn ensure_column(
     pool: &SqlitePool,
     table: &str,
@@ -5949,6 +6052,33 @@ mod tests {
             .await
             .expect("load library")
             .is_some()
+    }
+
+    #[tokio::test]
+    async fn migrations_are_idempotent_after_crash_between_alter_and_version_bump() {
+        // BUG-08: several migrations did a bare `ALTER TABLE ADD COLUMN`. If the process
+        // died after the ALTER committed but before the user_version bump, the next startup
+        // re-ran the ALTER and failed with "duplicate column name", bricking startup.
+        let db_path = temp_db_path("migrate-idempotent");
+        {
+            let database = Database::connect(&db_path)
+                .await
+                .expect("first connect migrates fully");
+            // Rewind the version below the raw-ALTER migrations while the columns they add
+            // already exist — exactly the post-crash state.
+            sqlx::query("PRAGMA user_version = 22")
+                .execute(&database.pool)
+                .await
+                .expect("rewind user_version");
+        }
+        // Re-running the migrations must be idempotent, not a duplicate-column error.
+        let reconnected = Database::connect(&db_path).await;
+        assert!(
+            reconnected.is_ok(),
+            "re-running migrations must be idempotent: {:?}",
+            reconnected.err()
+        );
+        let _ = std::fs::remove_file(db_path);
     }
 
     #[tokio::test]
@@ -6342,6 +6472,85 @@ mod tests {
 
         database.clear_favorite("track", "track_1").await.unwrap();
         assert!(database.starred_tracks().await.unwrap().is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn set_playlist_tracks_is_atomic_on_mid_batch_failure() {
+        // BUG-09: replacing a playlist's tracks was DELETE + INSERTs with no transaction,
+        // so a failure mid-batch (or a concurrent reader) could observe a half-written or
+        // empty playlist. The replace must be all-or-nothing.
+        let db_path = temp_db_path("playlist-atomic");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        let playlist = database
+            .create_playlist("P", None, &["t1".into(), "t2".into()], 100)
+            .await
+            .expect("create playlist");
+        assert_eq!(
+            database.playlist_track_ids(&playlist).await.unwrap(),
+            ["t1", "t2"]
+        );
+
+        // Force the *second* insert of the next replace to fail, after the DELETE and the
+        // first insert have run within the same call.
+        sqlx::query(
+            "CREATE TRIGGER fail_on_sentinel BEFORE INSERT ON playlist_tracks
+             WHEN NEW.track_id = '__fail__'
+             BEGIN SELECT RAISE(ABORT, 'forced'); END",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("install trigger");
+
+        let result = database
+            .set_playlist_tracks(&playlist, &["t3".into(), "__fail__".into()], 200)
+            .await;
+        assert!(result.is_err(), "the mid-batch failure must surface as an error");
+
+        // The original tracks survive — the whole replace rolled back.
+        assert_eq!(
+            database.playlist_track_ids(&playlist).await.unwrap(),
+            ["t1", "t2"],
+            "a failed replace must not leave the playlist emptied or half-written"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn albums_by_year_filters_to_range_and_orders_by_direction() {
+        // BUG-14: Subsonic getAlbumList type=byYear must filter to [fromYear,toYear]
+        // and order ascending when fromYear<=toYear, descending otherwise.
+        let db_path = temp_db_path("albums-by-year");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut library = fixture_library(); // album_1, year 2026
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+        for (id, year) in [("album_2000", 2000), ("album_2010", 2010), ("album_2020", 2020)] {
+            sqlx::query(
+                "INSERT INTO albums (id, title, artist_id, artist_name, year, track_count,
+                    artwork_url, artwork_path) VALUES (?1, ?1, 'artist_1', 'Artist', ?2, 1, NULL, NULL)",
+            )
+            .bind(id)
+            .bind(year)
+            .execute(&database.pool)
+            .await
+            .expect("insert album");
+        }
+
+        // Ascending range: 2010 and 2020 are in [2005,2025]; 2000 and 2026 excluded.
+        let (asc, _) = database.albums_by_year(2005, 2025, 50, 0).await.expect("byYear asc");
+        let asc_ids: Vec<_> = asc.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(asc_ids, ["album_2010", "album_2020"]);
+
+        // Descending direction (fromYear > toYear) reverses the order over the same range.
+        let (desc, _) = database.albums_by_year(2025, 2005, 50, 0).await.expect("byYear desc");
+        let desc_ids: Vec<_> = desc.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(desc_ids, ["album_2020", "album_2010"]);
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -7166,6 +7375,7 @@ mod tests {
                     volume: None,
                     repeat: musicata_core::RepeatMode::Off,
                     shuffle: false,
+                    shuffle_order: Vec::new(),
                 },
                 &[musicata_core::QueueItem {
                     track_id: Some("t1".to_string()),
@@ -7465,6 +7675,8 @@ mod tests {
             volume: Some(70),
             repeat: RepeatMode::All,
             shuffle: true,
+            // BUG-05: the shuffle play order must survive the save/load round-trip.
+            shuffle_order: vec![2, 0, 1],
         };
         database
             .save_player_queue("p1", &playback, &items)
@@ -7559,6 +7771,7 @@ mod tests {
             volume: Some(55),
             repeat: RepeatMode::All,
             shuffle: true,
+            shuffle_order: Vec::new(),
         };
         database
             .save_zone_queue("z1", &playback, &items)

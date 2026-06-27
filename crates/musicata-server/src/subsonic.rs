@@ -82,6 +82,22 @@ fn multi<'a>(params: &'a HashMap<String, Vec<String>>, key: &str) -> &'a [String
     params.get(key).map(Vec::as_slice).unwrap_or(&[])
 }
 
+/// Decode one hex digit (`0-9A-Fa-f`) to its 0–15 value.
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decode two hex-digit bytes to a single byte. Operates on raw bytes so a
+/// multi-byte UTF-8 sequence can never trigger a non-char-boundary slice panic.
+fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
+    Some(hex_digit(hi)? << 4 | hex_digit(lo)?)
+}
+
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -92,12 +108,12 @@ fn percent_decode(input: &str) -> String {
                 out.push(b' ');
                 i += 1;
             }
-            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&input[i + 1..i + 3], 16) {
-                Ok(byte) => {
+            b'%' if i + 2 < bytes.len() => match hex_byte(bytes[i + 1], bytes[i + 2]) {
+                Some(byte) => {
                     out.push(byte);
                     i += 3;
                 }
-                Err(_) => {
+                None => {
                     out.push(b'%');
                     i += 1;
                 }
@@ -287,12 +303,13 @@ fn md5_hex(input: &str) -> String {
 }
 
 fn decode_hex(hex: &str) -> Option<String> {
+    let hex = hex.as_bytes();
     if !hex.len().is_multiple_of(2) {
         return None;
     }
     let bytes: Option<Vec<u8>> = (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .map(|i| hex_byte(hex[i], hex[i + 1]))
         .collect();
     String::from_utf8(bytes?).ok()
 }
@@ -592,17 +609,21 @@ async fn get_song(state: &AppState, format: Format, params: &HashMap<String, Str
     }
 }
 
+/// Parse the `fromYear`/`toYear` parameters required by `getAlbumList type=byYear`.
+/// Both must be present and numeric; their order is preserved (it selects the sort
+/// direction downstream).
+fn parse_year_range(params: &HashMap<String, String>) -> Option<(i64, i64)> {
+    let from_year = params.get("fromYear")?.trim().parse::<i64>().ok()?;
+    let to_year = params.get("toYear")?.trim().parse::<i64>().ok()?;
+    Some((from_year, to_year))
+}
+
 async fn get_album_list(
     state: &AppState,
     format: Format,
     params: &HashMap<String, String>,
     wrapper: &str,
 ) -> Response {
-    let sort = match params.get("type").map(String::as_str) {
-        Some("alphabeticalByName") => Some("title"),
-        Some("newest") | Some("recent") | Some("byYear") => Some("year"),
-        _ => None, // alphabeticalByArtist / random / frequent / starred -> default order
-    };
     let size = params
         .get("size")
         .and_then(|value| value.parse::<i64>().ok())
@@ -613,10 +634,49 @@ async fn get_album_list(
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0)
         .max(0);
+    let kind = params.get("type").map(String::as_str);
 
-    let albums = match state.database.list_albums(sort, size, offset).await {
-        Ok((albums, _)) => albums,
-        Err(error) => return error_response(format, 0, &error.to_string()),
+    // `starred`, `random` and `byYear` are distinct queries — not just a sort over the
+    // full list — so each dispatches to its own source rather than falling through to the
+    // default order (which silently returned every album).
+    let albums = match kind {
+        Some("starred") => match state.database.starred_albums().await {
+            Ok(albums) => albums
+                .into_iter()
+                .skip(offset.max(0) as usize)
+                .take(size.max(0) as usize)
+                .collect(),
+            Err(error) => return error_response(format, 0, &error.to_string()),
+        },
+        Some("byYear") => {
+            let Some((from_year, to_year)) = parse_year_range(params) else {
+                return error_response(
+                    format,
+                    10,
+                    "Required parameter is missing (fromYear/toYear).",
+                );
+            };
+            match state
+                .database
+                .albums_by_year(from_year, to_year, size, offset)
+                .await
+            {
+                Ok((albums, _)) => albums,
+                Err(error) => return error_response(format, 0, &error.to_string()),
+            }
+        }
+        other => {
+            let sort = match other {
+                Some("alphabeticalByName") => Some("title"),
+                Some("newest") | Some("recent") => Some("year"),
+                Some("random") => Some("random"),
+                _ => None, // alphabeticalByArtist / frequent -> default order
+            };
+            match state.database.list_albums(sort, size, offset).await {
+                Ok((albums, _)) => albums,
+                Err(error) => return error_response(format, 0, &error.to_string()),
+            }
+        }
     };
     let album = albums_value(&albums, &load_favorites(state).await);
     ok_response(format, map1(wrapper, json!({ "album": album })))
@@ -1406,5 +1466,37 @@ mod tests {
         let mut xml = String::new();
         write_element(&mut xml, "item", &value);
         assert_eq!(xml, "<item name=\"Rock &amp; &lt;Roll&gt;\"/>");
+    }
+
+    #[test]
+    fn percent_decode_does_not_panic_on_multibyte_after_percent() {
+        // BUG-01: a multi-byte UTF-8 char right after `%` made the str-slice
+        // `&input[i+1..i+3]` land off a char boundary and panic (pre-auth DoS).
+        assert_eq!(percent_decode("%1€"), "%1€");
+        // A valid escape still decodes; a stray `%` at the end stays literal.
+        assert_eq!(percent_decode("a%41b"), "aAb");
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+    }
+
+    #[test]
+    fn parse_year_range_requires_both_numeric_years() {
+        // BUG-14: byYear must supply both fromYear and toYear; order is preserved so the
+        // caller can pick the sort direction.
+        let mut params = HashMap::new();
+        assert_eq!(parse_year_range(&params), None);
+        params.insert("fromYear".into(), "2020".into());
+        assert_eq!(parse_year_range(&params), None, "toYear still missing");
+        params.insert("toYear".into(), "2000".into());
+        assert_eq!(parse_year_range(&params), Some((2020, 2000)));
+        params.insert("toYear".into(), "notayear".into());
+        assert_eq!(parse_year_range(&params), None);
+    }
+
+    #[test]
+    fn decode_hex_does_not_panic_on_multibyte_char() {
+        // BUG-02: `decode_hex` checked byte length parity then sliced the str
+        // `&hex[i..i+2]`, panicking when a multi-byte char crossed the boundary.
+        assert_eq!(decode_hex("a€"), None);
+        assert_eq!(decode_hex("736573616d65"), Some("sesame".to_string()));
     }
 }

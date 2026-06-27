@@ -22,6 +22,19 @@ pub struct AudioPlayer {
     reported_ended: bool,
 }
 
+/// Resolve a stream URL against the server base and decide whether the endpoint's
+/// Bearer token may be attached. Only library streams — given as relative paths, which
+/// we resolve against our own server — are trusted with the token. Absolute URLs
+/// (radio/podcast, possibly external) are sent verbatim and never carry the token, so a
+/// look-alike host cannot capture it via a shared textual prefix.
+fn resolve_request(base_url: &str, stream_url: &str) -> (String, bool) {
+    if stream_url.starts_with("http://") || stream_url.starts_with("https://") {
+        (stream_url.to_string(), false)
+    } else {
+        (format!("{base_url}{stream_url}"), true)
+    }
+}
+
 impl AudioPlayer {
     pub fn new(base_url: String, token: String) -> Result<Self> {
         let (stream, handle) =
@@ -47,13 +60,9 @@ impl AudioPlayer {
     /// Library streams (under our server) carry the endpoint Bearer token; external streams
     /// (radio/podcast) don't.
     fn fetch(&self, stream_url: &str) -> Result<Vec<u8>> {
-        let url = if stream_url.starts_with("http://") || stream_url.starts_with("https://") {
-            stream_url.to_string()
-        } else {
-            format!("{}{}", self.base_url, stream_url)
-        };
+        let (url, send_token) = resolve_request(&self.base_url, stream_url);
         let mut request = self.agent.get(&url);
-        if url.starts_with(&self.base_url) {
+        if send_token {
             request = request.set("Authorization", &format!("Bearer {}", self.token));
         }
         let response = request.call().map_err(|error| anyhow!("fetch stream: {error}"))?;
@@ -136,5 +145,34 @@ impl AudioPlayer {
             self.reported_ended = true;
         }
         finished
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_request;
+
+    #[test]
+    fn library_relative_url_resolves_and_carries_token() {
+        let (url, send_token) =
+            resolve_request("http://127.0.0.1:3030", "/api/tracks/t1/stream");
+        assert_eq!(url, "http://127.0.0.1:3030/api/tracks/t1/stream");
+        assert!(send_token);
+    }
+
+    #[test]
+    fn lookalike_host_does_not_receive_token() {
+        // BUG-04: a prefix check sent the token to any URL textually starting with
+        // base_url, e.g. an attacker host that merely shares the prefix.
+        let (url, send_token) =
+            resolve_request("http://127.0.0.1:3030", "http://127.0.0.1:3030.example.com/track");
+        assert_eq!(url, "http://127.0.0.1:3030.example.com/track");
+        assert!(!send_token, "token must not leak to a look-alike host");
+    }
+
+    #[test]
+    fn external_stream_does_not_receive_token() {
+        let (_, send_token) = resolve_request("http://127.0.0.1:3030", "http://radio.example/s");
+        assert!(!send_token);
     }
 }
