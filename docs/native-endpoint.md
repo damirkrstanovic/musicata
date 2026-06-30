@@ -1,8 +1,8 @@
 # Native playback endpoint (M10)
 
 Status: **shipped** — the self-registering `native` player kind is complete and verified.
-`crates/musicata-endpoint`. (The audio path's *refinements* — `wss`, gapless, seek-following —
-remain; see Scope below.)
+`crates/musicata-endpoint`. (The audio path's remaining *refinements* — `wss`, seek-following —
+are listed under Scope below; **gapless** between consecutive library tracks now works.)
 
 A native endpoint is a small program a device (a Raspberry Pi by the speakers, a spare desktop)
 runs to become a real Musicata player — not a browser tab, not MPD. The server drives it from
@@ -92,7 +92,14 @@ channel (`/api/players/{id}/state` → 200) while a wrong/absent token is reject
   the LAN, not optimized for huge files.
 - **No precise seek-following:** a server-side seek on the same track isn't mirrored (rodio
   doesn't seek mid-stream easily). Track changes, pause/resume, and end-of-track all work.
-- **No gapless / crossfade.**
+- **Gapless (no crossfade):** consecutive **library** tracks play with no audible gap. The
+  server broadcasts a `next_up` hint (its repeat/shuffle-aware peek of the next track); the
+  endpoint fetch+decodes that track ~30 s before the boundary and appends it to a single
+  persistent rodio sink ~12 s before the end, so rodio plays it back-to-back. Limits: the very
+  last track of a shuffle cycle under repeat-all (the server reshuffles, so `next_up` is `None`
+  → one reload there), radio/external streams (never prefetched, to keep the token on the
+  library host), and a queue edit inside the final ~12 s window (a corrective reload = one gap).
+  "Gapless" means no audible gap, not codec-padding removal.
 - The audio path needs a real output device, so it's verified by **manual run** (like the
   `live_mpd` test); the server-side registration + stream auth and the client's decision logic
   are covered by automated tests.

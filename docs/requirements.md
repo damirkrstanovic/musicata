@@ -94,6 +94,9 @@ Initial playback requirements:
 - Support play, pause, stop, next, previous, seek, volume, shuffle, repeat, and queue editing.
 - Track now-playing state and playback progress.
 - Keep the playback engine independent from local file paths.
+- Play consecutive queued tracks **gapless** (no audible gap at a track boundary) on playback
+  paths that can support it. The server broadcasts a `next_up` hint so a player can prefetch
+  the next track; gapless here means "no audible gap," not codec-padding removal.
 
 Future player/provider targets:
 

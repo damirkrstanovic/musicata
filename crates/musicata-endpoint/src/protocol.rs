@@ -13,6 +13,10 @@ pub struct PlaybackState {
     pub status: String,
     #[serde(default)]
     pub now_playing: Option<QueueItem>,
+    /// The track the server will play next (its prefetch hint). The endpoint loads this ahead
+    /// of the boundary so playback is gapless. `None` when the next track can't be predicted.
+    #[serde(default)]
+    pub next_up: Option<QueueItem>,
 }
 
 /// The now-playing item — what to fetch and how to label it.
@@ -42,6 +46,14 @@ pub enum Action {
         title: String,
         play: bool,
     },
+    /// The server cursor moved to a track the endpoint already prefetched and appended — the
+    /// audio is already playing it gaplessly, so just adopt it as current (no reload).
+    Advance {
+        track_id: Option<String>,
+        stream_url: String,
+        title: String,
+        play: bool,
+    },
     Resume,
     Pause,
     Stop,
@@ -57,6 +69,9 @@ pub struct EndpointView {
     /// The currently-loaded stream URL (the identity for items without a track id, e.g. radio).
     pub stream_url: Option<String>,
     pub playing: bool,
+    /// The track id the endpoint has prefetched (and appended) for gapless advance. When the
+    /// server cursor reaches this id, the audio is already playing it — adopt, don't reload.
+    pub prefetched: Option<String>,
 }
 
 /// Decide the audio action for a new server state, given what the endpoint is doing now. Pure.
@@ -80,10 +95,22 @@ pub fn decide(view: &EndpointView, next: &PlaybackState) -> Action {
                 view.stream_url.as_deref() == Some(item.stream_url.as_str())
             };
             if !same {
-                Action::Load {
-                    stream_url: item.stream_url.clone(),
-                    title: item.title.clone(),
-                    play: want_playing,
+                // Did the cursor land on the track we already prefetched and appended? Then the
+                // audio is already playing it gaplessly — adopt it without a reload.
+                let advanced = item.track_id.is_some() && item.track_id == view.prefetched;
+                if advanced {
+                    Action::Advance {
+                        track_id: item.track_id.clone(),
+                        stream_url: item.stream_url.clone(),
+                        title: item.title.clone(),
+                        play: want_playing,
+                    }
+                } else {
+                    Action::Load {
+                        stream_url: item.stream_url.clone(),
+                        title: item.title.clone(),
+                        play: want_playing,
+                    }
                 }
             } else if want_playing && !view.playing {
                 Action::Resume
@@ -94,6 +121,26 @@ pub fn decide(view: &EndpointView, next: &PlaybackState) -> Action {
             }
         }
     }
+}
+
+/// The next library track the endpoint should prefetch for gapless playback, as
+/// `(stream_url, track_id)`, or `None` when there's nothing to prefetch. Only **library**
+/// tracks — those with a track id and a relative stream URL — are prefetched; radio/external
+/// streams (absolute URLs) are never prefetched, so the endpoint's bearer token never leaves
+/// the library host (the BUG-04 rule). Returns `None` when the hint is already prefetched.
+pub fn prefetch_target(view: &EndpointView, next: &PlaybackState) -> Option<(String, String)> {
+    let item = next.next_up.as_ref()?;
+    let track_id = item.track_id.as_ref()?;
+    if item.stream_url.is_empty()
+        || item.stream_url.starts_with("http://")
+        || item.stream_url.starts_with("https://")
+    {
+        return None;
+    }
+    if view.prefetched.as_deref() == Some(track_id.as_str()) {
+        return None;
+    }
+    Some((item.stream_url.clone(), track_id.clone()))
 }
 
 #[cfg(test)]
@@ -108,6 +155,15 @@ mod tests {
                 stream_url: url.to_string(),
                 ..Default::default()
             }),
+            next_up: None,
+        }
+    }
+
+    fn item(track: Option<&str>, url: &str) -> QueueItem {
+        QueueItem {
+            track_id: track.map(|id| id.to_string()),
+            stream_url: url.to_string(),
+            ..Default::default()
         }
     }
 
@@ -140,6 +196,7 @@ mod tests {
             track_id: Some("t1".into()),
             stream_url: Some("/s".into()),
             playing: true,
+            prefetched: None,
         };
         assert_eq!(decide(&view, &state("paused", Some("t1"), "/s")), Action::Pause);
 
@@ -153,6 +210,7 @@ mod tests {
             track_id: Some("t1".into()),
             stream_url: Some("/s".into()),
             playing: true,
+            prefetched: None,
         };
         assert_eq!(decide(&view, &state("playing", Some("t1"), "/s")), Action::Nothing);
     }
@@ -163,6 +221,7 @@ mod tests {
             track_id: Some("t1".into()),
             stream_url: Some("/s".into()),
             playing: true,
+            prefetched: None,
         };
         assert_eq!(decide(&view, &state("stopped", None, "")), Action::Stop);
         assert_eq!(decide(&EndpointView::default(), &state("stopped", None, "")), Action::Nothing);
@@ -175,6 +234,7 @@ mod tests {
             track_id: None,
             stream_url: Some("http://a/stream".into()),
             playing: true,
+            prefetched: None,
         };
         let mut next = state("playing", None, "");
         next.now_playing = Some(QueueItem {
@@ -184,6 +244,57 @@ mod tests {
         });
         match decide(&view, &next) {
             Action::Load { stream_url, .. } => assert_eq!(stream_url, "http://b/stream"),
+            other => panic!("expected Load, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefetches_only_library_next_up() {
+        let view = EndpointView::default();
+        // A library next_up (track id + relative URL) is the prefetch target.
+        let mut next = state("playing", Some("t1"), "/api/tracks/t1/stream");
+        next.next_up = Some(item(Some("t2"), "/api/tracks/t2/stream"));
+        assert_eq!(
+            prefetch_target(&view, &next),
+            Some(("/api/tracks/t2/stream".into(), "t2".into()))
+        );
+        // Radio/external next_up (absolute URL) is never prefetched — token must not leak.
+        next.next_up = Some(item(None, "http://radio.example/s"));
+        assert_eq!(prefetch_target(&view, &next), None);
+        next.next_up = Some(item(Some("t2"), "https://cdn.example/t2"));
+        assert_eq!(prefetch_target(&view, &next), None);
+        // No hint → nothing to prefetch.
+        next.next_up = None;
+        assert_eq!(prefetch_target(&view, &next), None);
+        // Already prefetched → no repeat.
+        next.next_up = Some(item(Some("t2"), "/api/tracks/t2/stream"));
+        let prefetched = EndpointView { prefetched: Some("t2".into()), ..view };
+        assert_eq!(prefetch_target(&prefetched, &next), None);
+    }
+
+    #[test]
+    fn advances_to_a_prefetched_track_without_reloading() {
+        // Currently playing t1, having prefetched t2; the cursor moves to t2.
+        let view = EndpointView {
+            track_id: Some("t1".into()),
+            stream_url: Some("/api/tracks/t1/stream".into()),
+            playing: true,
+            prefetched: Some("t2".into()),
+        };
+        let next = state("playing", Some("t2"), "/api/tracks/t2/stream");
+        assert_eq!(
+            decide(&view, &next),
+            Action::Advance {
+                track_id: Some("t2".into()),
+                stream_url: "/api/tracks/t2/stream".into(),
+                title: String::new(),
+                play: true,
+            }
+        );
+        // A cursor move to an *un*prefetched track still reloads.
+        let other = state("playing", Some("t3"), "/api/tracks/t3/stream");
+        match decide(&view, &other) {
+            Action::Load { stream_url, .. } => assert_eq!(stream_url, "/api/tracks/t3/stream"),
             other => panic!("expected Load, got {other:?}"),
         }
     }

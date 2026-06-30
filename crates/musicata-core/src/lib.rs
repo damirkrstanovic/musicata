@@ -641,6 +641,11 @@ pub struct PlaybackState {
     pub shuffle: bool,
     pub queue: Vec<QueueItem>,
     pub queue_position: Option<usize>,
+    /// The track the server will play next, given the current repeat/shuffle order — a hint
+    /// for clients that prefetch (the native endpoint's gapless playback). `None` when the
+    /// next item can't be predicted (end of a shuffle cycle, or the queue stops at the end).
+    #[serde(default)]
+    pub next_up: Option<QueueItem>,
 }
 
 /// A command issued to a player. `PlayTracks`/`Enqueue` reference library track
