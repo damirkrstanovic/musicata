@@ -13,7 +13,7 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
@@ -232,6 +232,12 @@ fn open_read_args() -> FileCreateArgs {
 /// unreachable host blocks the request (and the rescan lock) indefinitely.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How long to wait for a single SMB read/open before giving up. A healthy read is tens of ms
+/// on a 1 GbE LAN; this only fires on a wedged connection, so a stuck cover/stream can't hang
+/// the request — and the browser `<img>`/`<audio>` waiting on it — indefinitely. On a timeout
+/// the slot is invalidated so the next request reconnects rather than reusing the dead client.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Client config that permits guest/anonymous shares — those sessions can't sign,
 /// so signing must be allowed to skip for them or the connect is rejected.
 fn client_config() -> ClientConfig {
@@ -292,21 +298,83 @@ fn filetime_to_unix(time: smb::binrw_util::file_time::FileTime) -> Option<i64> {
         .map(|duration| duration.as_secs() as i64)
 }
 
-/// An SMB music source. Holds connection parameters and a lazily-established,
-/// reused client for streaming.
+/// A small set of independent SMB connections for serving. SMB2 multiplexes concurrent
+/// operations over one connection via credits, but a single connection still caps throughput
+/// and serializes the tail under a burst — a cover grid on first load measured ~2.6 s wall /
+/// p95 2.5 s over one connection. A few connections, used round-robin, spread that load so
+/// covers don't starve the stream. Each slot is established lazily and reconnected on error.
+struct SmbPool {
+    config: SmbConfig,
+    slots: Vec<Mutex<Option<Arc<Client>>>>,
+    next: AtomicUsize,
+}
+
+impl SmbPool {
+    fn new(config: SmbConfig) -> Self {
+        let slots = (0..smb_pool_size()).map(|_| Mutex::new(None)).collect();
+        Self {
+            config,
+            slots,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// Get a client from the next slot (round-robin), establishing it on first use. Returns the
+    /// slot index too, so the caller can invalidate just that slot on a failed operation.
+    async fn get(&self) -> anyhow::Result<(usize, Arc<Client>)> {
+        let slot = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        let mut guard = self.slots[slot].lock().await;
+        if let Some(client) = guard.as_ref() {
+            return Ok((slot, client.clone()));
+        }
+        let client = new_client();
+        connect_share(&client, &self.config).await?;
+        *guard = Some(client.clone());
+        Ok((slot, client))
+    }
+
+    /// Drop a slot's client so its next use reconnects — called when an op on it fails or times
+    /// out (e.g. the NAS rebooted), otherwise later requests would reuse the dead connection.
+    async fn invalidate(&self, slot: usize) {
+        if let Some(cell) = self.slots.get(slot) {
+            *cell.lock().await = None;
+        }
+    }
+
+    /// Establish every slot up front so the first request doesn't pay the connect latency
+    /// (measured ~436 ms cold vs ~35 ms warm for a stream's first byte). Errors are logged,
+    /// never fatal — a slot reconnects lazily on next use.
+    async fn warm(&self) {
+        for slot in 0..self.slots.len() {
+            if let Err(error) = self.get().await {
+                tracing::warn!(%error, slot, "smb: warm connect failed");
+            }
+        }
+    }
+}
+
+/// An SMB music source. Holds connection parameters and a small pool of lazily-established,
+/// reused clients for streaming and cover fetches.
 pub struct SmbProvider {
     provider_id: String,
     config: SmbConfig,
-    client: Mutex<Option<Arc<Client>>>,
+    pool: Arc<SmbPool>,
 }
 
 impl SmbProvider {
     pub fn from_record(record: &SourceRecord) -> anyhow::Result<Self> {
+        let config = SmbConfig::from_record(record)?;
         Ok(Self {
             provider_id: record.id.clone(),
-            config: SmbConfig::from_record(record)?,
-            client: Mutex::new(None),
+            pool: Arc::new(SmbPool::new(config.clone())),
+            config,
         })
+    }
+
+    /// Establish the serving connection pool up front (off the request hot path) so the first
+    /// play/cover doesn't pay the cold-connect cost.
+    pub async fn warm(&self) {
+        self.pool.warm().await;
     }
 
     pub fn provider_id(&self) -> &String {
@@ -442,14 +510,23 @@ impl SmbProvider {
         start: u64,
         end: u64,
     ) -> anyhow::Result<impl futures::Stream<Item = io::Result<Vec<u8>>> + Send + 'static> {
-        let client = self.client().await?;
+        let (slot, client) = self.pool.get().await?;
         let unc = self.config.item_unc(item_id)?;
-        let resource = match client.create_file(&unc, &open_read_args()).await {
-            Ok(resource) => resource,
-            Err(error) => {
-                // The cached connection may be dead — drop it so the next call reconnects.
-                self.invalidate_client().await;
+        let resource = match tokio::time::timeout(
+            READ_TIMEOUT,
+            client.create_file(&unc, &open_read_args()),
+        )
+        .await
+        {
+            Ok(Ok(resource)) => resource,
+            Ok(Err(error)) => {
+                // The connection may be dead — drop this slot so the next call reconnects.
+                self.pool.invalidate(slot).await;
                 return Err(anyhow!("open {item_id}: {error}"));
+            }
+            Err(_) => {
+                self.pool.invalidate(slot).await;
+                return Err(anyhow!("open {item_id}: timed out"));
             }
         };
         let Resource::File(file) = resource else {
@@ -459,6 +536,7 @@ impl SmbProvider {
         // A small bounded channel gives backpressure: at most a few chunks buffered.
         let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(4);
         let label = item_id.to_string();
+        let pool = self.pool.clone();
         tokio::spawn(async move {
             // Keep the client alive for the lifetime of the read.
             let _client = client;
@@ -466,19 +544,27 @@ impl SmbProvider {
             while offset <= end {
                 let want = ((end - offset + 1).min(STREAM_CHUNK_BYTES as u64)) as usize;
                 let mut buffer = vec![0u8; want];
-                match file.read_at(&mut buffer, offset).await {
-                    Ok(0) => break,
-                    Ok(read) => {
+                match tokio::time::timeout(READ_TIMEOUT, file.read_at(&mut buffer, offset)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(read)) => {
                         buffer.truncate(read);
                         if tx.send(Ok(buffer)).await.is_err() {
                             break; // client went away
                         }
                         offset += read as u64;
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         let _ = tx
                             .send(Err(io::Error::other(format!("smb read {label}: {error}"))))
                             .await;
+                        pool.invalidate(slot).await;
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(io::Error::other(format!("smb read {label}: timed out"))))
+                            .await;
+                        pool.invalidate(slot).await;
                         break;
                     }
                 }
@@ -491,13 +577,22 @@ impl SmbProvider {
     /// which is fetched in full rather than by range. Reads in chunks until EOF so a
     /// modest buffer is held regardless of the image size.
     pub async fn read_file(&self, item_id: &str) -> anyhow::Result<Vec<u8>> {
-        let client = self.client().await?;
+        let (slot, client) = self.pool.get().await?;
         let unc = self.config.item_unc(item_id)?;
-        let resource = match client.create_file(&unc, &open_read_args()).await {
-            Ok(resource) => resource,
-            Err(error) => {
-                self.invalidate_client().await;
+        let resource = match tokio::time::timeout(
+            READ_TIMEOUT,
+            client.create_file(&unc, &open_read_args()),
+        )
+        .await
+        {
+            Ok(Ok(resource)) => resource,
+            Ok(Err(error)) => {
+                self.pool.invalidate(slot).await;
                 return Err(anyhow!("open {item_id}: {error}"));
+            }
+            Err(_) => {
+                self.pool.invalidate(slot).await;
+                return Err(anyhow!("open {item_id}: timed out"));
             }
         };
         let Resource::File(file) = resource else {
@@ -510,10 +605,22 @@ impl SmbProvider {
         let mut out: Vec<u8> = Vec::new();
         let mut chunk = vec![0u8; CHUNK];
         loop {
-            let read = file
-                .read_at(&mut chunk, out.len() as u64)
-                .await
-                .map_err(|error| anyhow!("read {item_id}: {error}"))?;
+            let read = match tokio::time::timeout(
+                READ_TIMEOUT,
+                file.read_at(&mut chunk, out.len() as u64),
+            )
+            .await
+            {
+                Ok(Ok(read)) => read,
+                Ok(Err(error)) => {
+                    self.pool.invalidate(slot).await;
+                    return Err(anyhow!("read {item_id}: {error}"));
+                }
+                Err(_) => {
+                    self.pool.invalidate(slot).await;
+                    return Err(anyhow!("read {item_id}: timed out"));
+                }
+            };
             if read == 0 {
                 break;
             }
@@ -525,29 +632,10 @@ impl SmbProvider {
         Ok(out)
     }
 
-    /// Get (or establish) the shared client connected to the share.
-    async fn client(&self) -> anyhow::Result<Arc<Client>> {
-        let mut guard = self.client.lock().await;
-        if let Some(client) = guard.as_ref() {
-            return Ok(client.clone());
-        }
-        let client = new_client();
-        connect_share(&client, &self.config).await?;
-        *guard = Some(client.clone());
-        Ok(client)
-    }
-
-    /// Drop the cached connection so the next [`client`](Self::client) reconnects. Called
-    /// when an operation fails (e.g. the NAS rebooted and the cached client is dead),
-    /// otherwise every later request would reuse the dead connection until restart.
-    async fn invalidate_client(&self) {
-        *self.client.lock().await = None;
-    }
-
     /// Verify the source is reachable: connect and enumerate the root directory.
     /// Used to reject a misconfigured source at add time, before any scan.
     pub async fn validate(&self) -> anyhow::Result<()> {
-        let client = self.client().await?;
+        let (_slot, client) = self.pool.get().await?;
         let unc = self.config.item_unc("")?;
         let resource = client
             .create_file(&unc, &open_read_args())
