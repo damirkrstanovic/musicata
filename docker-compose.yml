@@ -1,0 +1,42 @@
+# Full Musicata stack: the server (web UI + API + players) and the optional audio-ML service
+# ("sounds-like" embeddings). Build + run with:  docker compose up -d --build
+#
+# Then open http://<host>:3030, create the admin account, and:
+#   • add your music source (e.g. an SMB share) in /admin — read over the wire, no host mount;
+#   • in /admin → Settings, enable audio analysis and set the service URL to  http://ml:3091
+#     (the server reaches the ml service by name on this compose network).
+#
+# Snapcast multi-room is not included here (it needs host audio devices); see docs/snapcast.md.
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3030:3030"
+    volumes:
+      # DB + artwork cache + saved sources/credentials + exports — persist this.
+      - musicata-data:/data
+      # Optional on-disk library; drop local files here. SMB/network sources need no mount
+      # (they're configured in /admin and read over the wire).
+      - ./music:/music
+    depends_on:
+      - ml
+    restart: unless-stopped
+
+  ml:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml
+    # No published port needed — the server calls it at http://ml:3091 on this network.
+    # Uncomment to curl /health or /info from the host:
+    # ports:
+    #   - "3091:3091"
+    volumes:
+      # Caches the ONNX model (downloaded from Hugging Face on first run — needs internet once).
+      - musicata-ml-data:/data
+    restart: unless-stopped
+
+volumes:
+  musicata-data:
+  musicata-ml-data:
