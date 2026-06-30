@@ -120,6 +120,25 @@ A sample unit ships in the archive (`musicata.service`); follow the install step
 header comment. It runs the server as a system user, keeps state (database + artwork cache) in
 `/var/lib/musicata`, and binds the LAN.
 
+### With Docker Compose (full stack)
+
+`docker-compose.yml` runs the **server** (`:3030`) and the optional **audio-ML service**
+(`musicata-ml`, "sounds-like" embeddings) together:
+
+```
+docker compose up -d --build
+```
+
+Then open `http://<host>:3030`, create the admin account, and:
+- add your music source (e.g. an SMB share) in **/admin** — read over the wire, **no host mount**;
+- in **/admin → Settings**, enable audio analysis and set the service URL to **`http://ml:3091`**
+  (the server reaches the `ml` container by name on the compose network).
+
+State (DB, artwork cache, sources/credentials) persists in the `musicata-data` volume; the ML
+model is cached in `musicata-ml-data` (downloaded once, needs internet on first run). A local
+on-disk library can be dropped in `./music`; SMB/network sources don't need it. Snapcast
+multi-room isn't included (it needs host audio devices) — see `docs/snapcast.md`.
+
 ### Remote access
 
 Musicata is **LAN-first**: session cookies are not `Secure`, and MPD/SMB/OpenSubsonic source
