@@ -47,7 +47,19 @@ pub async fn enabled(database: &Database) -> bool {
     matches!(database.get_setting(SETTING_ML_ENABLED).await, Ok(Some(v)) if v == "true")
 }
 
-async fn service_url(database: &Database) -> Option<String> {
+/// The default analysis-service URL when the user hasn't set one: `MUSICATA_ML_SERVICE_URL` (the
+/// Docker stack sets this to `http://ml:3091`), else a co-located service on localhost. So a
+/// standard setup needs no URL configured — just enable analysis.
+pub fn default_service_url() -> String {
+    std::env::var("MUSICATA_ML_SERVICE_URL")
+        .ok()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| "http://localhost:3091".to_string())
+}
+
+/// The effective analysis-service URL: the saved setting if set, else the default. Never empty.
+pub async fn service_url(database: &Database) -> String {
     database
         .get_setting(SETTING_ML_SERVICE_URL)
         .await
@@ -55,6 +67,7 @@ async fn service_url(database: &Database) -> Option<String> {
         .flatten()
         .map(|url| url.trim().to_string())
         .filter(|url| !url.is_empty())
+        .unwrap_or_else(default_service_url)
 }
 
 async fn schedule_seconds(database: &Database) -> i64 {
@@ -78,7 +91,7 @@ pub async fn ml_loop(
 ) {
     let _ = ready.wait_for(|&r| r).await;
     loop {
-        let delay = if enabled(&database).await && service_url(&database).await.is_some() {
+        let delay = if enabled(&database).await {
             let target = schedule_seconds(&database).await;
             Duration::from_secs(seconds_until(local_seconds_of_day(now_unix()), target) as u64)
         } else {
@@ -90,12 +103,10 @@ pub async fn ml_loop(
             _ = trigger.notified() => {} // manual "run now"
         }
 
-        let Some(url) = service_url(&database).await else {
-            continue;
-        };
         if !enabled(&database).await {
             continue;
         }
+        let url = service_url(&database).await;
         // Drain the whole backlog in this run (it's the scheduled window).
         while ml_pass(&database, &providers, &activity, &url).await > 0 {}
     }
