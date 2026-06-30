@@ -121,24 +121,49 @@ async fn ml_pass(
 
     let total = targets.len();
     let task = activity.start("ml", format!("Audio analysis (0/{total})"));
+    // Analyze ~one track per core at a time. The service decodes audio off its request thread
+    // (the dominant cost — inference is sub-second), so concurrent requests overlap the decodes
+    // across cores and only the inference serializes on the model; this bounds both the CPU fan-out
+    // and the parallel SMB reads.
+    let concurrency = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, BATCH as usize);
     let mut done = 0;
     let mut stored = 0;
-    for target in targets {
-        // An unreadable file is skipped (not marked), so it's retried next run.
-        let Ok(audio) = crate::read_track_source_file(providers, &target).await else {
+    for chunk in targets.chunks(concurrency) {
+        let mut set = tokio::task::JoinSet::new();
+        for target in chunk {
+            let providers = providers.clone();
+            let url = service_url.to_string();
+            let target = target.clone();
+            set.spawn(async move {
+                // An unreadable file is skipped (not marked), so it's retried next run.
+                let Ok(audio) = crate::read_track_source_file(&providers, &target).await else {
+                    return (target.track_id, None);
+                };
+                let analysis = tokio::task::spawn_blocking(move || analyze_via_service(&url, &audio))
+                    .await
+                    .unwrap_or_else(|_| Err("analysis task panicked".to_string()));
+                match analysis {
+                    Ok(analysis) => (target.track_id, Some(analysis)),
+                    // Service down / track undecodable → skip (retried next run).
+                    Err(error) => {
+                        tracing::debug!(track = %target.track_id, %error, "ml: analyze failed");
+                        (target.track_id, None)
+                    }
+                }
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let Ok((track_id, analysis)) = joined else { continue };
             done += 1;
-            continue;
-        };
-        let url = service_url.to_string();
-        let analysis = tokio::task::spawn_blocking(move || analyze_via_service(&url, &audio))
-            .await
-            .unwrap_or_else(|_| Err("analysis task panicked".to_string()));
-        match analysis {
-            Ok(analysis) => {
-                let tags_json = serde_json::to_string(&analysis.tags).unwrap_or_else(|_| "[]".into());
+            if let Some(analysis) = analysis {
+                let tags_json =
+                    serde_json::to_string(&analysis.tags).unwrap_or_else(|_| "[]".into());
                 if let Err(error) = database
                     .upsert_track_embedding(
-                        &target.track_id,
+                        &track_id,
                         &analysis.embedding,
                         MODEL_ID,
                         Some(env!("CARGO_PKG_VERSION")),
@@ -147,18 +172,13 @@ async fn ml_pass(
                     )
                     .await
                 {
-                    tracing::warn!(track = %target.track_id, %error, "ml: store failed");
+                    tracing::warn!(track = %track_id, %error, "ml: store failed");
                 } else {
                     stored += 1;
                 }
             }
-            // Service down / track undecodable → skip (retried next run); don't poison the batch.
-            Err(error) => {
-                tracing::debug!(track = %target.track_id, %error, "ml: analyze failed");
-            }
+            activity.update(task, format!("Audio analysis ({done}/{total})"));
         }
-        done += 1;
-        activity.update(task, format!("Audio analysis ({done}/{total})"));
     }
     if stored > 0 {
         activity.finish(task, true, Some(format!("Analyzed {stored} tracks")));
