@@ -318,6 +318,14 @@ fn parse_playback_state(
     } else {
         Some(queue_item(current))
     };
+    let queue_items: Vec<QueueItem> = split_objects(queue)
+        .iter()
+        .map(|object| queue_item(object))
+        .collect();
+    // MPD reports the next song's queue position directly; surface it as the prefetch hint.
+    let next_up = find(status, "nextsong")
+        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|index| queue_items.get(index).cloned());
 
     PlaybackState {
         status: match find(status, "state") {
@@ -335,11 +343,9 @@ fn parse_playback_state(
             .map(|volume| volume as u8),
         repeat: repeat_mode,
         shuffle: find(status, "random") == Some("1"),
-        queue: split_objects(queue)
-            .iter()
-            .map(|object| queue_item(object))
-            .collect(),
+        queue: queue_items,
         queue_position: find(status, "song").and_then(|value| value.parse().ok()),
+        next_up,
     }
 }
 

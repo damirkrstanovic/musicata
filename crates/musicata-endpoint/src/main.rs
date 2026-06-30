@@ -28,7 +28,14 @@ use serde::{Deserialize, Serialize};
 use tungstenite::Message;
 
 use crate::audio::AudioPlayer;
-use crate::protocol::{Action, EndpointView, PlaybackState, decide};
+use crate::protocol::{Action, EndpointView, PlaybackState, decide, prefetch_target};
+
+/// How long before a track ends to fetch+decode the next one into the buffer — early enough
+/// that a slow (SMB) fetch finishes before the boundary, late enough to waste little on skips.
+const PREFETCH_LEAD_SECS: f64 = 30.0;
+/// How long before a track ends to append the buffered next track to the sink. Kept short so a
+/// queue edit before this window simply drops the buffer; only an edit inside it costs a gap.
+const APPEND_WINDOW_SECS: f64 = 12.0;
 
 /// Saved endpoint credentials (one player registration).
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,6 +140,8 @@ fn run_session(creds: &Creds, audio: &mut AudioPlayer, view: &mut EndpointView) 
     eprintln!("connected.");
 
     let mut last_tick = Instant::now();
+    // The library track to prefetch next (from the server's `next_up` hint), if any.
+    let mut next_target: Option<(String, String)> = None;
 
     loop {
         match socket.read() {
@@ -147,6 +156,7 @@ fn run_session(creds: &Creds, audio: &mut AudioPlayer, view: &mut EndpointView) 
                     && let Ok(state) = serde_json::from_str::<PlaybackState>(body)
                 {
                     apply(audio, view, &state);
+                    next_target = prefetch_target(view, &state);
                 }
             }
             Ok(Message::Ping(payload)) => {
@@ -171,10 +181,31 @@ fn run_session(creds: &Creds, audio: &mut AudioPlayer, view: &mut EndpointView) 
                     "duration_seconds": audio.duration_seconds(),
                 });
                 let _ = socket.send(Message::text(frame.to_string()));
+
+                // Gapless prefetch: decode the next track ahead of the boundary, then append it
+                // to the sink in the final window so rodio plays it back-to-back (no gap).
+                if let Some(duration) = audio.duration_seconds() {
+                    let remaining = duration - audio.elapsed_seconds();
+                    if remaining <= PREFETCH_LEAD_SECS
+                        && let Some((stream_url, track_id)) = &next_target
+                    {
+                        match audio.prefetch(stream_url, track_id) {
+                            Ok(()) => view.prefetched = Some(track_id.clone()),
+                            Err(error) => eprintln!("prefetch failed: {error}"),
+                        }
+                    }
+                    if remaining <= APPEND_WINDOW_SECS {
+                        audio.append_pending();
+                    }
+                }
             }
             if audio.take_ended() {
                 let _ = socket.send(Message::text(r#"{"type":"ended"}"#.to_string()));
-                view.playing = false;
+                // A gapless boundary keeps audio flowing (the appended track is now playing);
+                // only a true end (the sink drained) stops playback.
+                if !audio.is_active() {
+                    view.playing = false;
+                }
             }
         }
     }
@@ -192,7 +223,22 @@ fn apply(audio: &mut AudioPlayer, view: &mut EndpointView, next: &PlaybackState)
             }
             view.track_id = next.now_playing.as_ref().and_then(|item| item.track_id.clone());
             view.stream_url = Some(stream_url);
+            view.prefetched = None;
             view.playing = play;
+        }
+        Action::Advance { track_id, stream_url, title, play } => {
+            // The cursor reached the track we already appended — it's playing gaplessly. Adopt
+            // it as current; only sync the pause state, since the audio already advanced.
+            if !title.is_empty() {
+                eprintln!("▶ {title}");
+            }
+            view.track_id = track_id;
+            view.stream_url = Some(stream_url);
+            view.prefetched = None;
+            view.playing = play;
+            if !play {
+                audio.pause();
+            }
         }
         Action::Resume => {
             audio.resume();

@@ -843,6 +843,7 @@ impl MpdPlayer {
             shuffle: state.shuffle,
             queue: state.queue.clone(),
             queue_position: state.position,
+            next_up: peek_next_index(&state).and_then(|index| state.queue.get(index).cloned()),
         }
     }
 
@@ -1476,6 +1477,7 @@ impl BrowserPlayer {
             shuffle: state.shuffle,
             queue: state.queue.clone(),
             queue_position: state.position,
+            next_up: peek_next_index(&state).and_then(|index| state.queue.get(index).cloned()),
         }
     }
 
@@ -1643,6 +1645,7 @@ impl ZonePlayer {
             shuffle: state.shuffle,
             queue: state.queue.clone(),
             queue_position: state.position,
+            next_up: peek_next_index(&state).and_then(|index| state.queue.get(index).cloned()),
         }
     }
 
@@ -1931,6 +1934,39 @@ fn advance(state: &mut QueueState, stop_at_end: bool) {
             state.duration_seconds = None;
         }
         None => {}
+    }
+}
+
+/// Peek the position the server would advance to next, **without mutating** — the `next_up`
+/// broadcast hint that lets a prefetching client (the native endpoint) load the next track
+/// ahead of the boundary for gapless playback. Mirrors `advance`'s decision but returns
+/// `None` where the real next item can't be predicted: the end of a shuffle cycle under
+/// repeat-all (where `advance` *reshuffles* with a fresh seed) and the end of the queue with
+/// no repeat. Under repeat-one the next playback is the same track, so it returns the current
+/// position.
+fn peek_next_index(state: &QueueState) -> Option<usize> {
+    let pos = state.position?;
+    let len = state.queue.len();
+    if len == 0 {
+        return None;
+    }
+    if state.repeat == RepeatMode::One {
+        return Some(pos);
+    }
+    if state.shuffle {
+        if !shuffle_order_valid(&state.shuffle_order, len, Some(pos)) {
+            return None;
+        }
+        let cursor = shuffle_cursor(&state.shuffle_order, pos);
+        // Last in the shuffled cycle: advance reshuffles, so the next track is unpredictable.
+        return (cursor + 1 < len).then(|| state.shuffle_order[cursor + 1]);
+    }
+    if pos + 1 < len {
+        Some(pos + 1)
+    } else if state.repeat == RepeatMode::All {
+        Some(0)
+    } else {
+        None
     }
 }
 
@@ -2265,6 +2301,7 @@ impl SnapcastPlayer {
             shuffle: state.shuffle,
             queue: state.queue.clone(),
             queue_position: state.position,
+            next_up: peek_next_index(&state).and_then(|index| state.queue.get(index).cloned()),
         }
     }
 
@@ -3582,6 +3619,32 @@ mod tests {
         assert!(!shuffle_order_valid(&[2, 2, 1], 3, Some(0)));
         // Current track no longer present (shouldn't happen, but guard).
         assert!(!shuffle_order_valid(&[2, 0, 1], 3, Some(9)));
+    }
+
+    #[test]
+    fn peek_next_index_predicts_the_prefetch_hint() {
+        let base = |position, repeat, shuffle, order: &[usize]| QueueState {
+            queue: vec![QueueItem::default(), QueueItem::default(), QueueItem::default()],
+            position: Some(position),
+            repeat,
+            shuffle,
+            shuffle_order: order.to_vec(),
+            ..Default::default()
+        };
+        // Linear: advance; stop at the end with no repeat; wrap with repeat-all.
+        assert_eq!(peek_next_index(&base(0, RepeatMode::Off, false, &[])), Some(1));
+        assert_eq!(peek_next_index(&base(2, RepeatMode::Off, false, &[])), None);
+        assert_eq!(peek_next_index(&base(2, RepeatMode::All, false, &[])), Some(0));
+        // Repeat-one: the same track plays next.
+        assert_eq!(peek_next_index(&base(1, RepeatMode::One, false, &[])), Some(1));
+        // Shuffle, mid-cycle: follow the shuffled order.
+        assert_eq!(peek_next_index(&base(1, RepeatMode::Off, true, &[1, 0, 2])), Some(0));
+        // Shuffle, last in the cycle under repeat-all: unpredictable (advance reshuffles).
+        assert_eq!(peek_next_index(&base(2, RepeatMode::All, true, &[1, 0, 2])), None);
+        // No position / empty queue: nothing to prefetch.
+        let mut none_pos = base(0, RepeatMode::All, false, &[]);
+        none_pos.position = None;
+        assert_eq!(peek_next_index(&none_pos), None);
     }
 
     // ---- Snapcast helpers (pure) ----

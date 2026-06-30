@@ -136,6 +136,9 @@ struct Config {
     /// Password for the OpenSubsonic API. When unset the API is unauthenticated
     /// (any credentials accepted) — convenient on a trusted LAN, hardened in M12.
     subsonic_password: Option<String>,
+    /// Recovery action (not persistent config): when set, reset this user's password to one
+    /// read from stdin — creating the account as an admin if it doesn't exist — and exit.
+    reset_admin: Option<String>,
 }
 
 #[tokio::main]
@@ -154,6 +157,22 @@ async fn main() -> Result<()> {
     let database = Database::connect(&config.database)
         .await
         .with_context(|| format!("failed to open database {}", config.database.display()))?;
+
+    // `--reset-admin USERNAME` is the locked-out recovery path: set the password (read from
+    // stdin) and exit, without binding a port or scanning. Done here, before any providers
+    // start, so it works on a server that otherwise can't be logged into.
+    if let Some(username) = config.reset_admin.clone() {
+        let password = prompt_new_password()?;
+        let outcome = auth::reset_admin_password(&database, &username, &password)
+            .await
+            .context("reset-admin failed")?;
+        match outcome {
+            auth::ResetOutcome::Created => eprintln!("created admin '{username}'"),
+            auth::ResetOutcome::Updated => eprintln!("reset password for '{username}'"),
+        }
+        return Ok(());
+    }
+
     let registry = build_registry(&database, &config).await?;
     let providers = Arc::new(RwLock::new(registry));
     // Restore the activity log from the database; mark any job left "running" as
@@ -6501,6 +6520,8 @@ impl Config {
             public_url: env("MUSICATA_PUBLIC_URL"),
             subsonic_user: env("MUSICATA_SUBSONIC_USER"),
             subsonic_password: env("MUSICATA_SUBSONIC_PASSWORD"),
+            // A console-only recovery action; never sourced from env or the config file.
+            reset_admin: None,
         }
         .apply_to(&mut config);
 
@@ -6526,6 +6547,7 @@ impl Default for Config {
             public_url: None,
             subsonic_user: "musicata".to_string(),
             subsonic_password: None,
+            reset_admin: None,
         }
     }
 }
@@ -6544,6 +6566,7 @@ struct ConfigOverrides {
     public_url: Option<String>,
     subsonic_user: Option<String>,
     subsonic_password: Option<String>,
+    reset_admin: Option<String>,
 }
 
 impl ConfigOverrides {
@@ -6605,9 +6628,15 @@ impl ConfigOverrides {
                         .ok_or_else(|| anyhow!("--subsonic-password requires a password"))?;
                     overrides.subsonic_password = Some(value);
                 }
+                "--reset-admin" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--reset-admin requires a username"))?;
+                    overrides.reset_admin = Some(value);
+                }
                 "--help" | "-h" => {
                     println!(
-                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan] [--no-incremental-rescan] [--scan-once] [--no-scan] [--mpd HOST:PORT[,HOST:PORT]] [--public-url URL] [--subsonic-user USER] [--subsonic-password PASS]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN, MUSICATA_INCREMENTAL_RESCAN, MUSICATA_SCAN_ONCE, MUSICATA_NO_SCAN, MUSICATA_MPD, MUSICATA_PUBLIC_URL, MUSICATA_SUBSONIC_USER, MUSICATA_SUBSONIC_PASSWORD\nConfig file keys: library, database, addr, rescan, incremental_rescan, scan_once, no_scan, mpd, public_url, subsonic_user, subsonic_password\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
+                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan] [--no-incremental-rescan] [--scan-once] [--no-scan] [--mpd HOST:PORT[,HOST:PORT]] [--public-url URL] [--subsonic-user USER] [--subsonic-password PASS] [--reset-admin USERNAME]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN, MUSICATA_INCREMENTAL_RESCAN, MUSICATA_SCAN_ONCE, MUSICATA_NO_SCAN, MUSICATA_MPD, MUSICATA_PUBLIC_URL, MUSICATA_SUBSONIC_USER, MUSICATA_SUBSONIC_PASSWORD\nConfig file keys: library, database, addr, rescan, incremental_rescan, scan_once, no_scan, mpd, public_url, subsonic_user, subsonic_password\n--reset-admin USERNAME: set USERNAME's password (read from stdin), creating an admin if absent, then exit — locked-out recovery.\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
                     );
                     std::process::exit(0);
                 }
@@ -6693,7 +6722,24 @@ impl ConfigOverrides {
         if let Some(subsonic_password) = self.subsonic_password {
             config.subsonic_password = Some(subsonic_password);
         }
+        if let Some(reset_admin) = self.reset_admin {
+            config.reset_admin = Some(reset_admin);
+        }
     }
+}
+
+/// Read a new password from stdin for `--reset-admin`. The prompt goes to stderr so it stays
+/// visible when stdout is redirected; the line is read as-is (note: a terminal echoes it).
+/// Trailing CR/LF is stripped but inner spaces are kept (passwords may contain them).
+fn prompt_new_password() -> Result<String> {
+    use std::io::Write;
+    eprint!("New password (min 8 chars): ");
+    std::io::stderr().flush().ok();
+    let mut password = String::new();
+    std::io::stdin()
+        .read_line(&mut password)
+        .context("read password from stdin")?;
+    Ok(password.trim_end_matches(['\n', '\r']).to_string())
 }
 
 /// Parse a comma-separated list of `host:port` addresses, trimming blanks.
