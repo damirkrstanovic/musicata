@@ -45,6 +45,30 @@
   }
   load();
 
+  // Audio-analysis (musicata-ml) status + manual run.
+  let mlStatus = $state<{ enabled: boolean; analyzed: number; total: number } | null>(null);
+  let mlMsg = $state("");
+
+  async function loadMlStatus() {
+    try {
+      mlStatus = await api.mlStatus();
+    } catch {
+      mlStatus = null;
+    }
+  }
+  loadMlStatus();
+
+  async function runMl() {
+    mlMsg = "Starting…";
+    try {
+      await api.mlAnalyze();
+      mlMsg = "Analysis started — the count below should climb.";
+      setTimeout(loadMlStatus, 1500);
+    } catch (e) {
+      mlMsg = e instanceof ApiError ? e.message : String(e);
+    }
+  }
+
   async function save(event: SubmitEvent) {
     event.preventDefault();
     busy = true;
@@ -88,6 +112,46 @@
       <span class="form-status" class:error>{status}</span>
     </div>
   </form>
+
+  <div class="admin-panel-head"><h2>Audio analysis (“sounds-like”)</h2></div>
+  <p class="admin-hint">
+    Analyzes tracks with the optional <code>musicata-ml</code> service to power audio “sounds-like”
+    radio. Runs daily at the time below, or on demand. CPU-heavy, one-time per track. The service
+    URL is <code>http://ml:3091</code> in the Docker stack (or <code>http://localhost:3091</code>
+    standalone).
+  </p>
+  <form class="field-form" onsubmit={save}>
+    <label class="toggle-row">
+      <input type="checkbox" bind:checked={settings.ml_enabled} />
+      <span>Analyze tracks for “sounds-like” recommendations</span>
+    </label>
+    <label class="field">
+      <span>Analysis service URL</span>
+      <input bind:value={settings.ml_service_url} placeholder="http://ml:3091" />
+    </label>
+    <label class="field">
+      <span>Daily run time</span>
+      <input type="time" bind:value={settings.ml_schedule} />
+    </label>
+    <div class="field-actions">
+      <button type="submit" class="primary-button" disabled={busy}>Save</button>
+      <span class="form-status" class:error>{status}</span>
+    </div>
+  </form>
+  <div class="field-form">
+    <div class="field-actions">
+      <button type="button" class="ghost-button" onclick={runMl}>Run analysis now</button>
+      <button type="button" class="ghost-button" onclick={loadMlStatus}>Refresh</button>
+      <span class="form-status">{mlMsg}</span>
+    </div>
+    {#if mlStatus}
+      <p class="admin-hint">
+        {mlStatus.analyzed.toLocaleString()} of {mlStatus.total.toLocaleString()} tracks analyzed{mlStatus.enabled
+          ? ""
+          : " — analysis is turned off above"}.
+      </p>
+    {/if}
+  </div>
 
   <div class="admin-panel-head"><h2>Listening history</h2></div>
   <p class="admin-hint">
