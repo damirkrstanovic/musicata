@@ -1035,7 +1035,8 @@ async fn loudness_loop(
     }
 }
 
-/// Whether continuous play / autoplay is on (default off — it's an opt-in "keep going").
+/// Whether continuous play / autoplay is on. **Default on** — when a playing queue nears its end
+/// it keeps the music going; the user can turn it off. Stored as "true"/"false"; unset = on.
 const SETTING_AUTOPLAY: &str = "autoplay";
 const AUTOPLAY_POLL: Duration = Duration::from_secs(6);
 /// Refill when fewer than this many tracks remain after the current one (Music Assistant's
@@ -1057,13 +1058,14 @@ async fn autoplay_loop(
     let _ = ready.wait_for(|&r| r).await;
     loop {
         tokio::time::sleep(AUTOPLAY_POLL).await;
+        // Default on: continue unless the user explicitly turned it off.
         let on = database
             .get_setting(SETTING_AUTOPLAY)
             .await
             .ok()
             .flatten()
             .as_deref()
-            == Some("true");
+            != Some("false");
         if !on {
             continue;
         }
@@ -3118,6 +3120,7 @@ struct AutoplayState {
 /// Continuous play / autoplay toggle (global). When on, the autoplay loop keeps a playing
 /// queue topped up with similar tracks.
 async fn get_autoplay(State(state): State<AppState>) -> Json<AutoplayState> {
+    // Default on: enabled unless explicitly turned off (matches the autoplay loop).
     let enabled = state
         .database
         .get_setting(SETTING_AUTOPLAY)
@@ -3125,7 +3128,7 @@ async fn get_autoplay(State(state): State<AppState>) -> Json<AutoplayState> {
         .ok()
         .flatten()
         .as_deref()
-        == Some("true");
+        != Some("false");
     Json(AutoplayState { enabled })
 }
 

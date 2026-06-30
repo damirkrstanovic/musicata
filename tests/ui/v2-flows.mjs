@@ -56,6 +56,13 @@ if (MODE === "behavior") {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ name: "Smoke FM", stream_url: "http://127.0.0.1:1/stream" }),
   });
+  // Continuous play defaults on; turn it off so the autoplay loop doesn't grow the queue
+  // under the queue/playback assertions below.
+  await api("/api/autoplay", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ enabled: false }),
+  });
 }
 
 const target = await (
