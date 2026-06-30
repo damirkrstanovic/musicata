@@ -6,6 +6,7 @@
   import { search } from "../lib/search.svelte";
   import { promptText } from "../lib/modal";
   import { playStream } from "../lib/playback";
+  import { radioMix } from "../lib/radioMix.svelte";
   import BrowseFilters from "./BrowseFilters.svelte";
   import AccountMenu from "./AccountMenu.svelte";
 
@@ -60,6 +61,14 @@
       type="button"
       onclick={() => nav.root({ name: "favorites" })}>Favorites</button
     >
+    {#if radioMix.active}
+      <button
+        class="nav-link"
+        class:is-active={nav.current.name === "mix"}
+        type="button"
+        onclick={() => nav.push({ name: "mix" })}>Mix</button
+      >
+    {/if}
   </nav>
 
   <section class="section">

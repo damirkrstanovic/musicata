@@ -384,7 +384,7 @@ await sleep(300);
 const npId = (await api("/api/players/browser-local/state"))?.now_playing?.track_id;
 if (npId) {
   const radio = await api(`/api/tracks/${npId}/radio?limit=10`);
-  check("radio endpoint returns tracks", (radio?.track_ids?.length ?? 0) >= 1, JSON.stringify(radio));
+  check("radio endpoint returns tracks", (radio?.tracks?.length ?? 0) >= 1, JSON.stringify(radio));
 }
 check("radio button present in footer", await js(`!!document.querySelector('.radio-btn')`));
 // Radio from the now-playing track must CONTINUE it (enqueue the station after it), not restart

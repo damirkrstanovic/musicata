@@ -1425,6 +1425,34 @@ impl Database {
         row.map(|row| track_from_row(&row)).transpose()
     }
 
+    /// Resolve track ids to their rows, preserving the input order and dropping any unknown ids.
+    /// Used by the radio/"mix" endpoints to return displayable rows, not just ids.
+    pub async fn tracks_by_ids(&self, ids: &[String]) -> Result<Vec<Track>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {} FROM tracks t WHERE t.id IN ({placeholders})",
+            track_columns("t")
+        );
+        let mut query = sqlx::query(&sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        let mut by_id: std::collections::HashMap<String, Track> =
+            std::collections::HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let track = track_from_row(row)?;
+            by_id.insert(track.id.clone(), track);
+        }
+        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+    }
+
     pub async fn albums_for_artist(&self, artist_id: &str) -> Result<Vec<Album>> {
         let sql =
             format!("SELECT {ALBUM_COLUMNS} FROM albums WHERE artist_id = ?1 ORDER BY year, title");

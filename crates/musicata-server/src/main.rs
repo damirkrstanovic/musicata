@@ -3013,7 +3013,9 @@ struct RadioQuery {
 
 #[derive(Debug, Serialize)]
 struct RadioResponse {
-    track_ids: Vec<String>,
+    /// The seed followed by the recommended tracks, as full rows so the client can both display
+    /// the mix (a browsable view) and play it.
+    tracks: Vec<musicata_core::Track>,
 }
 
 /// Seed a "radio" from a track: the seed followed by similar tracks (cached ListenBrainz
@@ -3042,7 +3044,8 @@ async fn track_radio(
     let mut track_ids = Vec::with_capacity(similar.len() + 1);
     track_ids.push(id);
     track_ids.extend(similar);
-    Ok(Json(RadioResponse { track_ids }))
+    let tracks = state.database.tracks_by_ids(&track_ids).await.map_err(db_error)?;
+    Ok(Json(RadioResponse { tracks }))
 }
 
 /// "Sounds like this" — the tracks whose **audio embedding** is nearest the seed (cosine KNN
@@ -3063,8 +3066,10 @@ async fn track_similar(
         .similar_by_embedding(&id, limit)
         .await
         .map_err(db_error)?;
-    let track_ids = similar.into_iter().map(|(track_id, _distance)| track_id).collect();
-    Ok(Json(RadioResponse { track_ids }))
+    let track_ids: Vec<String> =
+        similar.into_iter().map(|(track_id, _distance)| track_id).collect();
+    let tracks = state.database.tracks_by_ids(&track_ids).await.map_err(db_error)?;
+    Ok(Json(RadioResponse { tracks }))
 }
 
 /// An audio "radio" seeded from a track: the seed, then sonically-similar tracks **interleaved
@@ -3084,7 +3089,8 @@ async fn track_audio_radio(
     let mut track_ids = Vec::with_capacity(similar.len() + 1);
     track_ids.push(id);
     track_ids.extend(similar);
-    Ok(Json(RadioResponse { track_ids }))
+    let tracks = state.database.tracks_by_ids(&track_ids).await.map_err(db_error)?;
+    Ok(Json(RadioResponse { tracks }))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -8689,27 +8695,27 @@ mod tests {
 
         // a's nearest neighbor (excluding itself) is b.
         let similar = get(&app, &format!("/api/tracks/{a}/similar")).await;
-        let ids: Vec<&str> = similar["track_ids"]
+        let ids: Vec<&str> = similar["tracks"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_str().unwrap())
+            .map(|v| v["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec![b.as_str()]);
 
         // The audio "radio" leads with the seed, then the diversified similar tracks.
         let radio = get(&app, &format!("/api/tracks/{a}/audio-radio")).await;
-        let radio_ids: Vec<&str> = radio["track_ids"]
+        let radio_ids: Vec<&str> = radio["tracks"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_str().unwrap())
+            .map(|v| v["id"].as_str().unwrap())
             .collect();
         assert_eq!(radio_ids, vec![a.as_str(), b.as_str()]);
 
         // An un-analyzed track yields no neighbors.
         let empty = get(&app, &format!("/api/tracks/{c}/similar")).await;
-        assert!(empty["track_ids"].as_array().unwrap().is_empty());
+        assert!(empty["tracks"].as_array().unwrap().is_empty());
 
         // An unknown track is a 404.
         let unknown = app
