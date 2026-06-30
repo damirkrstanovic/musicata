@@ -919,6 +919,10 @@ async fn library_discovery_loop(
 ) {
     run_startup_migrations(&database).await;
     let _ = ready.send(true); // migrations done — workers may start.
+    // Apply already-acquired/local-cache covers (and grouping) up front, before the (slow)
+    // initial scan, so artwork shows immediately on startup from the persisted cache rather than
+    // only after the scan completes. (The initial scan re-applies again at the end.)
+    restore_after_scan(&database).await;
     scan_and_persist(
         &database,
         &providers,
@@ -6058,6 +6062,10 @@ async fn warm_album_cover(
                 now_unix_seconds(),
             )
             .await;
+        // Apply the cover URL now so it shows immediately, rather than waiting for the next
+        // post-scan `reapply_acquired_artwork` (the periodic scan is only an hourly safety net).
+        let url = format!("/api/albums/{id}/artwork?asset={}", cover.key);
+        let _ = database.set_album_artwork_url(id, &url).await;
     }
     all_cached
 }
@@ -9162,6 +9170,12 @@ mod tests {
         assert_eq!(acquired.provider, "local-cache");
         assert_eq!(acquired.status, "acquired");
         assert!(acquired.cache_key.is_some());
+        // Warming must apply `artwork_url` immediately (not wait for the next post-scan reapply),
+        // so the cover shows as soon as it's cached.
+        assert!(
+            database.album(&album_id).await.unwrap().unwrap().artwork_url.is_some(),
+            "warm must set artwork_url immediately",
+        );
 
         // Simulate a rescan dropping the folder cover, then heal.
         database.set_album_artwork(&album_id, None, None).await.unwrap();
