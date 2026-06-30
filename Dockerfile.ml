@@ -46,6 +46,9 @@ ENV MUSICATA_ML_ADDR=0.0.0.0:3091
 ENV MUSICATA_ML_MODEL=/data/Cnn14_16k.onnx
 ENV MUSICATA_ML_MODEL_URL=https://huggingface.co/pranjal-pravesh/PANNs_CNN14_ONNX/resolve/main/Cnn14_16k.onnx
 ENV MUSICATA_ML_DATA_URL=https://huggingface.co/pranjal-pravesh/PANNs_CNN14_ONNX/resolve/main/Cnn14_16k.onnx.data
+# Own /data as the runtime user so a fresh (named) volume is writable (Docker seeds a named
+# volume from the image's mountpoint ownership).
+RUN mkdir -p /data && chown 10001:10001 /data
 VOLUME /data
 EXPOSE 3091
 USER musicata

@@ -46,6 +46,10 @@ COPY --from=build /src/target/release/musicata-server /usr/local/bin/musicata-se
 ENV MUSICATA_DATABASE=/data/musicata.db
 ENV MUSICATA_ADDR=0.0.0.0:3030
 ENV MUSICATA_LIBRARY=/music
+# Own /data as the runtime user so a fresh (named) volume is writable — Docker seeds a named
+# volume from the image's mountpoint ownership. (A host bind-mount still needs chowning on the
+# host, or run with `--user`.)
+RUN mkdir -p /data && chown 10001:10001 /data
 VOLUME /data
 EXPOSE 3030
 USER musicata
