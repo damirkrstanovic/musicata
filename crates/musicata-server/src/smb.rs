@@ -26,8 +26,8 @@ use musicata_storage::SourceRecord;
 
 use crate::scan_concurrency::AdaptiveLimiter;
 use smb::{
-    Client, ClientConfig, ConnectionConfig, FileAccessMask, FileDirectoryInformation, Resource,
-    UncPath,
+    Client, ClientConfig, ConnectionConfig, FileAccessMask, FileDirectoryInformation, NotifyFilter,
+    Resource, UncPath,
     resource::{Directory, File, FileCreateArgs, GetLen, ReadAt},
 };
 use tokio::runtime::Handle;
@@ -237,6 +237,12 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// the request — and the browser `<img>`/`<audio>` waiting on it — indefinitely. On a timeout
 /// the slot is invalidated so the next request reconnects rather than reusing the dead client.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long an outstanding SMB2 change-notify waits before re-arming. CHANGE_NOTIFY is
+/// one-shot (one batch per request), so the watch loop re-issues after each batch; this bounds
+/// how long a single outstanding request lives, re-arming on idle so a silently-dropped
+/// connection surfaces (the re-arm read fails) rather than hanging forever.
+const WATCH_REARM: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Client config that permits guest/anonymous shares — those sessions can't sign,
 /// so signing must be allowed to skip for them or the connect is rejected.
@@ -630,6 +636,44 @@ impl SmbProvider {
             }
         }
         Ok(out)
+    }
+
+    /// Watch the share for changes over SMB2 CHANGE_NOTIFY (recursive), sending `()` on `tx` for
+    /// each batch of notifications — the network equivalent of a local filesystem watcher, so new
+    /// or edited files trigger a targeted rescan instead of waiting for the periodic safety-net
+    /// pass. Uses its own dedicated connection (a watch is long-lived and must not tie up the
+    /// serving pool). Returns `Err` on a connection failure so the caller can reconnect (and do a
+    /// catch-up scan for anything missed during the gap); an idle window just re-arms the watch.
+    pub async fn watch_changes(&self, tx: tokio::sync::mpsc::UnboundedSender<()>) -> anyhow::Result<()> {
+        let client = new_client();
+        connect_share(&client, &self.config).await?;
+        let unc = self.config.item_unc("")?;
+        let Resource::Directory(dir) = client
+            .create_file(&unc, &open_read_args())
+            .await
+            .map_err(|error| anyhow!("open share root for watch: {error}"))?
+        else {
+            anyhow::bail!("share root is not a directory");
+        };
+        loop {
+            // Notify on the changes that affect the library: files/dirs added, removed, or
+            // renamed, and content edits (size / last-write).
+            let filter = NotifyFilter::new()
+                .with_file_name(true)
+                .with_dir_name(true)
+                .with_size(true)
+                .with_last_write(true);
+            match dir.watch_timeout(filter, true, WATCH_REARM).await {
+                Ok(_changes) => {
+                    if tx.send(()).is_err() {
+                        return Ok(()); // receiver gone — stop watching
+                    }
+                }
+                // No changes within the window — re-arm (also surfaces a dead connection).
+                Err(smb::Error::OperationTimeout(..)) => {}
+                Err(error) => return Err(anyhow!("smb change-notify: {error}")),
+            }
+        }
     }
 
     /// Verify the source is reachable: connect and enumerate the root directory.

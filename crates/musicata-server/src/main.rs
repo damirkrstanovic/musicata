@@ -346,12 +346,20 @@ async fn main() -> Result<()> {
     // Persist the activity log (debounced) so its history survives a restart.
     tokio::spawn(persist_activity_log(database.clone(), activity.clone()));
 
-    // Watch the local library for changes so additions/edits show up immediately,
-    // rather than waiting for the next periodic pass. Network shares have no such
-    // notifications and rely on the periodic rescan.
+    // Watch sources for changes so additions/edits show up immediately rather than waiting for
+    // the next periodic pass: a local filesystem watcher for the on-disk library, and SMB2
+    // change-notify for network shares (both feed a debounced incremental rescan). With both in
+    // place the periodic pass is only an infrequent safety net (see `LIBRARY_RESCAN_INTERVAL`).
     if !config.no_scan && !config.no_incremental_rescan {
         spawn_library_watcher(
             config.library.clone(),
+            database.clone(),
+            providers.clone(),
+            rescan_lock.clone(),
+            activity.clone(),
+        );
+        #[cfg(feature = "provider-smb")]
+        spawn_smb_watchers(
             database.clone(),
             providers.clone(),
             rescan_lock.clone(),
@@ -398,11 +406,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// How often the library is re-scanned against the filesystem in the background.
-// Background rescans are incremental (only new/changed files have their tags read),
-// so a pass is cheap; but the directory walk still costs round-trips on a network
-// share, so we don't run it as tightly as a local-only scan would allow.
-const LIBRARY_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the library is re-scanned against the filesystem in the background — now only a
+/// **safety net**. Real-time updates come from watchers (a local filesystem watcher +
+/// SMB2 change-notify, see `spawn_library_watcher` / `spawn_smb_watchers`), so this periodic
+/// pass only needs to catch changes missed while a source/connection was down. Following
+/// Jellyfin's model (prior-art §2: watcher + ~12 h safety-net scan), it runs infrequently —
+/// a full directory walk over a network share is expensive, and re-walking the whole tree
+/// every minute was the cause of constant NAS load.
+const LIBRARY_RESCAN_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// How long a background worker (fingerprint/MusicBrainz/artwork) sleeps after finding its
 /// queue empty before polling again. Short, because polling is a single cheap indexed query;
@@ -758,6 +769,89 @@ fn spawn_library_watcher(
                 true,
             )
             .await;
+        }
+    });
+}
+
+/// Watch every SMB source over SMB2 change-notify — the network analogue of
+/// [`spawn_library_watcher`]. A change triggers a debounced incremental rescan, so files added
+/// or edited on the share show up promptly **without** the periodic loop re-walking the whole
+/// tree every minute. Each source reconnects on failure; a connection gap triggers a catch-up
+/// scan (for anything missed while disconnected), and an immediate/repeated failure backs off so
+/// a share whose server lacks change-notify just falls back to the periodic safety-net pass
+/// rather than scan-spamming. Best-effort throughout.
+#[cfg(feature = "provider-smb")]
+fn spawn_smb_watchers(
+    database: Database,
+    providers: Arc<RwLock<ProviderRegistry>>,
+    rescan_lock: Arc<Mutex<()>>,
+    activity: Arc<activity::ActivityLog>,
+) {
+    tokio::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        let handles = providers.read().await.handles();
+        let mut watching = 0usize;
+        for handle in handles {
+            if let providers::ProviderHandle::Smb(smb) = handle {
+                watching += 1;
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    // Back off on repeated immediate failures so an unsupported share doesn't
+                    // trigger a scan every few seconds; reset once a watch actually ran.
+                    let mut backoff = Duration::from_secs(10);
+                    loop {
+                        if tx.is_closed() {
+                            return;
+                        }
+                        let started = Instant::now();
+                        if let Err(error) = smb.watch_changes(tx.clone()).await {
+                            tracing::warn!(provider = %smb.provider_id(), %error, "smb watch ended; reconnecting");
+                        }
+                        if started.elapsed() >= Duration::from_secs(30) {
+                            // The watch was established and running, then dropped — catch up on
+                            // anything missed during the gap, and reset the backoff.
+                            if tx.send(()).is_err() {
+                                return;
+                            }
+                            backoff = Duration::from_secs(10);
+                        } else {
+                            backoff = (backoff * 2).min(Duration::from_secs(600));
+                        }
+                        tokio::time::sleep(backoff).await;
+                    }
+                });
+            }
+        }
+        drop(tx); // no SMB sources → the consumer below exits immediately
+        if watching == 0 {
+            return;
+        }
+        tracing::info!(sources = watching, "watching SMB sources for changes (change-notify)");
+
+        // Debounced consumer: coalesce a burst of notifications into one incremental rescan,
+        // then restore acquired/local-cache artwork + grouping (as the discovery loop does).
+        while rx.recv().await.is_some() {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(WATCH_DEBOUNCE) => break,
+                    message = rx.recv() => {
+                        if message.is_none() {
+                            return;
+                        }
+                    }
+                }
+            }
+            scan_and_persist(
+                &database,
+                &providers,
+                &rescan_lock,
+                &activity,
+                "SMB change detected",
+                true,
+            )
+            .await;
+            restore_after_scan(&database).await;
         }
     });
 }
@@ -6000,18 +6094,22 @@ async fn artwork_prewarm_loop(
         // Bounded concurrency (chunks of WARM_CONCURRENCY) so warming leaves SMB headroom for
         // live streams rather than saturating the pool.
         for chunk in todo.chunks(WARM_CONCURRENCY) {
-            let batch = chunk.iter().map(|id| {
+            let mut set = tokio::task::JoinSet::new();
+            for id in chunk {
                 let database = database.clone();
                 let providers = providers.clone();
                 let artwork_cache = artwork_cache.clone();
                 let id = id.clone();
-                async move {
+                set.spawn(async move {
                     let ok = warm_album_cover(&database, &providers, &artwork_cache, &id).await;
                     (id, ok)
-                }
-            });
-            for (id, ok) in futures::future::join_all(batch).await {
-                if ok && warmed.insert(id) {
+                });
+            }
+            while let Some(joined) = set.join_next().await {
+                if let Ok((id, ok)) = joined
+                    && ok
+                    && warmed.insert(id)
+                {
                     newly += 1;
                 }
             }
