@@ -416,7 +416,7 @@ h1 {
 
 .track {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   gap: 8px;
   align-items: center;
   min-width: 0;
@@ -440,8 +440,37 @@ h1 {
   font-variant-numeric: tabular-nums;
 }
 
+/* Explicit per-row play affordance — clicking it plays the list from that track. The whole row
+   still plays on click, but this gives an obvious target so the album/artist links don't get hit
+   by accident. */
+.track-play {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 0;
+  display: grid;
+  place-items: center;
+  background: var(--panel-strong);
+  color: var(--accent);
+  font-size: 0.72rem;
+  padding-left: 2px; /* optically center the ▶ glyph */
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+.track-play:hover,
+.track-play:focus-visible {
+  background: var(--accent);
+  color: #15171c;
+}
+
 .track.active {
   background: rgba(215, 180, 106, 0.12);
+}
+.track.active .track-play {
+  background: var(--accent);
+  color: #15171c;
 }
 
 .track.metadata-open {

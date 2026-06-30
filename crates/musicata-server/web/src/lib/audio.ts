@@ -47,6 +47,10 @@ export class BrowserAudio {
   private convProfileId: string | null = null;
   private conv?: ConvolverNode;
 
+  // The output device chosen before the graph exists; applied once `ensureGraph` builds it.
+  // `undefined` = never set (leave the OS default untouched).
+  private pendingSinkId: string | null | undefined = undefined;
+
   // Volume leveling (EBU R128). `levelingGain` sits at the end of the chain; its gain is set
   // per track from the now-playing item's LUFS, combined with the EQ preamp for clip safety.
   private levelingGain?: GainNode;
@@ -96,15 +100,18 @@ export class BrowserAudio {
     return this.claimed;
   }
 
-  /** Set (or clear, with `null`) the active EQ profile and apply it live. */
+  /** Set (or clear, with `null`) the active EQ profile and apply it live. Stores the profile and
+   *  applies it only if the audio graph already exists — the graph (and its `AudioContext`) is
+   *  built on the first user gesture, not here, so restoring a saved profile at load doesn't
+   *  create a suspended context (which browsers warn about: "AudioContext was prevented from
+   *  starting"). `ensureGraph()` applies the stored profile + IR when it builds. */
   setEq(profile: EqProfile | null): void {
     this.profile = profile;
-    this.ensureGraph();
     if (this.ctx) {
       this.rebuildChain();
       this.ctx.resume().catch(() => {});
+      void this.loadRoomIr(profile); // async; rebuilds again once the IR is decoded
     }
-    void this.loadRoomIr(profile); // async; rebuilds again once the IR is decoded
   }
 
   /** Fetch + decode a profile's room-correction impulse response (or clear it), then rebuild so
@@ -112,10 +119,13 @@ export class BrowserAudio {
   private async loadRoomIr(profile: EqProfile | null): Promise<void> {
     const id = profile?.roomIr ? profile.id : null;
     if (id === this.convProfileId) return;
+    // Without a context there's nothing to load into yet; don't record `convProfileId` so the
+    // IR is (re)loaded once `ensureGraph()` builds the graph on the first gesture.
+    if (!this.ctx) return;
     this.convProfileId = id;
-    if (!id || !this.ctx) {
+    if (!id) {
       this.convBuffer = null;
-      if (this.ctx) this.rebuildChain();
+      this.rebuildChain();
       return;
     }
     let decoded: AudioBuffer | null = null;
@@ -136,19 +146,25 @@ export class BrowserAudio {
   /** A/B bypass: route source straight to output (no preamp/EQ), keeping the active profile. */
   setBypass(on: boolean): void {
     this.bypassed = on;
-    this.ensureGraph();
     if (this.ctx) this.rebuildChain();
   }
 
   /** Route output to a specific device via `AudioContext.setSinkId`. Unsupported on
    *  Safari/Firefox — there we no-op and the OS default is used (the profile + volume still
-   *  swap, which covers the common single-output setup). `null`/"" selects the default. */
+   *  swap, which covers the common single-output setup). `null`/"" selects the default. Stores
+   *  the choice and applies it only once the graph exists (built on the first gesture), so
+   *  restoring a saved device at load doesn't create a suspended `AudioContext`. */
   async setSink(sinkId: string | null): Promise<void> {
-    this.ensureGraph();
+    this.pendingSinkId = sinkId;
+    if (this.ctx) await this.applySink();
+  }
+
+  /** Apply the stored output-device choice to the existing context. */
+  private async applySink(): Promise<void> {
     const ctx = this.ctx as (AudioContext & { setSinkId?: (id: string) => Promise<void> }) | undefined;
-    if (!ctx || typeof ctx.setSinkId !== "function") return;
+    if (!ctx || typeof ctx.setSinkId !== "function" || this.pendingSinkId === undefined) return;
     try {
-      await ctx.setSinkId(sinkId ?? "");
+      await ctx.setSinkId(this.pendingSinkId ?? "");
     } catch {
       // invalid / unplugged device — fall back to the OS default rather than dropping audio
     }
@@ -187,6 +203,9 @@ export class BrowserAudio {
       this.bufR = new Float32Array(new ArrayBuffer(this.analyserR.fftSize * 4));
       this.levelingGain = ctx.createGain();
       this.rebuildChain();
+      // Apply anything chosen before the graph existed (restored EQ IR + output device).
+      void this.loadRoomIr(this.profile);
+      void this.applySink();
     } catch {
       this.graphFailed = true; // already tapped, or Web Audio unavailable
       // If the element was already tapped before the failure, route it straight to output so

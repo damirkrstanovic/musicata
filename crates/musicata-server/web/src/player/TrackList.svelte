@@ -14,6 +14,13 @@
 <div class="track-list">
   {#each tracks as track, index (track.id)}
     <div class="track" class:active={player.nowPlaying?.track_id === track.id}>
+      <button
+        type="button"
+        class="track-play"
+        title="Play from here"
+        aria-label="Play {track.title}"
+        onclick={() => playTracks(tracks, index)}>▶</button
+      >
       <div
         class="track-main"
         role="button"
