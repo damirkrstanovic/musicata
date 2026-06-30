@@ -299,6 +299,9 @@ export const api = {
   settings: () => getJson<AppSettings>("/api/settings"),
   saveSettings: (body: AppSettings) => sendJson("/api/settings", "PATCH", body),
   clearHistory: () => sendJson<{ removed: number }>("/api/history", "DELETE"),
+  // Audio-analysis (musicata-ml) status + a manual "run now" trigger.
+  mlStatus: () => getJson<{ enabled: boolean; analyzed: number; total: number }>("/api/ml/status"),
+  mlAnalyze: () => sendJson("/api/ml/analyze", "POST"),
 
   // Snapcast multi-room (synchronized playback across rooms)
   snapcastStatus: () => getJson<SnapcastStatus>("/api/snapcast/status"),
