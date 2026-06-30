@@ -947,7 +947,7 @@ impl Database {
         let offset = offset as i64;
 
         let artist_rows = sqlx::query(
-            "SELECT a.id, a.name, a.album_count, a.track_count
+            "SELECT a.id, a.name, a.album_count, a.track_count, a.artwork_url
              FROM artists_fts f JOIN artists a ON a.rowid = f.rowid
              WHERE artists_fts MATCH ?1 ORDER BY rank LIMIT ?2 OFFSET ?3",
         )
@@ -963,9 +963,7 @@ impl Database {
                 name: row.try_get("name")?,
                 album_count: i64_to_usize(row.try_get("album_count")?, "album_count")?,
                 track_count: i64_to_usize(row.try_get("track_count")?, "track_count")?,
-                // The in-memory library snapshot (used for scan/merge) doesn't carry the
-                // served artwork URL — it lives in the DB column, re-applied post-scan.
-                artwork_url: None,
+                artwork_url: row.try_get("artwork_url")?,
             });
         }
 
@@ -6228,11 +6226,38 @@ mod tests {
         assert!(by_album.albums.iter().any(|album| album.title == "Album"));
 
         let by_artist = database.search("artist", 50, 0).await.expect("search");
+        let artist = by_artist
+            .artists
+            .iter()
+            .find(|artist| artist.name == "Artist")
+            .expect("artist match");
+
+        // Regression: search must carry the artist's `artwork_url` (it was hard-coded `None`, so
+        // a searched artist showed a monogram even when its detail page had a cover).
+        database
+            .upsert_acquired_artist_artwork(
+                &artist.id,
+                "test",
+                None,
+                Some("cachekey"),
+                Some("jpg"),
+                None,
+                "acquired",
+                0,
+            )
+            .await
+            .expect("record artist art");
+        database.reapply_acquired_artist_artwork().await.expect("reapply");
+        let again = database.search("artist", 50, 0).await.expect("search");
         assert!(
-            by_artist
+            again
                 .artists
                 .iter()
-                .any(|artist| artist.name == "Artist")
+                .find(|artist| artist.name == "Artist")
+                .expect("artist match")
+                .artwork_url
+                .is_some(),
+            "search must return the artist's artwork_url",
         );
 
         let _ = std::fs::remove_file(db_path);
