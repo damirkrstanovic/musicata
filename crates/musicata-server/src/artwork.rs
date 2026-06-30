@@ -8,8 +8,13 @@
 //! Lazy population only (no resizing or eviction yet) — see roadmap M3 / prior-art §8.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::fs;
+
+/// Per-process sequence making each temp file name unique, so concurrent `put`s never share a
+/// temp path (different extensions of the same key, or two writers of the same entry).
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A flat, sharded directory of cached artwork files.
 #[derive(Clone)]
@@ -53,9 +58,13 @@ impl ArtworkCache {
             tracing::warn!(%error, "artwork cache: create dir failed");
             return;
         }
-        // Concurrent puts of the same key write identical bytes, so sharing the temp
-        // name is harmless and the rename is atomic.
-        let tmp = parent.join(format!(".{key}.tmp"));
+        // A temp name unique per writer (key + extension + a process-wide sequence): different
+        // extensions of the same key (an original and its resized variants) and two concurrent
+        // writers must not share a temp, or one's rename removes the file the other is renaming
+        // ("No such file or directory"), dropping that cache entry. The rename into `path` stays
+        // atomic, so a reader never sees a partial file.
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".{key}.{extension}.{}.{seq}.tmp", std::process::id()));
         if let Err(error) = fs::write(&tmp, bytes).await {
             tracing::warn!(%error, "artwork cache: write failed");
             return;
@@ -97,6 +106,47 @@ mod tests {
 
         // A different extension is a different entry.
         assert!(cache.get("abcdef", "png").await.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_puts_of_same_key_all_persist() {
+        // Regression: the original + resized variants of one cover share a key but differ by
+        // extension; a shared temp name made concurrent renames race and drop entries. Every
+        // distinct (key, extension) must survive a concurrent storm.
+        let dir = temp_dir("concurrent");
+        let cache = ArtworkCache::new(&dir);
+        let exts = ["jpg", "128.jpg", "300.jpg", "600.jpg", "embedded"];
+
+        let mut tasks = Vec::new();
+        for ext in exts {
+            // Several writers per (key, ext) too, to exercise same-entry races.
+            for _ in 0..4 {
+                let cache = cache.clone();
+                tasks.push(tokio::spawn(async move {
+                    cache.put("abcdef", ext, format!("bytes-{ext}").as_bytes()).await;
+                }));
+            }
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        for ext in exts {
+            assert_eq!(
+                cache.get("abcdef", ext).await.as_deref(),
+                Some(format!("bytes-{ext}").as_bytes()),
+                "entry {ext} should persist after concurrent puts",
+            );
+        }
+        // No stray temp files left behind.
+        let leftover: Vec<_> = std::fs::read_dir(dir.join("ab"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "temp files left: {leftover:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
