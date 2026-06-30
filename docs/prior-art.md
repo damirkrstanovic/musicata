@@ -72,11 +72,16 @@ tags every pass is brutal over a network share.
 `crates/musicata-core/src/lib.rs` — the walk lists each dir once (one SMB round-trip,
 entries carry size+mtime); a file whose relative path + **size + mtime** match the
 prior library reuses its parsed track wholesale (no tag read, no cover-art listing);
-only new/changed files are opened. A `notify` recursive watcher on the local root
-(`spawn_library_watcher` in `main.rs`, 2s debounce) gives instant local updates;
-network shares have no watcher and rely on the periodic pass (`LIBRARY_RESCAN_INTERVAL`,
-60s — we can't use Jellyfin's 12h because SMB has no watcher). `detect_library_changes`
-only decides whether to *write*.
+only new/changed files are opened. Both source kinds now have a **watcher**, so the
+periodic pass is just a safety net (Jellyfin's model): a `notify` recursive watcher on the
+local root (`spawn_library_watcher`, 2s debounce) for on-disk libraries, and **SMB2
+change-notify** for network shares (`SmbProvider::watch_changes` via the `smb` crate's
+`Directory::watch_timeout`, recursive; `spawn_smb_watchers` debounces + triggers an
+incremental rescan, reconnects on drop with a catch-up scan). With both in place
+`LIBRARY_RESCAN_INTERVAL` is an **infrequent safety net (1h)**, not the primary path — we no
+longer re-walk the whole SMB tree every minute (which was constant NAS load). `detect_library_changes`
+only decides whether to *write*. (Earlier note, now resolved: SMB *does* have a watcher —
+SMB2 `CHANGE_NOTIFY` — so we no longer need a tight poll to stand in for one.)
 
 ---
 
