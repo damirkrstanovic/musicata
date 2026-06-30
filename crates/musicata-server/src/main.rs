@@ -3085,7 +3085,24 @@ async fn track_audio_radio(
         return Err(AppError::not_found(format!("unknown track: {id}")));
     }
     let limit = query.limit.unwrap_or(25).clamp(1, 100);
-    let similar = state.database.audio_radio(&id, limit).await.map_err(db_error)?;
+    let mut similar = state.database.audio_radio(&id, limit).await.map_err(db_error)?;
+    if similar.is_empty() {
+        // The seed has no audio embedding yet (musicata-ml hasn't analyzed the library), so the
+        // "sounds-like" KNN returns nothing — fall back to the metadata/ListenBrainz similar radio
+        // (its own local content fallback needs no ML) so the mix still has tracks instead of just
+        // the seed.
+        similar = recommendations::similar_track_ids(
+            &state.database,
+            &state.listenbrainz,
+            &state.musicbrainz,
+            &id,
+            &std::collections::HashSet::new(),
+            limit,
+            now_unix_seconds(),
+            None,
+        )
+        .await;
+    }
     let mut track_ids = Vec::with_capacity(similar.len() + 1);
     track_ids.push(id);
     track_ids.extend(similar);
