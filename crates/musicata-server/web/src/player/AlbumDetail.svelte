@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api, type AlbumDetail } from "../lib/api";
-  import { sizedArtwork, initial } from "../lib/dom";
+  import Cover from "./Cover.svelte";
   import { playTracks } from "../lib/playback";
   import TrackList from "./TrackList.svelte";
 
@@ -29,14 +29,9 @@
 </script>
 
 {#if detail}
-  {@const cover = sizedArtwork(detail.album.artwork_url, 400)}
   <section class="detail-hero">
     <div class="hero-cover">
-      {#if cover}
-        <img src={cover} alt="" />
-      {:else}
-        <span class="album-placeholder">{initial(detail.album.title)}</span>
-      {/if}
+      <Cover url={detail.album.artwork_url} size={400} label={detail.album.title} />
     </div>
     <div class="hero-info">
       <h2 class="hero-title">{detail.album.title}</h2>
