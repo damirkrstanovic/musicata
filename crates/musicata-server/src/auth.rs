@@ -20,7 +20,7 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use musicata_storage::UserRecord;
+use musicata_storage::{Database, UserRecord};
 
 use crate::{AppError, AppState};
 
@@ -370,6 +370,56 @@ fn validate_credentials(username: &str, password: &str) -> Result<(), AppError> 
     Ok(())
 }
 
+/// Whether [`reset_admin_password`] updated an existing account or created a new one.
+pub enum ResetOutcome {
+    Created,
+    Updated,
+}
+
+/// Reset (or create) an administrator's password directly against the database — the
+/// locked-out recovery path, run from the console with the server stopped (`--reset-admin`).
+/// If the user exists, set its password and ensure it's an admin; otherwise create a new
+/// admin account. Returns an [`anyhow`] error (not an HTTP `AppError`) for the CLI caller.
+pub async fn reset_admin_password(
+    database: &Database,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<ResetOutcome> {
+    let username = username.trim();
+    if username.is_empty() {
+        anyhow::bail!("username is required");
+    }
+    if password.len() < 8 {
+        anyhow::bail!("password must be at least 8 characters");
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        anyhow::bail!("password is too long");
+    }
+    let hash = hash_password(password).map_err(|_| anyhow::anyhow!("failed to hash password"))?;
+
+    match database.user_by_username(username).await? {
+        Some(existing) => {
+            database.set_user_password(&existing.id, &hash).await?;
+            if existing.role != ROLE_ADMIN {
+                database.set_user_role(&existing.id, ROLE_ADMIN).await?;
+            }
+            Ok(ResetOutcome::Updated)
+        }
+        None => {
+            let user = UserRecord {
+                id: generate_token(),
+                username: username.to_string(),
+                password_hash: hash,
+                role: ROLE_ADMIN.to_string(),
+                api_token: generate_token(),
+                created_at_unix_seconds: now(),
+            };
+            database.create_user(&user).await?;
+            Ok(ResetOutcome::Created)
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct LoginResponse {
     user: UserView,
@@ -640,6 +690,37 @@ fn internal(error: impl std::fmt::Display) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reset_admin_creates_then_updates() {
+        let dir = std::env::temp_dir().join(format!(
+            "musicata-reset-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::connect(dir.join("test.db")).await.expect("connect");
+
+        // Too-short password is rejected.
+        assert!(reset_admin_password(&db, "alice", "short").await.is_err());
+
+        // Absent user → created as an admin with the given password.
+        let outcome = reset_admin_password(&db, "alice", "longenough").await.expect("create");
+        assert!(matches!(outcome, ResetOutcome::Created));
+        let user = db.user_by_username("alice").await.unwrap().expect("user exists");
+        assert_eq!(user.role, ROLE_ADMIN);
+        assert!(verify_password("longenough", &user.password_hash));
+
+        // Existing user → password updated.
+        let outcome = reset_admin_password(&db, "alice", "anotherpass").await.expect("update");
+        assert!(matches!(outcome, ResetOutcome::Updated));
+        let user = db.user_by_username("alice").await.unwrap().expect("user exists");
+        assert!(verify_password("anotherpass", &user.password_hash));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn password_hash_round_trips() {

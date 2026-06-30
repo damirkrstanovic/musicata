@@ -102,6 +102,18 @@ Tagged releases attach Linux binaries for x86_64 and aarch64.
 2. Open `http://<host>:3030`, create the admin account, then add music sources and players
    from the **/admin** Settings page.
 
+**Locked out?** If you forget the admin password and have no second admin to reset it from the
+**/admin** Users panel, recover from the console with the server **stopped**:
+
+```
+./musicata-server --database /var/lib/musicata/musicata.db --reset-admin <username>
+```
+
+It prompts for a new password on stdin (min 8 chars), sets it — creating the account as an
+admin if it doesn't exist — and exits without binding a port. Point `--database` at the same DB
+the service uses. (The terminal echoes the typed password; clear your scrollback if that
+matters.)
+
 ### As a systemd service
 
 A sample unit ships in the archive (`musicata.service`); follow the install steps in its
