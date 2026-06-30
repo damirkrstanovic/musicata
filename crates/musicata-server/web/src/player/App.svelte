@@ -31,6 +31,7 @@
   import FavoritesView from "./FavoritesView.svelte";
   import PlaylistView from "./PlaylistView.svelte";
   import SmartPlaylistView from "./SmartPlaylistView.svelte";
+  import MixView from "./MixView.svelte";
   import InstallPrompt from "./InstallPrompt.svelte";
   import { install } from "../lib/install.svelte";
   import { audioDevices } from "../lib/audioDevices.svelte";
@@ -265,6 +266,8 @@
       <PlaylistView id={route.id} />
     {:else if route.name === "smart"}
       <SmartPlaylistView id={route.id} />
+    {:else if route.name === "mix"}
+      <MixView />
     {/if}
   </section>
 

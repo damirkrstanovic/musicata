@@ -326,14 +326,15 @@ export const api = {
       { percent },
     ),
 
-  // Recommendations: radio (seed + similar tracks) + continuous-play toggle.
+  // Recommendations: radio (seed + similar tracks) + continuous-play toggle. Returns full track
+  // rows (seed first) so the "mix" view can display the station, not just play it.
   trackRadio: (id: string, limit = 25) =>
-    getJson<{ track_ids: string[] }>(`/api/tracks/${encodeURIComponent(id)}/radio`, {
+    getJson<{ tracks: TrackRow[] }>(`/api/tracks/${encodeURIComponent(id)}/radio`, {
       limit: String(limit),
     }),
   // Audio "radio": a diverse station from the musicata-ml embedding (sounds-like, artist-interleaved).
   trackAudioRadio: (id: string, limit = 25) =>
-    getJson<{ track_ids: string[] }>(`/api/tracks/${encodeURIComponent(id)}/audio-radio`, {
+    getJson<{ tracks: TrackRow[] }>(`/api/tracks/${encodeURIComponent(id)}/audio-radio`, {
       limit: String(limit),
     }),
   autoplay: () => getJson<{ enabled: boolean }>("/api/autoplay"),
