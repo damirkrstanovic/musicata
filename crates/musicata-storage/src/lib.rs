@@ -1584,6 +1584,18 @@ impl Database {
         Ok(())
     }
 
+    /// Set only an album's `artwork_url`, leaving `artwork_path` untouched — used when the
+    /// pre-warm worker locally caches a cover, so it shows immediately without waiting for the
+    /// next post-scan `reapply_acquired_artwork`.
+    pub async fn set_album_artwork_url(&self, album_id: &str, artwork_url: &str) -> Result<()> {
+        sqlx::query("UPDATE albums SET artwork_url = ?2 WHERE id = ?1")
+            .bind(album_id)
+            .bind(artwork_url)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // ---- Acquired (externally fetched) album artwork -------------------------
 
     /// Albums that still need a cover fetched from an external provider: no
