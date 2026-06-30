@@ -12,6 +12,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    environment:
+      # Default analysis-service URL (the `ml` container on this network) so you only need to
+      # flip on audio analysis in /admin — no URL to type. Override in /admin if it runs elsewhere.
+      MUSICATA_ML_SERVICE_URL: http://ml:3091
     ports:
       - "3030:3030"
     volumes:

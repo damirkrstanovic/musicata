@@ -4312,12 +4312,9 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
         .map_err(db_error)?
         .unwrap_or_default();
     let ml_enabled = ml::enabled(&state.database).await;
-    let ml_service_url = state
-        .database
-        .get_setting(ml::SETTING_ML_SERVICE_URL)
-        .await
-        .map_err(db_error)?
-        .unwrap_or_default();
+    // The effective URL (saved setting, else env/localhost default) so the UI shows it pre-filled
+    // and a standard setup needs no configuration.
+    let ml_service_url = ml::service_url(&state.database).await;
     let ml_schedule = state
         .database
         .get_setting(ml::SETTING_ML_SCHEDULE)

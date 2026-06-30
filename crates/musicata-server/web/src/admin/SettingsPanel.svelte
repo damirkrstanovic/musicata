@@ -117,8 +117,8 @@
   <p class="admin-hint">
     Analyzes tracks with the optional <code>musicata-ml</code> service to power audio “sounds-like”
     radio. Runs daily at the time below, or on demand. CPU-heavy, one-time per track. The service
-    URL is <code>http://ml:3091</code> in the Docker stack (or <code>http://localhost:3091</code>
-    standalone).
+    URL below is preset for the standard (Docker / co-located) setup — change it only if the
+    <code>musicata-ml</code> service runs somewhere else.
   </p>
   <form class="field-form" onsubmit={save}>
     <label class="toggle-row">
