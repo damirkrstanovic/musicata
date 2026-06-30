@@ -39,6 +39,10 @@
   let audioEl: HTMLAudioElement;
   let audio: BrowserAudio | null = null;
   let ws: PlayerSocket | null = null;
+  // Set when the connection drops while this tab was the playing output, so we resume on
+  // reconnect: a restarted server restores the session as *paused* (it can't know a tab is still
+  // here), which would otherwise leave the footer paused while audio was mid-track.
+  let resumeOnReconnect = false;
 
   // A value (not a getter call) so TS narrows `route` in each branch below.
   const route = $derived(nav.current);
@@ -81,6 +85,14 @@
     if (!player.seekDragging) {
       player.elapsed = next.elapsed_seconds ?? 0;
       player.duration = next.duration_seconds ?? 0;
+    }
+    // We were playing when the server went away, and it came back with the session paused (its
+    // restore can't know this tab is still here) — resume so playback continues seamlessly.
+    if (resumeOnReconnect && player.isBrowserOutput) {
+      resumeOnReconnect = false;
+      if (next.now_playing && next.status !== "playing") {
+        sendCommand(player.target, { command: "play" });
+      }
     }
     if (player.isBrowserOutput) audio?.drive(next);
     if (trackChanged) {
@@ -195,7 +207,11 @@
         // Server went away — surface it and don't let buffered audio keep playing on this tab.
         // connectPlayer keeps retrying to the same (stable) id, so this self-heals on its own.
         player.connection = "reconnecting";
-        if (player.isBrowserOutput) audio?.pause();
+        if (player.isBrowserOutput) {
+          // Remember we were playing so we resume once the (restarted) server is back.
+          if (player.status === "playing") resumeOnReconnect = true;
+          audio?.pause();
+        }
       },
     });
   }
