@@ -396,6 +396,19 @@ rather than a 2 MB original. Where should bytes live, and who fetches them?
 This is the natural sequel to §4 (network never on the hot path) and §2 (cheap steady
 state — reuse by mtime/hash). See `docs/roadmap.md` M3 for the staged plan.
 
+**Client-side robustness (the loading side, learned from moode `../moode`).** Serving fast
+isn't enough — the *browser* must degrade gracefully, or covers flicker/blank during navigation.
+moode's `coverart.php` **redirects to a default cover on a miss** (`header('Location: '.DEFAULT_ALBUM_COVER)`)
+so an `<img>` never breaks, and its UI uses a **JS lazyload library** (jQuery `.lazyload()` with
+`data-original`, `scripts-library.js`) rather than relying on native `loading="lazy"`. We hit the
+matching bug: a naive `<img loading="lazy">` with no error handling left covers permanently blank
+when a first request was cancelled by navigation, slow (cold SMB), or transiently 404'd — fixed by
+re-navigating (fresh elements re-request). Our fix is `web/src/player/Cover.svelte`: a monogram
+base layer + artwork that **lazy-loads via an `IntersectionObserver`** (reliable for
+dynamically-rendered grids, unlike native lazy), **fades in on load**, and **retries with backoff
+on error/abort** before settling on the monogram — so a cover is never a broken/blank `<img>`.
+Used by every album/artist cover (`AlbumCard`, `ArtistCard`, the detail heroes).
+
 **Implemented — the acquisition lane (embedded + external providers).** Bytes in the
 cache, provenance in the DB, acquisition pluggable, exactly as above:
 - **Embedded artwork** fills coverless albums from a track's tags: the scanner points

@@ -1,9 +1,8 @@
 <script lang="ts">
   import type { Artist } from "../types/Artist";
-  import { sizedArtwork, initial } from "../lib/dom";
+  import Cover from "./Cover.svelte";
 
   let { artist, onopen }: { artist: Artist; onopen: () => void } = $props();
-  const image = $derived(sizedArtwork(artist.artwork_url, 300));
 </script>
 
 <div
@@ -19,11 +18,7 @@
   }}
 >
   <div class="artist-avatar" aria-hidden="true">
-    {#if image}
-      <img src={image} alt="" loading="lazy" />
-    {:else}
-      {initial(artist.name)}
-    {/if}
+    <Cover url={artist.artwork_url} size={300} label={artist.name} />
   </div>
   <div class="card-text">
     <strong>{artist.name}</strong>

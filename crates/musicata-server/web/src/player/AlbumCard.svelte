@@ -1,11 +1,10 @@
 <script lang="ts">
   import type { Album } from "../types/Album";
   import { api } from "../lib/api";
-  import { sizedArtwork, initial } from "../lib/dom";
   import { playTracks } from "../lib/playback";
+  import Cover from "./Cover.svelte";
 
   let { album, onopen }: { album: Album; onopen: () => void } = $props();
-  const cover = $derived(sizedArtwork(album.artwork_url, 300));
 
   async function playAlbum(event: MouseEvent) {
     event.stopPropagation();
@@ -27,11 +26,7 @@
   }}
 >
   <div class="card-cover">
-    {#if cover}
-      <img src={cover} alt="" loading="lazy" />
-    {:else}
-      <span class="album-placeholder">{initial(album.title)}</span>
-    {/if}
+    <Cover url={album.artwork_url} size={300} label={album.title} />
     <button class="card-play" type="button" title="Play album" aria-label="Play album" onclick={playAlbum}>▶</button>
   </div>
   <div class="card-text">

@@ -1,8 +1,8 @@
 <script lang="ts">
   import { api, type ArtistDetail } from "../lib/api";
-  import { sizedArtwork, initial } from "../lib/dom";
   import { nav } from "../lib/nav.svelte";
   import AlbumCard from "./AlbumCard.svelte";
+  import Cover from "./Cover.svelte";
   import TrackList from "./TrackList.svelte";
 
   let { id }: { id: string } = $props();
@@ -29,15 +29,10 @@
 </script>
 
 {#if detail}
-  {@const image = sizedArtwork(detail.artist.artwork_url, 400)}
   <section class="detail-hero">
     <div class="hero-cover artist">
       <span class="artist-avatar large" aria-hidden="true">
-        {#if image}
-          <img src={image} alt="" />
-        {:else}
-          {initial(detail.artist.name)}
-        {/if}
+        <Cover url={detail.artist.artwork_url} size={400} label={detail.artist.name} />
       </span>
     </div>
     <div class="hero-info">
