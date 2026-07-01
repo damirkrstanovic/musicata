@@ -154,7 +154,9 @@ async fn analyze(
     body: Bytes,
 ) -> Result<Json<Analysis>, (StatusCode, String)> {
     let result = tokio::task::spawn_blocking(move || -> Result<Analysis, String> {
-        let samples = decode::decode_to_mono(&body, SAMPLE_RATE).map_err(|e| e.to_string())?;
+        // Decode returns an already-centered ≤MAX_ANALYZE_SECONDS window at the model rate.
+        let samples = decode::decode_to_mono(&body, SAMPLE_RATE, MAX_ANALYZE_SECONDS)
+            .map_err(|e| e.to_string())?;
         let excerpt = center_excerpt(&samples, MAX_ANALYZE_SECONDS * SAMPLE_RATE as usize);
         let mut model = lock_recovered(&state.model);
         model.analyze(excerpt, 12).map_err(|e| e.to_string())
