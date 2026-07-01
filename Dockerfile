@@ -32,7 +32,13 @@ WORKDIR /src
 COPY . .
 COPY --from=web /web/dist crates/musicata-server/web/dist
 ENV MUSICATA_SKIP_WEB_BUILD=1
-RUN cargo build --release -p musicata-server
+# Cache the cargo registry + target/ across builds, so a source change recompiles only the
+# changed crates instead of the whole dependency tree. target/ is a cache mount (not part of the
+# image layer), so copy the binary out to a plain path for the runtime stage to COPY.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p musicata-server \
+    && cp target/release/musicata-server /musicata-server
 
 # 3. Runtime.
 FROM debian:bookworm-slim
@@ -40,7 +46,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --uid 10001 musicata
-COPY --from=build /src/target/release/musicata-server /usr/local/bin/musicata-server
+COPY --from=build /musicata-server /usr/local/bin/musicata-server
 
 # Database + artwork cache live under /data; mount a host directory there.
 ENV MUSICATA_DATABASE=/data/musicata.db

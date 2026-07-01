@@ -15,8 +15,12 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-/// Decode `audio` (any supported format) to a mono f32 waveform at `target_rate` Hz.
-pub fn decode_to_mono(audio: &[u8], target_rate: u32) -> Result<Vec<f32>> {
+/// Decode `audio` (any supported format) to a mono f32 waveform at `target_rate` Hz, returning
+/// at most a centered `max_seconds` window. The excerpt is taken at the source rate **before**
+/// resampling, so cost is bounded by the window rather than the track length — a 20-minute song
+/// no longer resamples tens of millions of samples just to keep 15 s (which made long tracks
+/// blow the caller's analyze timeout).
+pub fn decode_to_mono(audio: &[u8], target_rate: u32, max_seconds: usize) -> Result<Vec<f32>> {
     let stream = MediaSourceStream::new(Box::new(Cursor::new(audio.to_vec())), Default::default());
     let probed = symphonia::default::get_probe()
         .format(
@@ -74,11 +78,25 @@ pub fn decode_to_mono(audio: &[u8], target_rate: u32) -> Result<Vec<f32>> {
     if mono.is_empty() {
         return Err(anyhow!("no audio decoded"));
     }
+    // Trim to a centered `max_seconds` window at the source rate, so only the excerpt is
+    // resampled (the model sees a short clip regardless of how long the track is).
+    let mono = center_window(mono, max_seconds.saturating_mul(source_rate as usize));
     if source_rate == target_rate {
         Ok(mono)
     } else {
         resample_mono(&mono, source_rate, target_rate)
     }
+}
+
+/// Keep a centered window of at most `max` samples (the whole signal if it's already shorter).
+fn center_window(mut samples: Vec<f32>, max: usize) -> Vec<f32> {
+    if max == 0 || samples.len() <= max {
+        return samples;
+    }
+    let start = (samples.len() - max) / 2;
+    samples.drain(..start);
+    samples.truncate(max);
+    samples
 }
 
 /// Append a packet's interleaved samples to `out`, downmixing to mono (average of channels).
@@ -146,7 +164,7 @@ mod tests {
     fn decodes_and_resamples_to_16k() {
         // A 1 s 44.1 kHz tone resamples to ~16000 mono samples.
         let wav = sine_wav(44_100, 1);
-        let mono = decode_to_mono(&wav, 16_000).expect("decode");
+        let mono = decode_to_mono(&wav, 16_000, 15).expect("decode");
         assert!(
             (mono.len() as i64 - 16_000).abs() < 400,
             "expected ~16000 samples, got {}",
@@ -159,7 +177,21 @@ mod tests {
     #[test]
     fn passthrough_when_already_16k() {
         let wav = sine_wav(16_000, 1);
-        let mono = decode_to_mono(&wav, 16_000).expect("decode");
+        let mono = decode_to_mono(&wav, 16_000, 15).expect("decode");
         assert!((mono.len() as i64 - 16_000).abs() < 50);
+    }
+
+    #[test]
+    fn long_track_is_windowed_before_resample() {
+        // A 30 s 44.1 kHz tone with a 15 s window resamples to ~15 s at 16k, not ~30 s — proving
+        // the excerpt is taken before the (expensive) resample, so cost doesn't grow with length.
+        let wav = sine_wav(44_100, 30);
+        let mono = decode_to_mono(&wav, 16_000, 15).expect("decode");
+        assert!(
+            (mono.len() as i64 - 15 * 16_000).abs() < 2_000,
+            "expected ~{} samples (15 s), got {}",
+            15 * 16_000,
+            mono.len()
+        );
     }
 }

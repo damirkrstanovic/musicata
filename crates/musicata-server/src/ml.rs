@@ -107,28 +107,45 @@ pub async fn ml_loop(
             continue;
         }
         let url = service_url(&database).await;
-        // Drain the whole backlog in this run (it's the scheduled window).
-        while ml_pass(&database, &providers, &activity, &url).await > 0 {}
+        // Drain the whole backlog in this run (it's the scheduled window). Page with a keyset
+        // cursor so a cluster of tracks the service can't analyze is stepped past (retried next
+        // run) rather than halting the drain and stranding the rest of the library behind it.
+        let mut cursor: Option<(String, String, String)> = None;
+        while let Some(next) = ml_pass(&database, &providers, &activity, &url, cursor).await {
+            cursor = Some(next);
+        }
     }
 }
 
-/// Analyze one batch of un-embedded tracks via the service. Returns how many were stored.
+/// Analyze one batch of un-embedded tracks via the service, starting after `after` in
+/// `(artist, title, id)` order. Returns the cursor to continue from (the last track in the batch),
+/// or `None` when the backlog is drained. Failed tracks are skipped, not marked, so they're
+/// retried on the next scheduled run — but the cursor still advances past them, so a batch that
+/// stores nothing can't halt the drain.
 async fn ml_pass(
     database: &Database,
     providers: &Arc<RwLock<ProviderRegistry>>,
     activity: &Arc<ActivityLog>,
     service_url: &str,
-) -> usize {
-    let targets = match database.tracks_missing_embedding(BATCH).await {
+    after: Option<(String, String, String)>,
+) -> Option<(String, String, String)> {
+    let after = after
+        .as_ref()
+        .map(|(artist, title, id)| (artist.as_str(), title.as_str(), id.as_str()));
+    let targets = match database.tracks_missing_embedding(after, BATCH).await {
         Ok(targets) => targets,
         Err(error) => {
             tracing::warn!(%error, "ml: failed to list tracks");
-            return 0;
+            return None;
         }
     };
     if targets.is_empty() {
-        return 0;
+        return None;
     }
+    // The last track in stable order — the cursor to resume from, regardless of how many stored.
+    let next_cursor = targets.last().map(|target| {
+        (target.artist_name.clone(), target.title.clone(), target.track_id.clone())
+    });
 
     let total = targets.len();
     let task = activity.start("ml", format!("Audio analysis (0/{total})"));
@@ -196,7 +213,7 @@ async fn ml_pass(
     } else {
         activity.remove(task);
     }
-    stored
+    next_cursor
 }
 
 /// POST the audio bytes to the service's `/analyze` and parse the embedding + tags.

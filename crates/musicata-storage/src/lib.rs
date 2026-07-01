@@ -2181,20 +2181,34 @@ impl Database {
     // ---- Audio embeddings (musicata-ml) ----------------------------------------
 
     /// Library tracks with no audio-ML analysis yet — the embedding worker's backlog.
+    /// Tracks with no analysis yet, in a stable `(artist, title, id)` order, starting **after**
+    /// the given keyset cursor. The worker pages through the whole backlog with this cursor so a
+    /// cluster of tracks that keep failing (e.g. the service can't decode them) is stepped past
+    /// rather than re-served forever — an all-failing batch must not strand the rest of the
+    /// library. Pass `None` to start from the beginning.
     pub async fn tracks_missing_embedding(
         &self,
+        after: Option<(&str, &str, &str)>,
         limit: i64,
     ) -> Result<Vec<TrackFingerprintTarget>> {
+        let (after_artist, after_title, after_id) = match after {
+            Some((artist, title, id)) => (Some(artist), Some(title), Some(id)),
+            None => (None, None, None),
+        };
         let rows = sqlx::query(
             "SELECT t.id, t.title, t.artist_name, t.extension, t.provider_id,
                     t.provider_item_id, t.path, t.duration_seconds
              FROM tracks t
              LEFT JOIN track_features f ON f.track_id = t.id
              WHERE f.track_id IS NULL
-             ORDER BY t.artist_name, t.title
+               AND (?2 IS NULL OR (t.artist_name, t.title, t.id) > (?2, ?3, ?4))
+             ORDER BY t.artist_name, t.title, t.id
              LIMIT ?1",
         )
         .bind(limit)
+        .bind(after_artist)
+        .bind(after_title)
+        .bind(after_id)
         .fetch_all(&self.pool)
         .await?;
         rows.iter()
@@ -7142,6 +7156,51 @@ mod tests {
 
         // A track with no embedding yields nothing.
         assert!(database.similar_by_embedding("missing", 5).await.unwrap().is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn tracks_missing_embedding_pages_past_unanalyzed_tracks() {
+        // Regression: a cluster of tracks that always fail to analyze must not strand the rest of
+        // the backlog. The worker pages with a keyset cursor, so it steps over the failing tracks
+        // (retried next run) and still reaches everything after them.
+        let db_path = temp_db_path("embedding-cursor");
+        let database = Database::connect(&db_path).await.expect("connect database");
+
+        // Four un-analyzed tracks in a known (artist, title) order: A, B, C, D.
+        let mut library = fixture_library();
+        let base = library.tracks[0].clone();
+        library.tracks = ["A", "B", "C", "D"]
+            .iter()
+            .map(|artist| {
+                let mut track = base.clone();
+                track.id = format!("track_{artist}");
+                track.artist_name = artist.to_string();
+                track.relative_path = format!("{artist}/song.mp3");
+                track.provider.item_id = format!("{artist}/song.mp3");
+                track
+            })
+            .collect();
+        database.save_library(&mut library).await.expect("save");
+
+        // From the start, the first two by order are A, B.
+        let first = database.tracks_missing_embedding(None, 2).await.unwrap();
+        assert_eq!(
+            first.iter().map(|t| t.artist_name.as_str()).collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+
+        // A and B are never embedded (they "fail"). Paging past B must still reach C and D.
+        let b = &first[1];
+        let rest = database
+            .tracks_missing_embedding(Some((&b.artist_name, &b.title, &b.track_id)), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rest.iter().map(|t| t.artist_name.as_str()).collect::<Vec<_>>(),
+            ["C", "D"]
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
