@@ -24,10 +24,15 @@ FROM rust:1-trixie AS build
 ENV RUSTFLAGS="-C target-cpu=x86-64-v2"
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p musicata-ml
-# Stash the ONNX Runtime shared library (ort's download-binaries places it under target/) so
-# the slim runtime can load it. A no-op if ort linked it statically.
-RUN mkdir -p /ort && find target/release -name 'libonnxruntime.so*' -exec cp -v {} /ort/ \;
+# Cache the cargo registry + target/ across builds so deps aren't recompiled and ORT isn't
+# re-downloaded every time. Both outputs are copied out of the target/ cache mount to plain
+# paths (a cache mount isn't part of the image layer the runtime stage COPYs from), and the ORT
+# .so stash must run in the same RUN — the mount only exists for the RUN that declares it.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p musicata-ml \
+    && cp target/release/musicata-ml /musicata-ml \
+    && mkdir -p /ort && find target/release -name 'libonnxruntime.so*' -exec cp -v {} /ort/ \;
 
 # 2. Runtime. Needs only TLS roots (HTTPS model download) + the ORT lib. Must match the build
 #    glibc (trixie), so the downloaded ONNX Runtime resolves at load time.
@@ -36,7 +41,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --uid 10001 musicata
-COPY --from=build /src/target/release/musicata-ml /usr/local/bin/musicata-ml
+COPY --from=build /musicata-ml /usr/local/bin/musicata-ml
 COPY --from=build /ort/ /usr/local/lib/
 RUN ldconfig
 ENV LD_LIBRARY_PATH=/usr/local/lib
