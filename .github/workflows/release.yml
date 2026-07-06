@@ -38,11 +38,11 @@ jobs:
       # Overrides .cargo/config.toml's [build] rustflags for this build.
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Build the embedded web app once (it's arch-independent); the Rust build
       # then reuses web/dist via MUSICATA_SKIP_WEB_BUILD.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
       - name: Build web assets
@@ -60,6 +60,11 @@ jobs:
       - name: Build
         env:
           MUSICATA_SKIP_WEB_BUILD: "1"
+          # sqlite-vec.c uses the BSD-legacy types u_int8_t/16/32/64_t. glibc defines them, but
+          # musl doesn't — so alias them to the C99 names for the (musl) cross-build. cc-rs appends
+          # CFLAGS/TARGET_CFLAGS to the zig cc invocation for every C dep in the build.
+          CFLAGS: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
+          TARGET_CFLAGS: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
         run: cargo zigbuild --release -p musicata-server --target ${{ matrix.target }}
 
       - name: Package
@@ -70,7 +75,7 @@ jobs:
           cp packaging/musicata.service README.md "$dist/"
           tar -czf "$dist.tar.gz" "$dist"
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: ${{ matrix.name }}.tar.gz
