@@ -1,5 +1,8 @@
 # Full Musicata stack: the server (web UI + API + players) and the optional audio-ML service
-# ("sounds-like" embeddings). Build + run with:  docker compose up -d --build
+# ("sounds-like" embeddings).
+#   docker compose up -d            # pull the published images from GHCR and run
+#   docker compose up -d --build    # build from this checkout instead (dev / local changes)
+# Pin a release with e.g.  MUSICATA_TAG=0.9 docker compose up -d  (default: latest).
 #
 # Then open http://<host>:3030, create the admin account, and:
 #   • add your music source (e.g. an SMB share) in /admin — read over the wire, no host mount;
@@ -9,6 +12,7 @@
 # Snapcast multi-room is not included here (it needs host audio devices); see docs/snapcast.md.
 services:
   server:
+    image: ghcr.io/damirkrstanovic/musicata-server:${MUSICATA_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile
@@ -29,6 +33,7 @@ services:
     restart: unless-stopped
 
   ml:
+    image: ghcr.io/damirkrstanovic/musicata-ml:${MUSICATA_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile.ml

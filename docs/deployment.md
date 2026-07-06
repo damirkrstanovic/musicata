@@ -123,11 +123,18 @@ header comment. It runs the server as a system user, keeps state (database + art
 ### With Docker Compose (full stack)
 
 `docker-compose.yml` runs the **server** (`:3030`) and the optional **audio-ML service**
-(`musicata-ml`, "sounds-like" embeddings) together:
+(`musicata-ml`, "sounds-like" embeddings) together. It **pulls prebuilt images from GHCR** — no
+source checkout or Rust build needed, just the compose file:
 
 ```
-docker compose up -d --build
+docker compose up -d              # pull ghcr.io/damirkrstanovic/musicata-{server,ml} and run
 ```
+
+- **Pin a version:** `MUSICATA_TAG=0.9 docker compose up -d` (default `latest` = newest release).
+  Images are published on each `v*` tag by `.github/workflows/docker-publish.yml`.
+- **Build from source instead** (local changes / an unreleased commit): `docker compose up -d --build`.
+- The GHCR packages must be **public** for an unauthenticated pull. If they're private, run
+  `docker login ghcr.io` first (a GitHub token with `read:packages`).
 
 Then open `http://<host>:3030`, create the admin account, and:
 - add your music source (e.g. an SMB share) in **/admin** — read over the wire, **no host mount**;
