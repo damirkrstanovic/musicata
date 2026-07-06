@@ -28,8 +28,11 @@ COPY . .
 # re-downloaded every time. Both outputs are copied out of the target/ cache mount to plain
 # paths (a cache mount isn't part of the image layer the runtime stage COPYs from), and the ORT
 # .so stash must run in the same RUN — the mount only exists for the RUN that declares it.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+# The cache ids are image-specific: this image is trixie (glibc 2.41) while Dockerfile is bookworm
+# (glibc 2.36). An unnamed mount's id defaults to its target path, so the two would share one
+# target/ cache and each other's build-script binaries wouldn't run under the wrong glibc.
+RUN --mount=type=cache,id=musicata-ml-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=musicata-ml-target,target=/src/target \
     cargo build --release -p musicata-ml \
     && cp target/release/musicata-ml /musicata-ml \
     && mkdir -p /ort && find target/release -name 'libonnxruntime.so*' -exec cp -v {} /ort/ \;

@@ -35,8 +35,11 @@ ENV MUSICATA_SKIP_WEB_BUILD=1
 # Cache the cargo registry + target/ across builds, so a source change recompiles only the
 # changed crates instead of the whole dependency tree. target/ is a cache mount (not part of the
 # image layer), so copy the binary out to a plain path for the runtime stage to COPY.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+# The cache ids are image-specific: this image is bookworm (glibc 2.36) while Dockerfile.ml is
+# trixie (glibc 2.41). An unnamed mount's id defaults to its target path, so the two would share
+# one target/ cache and each other's build-script binaries wouldn't run under the wrong glibc.
+RUN --mount=type=cache,id=musicata-server-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=musicata-server-target,target=/src/target \
     cargo build --release -p musicata-server \
     && cp target/release/musicata-server /musicata-server
 
