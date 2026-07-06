@@ -4,7 +4,7 @@
   import { audioDevices } from "../lib/audioDevices.svelte";
   import { meter } from "../lib/meter.svelte";
   import { statsPanel } from "../lib/statsPanel.svelte";
-  import { startRadio } from "../lib/playback";
+  import { startRadio, togglePlayback, next, previous } from "../lib/playback";
   import { sendCommand, type PlayerCommand } from "../lib/commands";
   import type { RepeatMode } from "../types/RepeatMode";
   import SeekBar from "./SeekBar.svelte";
@@ -65,15 +65,16 @@
         aria-pressed={player.shuffle}
         onclick={() => send({ command: "set_shuffle", enabled: !player.shuffle })}>⤨</button
       >
-      <button class="control" type="button" title="Previous" onclick={() => send({ command: "previous" })}>⏮</button>
+      <button class="control" type="button" title="Previous" onclick={() => previous()}>⏮</button>
       <button
         class="control play"
+        class:needs-tap={player.playBlocked}
         type="button"
-        title={player.status === "playing" ? "Pause" : "Play"}
-        onclick={() => send({ command: player.status === "playing" ? "pause" : "play" })}
-        >{player.status === "playing" ? "❚❚" : "▶"}</button
+        title={player.status === "playing" && !player.playBlocked ? "Pause" : "Play"}
+        onclick={() => togglePlayback()}
+        >{player.status === "playing" && !player.playBlocked ? "❚❚" : "▶"}</button
       >
-      <button class="control" type="button" title="Next" onclick={() => send({ command: "next" })}>⏭</button>
+      <button class="control" type="button" title="Next" onclick={() => next()}>⏭</button>
       <button
         class="toggle"
         class:active={player.repeat !== "off"}
@@ -189,6 +190,21 @@
   .output-btn.active {
     background: rgba(212, 175, 55, 0.18);
     color: #d4af37;
+  }
+  /* Autoplay blocked: the server thinks we're playing but the browser refused sound. Pulse the
+     play control so the user knows a tap is needed to actually start it. */
+  .control.play.needs-tap {
+    color: #d4af37;
+    animation: needs-tap-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes needs-tap-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.45;
+    }
   }
   .conn-sub {
     color: #e0a86b;

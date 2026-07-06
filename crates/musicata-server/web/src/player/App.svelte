@@ -5,7 +5,7 @@
   import { nav } from "../lib/nav.svelte";
   import { connectPlayer, type PlayerSocket, type ProgressTick } from "../lib/playerWs";
   import { BrowserAudio } from "../lib/audio";
-  import { setAudio } from "../lib/playback";
+  import { setAudio, resume, pause, next as skipNext, previous as skipPrevious } from "../lib/playback";
   import { sendCommand } from "../lib/commands";
   import { setMediaMetadata, setMediaPosition, setMediaHandlers } from "../lib/media";
   import { favorites } from "../lib/favorites.svelte";
@@ -91,7 +91,7 @@
     if (resumeOnReconnect && player.isBrowserOutput) {
       resumeOnReconnect = false;
       if (next.now_playing && next.status !== "playing") {
-        sendCommand(player.target, { command: "play" });
+        void resume();
       }
     }
     if (player.isBrowserOutput) audio?.drive(next);
@@ -123,6 +123,13 @@
     audio?.setLevelingMode(mode);
   });
 
+  // Tell the driver when this tab is the active browser output, so the first user gesture adopts
+  // output and any transport control can drive audio (read the reactive dep first; see the note).
+  $effect(() => {
+    const isOutput = player.isBrowserOutput;
+    audio?.setDesignatedOutput(isOutput);
+  });
+
   onMount(async () => {
     audio = new BrowserAudio(audioEl);
     setAudio(audio);
@@ -131,13 +138,14 @@
     audio.setLevelingMode(dsp.levelingMode);
     audio.onProgress((msg) => ws?.send(msg));
     audio.onEnded(() => ws?.send({ type: "ended" }));
+    audio.onBlocked((b) => (player.playBlocked = b));
     audio.start();
 
     setMediaHandlers({
-      play: () => sendCommand(player.target, { command: "play" }),
-      pause: () => sendCommand(player.target, { command: "pause" }),
-      previoustrack: () => sendCommand(player.target, { command: "previous" }),
-      nexttrack: () => sendCommand(player.target, { command: "next" }),
+      play: () => void resume(),
+      pause: () => pause(),
+      previoustrack: () => skipPrevious(),
+      nexttrack: () => skipNext(),
       seekto: (d) => {
         if (d.seekTime != null)
           sendCommand(player.target, { command: "seek", position_seconds: d.seekTime });

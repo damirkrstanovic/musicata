@@ -40,6 +40,16 @@ export class BrowserAudio {
   private bypassed = false;
   private graphFailed = false;
 
+  // Set by the app when this tab is the active browser output. On the first user gesture we then
+  // adopt output (claimed = true) so ANY transport control drives audio — not only the paths that
+  // call claim() explicitly. (No cross-tab output arbitration yet, so two tabs both targeting the
+  // browser player could both adopt; single-tab is the common case.)
+  private designatedOutput = false;
+  // True while the desired state is "playing" but the element's play() was blocked (autoplay
+  // policy). Surfaced so the UI can offer "tap to resume" instead of a silent, false "playing".
+  private blocked = false;
+  private onBlockedCb?: (blocked: boolean) => void;
+
   // Room correction (Phase 4): a ConvolverNode after the EQ bands loaded from a profile's WAV
   // impulse response. `convBuffer` is the decoded IR; `convProfileId` tracks which profile's IR
   // is loaded so we don't refetch on every rebuild.
@@ -74,6 +84,10 @@ export class BrowserAudio {
     const unlock = () => {
       this.ensureGraph();
       this.ctx?.resume().catch(() => {});
+      // Adopt output on the first gesture if this tab is the active browser output, so a restored
+      // track plays via any control (footer, media keys, next/prev) — not only the paths that
+      // claim() explicitly. drive() then acts on the next state instead of silently no-opping.
+      if (this.designatedOutput) this.claimed = true;
       if (this.ctx?.state === "running" || this.graphFailed) {
         for (const ev of ["pointerdown", "keydown", "click"] as const) {
           document.removeEventListener(ev, unlock, true);
@@ -98,6 +112,25 @@ export class BrowserAudio {
   }
   get isClaimed(): boolean {
     return this.claimed;
+  }
+
+  /** Tell the driver whether this tab is the active browser output. When true, the first user
+   *  gesture adopts output (see the constructor's `unlock`), so any transport control drives
+   *  audio without an explicit claim. */
+  setDesignatedOutput(on: boolean): void {
+    this.designatedOutput = on;
+  }
+
+  /** Observe the "playback blocked" state: true when we want to play but the browser refused
+   *  `el.play()` (autoplay policy), false once it plays. The UI uses this to offer a tap-to-resume
+   *  affordance instead of showing a silent, false "playing". */
+  onBlocked(cb: (blocked: boolean) => void): void {
+    this.onBlockedCb = cb;
+  }
+  private setBlocked(v: boolean): void {
+    if (this.blocked === v) return;
+    this.blocked = v;
+    this.onBlockedCb?.(v);
   }
 
   /** Set (or clear, with `null`) the active EQ profile and apply it live. Stores the profile and
@@ -362,9 +395,12 @@ export class BrowserAudio {
   primePlay(streamUrl: string): void {
     this.ctx?.resume().catch(() => {});
     if (!this.el.src.endsWith(streamUrl)) this.el.src = streamUrl;
-    this.el.play().catch(() => {
-      // gesture not honored / will retry via drive()
-    });
+    this.el
+      .play()
+      .then(() => this.setBlocked(false))
+      .catch(() => {
+        // gesture not honored / will retry via drive()
+      });
   }
 
   private report(): void {
@@ -387,11 +423,15 @@ export class BrowserAudio {
       const elapsed = playback.elapsed_seconds ?? 0;
       if (Math.abs(this.el.currentTime - elapsed) > 2) this.el.currentTime = elapsed;
       this.ctx?.resume().catch(() => {});
-      this.el.play().catch(() => {
-        // autoplay policy: needs a user gesture
-      });
+      // Track whether the browser actually let us play: a rejection (autoplay policy) surfaces a
+      // tap-to-resume affordance rather than a silent, false "playing".
+      this.el
+        .play()
+        .then(() => this.setBlocked(false))
+        .catch(() => this.setBlocked(true));
     } else {
       this.el.pause();
+      this.setBlocked(false);
     }
   }
 }

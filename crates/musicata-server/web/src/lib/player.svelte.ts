@@ -31,6 +31,9 @@ class Player {
   duration = $state(0);
   seekDragging = $state(false);
   queueOpen = $state(false);
+  /** The browser output wants to play but the browser blocked `el.play()` (autoplay policy).
+   *  The footer surfaces a tap-to-resume affordance while this is set. */
+  playBlocked = $state(false);
 
   get target(): Target | null {
     return this.activeId ? { kind: this.activeKind, id: this.activeId } : null;

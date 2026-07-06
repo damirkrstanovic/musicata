@@ -76,8 +76,14 @@ const exceptions = [];
 ws.addEventListener("message", (e) => {
   const m = JSON.parse(e.data);
   if (m.id && pending.has(m.id)) (pending.get(m.id)(m.result), pending.delete(m.id));
-  if (m.method === "Runtime.exceptionThrown")
-    exceptions.push(m.params.exceptionDetails.exception?.description || m.params.exceptionDetails.text);
+  if (m.method === "Runtime.exceptionThrown") {
+    const d = m.params.exceptionDetails;
+    // Ignore errors thrown by browser extensions injected into the page (chrome-extension://…):
+    // not app bugs, and a page reload re-triggers a flaky one in this headless profile.
+    const origin = d.url || d.stackTrace?.callFrames?.[0]?.url || "";
+    if (origin.startsWith("chrome-extension://")) return;
+    exceptions.push(d.exception?.description || d.text);
+  }
 });
 const send = (method, params = {}) =>
   new Promise((res) => (pending.set(++id, res), ws.send(JSON.stringify({ id, method, params }))));
@@ -85,6 +91,17 @@ const js = async (expr) =>
   (await send("Runtime.evaluate", { expression: expr, returnByValue: true })).result?.value;
 const clickText = (sel, text) =>
   js(`[...document.querySelectorAll(${JSON.stringify(sel)})].find(b=>b.textContent.trim()===${JSON.stringify(text)})?.click()`);
+// Poll `boolExpr` (evaluated in the page) until true, returning the elapsed ms, or Infinity if it
+// never became true within `budgetMs`. Used for the latency checks below. Coarse by design — the
+// value includes CDP round-trips + the poll granularity — so budgets are generous.
+async function waitUntil(boolExpr, budgetMs, pollMs = 50) {
+  const start = Date.now();
+  do {
+    if (await js(`!!(${boolExpr})`)) return Date.now() - start;
+    await sleep(pollMs);
+  } while (Date.now() - start < budgetMs);
+  return Infinity;
+}
 
 await send("Runtime.enable");
 await send("Page.enable");
@@ -444,6 +461,80 @@ await clickText(".queue-head button", "Clear");
 await sleep(800);
 check("clear empties the queue", (await js(`document.querySelectorAll('.queue-row').length`)) === 0);
 await clickText(".queue-head button", "Close");
+
+// ---- Latency: client-side responsiveness of the core paths, against the local testdata fixture
+// with deliberately GENEROUS budgets. These measure client + server-logic + WS-broadcast time —
+// NOT SMB read latency (that needs the live share, and is machine/network dependent). The point
+// is to catch a gross regression (a path that got much slower or stopped responding), not to pin
+// a millisecond budget. Each playback check also asserts audio actually advances, so a fast-but-
+// silent "playing" still fails.
+await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>!/zone/i.test(o.textContent)); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`); // output → the browser player
+await sleep(700);
+await clickText(".seg", "Tracks");
+await sleep(500);
+
+// Establish a clean, really-playing baseline on the browser player: click a track, wait until the
+// status is playing AND the elapsed clock has ticked (proof of actual audio). All measurements
+// below are same-track transitions from here, so they aren't confounded by track-load or by a
+// stale state arriving after the output switch.
+await js(`document.querySelector('.track-main')?.click()`);
+await waitUntil(`document.querySelector('.transport')?.dataset.status === "playing"`, 5000);
+const warmTime = await js(`document.querySelector('.seek-row .time')?.textContent`);
+await waitUntil(`document.querySelector('.seek-row .time')?.textContent !== ${JSON.stringify(warmTime)}`, 4000);
+
+// Pause: Play button → status reads paused.
+await js(`document.querySelector('.transport-buttons .control.play')?.click()`);
+const pauseMs = await waitUntil(`document.querySelector('.transport')?.dataset.status === "paused"`, 3000);
+check("latency: pause responds within budget", pauseMs < 2000, `${pauseMs}ms`);
+
+// Resume to audio: Play button → status playing AND the elapsed clock advances again (real audio
+// back, not just a status flip). Measured from the paused clock value so a false "playing" fails.
+const pausedTime = await js(`document.querySelector('.seek-row .time')?.textContent`);
+await js(`document.querySelector('.transport-buttons .control.play')?.click()`);
+const resumeMs = await waitUntil(
+  `document.querySelector('.transport')?.dataset.status === "playing" && document.querySelector('.seek-row .time')?.textContent !== ${JSON.stringify(pausedTime)}`,
+  5000,
+);
+check("latency: resume to real audio within budget", resumeMs < 4000, `${resumeMs}ms`);
+
+// Next: click Next → a different track becomes now-playing.
+const beforeNext = await js(`document.querySelector('#now-title')?.textContent`);
+await js(`[...document.querySelectorAll('.transport-buttons .control')].find(b=>b.title==='Next')?.click()`);
+const nextMs = await waitUntil(
+  `document.querySelector('#now-title')?.textContent !== ${JSON.stringify(beforeNext)}`,
+  4000,
+);
+check("latency: next changes track within budget", nextMs < 3000, `${nextMs}ms`);
+
+// Search-to-render: type a query → the search results title appears.
+await js(`(()=>{const el=document.querySelector('.search input'); el.value='the'; el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+const searchMs = await waitUntil(`/search/i.test(document.querySelector('.content-title h2')?.textContent || "")`, 3000);
+check("latency: search renders within budget", searchMs < 2500, `${searchMs}ms`);
+await js(`(()=>{const el=document.querySelector('.search input'); el.value=''; el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+await sleep(400);
+
+// Resume after restart: reopening the app (a page reload) restores the persisted now-playing
+// track, and the footer Play must actually play it on THIS tab. The bug — the footer sent a bare
+// `play` while the freshly-loaded tab had never claimed browser output, so `drive()` skipped it
+// and nothing played, even though picking a track from the library (which claims) worked.
+await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>!/zone/i.test(o.textContent)); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`); // output → the browser player itself, not the zone
+await sleep(800);
+await clickText(".seg", "Tracks");
+await sleep(600);
+await js(`document.querySelector('.track-main')?.click()`); // play a track on the browser player
+await sleep(1500);
+await js(`document.querySelector('.transport-buttons .control.play')?.click()`); // pause → a persisted, paused now-playing
+await sleep(500);
+const restartTitle = await js(`document.querySelector('#now-title')?.textContent`);
+await send("Page.reload"); // reopen the app: a fresh tab that has NOT claimed output
+await sleep(2800); // reconnect + restore the persisted session
+check("restart restores the now-playing track", (await js(`document.querySelector('#now-title')?.textContent`)) === restartTitle, `${restartTitle}`);
+const r1 = await js(`document.querySelector('.seek-row .time')?.textContent`);
+await js(`document.querySelector('.transport-buttons .control.play')?.click()`); // footer Play on the never-claimed tab
+await sleep(2600);
+check("restart resume goes to playing", (await js(`document.querySelector('.transport')?.dataset.status`)) === "playing");
+const r2 = await js(`document.querySelector('.seek-row .time')?.textContent`);
+check("restart resume actually plays on this tab (elapsed advances)", !!r1 && r1 !== r2, `${r1} -> ${r2}`);
 
 check("no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
 console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);

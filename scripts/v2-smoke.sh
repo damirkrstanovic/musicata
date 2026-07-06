@@ -11,6 +11,10 @@ BASE_PATH="${1:-/v2}"
 CHROME="${CHROME:-$HOME/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome}"
 REAL_DB="${MUSICATA_REAL_DB:-.musicata/musicata.db}"
 
+# Static guard (no browser needed): every playback command must go through the transport module,
+# so a new control can't silently skip claiming the browser output. Fail fast, before the build.
+node tests/ui/transport-guard.mjs
+
 if [ ! -x "$CHROME" ]; then echo "no chromium at $CHROME; skipping"; exit 0; fi
 
 cargo build -p musicata-server

@@ -35,6 +35,59 @@ export async function playTracks(tracks: TrackRow[], startIndex = 0): Promise<vo
   });
 }
 
+// ---- Transport verbs ----
+// EVERY playback-affecting command goes through these so no caller can forget the "claim +
+// prime the browser output inside the gesture" ritual. Sending a raw `play`/`next`/… command
+// straight to the browser output leaves `drive()` a no-op (the tab never claimed) or blocked by
+// autoplay policy — the UI shows "playing" over silence. A source guard (tests/ui/
+// transport-guard.mjs) enforces that these command literals live only in this file.
+
+/** Pause the active target. */
+export function pause(): void {
+  if (player.target) void sendCommand(player.target, { command: "pause" });
+}
+
+/** Resume the active target. When this tab is the browser output, claim + prime the now-playing
+ *  stream *inside the click gesture* (like {@link playTracks}) so the restored track actually
+ *  plays: a bare `play` would arrive back over the WS *after* the gesture, and `drive()` would
+ *  skip it because the tab never claimed output (autoplay blocks a gesture-less `el.play()`). */
+export async function resume(): Promise<void> {
+  if (!player.target) return;
+  if (player.isBrowserOutput) {
+    audio?.claim();
+    const stream = player.nowPlaying?.stream_url;
+    if (stream) audio?.primePlay(stream);
+  }
+  await sendCommand(player.target, { command: "play" });
+}
+
+/** Footer Play/Pause. */
+export function togglePlayback(): void {
+  // Blocked by autoplay: the server status already reads "playing", so a tap must force a real,
+  // in-gesture play (resume) to clear it rather than toggling to pause.
+  if (player.playBlocked) {
+    void resume();
+    return;
+  }
+  if (player.status === "playing") pause();
+  else void resume();
+}
+
+/** Skip to the next / previous queued track. Claims the browser output inside the gesture so
+ *  `drive()` plays the new track once the server's state arrives (the next track's stream URL
+ *  isn't known until then, so there's nothing to prime yet — the claim is what matters). */
+export function next(): void {
+  step("next");
+}
+export function previous(): void {
+  step("previous");
+}
+function step(command: "next" | "previous"): void {
+  if (!player.target) return;
+  if (player.isBrowserOutput) audio?.claim();
+  void sendCommand(player.target, { command });
+}
+
 /** Start a "radio" from a seed track: the seed plus similar tracks. Call from a click handler. */
 export async function startRadio(seedTrackId: string): Promise<void> {
   // Claim output inside the gesture before the await, so autoplay policy lets it play.
