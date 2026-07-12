@@ -2146,20 +2146,35 @@ impl Database {
     /// Tracks with no EBU R128 loudness analysis yet — candidates for the loudness pass.
     /// Reuses [`TrackFingerprintTarget`] (it carries exactly what's needed to read + decode
     /// the file). Anti-joins `track_loudness`, so once analyzed a track is never re-queued.
+    ///
+    /// Returned in stable `(artist, title, id)` order after the `after` keyset cursor (`None`
+    /// starts from the beginning). The loudness worker pages the backlog with this cursor so a
+    /// cluster of tracks that keep failing (e.g. an offline source) is stepped past rather than
+    /// re-served forever, stranding the rest of the library behind it — the same paging
+    /// `tracks_missing_embedding` uses.
     pub async fn tracks_missing_loudness(
         &self,
+        after: Option<(&str, &str, &str)>,
         limit: i64,
     ) -> Result<Vec<TrackFingerprintTarget>> {
+        let (after_artist, after_title, after_id) = match after {
+            Some((artist, title, id)) => (Some(artist), Some(title), Some(id)),
+            None => (None, None, None),
+        };
         let rows = sqlx::query(
             "SELECT t.id, t.title, t.artist_name, t.extension, t.provider_id,
                     t.provider_item_id, t.path, t.duration_seconds
              FROM tracks t
              LEFT JOIN track_loudness l ON l.track_id = t.id
              WHERE l.track_id IS NULL
-             ORDER BY t.artist_name, t.title
+               AND (?2 IS NULL OR (t.artist_name, t.title, t.id) > (?2, ?3, ?4))
+             ORDER BY t.artist_name, t.title, t.id
              LIMIT ?1",
         )
         .bind(limit)
+        .bind(after_artist)
+        .bind(after_title)
+        .bind(after_id)
         .fetch_all(&self.pool)
         .await?;
         rows.iter()
@@ -8606,7 +8621,7 @@ mod tests {
         database.save_library(&mut library).await.expect("save");
 
         // A fresh track has no loudness yet — it's a candidate for analysis.
-        let missing = database.tracks_missing_loudness(10).await.expect("missing");
+        let missing = database.tracks_missing_loudness(None, 10).await.expect("missing");
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].track_id, "track_1");
         assert!(database.track_loudness("track_1").await.expect("read").is_none());
@@ -8620,7 +8635,7 @@ mod tests {
             database.track_loudness("track_1").await.expect("read"),
             Some((-16.5, -1.2))
         );
-        assert!(database.tracks_missing_loudness(10).await.expect("missing").is_empty());
+        assert!(database.tracks_missing_loudness(None, 10).await.expect("missing").is_empty());
 
         // A NULL marker (un-measurable track) still suppresses re-analysis but reads as None.
         database
@@ -8628,7 +8643,7 @@ mod tests {
             .await
             .expect("upsert null");
         assert!(database.track_loudness("track_1").await.expect("read").is_none());
-        assert!(database.tracks_missing_loudness(10).await.expect("missing").is_empty());
+        assert!(database.tracks_missing_loudness(None, 10).await.expect("missing").is_empty());
 
         // A loaded queue gets its loudness re-attached from the table.
         database
@@ -8642,6 +8657,42 @@ mod tests {
         database.fill_queue_loudness(&mut items).await.expect("fill");
         assert_eq!(items[0].integrated_loudness_lufs, Some(-12.0));
         assert_eq!(items[0].true_peak_dbtp, Some(-0.5));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn loudness_backlog_pages_past_a_stuck_front() {
+        let db_path = temp_db_path("loudness-paging");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = fixture_library();
+        // A second, later-sorting track so the backlog can be paged one at a time.
+        let mut t2 = library.tracks[0].clone();
+        t2.id = "track_2".to_string();
+        t2.title = "Zzz".to_string(); // sorts after "Song" under the same artist
+        t2.provider.item_id = "album/song2.mp3".to_string();
+        t2.stream_url = "/api/tracks/track_2/stream".to_string();
+        library.tracks.push(t2);
+        database.save_library(&mut library).await.expect("save");
+
+        // Batch size 1: the first page is track_1; resuming after its keyset cursor yields
+        // track_2 — never track_1 again — so an unmeasured (stuck) front can't strand the tail.
+        let first = database.tracks_missing_loudness(None, 1).await.expect("first");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].track_id, "track_1");
+
+        let c1 = &first[0];
+        let after = Some((c1.artist_name.as_str(), c1.title.as_str(), c1.track_id.as_str()));
+        let second = database.tracks_missing_loudness(after, 1).await.expect("second");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].track_id, "track_2");
+
+        // Past the last track the sweep ends, even though neither track was ever measured.
+        let c2 = &second[0];
+        let after2 = Some((c2.artist_name.as_str(), c2.title.as_str(), c2.track_id.as_str()));
+        assert!(
+            database.tracks_missing_loudness(after2, 1).await.expect("third").is_empty()
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
