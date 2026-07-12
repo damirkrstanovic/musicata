@@ -1028,10 +1028,14 @@ async fn loudness_loop(
 ) {
     let _ = ready.wait_for(|&r| r).await;
     loop {
-        let did = loudness_pass(&database, &providers, &activity).await;
-        if did == 0 {
-            tokio::time::sleep(BACKGROUND_IDLE_POLL).await;
+        // Sweep the whole backlog, paging with a keyset cursor so a cluster of tracks that keep
+        // failing (e.g. an offline source) is stepped past rather than re-served forever, stranding
+        // the rest of the library behind it. Each sweep starts fresh, so transient failures retry.
+        let mut cursor: Option<(String, String, String)> = None;
+        while let Some(next) = loudness_pass(&database, &providers, &activity, cursor).await {
+            cursor = Some(next);
         }
+        tokio::time::sleep(BACKGROUND_IDLE_POLL).await;
     }
 }
 
@@ -1139,27 +1143,41 @@ async fn autoplay_candidates(
 const LOUDNESS_BATCH: i64 = 200;
 /// Concurrent decodes. Loudness analysis is pure-CPU (decode + R128), so a few across cores.
 const LOUDNESS_CONCURRENCY: usize = 4;
+/// Wall-clock budget for a single track's full decode. Generous enough for any real track (even
+/// a multi-hour mix decodes in seconds), so exceeding it means a malformed/pathological file —
+/// abandon it (marked un-measurable) rather than let it pin a core and spin the loudness loop.
+const LOUDNESS_MAX_WALL: Duration = Duration::from_secs(30);
 
-/// Analyze a batch of un-measured tracks. Returns how many were given a durable verdict
-/// (measured, or marked un-measurable) so the loop knows whether to keep draining or idle.
+/// Analyze one batch of un-measured tracks, starting after `after` in `(artist, title, id)`
+/// order. Returns the cursor to continue from (the last track in the batch, whether or not it
+/// could be measured, so a failing cluster can't halt the sweep), or `None` when the backlog is
+/// drained or loudness analysis is off.
 async fn loudness_pass(
     database: &Database,
     providers: &Arc<RwLock<ProviderRegistry>>,
     activity: &Arc<activity::ActivityLog>,
-) -> usize {
+    after: Option<(String, String, String)>,
+) -> Option<(String, String, String)> {
     if !setting_enabled(database, SETTING_LOUDNESS).await {
-        return 0;
+        return None;
     }
-    let targets = match database.tracks_missing_loudness(LOUDNESS_BATCH).await {
+    let after = after
+        .as_ref()
+        .map(|(artist, title, id)| (artist.as_str(), title.as_str(), id.as_str()));
+    let targets = match database.tracks_missing_loudness(after, LOUDNESS_BATCH).await {
         Ok(targets) => targets,
         Err(error) => {
             tracing::warn!(%error, "loudness: failed to list tracks");
-            return 0;
+            return None;
         }
     };
     if targets.is_empty() {
-        return 0;
+        return None;
     }
+    // The last track in stable order — the cursor to resume from, regardless of how many stored.
+    let next_cursor = targets.last().map(|target| {
+        (target.artist_name.clone(), target.title.clone(), target.track_id.clone())
+    });
 
     let total = targets.len();
     let task = activity.start("loudness", format!("Analyzing loudness (0/{total})"));
@@ -1187,10 +1205,11 @@ async fn loudness_pass(
                 return;
             };
             let extension = target.extension.clone();
-            let result =
-                tokio::task::spawn_blocking(move || loudness::analyze_loudness(&audio, &extension))
-                    .await
-                    .unwrap_or_else(|_| Err("analysis task panicked".to_string()));
+            let result = tokio::task::spawn_blocking(move || {
+                loudness::analyze_loudness(&audio, &extension, LOUDNESS_MAX_WALL)
+            })
+            .await
+            .unwrap_or_else(|_| Err("analysis task panicked".to_string()));
             let now = now_unix_seconds();
             match result {
                 Ok((lufs, true_peak)) => {
@@ -1229,7 +1248,7 @@ async fn loudness_pass(
     {
         tracing::warn!(%error, "recompute album loudness failed");
     }
-    durable
+    next_cursor
 }
 
 /// Snapshot/static path (`--no-incremental-rescan`): a single ordered fill — scan, then

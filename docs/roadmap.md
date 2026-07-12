@@ -802,8 +802,15 @@ Tasks:
   Multi-room panel (enable + per-room volume); **4** per-track R128 leveling in the writer.
   `snapcast` cargo feature; `rubato` (MIT) dep. Verified two snapclients 100 %
   sample-identical (sub-ms offset). MVP scope: one synced stream to N rooms (independent
-  per-room streams are a future extension). **Note:** the loudness analysis loop can spin on
-  certain malformed tracks — a *pre-existing* issue surfaced during testing, tracked separately.
+  per-room streams are a future extension). **Note (fixed):** the loudness analysis loop could
+  pin a CPU core on certain malformed/oversized tracks — `analyze_loudness` fully decoded every
+  track with no bound (unlike `fingerprint.rs`, which caps decode), and symphonia's format probe
+  alone scanned the whole file. Fixed with a wall-clock budget enforced at the byte source
+  (`DeadlineSource`, so it bounds the probe *and* the decode); an over-budget track is marked
+  un-measurable so the loop moves on instead of spinning. `LOUDNESS_MAX_WALL` in `main.rs`. The
+  same pass also gained the keyset-cursor paging the ML worker already had
+  (`tracks_missing_loudness(after, …)`), so a cluster of unreadable tracks at the front of the
+  backlog is stepped past rather than re-served forever, stranding the rest of the library.
 - **Chromecast and UPnP/DLNA — not planned** (decision 2026-06-27). Chromecast has no open
   self-contained sender; UPnP/DLNA is aging and low-value (existing-AV-receiver push only, no
   auth/sync) — Snapcast and the native endpoint cover the real cases.
