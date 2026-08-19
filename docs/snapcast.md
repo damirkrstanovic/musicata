@@ -2,6 +2,11 @@
 
 Date: 2026-06-07
 
+> **Status — shipped.** Synchronized multi-room playout runs through `src/snapcast/`
+> (feature-gated on `snapcast`, needs `snapserver`/`snapclient` at runtime), configured
+> from /admin. Read the rest as the design behind what shipped; roadmap M10/M11 track
+> what's left.
+
 ## Context
 
 Milestone 10 calls for non-browser player endpoints and "research Snapcast for synchronized

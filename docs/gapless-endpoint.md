@@ -1,7 +1,9 @@
 # Gapless playback for the native endpoint
 
 **Date:** 2026-06-30
-**Status:** Approved — implementing
+**Status:** Shipped (merged to `main`). The endpoint holds one persistent rodio `Sink` and
+prefetches the next track into it — see `crates/musicata-endpoint/src/audio.rs`. Kept as the
+design record for why it works this way, not as open work.
 **Scope:** `musicata-core`, `musicata-server`, `musicata-endpoint`, docs
 
 ## Goal

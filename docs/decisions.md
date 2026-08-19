@@ -232,3 +232,39 @@ A batch of milestone work was done autonomously; the judgement calls are recorde
   filesystem permissions (the systemd unit already runs as a locked-down system user with state
   in `0750` `/var/lib/musicata`) plus clear documentation. Real encryption is revisited if/when
   an OS-keyring integration lands. Documented in `deployment.md` and the roadmap.
+
+## 2026-06-14 — Frontend: Svelte 5 + Vite, not SvelteKit or a Rust/WASM UI
+
+The web app was rewritten from vanilla JS to Svelte 5 + TypeScript, built by Vite and embedded
+via `rust-embed`. Recorded here because the rejected options keep coming up:
+
+- **Not SvelteKit.** Its value is SSR + filesystem routing + a Node server adapter. Assets are
+  static and embedded and axum is the server, so none of that applies. Plain Svelte + Vite gives
+  the compiler and component model without the meta-framework.
+- **Not Leptos/Dioxus or a Rust/WASM UI**, which the initial research recommended. A polished,
+  installable PWA was the requirement; the Rust UI frameworks would have traded that for stack
+  purity.
+- **Svelte 5 runes, specifically**, because fine-grained signals preserve the playback hot path:
+  `elapsed`/`duration` are their own signals, so a progress tick updates the footer time without
+  touching the now-title or sweeping the track list. That invariant is the acceptance gate —
+  `tests/ui/v2-flows.mjs` asserts it with a MutationObserver.
+- **`styles.css` kept global and unchanged** through the migration; componentizing CSS at the
+  same time would have multiplied risk for no functional gain.
+- **Node + npm became build-time dependencies**, with `MUSICATA_SKIP_WEB_BUILD=1` + a prebuilt
+  `web/dist/` as the offline/CI escape hatch.
+
+## 2026-05-24 — Initial Rust stack, and the alternatives rejected
+
+From the opening survey. Adopted: **tokio** (async runtime), **axum** (HTTP/WebSocket/streaming),
+**tower/tower-http** (middleware), **sqlx + SQLite** (embedded, local-first), **lofty** (tags and
+artwork), **symphonia** (Rust-native decode), **serde**, **tracing**.
+
+Rejected, with the reason:
+
+- **Tantivy for full-text search → SQLite FTS5.** Search lives in the same database as the
+  library, so FTS5 avoids a second index to build, invalidate, and keep consistent (roadmap M4).
+- **FFmpeg as a core dependency.** Kept out of the default build; symphonia covers the formats
+  the library serves, and a heavy native dep would undercut the single-binary story.
+- **Native mobile apps.** The installable PWA is the client. If a desktop package is ever wanted,
+  a Tauri wrapper around the same web app is the likely path.
+

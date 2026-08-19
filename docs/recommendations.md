@@ -2,6 +2,12 @@
 
 Date: 2026-05-24
 
+> **Status — core shipped, follow-ups open.** Durable listening history, smart playlists,
+> ListenBrainz similar-track radio and scrobbling, and the optional audio-embedding
+> similarity all ship. Still open: richer playback events (loved/disliked/rated) and
+> recommendation *import* from ListenBrainz — see roadmap M7. This document is the
+> original research; it records options that were considered, not all of which were taken.
+
 ## Question
 
 Can Musicata support recommendation engines by gathering listening history, using metadata, genre analysis, and optional machine learning?

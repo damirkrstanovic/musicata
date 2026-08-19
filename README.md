@@ -85,7 +85,6 @@ covered in **[Running & deploying Musicata](docs/deployment.md)**.
 - [Audio ML Service (embeddings & tags)](docs/musicata-ml.md)
 - [Plugins](docs/plugins.md)
 - [Web UI Style Guide](docs/style-guide.md)
-- [Research](docs/research.md)
 - [Initial Requirements](docs/requirements.md)
 
 Contributors: see **[AGENTS.md](AGENTS.md)** for architecture, conventions, and the build/test

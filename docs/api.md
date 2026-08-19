@@ -272,6 +272,17 @@ EQ + room/headphone correction profiles. Authenticated (not admin-only).
 | PUT/DELETE | `/api/dsp/profiles/{id}` | Upsert / delete a profile. |
 | GET/POST/DELETE | `/api/dsp/profiles/{id}/impulse` | Get / upload (WAV) / delete a profile's impulse response. |
 
+### Audio ML (embeddings & tags)
+
+Drives the optional `musicata-ml` service (see [musicata-ml.md](musicata-ml.md)). Enabled and
+pointed at a service URL from **/admin → Settings**; the analysis itself runs on its own
+background worker.
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET | `/api/ml/status` | Whether analysis is enabled, plus `analyzed` / `total` track counts. |
+| POST | `/api/ml/analyze` | Wake the analysis worker now instead of waiting for its schedule. Returns `202 Accepted`. |
+
 ### Snapcast (feature-gated)
 
 Present only with the `snapcast` build feature.

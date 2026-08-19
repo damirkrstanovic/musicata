@@ -769,7 +769,7 @@ Tasks:
   the queue model) beyond the Snapcast case. **Gapless follow-up:** the endpoint now plays
   consecutive library tracks with no audible gap — the server broadcasts a repeat/shuffle-aware
   `next_up` hint and the endpoint prefetches+appends the next track to one persistent rodio sink
-  (design: `docs/superpowers/specs/2026-06-30-gapless-native-endpoint-design.md`).
+  (design: `docs/gapless-endpoint.md`).
 - [x] Introduce authentication between the server and players/endpoints (the
   *endpoint→server* direction). **Shipped** — see [player-auth.md](player-auth.md). A per-player
   bearer token is issued at registration (`POST /api/players {"issue_token":true}` → `auth_token`

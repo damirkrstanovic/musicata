@@ -2,6 +2,12 @@
 
 Date: 2026-06-07
 
+> **Status — shipped, with follow-ups.** Per-output parametric EQ and room/headphone
+> correction run in the browser player (`web/src/lib/dsp.ts`, `EqPanel.svelte`) and
+> server-side for Snapcast (`src/snapcast/dsp.rs`). The CamillaDSP/DAC tier and the
+> signal-path badge are still open — see roadmap M11 for the current state. Read the rest
+> as the design behind what shipped.
+
 ## Context
 
 Milestone 11 reserves a **per-zone DSP pipeline** and names CamillaDSP as the engine.
