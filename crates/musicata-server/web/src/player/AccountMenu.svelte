@@ -7,6 +7,10 @@
   import { session } from "../lib/session.svelte";
   import { openModal } from "../lib/modal";
 
+  // AGPL section 13: anyone interacting with Musicata over a network must be offered its
+  // source. If you run a MODIFIED Musicata, repoint this at your own fork.
+  const SOURCE_URL = "https://github.com/damirkrstanovic/musicata";
+
   let open = $state(false);
 
   const username = $derived(session.user?.username ?? "Account");
@@ -55,6 +59,7 @@
       {/if}
       <button type="button" class="item" onclick={changePassword}>Change password</button>
       <button type="button" class="item" onclick={showToken}>Subsonic token</button>
+      <a class="item" href={SOURCE_URL} target="_blank" rel="noopener noreferrer">Source code</a>
       <button type="button" class="item danger" onclick={() => session.logout()}>Sign out</button>
     </div>
   {/if}

@@ -46,6 +46,8 @@ RUN apt-get update \
     && useradd --system --no-create-home --uid 10001 musicata
 COPY --from=build /musicata-ml /usr/local/bin/musicata-ml
 COPY --from=build /ort/ /usr/local/lib/
+# The AGPL requires the license text to accompany the binary in object form too.
+COPY COPYING NOTICE /usr/share/doc/musicata/
 RUN ldconfig
 ENV LD_LIBRARY_PATH=/usr/local/lib
 

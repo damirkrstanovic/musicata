@@ -72,7 +72,7 @@ jobs:
           dist="${{ matrix.name }}"
           mkdir "$dist"
           cp "target/${{ matrix.target }}/release/musicata-server" "$dist/"
-          cp packaging/musicata.service README.md "$dist/"
+          cp packaging/musicata.service README.md COPYING NOTICE "$dist/"
           tar -czf "$dist.tar.gz" "$dist"
 
       - uses: softprops/action-gh-release@v3

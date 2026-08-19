@@ -50,6 +50,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --uid 10001 musicata
 COPY --from=build /musicata-server /usr/local/bin/musicata-server
+# The AGPL requires the license text to accompany the binary in object form too.
+COPY COPYING NOTICE /usr/share/doc/musicata/
 
 # Database + artwork cache live under /data; mount a host directory there.
 ENV MUSICATA_DATABASE=/data/musicata.db

@@ -93,4 +93,12 @@ workflow.
 
 ## License
 
-AGPL-3.0.
+Musicata is free software licensed under the **GNU Affero General Public License, version 3
+or later** — see [COPYING](COPYING) for the full text. If you run a modified Musicata as a
+network service, AGPL section 13 requires you to offer its source to your users; the player's
+account menu carries a **Source code** link for exactly that, so point it at your fork.
+
+Third-party material bundled in this repository (the AudioSet labels and the AutoEq presets)
+is attributed in [NOTICE](NOTICE).
+
+Security reports: see [SECURITY.md](SECURITY.md) — please don't file them as public issues.

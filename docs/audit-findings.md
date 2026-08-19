@@ -6,6 +6,12 @@ become a regression test. Check the box when resolved; note the fixing commit/PR
 
 Severity legend: 🔴 bug (wrong/unsafe behavior) · 🟡 issue (suboptimal/fragile) · 🔵 overcomplicated.
 
+> **All security-marked bugs on this page were fixed on 2026-06-27 and shipped in v1.0.**
+> The repros below are published so they can be read as regression tests, not as live
+> exploits — but they *do* work against **v0.9 and earlier**, which predate the fixes. No
+> binaries were ever published for those tags; if you built one from source, upgrade.
+> Report anything new privately instead — see [SECURITY.md](../SECURITY.md).
+
 **Status summary:** 15 bugs (✅ all 15 fixed with tests) · issues ISS-01..44 (✅ 39 fixed, 5 deferred: ISS-05/06 MPD race+poll, ISS-09 jsonp, ISS-23 concurrent scan, ISS-43 endpoint async download) · overcomplicated CPX-01..10 (✅ 4 fixed: CPX-02/03/07/08; 6 deferred/won't-fix with rationale: CPX-01 scanner hot path, CPX-04 needs fingerprint column, CPX-05 migration de-dup risk, CPX-06 needs streaming dep, CPX-09 embedding stability, CPX-10 index keying is correct).
 
 Deferred items each carry a one-line rationale inline. (The "38 issues" headline from the original audit corresponds to this ISS-01..44 list.)

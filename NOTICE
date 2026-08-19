@@ -1,0 +1,64 @@
+Musicata
+Copyright (C) 2026 Damir Krstanović
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See COPYING for the full license text.
+
+--------------------------------------------------------------------------------
+Third-party material redistributed in this repository
+--------------------------------------------------------------------------------
+
+Musicata's Rust and npm dependencies are fetched at build time and are not
+redistributed here; their licenses are recorded in Cargo.lock / package-lock.json
+and in the per-dependency comments in each crate's Cargo.toml. The PANNs CNN14
+ONNX model used by musicata-ml is downloaded at runtime and is likewise not
+redistributed (see docs/musicata-ml.md).
+
+The following third-party works ARE included in this repository and carry their
+own license terms:
+
+1. AudioSet class labels
+   File:    crates/musicata-ml/data/audioset_labels.txt
+   Source:  Google AudioSet ontology <https://research.google.com/audioset/>
+   License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+            <https://creativecommons.org/licenses/by/4.0/>
+
+   The 527 class display names are taken, unmodified and in the model's output
+   order, from the AudioSet ontology published by Google LLC. They are used to
+   label the audio-tagging output of musicata-ml. CC BY 4.0 is one-way
+   compatible with the GNU GPL family, so this material may be redistributed
+   under this repository's terms; this notice provides the required attribution.
+
+2. AutoEq headphone correction presets
+   File:    crates/musicata-server/web/src/lib/autoeq-presets.json
+   Source:  AutoEq <https://github.com/jaakkopasanen/AutoEq> / <https://autoeq.app>
+   License: MIT
+
+     Copyright (c) 2018 Jaakko Pasanen
+
+     Permission is hereby granted, free of charge, to any person obtaining a copy
+     of this software and associated documentation files (the "Software"), to deal
+     in the Software without restriction, including without limitation the rights
+     to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+     copies of the Software, and to permit persons to whom the Software is
+     furnished to do so, subject to the following conditions:
+
+     The above copyright notice and this permission notice shall be included in all
+     copies or substantial portions of the Software.
+
+     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+     IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+     FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+     AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+     SOFTWARE.
+
+   Note on the underlying measurements: AutoEq's ParametricEQ results are
+   computed from headphone frequency-response measurements contributed by third
+   parties (oratory1990, Crinacle, Rtings and others), each of which publishes
+   under its own terms — some non-commercial. The bundled subset is a small,
+   curated convenience set; if you redistribute a larger set, check the terms of
+   the measurement sources it derives from.

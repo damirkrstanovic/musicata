@@ -4,6 +4,8 @@
   import { api } from "../lib/api";
   import { parseParametricEq } from "../lib/dsp";
   import { responseCurveDb, logFreqs } from "../lib/eqcurve";
+  // Curated ParametricEQ presets from the AutoEq project (MIT, (c) 2018 Jaakko Pasanen).
+  // See NOTICE for the full notice and a caveat on the underlying measurement data.
   import autoeqPresets from "../lib/autoeq-presets.json";
 
   function addOutput() {

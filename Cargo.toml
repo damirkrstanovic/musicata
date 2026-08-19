@@ -28,7 +28,7 @@ strip = true
 [workspace.package]
 edition = "2024"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/musicata/musicata"
+repository = "https://github.com/damirkrstanovic/musicata"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
