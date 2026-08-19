@@ -150,7 +150,6 @@ fn seekcur_arg(position_seconds: f64) -> String {
 }
 
 impl MpdConnection {
-
     pub async fn set_volume(&mut self, volume: u8) -> Result<()> {
         self.command(&format!("setvol {}", volume.min(100))).await?;
         Ok(())

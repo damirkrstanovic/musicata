@@ -155,7 +155,11 @@ pub fn analyze_loudness(
     let peak = (0..channels)
         .filter_map(|ch| ebu.true_peak(ch).ok())
         .fold(0.0f64, f64::max);
-    let true_peak_dbtp = if peak > 0.0 { 20.0 * peak.log10() } else { -120.0 };
+    let true_peak_dbtp = if peak > 0.0 {
+        20.0 * peak.log10()
+    } else {
+        -120.0
+    };
 
     Ok((lufs, true_peak_dbtp))
 }
@@ -206,14 +210,20 @@ mod tests {
             analyze_loudness(&sine_wav(4, 0.5), "wav", TEST_BUDGET).expect("analyze");
         // A half-scale 440 Hz tone sits well within a sane loudness range and below 0 dBFS.
         assert!(lufs > -30.0 && lufs < 0.0, "plausible LUFS, got {lufs}");
-        assert!(peak < 0.0 && peak > -12.0, "true-peak below 0 dBFS, got {peak}");
+        assert!(
+            peak < 0.0 && peak > -12.0,
+            "true-peak below 0 dBFS, got {peak}"
+        );
     }
 
     #[test]
     fn louder_tone_measures_higher() {
         let (quiet, _) = analyze_loudness(&sine_wav(4, 0.2), "wav", TEST_BUDGET).expect("quiet");
         let (loud, _) = analyze_loudness(&sine_wav(4, 0.8), "wav", TEST_BUDGET).expect("loud");
-        assert!(loud > quiet + 3.0, "louder tone is measurably louder: {quiet} -> {loud}");
+        assert!(
+            loud > quiet + 3.0,
+            "louder tone is measurably louder: {quiet} -> {loud}"
+        );
     }
 
     /// A malformed track that decodes into a dense run of garbage frames used to pin a CPU core
@@ -227,7 +237,10 @@ mod tests {
         let started = Instant::now();
         let result = analyze_loudness(&garbage, "mp3", Duration::from_millis(300));
         let elapsed = started.elapsed();
-        assert!(result.is_err(), "a pathological decode must not yield a reading");
+        assert!(
+            result.is_err(),
+            "a pathological decode must not yield a reading"
+        );
         assert!(
             elapsed < Duration::from_secs(3),
             "budget must abandon the decode promptly, took {elapsed:?}"

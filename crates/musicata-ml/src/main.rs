@@ -135,7 +135,10 @@ mod tests {
                 panic!("boom while holding the lock");
             })
         };
-        assert!(poisoner.join().is_err(), "the thread panicked, poisoning the lock");
+        assert!(
+            poisoner.join().is_err(),
+            "the thread panicked, poisoning the lock"
+        );
         assert!(mutex.lock().is_err(), "the mutex is now poisoned");
 
         // Recovery still yields the guard and the value.
@@ -161,7 +164,9 @@ async fn info(State(state): State<AppState>) -> Json<serde_json::Value> {
 /// Lock a mutex, recovering the guard even if a previous holder panicked. A single bad
 /// request must not poison the model and brick every later request.
 fn lock_recovered<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// `POST /analyze` — body is the raw audio file; returns the embedding + top tags.

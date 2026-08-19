@@ -198,10 +198,19 @@ mod tests {
             playing: true,
             prefetched: None,
         };
-        assert_eq!(decide(&view, &state("paused", Some("t1"), "/s")), Action::Pause);
+        assert_eq!(
+            decide(&view, &state("paused", Some("t1"), "/s")),
+            Action::Pause
+        );
 
-        let paused = EndpointView { playing: false, ..view.clone() };
-        assert_eq!(decide(&paused, &state("playing", Some("t1"), "/s")), Action::Resume);
+        let paused = EndpointView {
+            playing: false,
+            ..view.clone()
+        };
+        assert_eq!(
+            decide(&paused, &state("playing", Some("t1"), "/s")),
+            Action::Resume
+        );
     }
 
     #[test]
@@ -212,7 +221,10 @@ mod tests {
             playing: true,
             prefetched: None,
         };
-        assert_eq!(decide(&view, &state("playing", Some("t1"), "/s")), Action::Nothing);
+        assert_eq!(
+            decide(&view, &state("playing", Some("t1"), "/s")),
+            Action::Nothing
+        );
     }
 
     #[test]
@@ -224,7 +236,10 @@ mod tests {
             prefetched: None,
         };
         assert_eq!(decide(&view, &state("stopped", None, "")), Action::Stop);
-        assert_eq!(decide(&EndpointView::default(), &state("stopped", None, "")), Action::Nothing);
+        assert_eq!(
+            decide(&EndpointView::default(), &state("stopped", None, "")),
+            Action::Nothing
+        );
     }
 
     #[test]
@@ -268,7 +283,10 @@ mod tests {
         assert_eq!(prefetch_target(&view, &next), None);
         // Already prefetched → no repeat.
         next.next_up = Some(item(Some("t2"), "/api/tracks/t2/stream"));
-        let prefetched = EndpointView { prefetched: Some("t2".into()), ..view };
+        let prefetched = EndpointView {
+            prefetched: Some("t2".into()),
+            ..view
+        };
         assert_eq!(prefetch_target(&prefetched, &next), None);
     }
 

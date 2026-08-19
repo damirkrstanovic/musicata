@@ -95,7 +95,10 @@ impl AdaptiveLimiter {
     }
 
     fn increase(&self) {
-        let _guard = self.adjust.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self
+            .adjust
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.limit.load(Ordering::Relaxed);
         if current < self.max {
             self.sem.add_permits(1);
@@ -104,7 +107,10 @@ impl AdaptiveLimiter {
     }
 
     fn decrease(&self) {
-        let _guard = self.adjust.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self
+            .adjust
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.limit.load(Ordering::Relaxed);
         let target = (current / 2).max(self.min);
         if target < current {

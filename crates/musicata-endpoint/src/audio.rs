@@ -90,7 +90,9 @@ impl AudioPlayer {
         if send_token {
             request = request.set("Authorization", &format!("Bearer {}", self.token));
         }
-        let response = request.call().map_err(|error| anyhow!("fetch stream: {error}"))?;
+        let response = request
+            .call()
+            .map_err(|error| anyhow!("fetch stream: {error}"))?;
         let mut bytes = Vec::new();
         response
             .into_reader()
@@ -135,8 +137,14 @@ impl AudioPlayer {
     /// cost is paid before the boundary. Only library streams should be passed here (callers
     /// gate on `prefetch_target`); the buffer is dropped cheaply if the queue changes.
     pub fn prefetch(&mut self, stream_url: &str, track_id: &str) -> Result<()> {
-        let already = self.pending.as_ref().is_some_and(|p| p.track_id == track_id)
-            || self.appended.as_ref().is_some_and(|a| a.track_id == track_id);
+        let already = self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.track_id == track_id)
+            || self
+                .appended
+                .as_ref()
+                .is_some_and(|a| a.track_id == track_id);
         if already {
             return Ok(());
         }
@@ -254,8 +262,7 @@ mod tests {
 
     #[test]
     fn library_relative_url_resolves_and_carries_token() {
-        let (url, send_token) =
-            resolve_request("http://127.0.0.1:3030", "/api/tracks/t1/stream");
+        let (url, send_token) = resolve_request("http://127.0.0.1:3030", "/api/tracks/t1/stream");
         assert_eq!(url, "http://127.0.0.1:3030/api/tracks/t1/stream");
         assert!(send_token);
     }
@@ -264,8 +271,10 @@ mod tests {
     fn lookalike_host_does_not_receive_token() {
         // BUG-04: a prefix check sent the token to any URL textually starting with
         // base_url, e.g. an attacker host that merely shares the prefix.
-        let (url, send_token) =
-            resolve_request("http://127.0.0.1:3030", "http://127.0.0.1:3030.example.com/track");
+        let (url, send_token) = resolve_request(
+            "http://127.0.0.1:3030",
+            "http://127.0.0.1:3030.example.com/track",
+        );
         assert_eq!(url, "http://127.0.0.1:3030.example.com/track");
         assert!(!send_token, "token must not leak to a look-alike host");
     }

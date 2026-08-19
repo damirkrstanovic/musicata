@@ -10,8 +10,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
@@ -185,7 +185,10 @@ async fn resolve_user(
         role: user.role,
     };
     if let Some(token) = cookie
-        && let Ok(Some(user)) = state.database.session_user(&hash_token(&token), now()).await
+        && let Ok(Some(user)) = state
+            .database
+            .session_user(&hash_token(&token), now())
+            .await
     {
         return Some(to_current(user));
     }
@@ -276,7 +279,11 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
                 return next.run(request).await;
             }
             if is_stream_path(&path)
-                && state.database.player_token_exists(&hashed).await.unwrap_or(false)
+                && state
+                    .database
+                    .player_token_exists(&hashed)
+                    .await
+                    .unwrap_or(false)
             {
                 return next.run(request).await;
             }
@@ -297,7 +304,9 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
 // SameSite=Lax + HttpOnly; no `Secure` so it works over plain http on the LAN (the documented
 // deployment is LAN + VPN, not raw internet — see roadmap M12). A TLS reverse proxy can add it.
 fn session_cookie(token: &str) -> String {
-    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECONDS}")
+    format!(
+        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECONDS}"
+    )
 }
 
 fn cleared_cookie() -> String {
@@ -362,7 +371,9 @@ fn validate_credentials(username: &str, password: &str) -> Result<(), AppError> 
         return Err(AppError::bad_request("username is required"));
     }
     if password.len() < 8 {
-        return Err(AppError::bad_request("password must be at least 8 characters"));
+        return Err(AppError::bad_request(
+            "password must be at least 8 characters",
+        ));
     }
     if password.len() > MAX_PASSWORD_BYTES {
         return Err(AppError::bad_request("password is too long"));
@@ -493,7 +504,11 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
     if let Some(token) = cookie_value(&headers, SESSION_COOKIE) {
         let _ = state.database.delete_session(&hash_token(&token)).await;
     }
-    ([(header::SET_COOKIE, cleared_cookie())], StatusCode::NO_CONTENT).into_response()
+    (
+        [(header::SET_COOKIE, cleared_cookie())],
+        StatusCode::NO_CONTENT,
+    )
+        .into_response()
 }
 
 /// The signed-in user.
@@ -563,10 +578,16 @@ pub async fn change_password(
         return Err(AppError::unauthorized("current password is wrong"));
     }
     if body.new_password.len() < 8 {
-        return Err(AppError::bad_request("password must be at least 8 characters"));
+        return Err(AppError::bad_request(
+            "password must be at least 8 characters",
+        ));
     }
     let hash = hash_password(&body.new_password)?;
-    state.database.set_user_password(&user.id, &hash).await.map_err(internal)?;
+    state
+        .database
+        .set_user_password(&user.id, &hash)
+        .await
+        .map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -604,7 +625,9 @@ pub async fn create_user(
         .map_err(internal)?
         .is_some()
     {
-        return Err(AppError::bad_request("a user with that name already exists"));
+        return Err(AppError::bad_request(
+            "a user with that name already exists",
+        ));
     }
     let role = match body.role.as_deref() {
         Some(ROLE_ADMIN) => ROLE_ADMIN,
@@ -640,19 +663,33 @@ pub async fn update_user(
         .map_err(internal)?
         .ok_or_else(|| AppError::not_found("unknown user"))?;
     if let Some(role) = body.role.as_deref() {
-        let role = if role == ROLE_ADMIN { ROLE_ADMIN } else { ROLE_LISTENER };
+        let role = if role == ROLE_ADMIN {
+            ROLE_ADMIN
+        } else {
+            ROLE_LISTENER
+        };
         // Don't let the last admin demote themselves into a lockout.
         if target.role == ROLE_ADMIN && role == ROLE_LISTENER && admin_count(&state).await? <= 1 {
             return Err(AppError::bad_request("can't demote the only administrator"));
         }
-        state.database.set_user_role(&id, role).await.map_err(internal)?;
+        state
+            .database
+            .set_user_role(&id, role)
+            .await
+            .map_err(internal)?;
     }
     if let Some(password) = body.password {
         if password.len() < 8 {
-            return Err(AppError::bad_request("password must be at least 8 characters"));
+            return Err(AppError::bad_request(
+                "password must be at least 8 characters",
+            ));
         }
         let hash = hash_password(&password)?;
-        state.database.set_user_password(&id, &hash).await.map_err(internal)?;
+        state
+            .database
+            .set_user_password(&id, &hash)
+            .await
+            .map_err(internal)?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -701,22 +738,36 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let db = Database::connect(dir.join("test.db")).await.expect("connect");
+        let db = Database::connect(dir.join("test.db"))
+            .await
+            .expect("connect");
 
         // Too-short password is rejected.
         assert!(reset_admin_password(&db, "alice", "short").await.is_err());
 
         // Absent user → created as an admin with the given password.
-        let outcome = reset_admin_password(&db, "alice", "longenough").await.expect("create");
+        let outcome = reset_admin_password(&db, "alice", "longenough")
+            .await
+            .expect("create");
         assert!(matches!(outcome, ResetOutcome::Created));
-        let user = db.user_by_username("alice").await.unwrap().expect("user exists");
+        let user = db
+            .user_by_username("alice")
+            .await
+            .unwrap()
+            .expect("user exists");
         assert_eq!(user.role, ROLE_ADMIN);
         assert!(verify_password("longenough", &user.password_hash));
 
         // Existing user → password updated.
-        let outcome = reset_admin_password(&db, "alice", "anotherpass").await.expect("update");
+        let outcome = reset_admin_password(&db, "alice", "anotherpass")
+            .await
+            .expect("update");
         assert!(matches!(outcome, ResetOutcome::Updated));
-        let user = db.user_by_username("alice").await.unwrap().expect("user exists");
+        let user = db
+            .user_by_username("alice")
+            .await
+            .unwrap()
+            .expect("user exists");
         assert!(verify_password("anotherpass", &user.password_hash));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -810,8 +861,14 @@ mod tests {
     #[test]
     fn cookie_parsing() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "foo=bar; musicata_session=abc123; x=y".parse().unwrap());
-        assert_eq!(cookie_value(&headers, SESSION_COOKIE), Some("abc123".to_string()));
+        headers.insert(
+            header::COOKIE,
+            "foo=bar; musicata_session=abc123; x=y".parse().unwrap(),
+        );
+        assert_eq!(
+            cookie_value(&headers, SESSION_COOKIE),
+            Some("abc123".to_string())
+        );
         assert_eq!(cookie_value(&headers, "missing"), None);
     }
 }

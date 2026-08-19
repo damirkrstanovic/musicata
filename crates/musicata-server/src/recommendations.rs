@@ -18,8 +18,7 @@ use musicata_storage::Database;
 /// The ListenBrainz Labs similarity model (session-based collaborative filtering). The string
 /// encodes the model's own knobs (`limit_50`, `skip_30`, `threshold_15`); it is versioned
 /// upstream and may need refreshing — check labs.api.listenbrainz.org if results dry up.
-pub const LB_SIMILAR_ALGORITHM: &str =
-    "session_based_days_7500_session_300_contribution_5_threshold_15_limit_50_skip_30_top_n_listeners_1000";
+pub const LB_SIMILAR_ALGORITHM: &str = "session_based_days_7500_session_300_contribution_5_threshold_15_limit_50_skip_30_top_n_listeners_1000";
 /// similar-artists uses a *different* algorithm enum than similar-recordings (no
 /// `top_n_listeners`). Artist similarity has far better coverage, so it's the primary source.
 pub const LB_ARTISTS_ALGORITHM: &str =
@@ -111,7 +110,9 @@ impl ListenBrainzClient {
             .call()
             .map_err(|error| match error {
                 ureq::Error::Status(status, response) => {
-                    let body = response.into_string().unwrap_or_else(|_| "<no body>".to_string());
+                    let body = response
+                        .into_string()
+                        .unwrap_or_else(|_| "<no body>".to_string());
                     format!("ListenBrainz HTTP {status}: {body}")
                 }
                 ureq::Error::Transport(error) => error.to_string(),
@@ -134,7 +135,9 @@ impl ListenBrainzClient {
             .call()
             .map_err(|error| match error {
                 ureq::Error::Status(status, response) => {
-                    let body = response.into_string().unwrap_or_else(|_| "<no body>".to_string());
+                    let body = response
+                        .into_string()
+                        .unwrap_or_else(|_| "<no body>".to_string());
                     format!("ListenBrainz HTTP {status}: {body}")
                 }
                 ureq::Error::Transport(error) => error.to_string(),
@@ -175,7 +178,10 @@ fn parse_similar_artists(value: &Value) -> Vec<ScoredArtist> {
 
 /// Parse a ListenBrainz Labs similar-recordings response into scored MBIDs.
 fn parse_similar_recordings(value: &Value) -> Vec<ScoredMbid> {
-    parse_scored(value, "recording_mbid", |mbid, score| ScoredMbid { mbid, score })
+    parse_scored(value, "recording_mbid", |mbid, score| ScoredMbid {
+        mbid,
+        score,
+    })
 }
 
 /// Cached similar recordings for a seed MBID: serve the cache if fresh, else fetch (once,
@@ -186,10 +192,13 @@ async fn cached_similar_recordings(
     recording_mbid: &str,
     now_unix: i64,
 ) -> Vec<ScoredMbid> {
-    if let Ok(Some((json, fetched))) = database.get_similarity_cache("recording", recording_mbid).await
-        && now_unix - fetched < CACHE_TTL_SECONDS {
-            return serde_json::from_str(&json).unwrap_or_default();
-        }
+    if let Ok(Some((json, fetched))) = database
+        .get_similarity_cache("recording", recording_mbid)
+        .await
+        && now_unix - fetched < CACHE_TTL_SECONDS
+    {
+        return serde_json::from_str(&json).unwrap_or_default();
+    }
     let client = client.clone();
     let mbid = recording_mbid.to_string();
     let fetched = tokio::task::spawn_blocking(move || client.similar_recordings(&mbid)).await;
@@ -215,15 +224,18 @@ async fn cached_similar_artists(
     now_unix: i64,
 ) -> Vec<ScoredArtist> {
     if let Ok(Some((json, fetched))) = database.get_similarity_cache("artist", artist_mbid).await
-        && now_unix - fetched < CACHE_TTL_SECONDS {
-            return serde_json::from_str(&json).unwrap_or_default();
-        }
+        && now_unix - fetched < CACHE_TTL_SECONDS
+    {
+        return serde_json::from_str(&json).unwrap_or_default();
+    }
     let client = client.clone();
     let mbid = artist_mbid.to_string();
     match tokio::task::spawn_blocking(move || client.similar_artists(&mbid)).await {
         Ok(Ok(artists)) => {
             if let Ok(json) = serde_json::to_string(&artists) {
-                let _ = database.set_similarity_cache("artist", artist_mbid, &json, now_unix).await;
+                let _ = database
+                    .set_similarity_cache("artist", artist_mbid, &json, now_unix)
+                    .await;
             }
             artists
         }
@@ -246,15 +258,21 @@ async fn seed_artist_mbid(
     if let Ok(Some(mbid)) = database.track_artist_mbid(seed_track_id).await {
         return Some(mbid);
     }
-    let artist_name = database.track(seed_track_id).await.ok().flatten()?.artist_name;
+    let artist_name = database
+        .track(seed_track_id)
+        .await
+        .ok()
+        .flatten()?
+        .artist_name;
     let key = artist_name.trim().to_lowercase();
     if key.is_empty() {
         return None;
     }
     if let Ok(Some((cached, fetched))) = database.get_similarity_cache("artist_name", &key).await
-        && now_unix - fetched < CACHE_TTL_SECONDS {
-            return (!cached.is_empty()).then_some(cached);
-        }
+        && now_unix - fetched < CACHE_TTL_SECONDS
+    {
+        return (!cached.is_empty()).then_some(cached);
+    }
     let mb = mb.clone();
     let name = artist_name.clone();
     let mbid = match tokio::task::spawn_blocking(move || mb.search_artist_mbid(&name)).await {
@@ -367,11 +385,15 @@ pub async fn similar_track_ids(
     let mut seen = exclude.clone();
     seen.insert(seed_track_id.to_string());
     if let Some(window) = recency_window_secs
-        && let Ok(recent) = database.recently_played_track_ids(now_unix - window).await {
-            seen.extend(recent);
-        }
+        && let Ok(recent) = database.recently_played_track_ids(now_unix - window).await
+    {
+        seen.extend(recent);
+    }
     // Skip penalty: tracks the listener keeps skipping are held back, not banned (see below).
-    let penalized = database.frequently_skipped_track_ids().await.unwrap_or_default();
+    let penalized = database
+        .frequently_skipped_track_ids()
+        .await
+        .unwrap_or_default();
 
     let mut out: Vec<String> = Vec::new();
     let mut deferred: Vec<String> = Vec::new();
@@ -403,7 +425,10 @@ pub async fn similar_track_ids(
                     // Key by lowercase explicitly so the lookup in
                     // `weighted_artist_track_order` (also lowercased) matches regardless of
                     // the case the storage query returns.
-                    by_artist.entry(name.to_lowercase()).or_default().push(track_id);
+                    by_artist
+                        .entry(name.to_lowercase())
+                        .or_default()
+                        .push(track_id);
                 }
                 let seed = (now_unix as u64) ^ fnv1a(seed_track_id);
                 for id in weighted_artist_track_order(&artists, &by_artist, seed, PER_ARTIST) {
@@ -417,19 +442,20 @@ pub async fn similar_track_ids(
 
     // 2. Similar recordings (bonus — often empty for a given recording MBID).
     if out.len() < limit
-        && let Ok(Some(mbid)) = database.track_recording_mbid(seed_track_id).await {
-            let scored = cached_similar_recordings(database, client, &mbid, now_unix).await;
-            if !scored.is_empty() {
-                let mbids: Vec<String> = scored.into_iter().map(|s| s.mbid).collect();
-                if let Ok(local) = database.tracks_for_recording_mbids(&mbids).await {
-                    for id in local {
-                        if consider!(id) {
-                            break;
-                        }
+        && let Ok(Some(mbid)) = database.track_recording_mbid(seed_track_id).await
+    {
+        let scored = cached_similar_recordings(database, client, &mbid, now_unix).await;
+        if !scored.is_empty() {
+            let mbids: Vec<String> = scored.into_iter().map(|s| s.mbid).collect();
+            if let Ok(local) = database.tracks_for_recording_mbids(&mbids).await {
+                for id in local {
+                    if consider!(id) {
+                        break;
                     }
                 }
             }
         }
+    }
 
     // 3. Local content fallback (always available, no network).
     if out.len() < limit {
@@ -466,7 +492,13 @@ mod tests {
         ]);
         let parsed = parse_similar_recordings(&value);
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0], ScoredMbid { mbid: "a".into(), score: 458.0 });
+        assert_eq!(
+            parsed[0],
+            ScoredMbid {
+                mbid: "a".into(),
+                score: 458.0
+            }
+        );
         assert_eq!(parsed[1].mbid, "b");
     }
 
@@ -506,19 +538,31 @@ mod tests {
         ]);
         let parsed = parse_similar_artists(&value);
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0], ScoredArtist { name: "Nile Rodgers".into(), score: 10614.0 });
+        assert_eq!(
+            parsed[0],
+            ScoredArtist {
+                name: "Nile Rodgers".into(),
+                score: 10614.0
+            }
+        );
         assert_eq!(parsed[1].name, "Gorillaz");
     }
 
     fn artist(name: &str, score: f64) -> ScoredArtist {
-        ScoredArtist { name: name.into(), score }
+        ScoredArtist {
+            name: name.into(),
+            score,
+        }
     }
 
     fn pool(entries: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
         entries
             .iter()
             .map(|(name, tracks)| {
-                (name.to_lowercase(), tracks.iter().map(|t| t.to_string()).collect())
+                (
+                    name.to_lowercase(),
+                    tracks.iter().map(|t| t.to_string()).collect(),
+                )
             })
             .collect()
     }
@@ -570,16 +614,28 @@ mod tests {
         let artists = client
             .similar_artists("b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d")
             .expect("live similar-artists call");
-        assert!(!artists.is_empty(), "expected similar artists for The Beatles");
+        assert!(
+            !artists.is_empty(),
+            "expected similar artists for The Beatles"
+        );
         assert!(artists[0].score > 0.0, "first artist should carry a score");
-        assert!(!artists[0].name.is_empty(), "first artist should have a name");
+        assert!(
+            !artists[0].name.is_empty(),
+            "first artist should have a name"
+        );
 
         // similar-recordings: sparse, but a top LB-indexed Beatles recording has neighbors.
         let recordings = client
             .similar_recordings("0cdc9b5b-b16b-4ff1-9f16-5b4ba76f1c17")
             .expect("live similar-recordings call");
-        assert!(!recordings.is_empty(), "expected similar recordings for an indexed MBID");
-        assert!(recordings[0].score > 0.0, "first recording should carry a score");
+        assert!(
+            !recordings.is_empty(),
+            "expected similar recordings for an indexed MBID"
+        );
+        assert!(
+            recordings[0].score > 0.0,
+            "first recording should carry a score"
+        );
     }
 
     #[test]
@@ -589,9 +645,14 @@ mod tests {
         let artists = [artist("High", 1000.0), artist("Low", 1.0)];
         let by_artist = pool(&[("High", &["h"]), ("Low", &["l"])]);
         let high_first = (0..400u64)
-            .filter(|&seed| weighted_artist_track_order(&artists, &by_artist, seed, 1).first()
-                == Some(&"h".to_string()))
+            .filter(|&seed| {
+                weighted_artist_track_order(&artists, &by_artist, seed, 1).first()
+                    == Some(&"h".to_string())
+            })
             .count();
-        assert!(high_first > 320, "expected High to lead most draws, got {high_first}/400");
+        assert!(
+            high_first > 320,
+            "expected High to lead most draws, got {high_first}/400"
+        );
     }
 }

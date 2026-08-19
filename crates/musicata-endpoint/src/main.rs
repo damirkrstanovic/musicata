@@ -91,11 +91,17 @@ fn resolve_creds(args: &Args) -> Result<Creds> {
             .user_token
             .as_deref()
             .context("--register needs --user-token (your Musicata API token)")?;
-        let name = args.name.clone().unwrap_or_else(|| "Musicata Endpoint".to_string());
+        let name = args
+            .name
+            .clone()
+            .unwrap_or_else(|| "Musicata Endpoint".to_string());
         let address = args.address.clone().unwrap_or_else(|| slug(&name));
         let creds = register(&args.server, user_token, &name, &address)?;
         save_creds(&args.state, &creds)?;
-        eprintln!("registered '{name}' as player {} — saved to {}", creds.id, args.state);
+        eprintln!(
+            "registered '{name}' as player {} — saved to {}",
+            creds.id, args.state
+        );
         return Ok(creds);
     }
     if let (Some(id), Some(token)) = (args.id.clone(), args.token.clone()) {
@@ -129,7 +135,9 @@ fn register(server: &str, user_token: &str, name: &str, address: &str) -> Result
         }))
         .map_err(|error| anyhow!("register: {error}"))?;
     let body: serde_json::Value = response.into_json().context("decode registration")?;
-    let id = body["id"].as_str().context("registration returned no player id")?;
+    let id = body["id"]
+        .as_str()
+        .context("registration returned no player id")?;
     let token = body["auth_token"]
         .as_str()
         .context("registration returned no token (issue_token rejected?)")?;
@@ -168,9 +176,7 @@ fn run_session(creds: &Creds, audio: &mut AudioPlayer, view: &mut EndpointView) 
                     .ok()
                     .and_then(|value| value.get("type").cloned())
                     .is_some();
-                if !is_event
-                    && let Ok(state) = serde_json::from_str::<PlaybackState>(body)
-                {
+                if !is_event && let Ok(state) = serde_json::from_str::<PlaybackState>(body) {
                     apply(audio, view, &state);
                     next_target = prefetch_target(view, &state);
                 }
@@ -230,19 +236,31 @@ fn run_session(creds: &Creds, audio: &mut AudioPlayer, view: &mut EndpointView) 
 /// Apply the decided action to the audio player and update our view of what we're doing.
 fn apply(audio: &mut AudioPlayer, view: &mut EndpointView, next: &PlaybackState) {
     match decide(view, next) {
-        Action::Load { stream_url, title, play } => {
+        Action::Load {
+            stream_url,
+            title,
+            play,
+        } => {
             if !title.is_empty() {
                 eprintln!("▶ {title}");
             }
             if let Err(error) = audio.load(&stream_url, play) {
                 eprintln!("load failed: {error}");
             }
-            view.track_id = next.now_playing.as_ref().and_then(|item| item.track_id.clone());
+            view.track_id = next
+                .now_playing
+                .as_ref()
+                .and_then(|item| item.track_id.clone());
             view.stream_url = Some(stream_url);
             view.prefetched = None;
             view.playing = play;
         }
-        Action::Advance { track_id, stream_url, title, play } => {
+        Action::Advance {
+            track_id,
+            stream_url,
+            title,
+            play,
+        } => {
             // The cursor reached the track we already appended — it's playing gaplessly. Adopt
             // it as current; only sync the pause state, since the audio already advanced.
             if !title.is_empty() {
@@ -302,10 +320,20 @@ fn ws_target(server: &str, id: &str, token: &str) -> Result<(String, String)> {
 fn slug(name: &str) -> String {
     let s: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     let s = s.trim_matches('-').to_string();
-    if s.is_empty() { "endpoint".to_string() } else { s }
+    if s.is_empty() {
+        "endpoint".to_string()
+    } else {
+        s
+    }
 }
 
 fn save_creds(path: &str, creds: &Creds) -> Result<()> {
@@ -424,9 +452,15 @@ mod tests {
     fn args_require_server() {
         assert!(Args::parse(["--register"].into_iter().map(String::from)).is_err());
         let args = Args::parse(
-            ["--server", "http://h:3030", "--register", "--user-token", "x"]
-                .into_iter()
-                .map(String::from),
+            [
+                "--server",
+                "http://h:3030",
+                "--register",
+                "--user-token",
+                "x",
+            ]
+            .into_iter()
+            .map(String::from),
         )
         .unwrap();
         assert!(args.register);

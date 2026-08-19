@@ -143,10 +143,12 @@ async fn handle(
     // carry one `songId` per track — a 64 KiB limit silently dropped large playlists (and
     // with them the auth params), surfacing as a confusing "missing parameter" error.
     let mut pairs = parse_pairs(parts.uri.query().unwrap_or(""));
-    if parts.method == Method::POST && is_form_body(&parts.headers)
-        && let Ok(bytes) = to_bytes(body, MAX_FORM_BODY_BYTES).await {
-            pairs.extend(parse_pairs(&String::from_utf8_lossy(&bytes)));
-        }
+    if parts.method == Method::POST
+        && is_form_body(&parts.headers)
+        && let Ok(bytes) = to_bytes(body, MAX_FORM_BODY_BYTES).await
+    {
+        pairs.extend(parse_pairs(&String::from_utf8_lossy(&bytes)));
+    }
     // `all` keeps every value per key (for repeated params); `params` is first-value.
     let mut all: HashMap<String, Vec<String>> = HashMap::new();
     for (key, value) in pairs {
@@ -1508,7 +1510,10 @@ mod tests {
         // ISS-10: newline/tab/CR in an attribute must be numeric-escaped, else XML
         // attribute-value normalization collapses them to spaces and the value is lost.
         assert_eq!(escape_attr("a\nb\tc\rd"), "a&#xA;b&#x9;c&#xD;d");
-        assert_eq!(escape_attr("Rock & \"Roll\""), "Rock &amp; &quot;Roll&quot;");
+        assert_eq!(
+            escape_attr("Rock & \"Roll\""),
+            "Rock &amp; &quot;Roll&quot;"
+        );
     }
 
     #[test]

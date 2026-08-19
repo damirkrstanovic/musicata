@@ -24,11 +24,11 @@ mod backup;
 mod dsp;
 mod fingerprint;
 mod loudness;
+mod ml;
 mod mpd;
 mod musicbrainz;
 #[cfg(feature = "provider-opensubsonic")]
 mod opensubsonic;
-mod ml;
 mod players;
 #[cfg(feature = "provider-podcast")]
 mod podcast;
@@ -843,7 +843,10 @@ fn spawn_smb_watchers(
         if watching == 0 {
             return;
         }
-        tracing::info!(sources = watching, "watching SMB sources for changes (change-notify)");
+        tracing::info!(
+            sources = watching,
+            "watching SMB sources for changes (change-notify)"
+        );
 
         // Debounced consumer: coalesce a burst of notifications into one incremental rescan,
         // then restore acquired/local-cache artwork + grouping (as the discovery loop does).
@@ -1091,27 +1094,27 @@ async fn autoplay_loop(
         }
         if let Some(handle) = players.get(players::BROWSER_PLAYER_ID).await
             && let Ok(state) = handle.state(&database).await
-                && let Some(ids) =
-                    autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await
-                {
-                    let _ = handle
-                        .execute(
-                            PlayerCommand::Enqueue { track_ids: ids },
-                            &database,
-                            players.public_base_url(),
-                        )
-                        .await;
-                }
+            && let Some(ids) =
+                autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await
+        {
+            let _ = handle
+                .execute(
+                    PlayerCommand::Enqueue { track_ids: ids },
+                    &database,
+                    players.public_base_url(),
+                )
+                .await;
+        }
         if let Ok(zones) = players.zones().await {
             for zone in zones {
                 if let Ok(state) = players.zone_state(&zone.id).await
                     && let Some(ids) =
                         autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await
-                    {
-                        let _ = players
-                            .command_zone(&zone.id, PlayerCommand::Enqueue { track_ids: ids })
-                            .await;
-                    }
+                {
+                    let _ = players
+                        .command_zone(&zone.id, PlayerCommand::Enqueue { track_ids: ids })
+                        .await;
+                }
             }
         }
     }
@@ -1180,7 +1183,10 @@ async fn loudness_pass(
     let after = after
         .as_ref()
         .map(|(artist, title, id)| (artist.as_str(), title.as_str(), id.as_str()));
-    let targets = match database.tracks_missing_loudness(after, LOUDNESS_BATCH).await {
+    let targets = match database
+        .tracks_missing_loudness(after, LOUDNESS_BATCH)
+        .await
+    {
         Ok(targets) => targets,
         Err(error) => {
             tracing::warn!(%error, "loudness: failed to list tracks");
@@ -1192,7 +1198,11 @@ async fn loudness_pass(
     }
     // The last track in stable order — the cursor to resume from, regardless of how many stored.
     let next_cursor = targets.last().map(|target| {
-        (target.artist_name.clone(), target.title.clone(), target.track_id.clone())
+        (
+            target.artist_name.clone(),
+            target.title.clone(),
+            target.track_id.clone(),
+        )
     });
 
     let total = targets.len();
@@ -1924,62 +1934,74 @@ async fn snapcast_settings_from_db(
         settings.manage_server = value == "true";
     }
     if let Some(value) = get("snapcast.server_binary").await?
-        && !value.is_empty() {
-            settings.server_binary = value;
-        }
+        && !value.is_empty()
+    {
+        settings.server_binary = value;
+    }
     if let Some(value) = get("snapcast.fifo_path").await?
-        && !value.is_empty() {
-            settings.fifo_path = value.into();
-        }
+        && !value.is_empty()
+    {
+        settings.fifo_path = value.into();
+    }
     if let Some(value) = get("snapcast.sample_rate").await?
-        && let Ok(rate) = value.parse() {
-            settings.sample_rate = rate;
-        }
+        && let Ok(rate) = value.parse()
+    {
+        settings.sample_rate = rate;
+    }
     if let Some(value) = get("snapcast.control_host").await?
-        && !value.is_empty() {
-            settings.control_host = value;
-        }
+        && !value.is_empty()
+    {
+        settings.control_host = value;
+    }
     if let Some(value) = get("snapcast.control_port").await?
-        && let Ok(port) = value.parse() {
-            settings.control_port = port;
-        }
+        && let Ok(port) = value.parse()
+    {
+        settings.control_port = port;
+    }
     if let Some(value) = get("snapcast.http_port").await?
-        && let Ok(port) = value.parse() {
-            settings.http_port = port;
-        }
+        && let Ok(port) = value.parse()
+    {
+        settings.http_port = port;
+    }
     if let Some(value) = get("snapcast.auth_enabled").await? {
         settings.auth_enabled = value == "true";
     }
     if let Some(value) = get("snapcast.server_host").await?
-        && !value.is_empty() {
-            settings.server_host = value;
-        }
+        && !value.is_empty()
+    {
+        settings.server_host = value;
+    }
     if let Some(value) = get("snapcast.airplay_enabled").await? {
         settings.airplay_enabled = value == "true";
     }
     if let Some(value) = get("snapcast.airplay_binary").await?
-        && !value.is_empty() {
-            settings.airplay_binary = value;
-        }
+        && !value.is_empty()
+    {
+        settings.airplay_binary = value;
+    }
     if let Some(value) = get("snapcast.airplay_device_name").await?
-        && !value.is_empty() {
-            settings.airplay_device_name = value;
-        }
+        && !value.is_empty()
+    {
+        settings.airplay_device_name = value;
+    }
     if let Some(value) = get("snapcast.spotify_enabled").await? {
         settings.spotify_enabled = value == "true";
     }
     if let Some(value) = get("snapcast.spotify_binary").await?
-        && !value.is_empty() {
-            settings.spotify_binary = value;
-        }
+        && !value.is_empty()
+    {
+        settings.spotify_binary = value;
+    }
     if let Some(value) = get("snapcast.spotify_device_name").await?
-        && !value.is_empty() {
-            settings.spotify_device_name = value;
-        }
+        && !value.is_empty()
+    {
+        settings.spotify_device_name = value;
+    }
     if let Some(value) = get("snapcast.spotify_bitrate").await?
-        && let Ok(bitrate) = value.parse() {
-            settings.spotify_bitrate = bitrate;
-        }
+        && let Ok(bitrate) = value.parse()
+    {
+        settings.spotify_bitrate = bitrate;
+    }
     settings.rooms = snapcast_rooms_from_db(database).await;
     Ok(settings)
 }
@@ -3081,7 +3103,11 @@ async fn track_radio(
     let mut track_ids = Vec::with_capacity(similar.len() + 1);
     track_ids.push(id);
     track_ids.extend(similar);
-    let tracks = state.database.tracks_by_ids(&track_ids).await.map_err(db_error)?;
+    let tracks = state
+        .database
+        .tracks_by_ids(&track_ids)
+        .await
+        .map_err(db_error)?;
     Ok(Json(RadioResponse { tracks }))
 }
 
@@ -3103,9 +3129,15 @@ async fn track_similar(
         .similar_by_embedding(&id, limit)
         .await
         .map_err(db_error)?;
-    let track_ids: Vec<String> =
-        similar.into_iter().map(|(track_id, _distance)| track_id).collect();
-    let tracks = state.database.tracks_by_ids(&track_ids).await.map_err(db_error)?;
+    let track_ids: Vec<String> = similar
+        .into_iter()
+        .map(|(track_id, _distance)| track_id)
+        .collect();
+    let tracks = state
+        .database
+        .tracks_by_ids(&track_ids)
+        .await
+        .map_err(db_error)?;
     Ok(Json(RadioResponse { tracks }))
 }
 
@@ -3122,7 +3154,11 @@ async fn track_audio_radio(
         return Err(AppError::not_found(format!("unknown track: {id}")));
     }
     let limit = query.limit.unwrap_or(25).clamp(1, 100);
-    let mut similar = state.database.audio_radio(&id, limit).await.map_err(db_error)?;
+    let mut similar = state
+        .database
+        .audio_radio(&id, limit)
+        .await
+        .map_err(db_error)?;
     if similar.is_empty() {
         // The seed has no audio embedding yet (musicata-ml hasn't analyzed the library), so the
         // "sounds-like" KNN returns nothing — fall back to the metadata/ListenBrainz similar radio
@@ -3143,7 +3179,11 @@ async fn track_audio_radio(
     let mut track_ids = Vec::with_capacity(similar.len() + 1);
     track_ids.push(id);
     track_ids.extend(similar);
-    let tracks = state.database.tracks_by_ids(&track_ids).await.map_err(db_error)?;
+    let tracks = state
+        .database
+        .tracks_by_ids(&track_ids)
+        .await
+        .map_err(db_error)?;
     Ok(Json(RadioResponse { tracks }))
 }
 
@@ -4430,7 +4470,10 @@ async fn update_settings(
     if let Some(enabled) = update.ml_enabled {
         state
             .database
-            .set_setting(ml::SETTING_ML_ENABLED, if enabled { "true" } else { "false" })
+            .set_setting(
+                ml::SETTING_ML_ENABLED,
+                if enabled { "true" } else { "false" },
+            )
             .await
             .map_err(db_error)?;
     }
@@ -4451,7 +4494,10 @@ async fn update_settings(
     if let Some(enabled) = update.history_enabled {
         state
             .database
-            .set_setting(SETTING_HISTORY_ENABLED, if enabled { "true" } else { "false" })
+            .set_setting(
+                SETTING_HISTORY_ENABLED,
+                if enabled { "true" } else { "false" },
+            )
             .await
             .map_err(db_error)?;
     }
@@ -5088,23 +5134,26 @@ async fn create_source(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
-                    AppError::bad_request("an item identifier is required for an Internet Archive source")
+                    AppError::bad_request(
+                        "an item identifier is required for an Internet Archive source",
+                    )
                 })?;
-            let identifier = crate::archive_org::ArchiveConfig::from_record(&musicata_storage::SourceRecord {
-                id: String::new(),
-                kind: "archive".to_string(),
-                display_name: String::new(),
-                enabled: true,
-                host: Some(raw.to_string()),
-                share: None,
-                base_path: None,
-                username: None,
-                password: None,
-                domain: None,
-                created_at_unix_seconds: 0,
-            })
-            .map_err(|error| AppError::bad_request(error.to_string()))?
-            .identifier;
+            let identifier =
+                crate::archive_org::ArchiveConfig::from_record(&musicata_storage::SourceRecord {
+                    id: String::new(),
+                    kind: "archive".to_string(),
+                    display_name: String::new(),
+                    enabled: true,
+                    host: Some(raw.to_string()),
+                    share: None,
+                    base_path: None,
+                    username: None,
+                    password: None,
+                    domain: None,
+                    created_at_unix_seconds: 0,
+                })
+                .map_err(|error| AppError::bad_request(error.to_string()))?
+                .identifier;
             let display_name = request
                 .display_name
                 .as_deref()
@@ -5932,7 +5981,13 @@ async fn resolve_album_cover(
         // folder/embedded cover promoted to an acquired row), not a real image extension.
         if let Some(bytes) = artwork_cache.get(&key, &ext).await {
             let content_type = sniff_image_content_type(&bytes);
-            return Ok(Some(AlbumCover { key, cache_ext: ext, content_type, bytes, persisted: true }));
+            return Ok(Some(AlbumCover {
+                key,
+                cache_ext: ext,
+                content_type,
+                bytes,
+                persisted: true,
+            }));
         }
         // Cache miss (cleared/evicted) but we recorded the source — re-fetch once. Only an
         // external cover has a `remote_url`; a local-cache row falls through to re-read the source.
@@ -5945,7 +6000,13 @@ async fn resolve_album_cover(
             if let Some((bytes, _)) = downloaded {
                 artwork_cache.put(&key, &ext, &bytes).await;
                 let content_type = sniff_image_content_type(&bytes);
-                return Ok(Some(AlbumCover { key, cache_ext: ext, content_type, bytes, persisted: true }));
+                return Ok(Some(AlbumCover {
+                    key,
+                    cache_ext: ext,
+                    content_type,
+                    bytes,
+                    persisted: true,
+                }));
             }
         }
         // Couldn't produce it — fall through to the embedded/folder logic.
@@ -6002,7 +6063,8 @@ async fn resolve_album_cover(
     {
         let provider_id = database.album_provider_id(id).await.map_err(db_error)?;
         if let Some(provider_id) = provider_id
-            && let Some(providers::ProviderHandle::Smb(smb)) = providers.read().await.get(&provider_id)
+            && let Some(providers::ProviderHandle::Smb(smb)) =
+                providers.read().await.get(&provider_id)
         {
             let key = artwork_asset_id(&path);
             let extension = artwork_extension(&path);
@@ -6181,11 +6243,18 @@ async fn artwork_prewarm_loop(
             }
             // Periodic progress so a long first pass over a large library is visible.
             if newly > 0 && newly % 200 == 0 {
-                tracing::info!(warmed = warmed.len(), "artwork prewarm: warming album covers…");
+                tracing::info!(
+                    warmed = warmed.len(),
+                    "artwork prewarm: warming album covers…"
+                );
             }
         }
         if newly > 0 {
-            tracing::info!(newly, total = warmed.len(), "artwork prewarm: warmed album covers");
+            tracing::info!(
+                newly,
+                total = warmed.len(),
+                "artwork prewarm: warmed album covers"
+            );
         }
         // All resolvable covers cached → idle; re-list periodically so covers added by a later
         // scan (and any that failed transiently) get another pass.
@@ -6565,9 +6634,13 @@ async fn read_album_source_file(
 ) -> Result<Vec<u8>, AppError> {
     #[cfg(feature = "provider-smb")]
     {
-        let provider_id = database.album_provider_id(album_id).await.map_err(db_error)?;
+        let provider_id = database
+            .album_provider_id(album_id)
+            .await
+            .map_err(db_error)?;
         if let Some(provider_id) = provider_id
-            && let Some(providers::ProviderHandle::Smb(smb)) = providers.read().await.get(&provider_id)
+            && let Some(providers::ProviderHandle::Smb(smb)) =
+                providers.read().await.get(&provider_id)
         {
             let item_id = path.to_string_lossy().into_owned();
             return smb.read_file(&item_id).await.map_err(|error| {
@@ -8231,7 +8304,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/auth/setup")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"username":"admin","password":"password123"}"#))
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"password123"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -8265,7 +8340,10 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&body_text(registered.into_body()).await).unwrap();
         let player_id = body["id"].as_str().expect("player id").to_string();
-        let token = body["auth_token"].as_str().expect("token issued").to_string();
+        let token = body["auth_token"]
+            .as_str()
+            .expect("token issued")
+            .to_string();
 
         let state_path = format!("/api/players/{player_id}/state");
         let get = |creds: Option<(&'static str, String)>| {
@@ -8327,7 +8405,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/auth/setup")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"username":"admin","password":"password123"}"#))
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"password123"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -8360,7 +8440,10 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&body_text(registered.into_body()).await).unwrap();
         assert_eq!(body["kind"], "native");
-        let token = body["auth_token"].as_str().expect("token issued").to_string();
+        let token = body["auth_token"]
+            .as_str()
+            .expect("token issued")
+            .to_string();
 
         // A real track id from the fixture library (via the admin session).
         let tracks: serde_json::Value = serde_json::from_str(
@@ -8380,7 +8463,10 @@ mod tests {
             .await,
         )
         .unwrap();
-        let track_id = tracks["items"][0]["id"].as_str().expect("a track id").to_string();
+        let track_id = tracks["items"][0]["id"]
+            .as_str()
+            .expect("a track id")
+            .to_string();
         let stream_path = format!("/api/tracks/{track_id}/stream");
 
         let stream = |auth: Option<String>| {
@@ -8393,13 +8479,22 @@ mod tests {
 
         // The endpoint token authenticates the stream (auth passes — not 401).
         assert_ne!(
-            stream(Some(format!("Bearer {token}"))).await.unwrap().status(),
+            stream(Some(format!("Bearer {token}")))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::UNAUTHORIZED
         );
         // No credential and a wrong token are both rejected.
-        assert_eq!(stream(None).await.unwrap().status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
-            stream(Some("Bearer nope".to_string())).await.unwrap().status(),
+            stream(None).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            stream(Some("Bearer nope".to_string()))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::UNAUTHORIZED
         );
     }
@@ -8704,7 +8799,11 @@ mod tests {
             serde_json::from_str(&body_text(cleared.into_body()).await).unwrap();
         assert_eq!(cleared["removed"], 1);
         assert_eq!(
-            history(&app, "/api/history/recent").await.as_array().unwrap().len(),
+            history(&app, "/api/history/recent")
+                .await
+                .as_array()
+                .unwrap()
+                .len(),
             0
         );
     }
@@ -8742,8 +8841,14 @@ mod tests {
         let mut vb = vec![0.0f32; dim];
         vb[0] = 0.9;
         vb[1] = 0.1;
-        database.upsert_track_embedding(&a, &va, "panns", None, "[]", 1).await.unwrap();
-        database.upsert_track_embedding(&b, &vb, "panns", None, "[]", 1).await.unwrap();
+        database
+            .upsert_track_embedding(&a, &va, "panns", None, "[]", 1)
+            .await
+            .unwrap();
+        database
+            .upsert_track_embedding(&b, &vb, "panns", None, "[]", 1)
+            .await
+            .unwrap();
 
         // a's nearest neighbor (excluding itself) is b.
         let similar = get(&app, &format!("/api/tracks/{a}/similar")).await;
@@ -9202,9 +9307,16 @@ mod tests {
         fs::write(root.join("1994 - Album/track.mp3"), b"fixture audio").unwrap();
         // A real JPEG so `resize_to_jpeg` succeeds and the cover is fully cached.
         let mut jpeg = Vec::new();
-        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([120, 130, 140])))
-            .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
-            .unwrap();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([120, 130, 140]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
         fs::write(root.join("1994 - Album/cover.jpg"), &jpeg).unwrap();
 
         let mut library = scan_local_library(&root).expect("scan");
@@ -9224,23 +9336,50 @@ mod tests {
 
         // Warm it: caches the cover + ladder and records the local-cache acquired row.
         assert!(super::warm_album_cover(&database, &providers, &cache, &album_id).await);
-        let acquired = database.acquired_artwork(&album_id).await.unwrap().expect("recorded");
+        let acquired = database
+            .acquired_artwork(&album_id)
+            .await
+            .unwrap()
+            .expect("recorded");
         assert_eq!(acquired.provider, "local-cache");
         assert_eq!(acquired.status, "acquired");
         assert!(acquired.cache_key.is_some());
         // Warming must apply `artwork_url` immediately (not wait for the next post-scan reapply),
         // so the cover shows as soon as it's cached.
         assert!(
-            database.album(&album_id).await.unwrap().unwrap().artwork_url.is_some(),
+            database
+                .album(&album_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .artwork_url
+                .is_some(),
             "warm must set artwork_url immediately",
         );
 
         // Simulate a rescan dropping the folder cover, then heal.
-        database.set_album_artwork(&album_id, None, None).await.unwrap();
-        assert!(database.album(&album_id).await.unwrap().unwrap().artwork_url.is_none());
+        database
+            .set_album_artwork(&album_id, None, None)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .album(&album_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .artwork_url
+                .is_none()
+        );
         database.reapply_acquired_artwork().await.unwrap();
         assert!(
-            database.album(&album_id).await.unwrap().unwrap().artwork_url.is_some(),
+            database
+                .album(&album_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .artwork_url
+                .is_some(),
             "reapply must restore the cover's artwork_url after a rescan",
         );
 

@@ -81,7 +81,9 @@ impl MusicBrainzClient {
     fn execute(&self, request: ureq::Request) -> Result<Value, String> {
         self.reserve_slot();
         match request.call() {
-            Ok(response) => response.into_json::<Value>().map_err(|error| error.to_string()),
+            Ok(response) => response
+                .into_json::<Value>()
+                .map_err(|error| error.to_string()),
             Err(ureq::Error::Status(503, response)) => {
                 let retry_after = response
                     .header("Retry-After")
@@ -377,8 +379,11 @@ impl MusicBrainzClient {
         recording_mbid: &str,
         release_mbid: Option<&str>,
     ) -> Result<MusicBrainzEnrichment, String> {
-        let recording_url =
-            musicbrainz_entity_url(&self.base_url, MusicBrainzEntityType::Recording, recording_mbid);
+        let recording_url = musicbrainz_entity_url(
+            &self.base_url,
+            MusicBrainzEntityType::Recording,
+            recording_mbid,
+        );
         let recording = self.execute(
             self.http
                 .get(&recording_url)
@@ -389,8 +394,11 @@ impl MusicBrainzClient {
 
         if let Some(release_mbid) = release_mbid {
             // No manual sleep: the shared limiter already spaces this from the first call.
-            let release_url =
-                musicbrainz_entity_url(&self.base_url, MusicBrainzEntityType::Release, release_mbid);
+            let release_url = musicbrainz_entity_url(
+                &self.base_url,
+                MusicBrainzEntityType::Release,
+                release_mbid,
+            );
             let release = self.execute(
                 self.http
                     .get(&release_url)
@@ -1662,7 +1670,10 @@ mod tests {
         });
         let enrichment = parse_recording_enrichment(&value);
         assert_eq!(enrichment.title.as_deref(), Some("Strobe"));
-        assert_eq!(enrichment.artist_name.as_deref(), Some("deadmau5 & Kaskade"));
+        assert_eq!(
+            enrichment.artist_name.as_deref(),
+            Some("deadmau5 & Kaskade")
+        );
         assert_eq!(enrichment.artist_mbid.as_deref(), Some(ARTIST_ID));
         assert_eq!(enrichment.year, Some(2010));
         assert_eq!(enrichment.recording_date.as_deref(), Some("2010-10-05"));
@@ -1697,9 +1708,15 @@ mod tests {
         });
         merge_release_enrichment(&mut enrichment, &release, RECORDING_ID);
 
-        assert_eq!(enrichment.album_title.as_deref(), Some("For Lack of a Better Name"));
+        assert_eq!(
+            enrichment.album_title.as_deref(),
+            Some("For Lack of a Better Name")
+        );
         assert_eq!(enrichment.album_artist_name.as_deref(), Some("deadmau5"));
-        assert_eq!(enrichment.release_group_mbid.as_deref(), Some(RELEASE_GROUP_ID));
+        assert_eq!(
+            enrichment.release_group_mbid.as_deref(),
+            Some(RELEASE_GROUP_ID)
+        );
         assert_eq!(enrichment.track_number, Some(7));
         assert_eq!(enrichment.track_total, Some(9));
         assert_eq!(enrichment.disc_number, Some(1));

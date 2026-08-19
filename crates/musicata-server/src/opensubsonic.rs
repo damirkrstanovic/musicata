@@ -263,7 +263,10 @@ impl OpenSubsonicClient {
 
     fn reserve_slot(&self) {
         let start = {
-            let mut slot = self.next_slot.lock().expect("opensubsonic limiter poisoned");
+            let mut slot = self
+                .next_slot
+                .lock()
+                .expect("opensubsonic limiter poisoned");
             let now = Instant::now();
             let start = match *slot {
                 Some(next) if next > now => next,
@@ -336,7 +339,10 @@ impl OpenSubsonicClient {
                 ("offset", &offset),
             ],
         )?;
-        Ok(response.album_list2.map(|list| list.album).unwrap_or_default())
+        Ok(response
+            .album_list2
+            .map(|list| list.album)
+            .unwrap_or_default())
     }
 
     /// An album with its songs.
@@ -736,15 +742,19 @@ impl OpenSubsonicProvider {
     )> {
         let client = self.client.clone();
         let song_id = item_id.to_string();
-        let response = tokio::task::spawn_blocking(move || {
-            client.open_stream(&song_id, range.as_deref())
-        })
-        .await?
-        .map_err(|error| anyhow::anyhow!("upstream stream: {error}"))?;
+        let response =
+            tokio::task::spawn_blocking(move || client.open_stream(&song_id, range.as_deref()))
+                .await?
+                .map_err(|error| anyhow::anyhow!("upstream stream: {error}"))?;
 
         let status = response.status();
         let mut headers = Vec::new();
-        for name in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"] {
+        for name in [
+            "Content-Type",
+            "Content-Length",
+            "Content-Range",
+            "Accept-Ranges",
+        ] {
             if let Some(value) = response.header(name) {
                 headers.push((name.to_string(), value.to_string()));
             }
@@ -785,10 +795,7 @@ mod tests {
     #[test]
     fn md5_token_matches_subsonic_vector() {
         // The canonical Subsonic example: password "sesame", salt "c19b2d" → known token.
-        assert_eq!(
-            md5_hex("sesamec19b2d"),
-            "26719a1196d2a940705a59634eb18eab"
-        );
+        assert_eq!(md5_hex("sesamec19b2d"), "26719a1196d2a940705a59634eb18eab");
     }
 
     #[test]
@@ -834,13 +841,19 @@ mod tests {
         assert_eq!(extension_from_content_type("audio/flac"), "flac");
         assert_eq!(extension_from_content_type("audio/mpeg"), "mp3");
         assert_eq!(extension_from_content_type("audio/mp4; codecs=mp4a"), "m4a");
-        assert_eq!(extension_from_content_type("application/octet-stream"), "mp3");
+        assert_eq!(
+            extension_from_content_type("application/octet-stream"),
+            "mp3"
+        );
     }
 
     #[test]
     fn parse_created_to_unix() {
         // 2013-05-17T00:00:00Z = 1368748800.
-        assert_eq!(parse_created(Some("2013-05-17T00:00:00.000Z")), Some(1368748800));
+        assert_eq!(
+            parse_created(Some("2013-05-17T00:00:00.000Z")),
+            Some(1368748800)
+        );
         assert_eq!(parse_created(Some("1970-01-01T00:00:01Z")), Some(1));
         assert_eq!(parse_created(None), None);
         assert_eq!(parse_created(Some("garbage")), None);

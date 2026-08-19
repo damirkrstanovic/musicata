@@ -134,7 +134,9 @@ struct Enclosure {
 
 /// Trim and drop-if-empty, so blank XML elements become `None`.
 fn cleaned(value: Option<String>) -> Option<String> {
-    value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Parse a podcast RSS document into a [`PodcastFeed`]. Items without a playable
@@ -149,7 +151,8 @@ pub fn parse_feed(xml: &str) -> anyhow::Result<PodcastFeed> {
         .filter_map(|item| {
             let enclosure = item.enclosure?;
             let stream_url = cleaned(enclosure.url)?;
-            let id = cleaned(item.guid.and_then(|guid| guid.value)).unwrap_or_else(|| stream_url.clone());
+            let id = cleaned(item.guid.and_then(|guid| guid.value))
+                .unwrap_or_else(|| stream_url.clone());
             let title = cleaned(item.title).unwrap_or_else(|| "Untitled episode".to_string());
             Some(PodcastEpisode {
                 id,
@@ -294,7 +297,10 @@ mod tests {
         assert_eq!(first.title, "Episode One");
         assert_eq!(first.stream_url, "https://cdn.example.com/ep1.mp3");
         assert_eq!(first.mime.as_deref(), Some("audio/mpeg"));
-        assert_eq!(first.published.as_deref(), Some("Mon, 01 Jun 2026 10:00:00 +0000"));
+        assert_eq!(
+            first.published.as_deref(),
+            Some("Mon, 01 Jun 2026 10:00:00 +0000")
+        );
 
         // No <guid> → the id falls back to the enclosure URL.
         assert_eq!(feed.episodes[1].id, "https://cdn.example.com/ep2.mp3");
@@ -342,7 +348,10 @@ mod tests {
             </rss>"#;
         let feed = parse_feed(feed_xml).expect("a malformed enclosure must not fail the feed");
         assert_eq!(feed.episodes.len(), 1);
-        assert_eq!(feed.episodes[0].stream_url, "https://cdn.example.com/ok.mp3");
+        assert_eq!(
+            feed.episodes[0].stream_url,
+            "https://cdn.example.com/ok.mp3"
+        );
     }
 
     #[test]

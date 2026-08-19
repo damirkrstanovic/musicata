@@ -182,7 +182,9 @@ fn submit_listens(token: &str, body: &Value) -> Result<(), SubmitError> {
         .send_json(body.clone())
         .map_err(|error| match error {
             ureq::Error::Status(status, response) => {
-                let body = response.into_string().unwrap_or_else(|_| "<no body>".into());
+                let body = response
+                    .into_string()
+                    .unwrap_or_else(|_| "<no body>".into());
                 let message = format!("ListenBrainz HTTP {status}: {body}");
                 if is_retryable_status(status) {
                     SubmitError::Retryable(message)

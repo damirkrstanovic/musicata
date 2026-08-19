@@ -304,7 +304,10 @@ async fn record_action(database: &Database, player_id: &str, action: ListenActio
     let now = now_unix();
     let mut played: Vec<&str> = Vec::new();
     for (track_id, kind) in &writes {
-        if let Err(error) = database.record_listen(track_id, player_id, now, *kind).await {
+        if let Err(error) = database
+            .record_listen(track_id, player_id, now, *kind)
+            .await
+        {
             tracing::warn!(%player_id, %track_id, ?kind, %error, "failed to record listen");
             continue;
         }
@@ -532,9 +535,10 @@ impl PlayerManager {
     #[cfg(feature = "snapcast")]
     pub async fn set_snapcast_dsp(&self, eq: Option<StereoEq>) {
         if let Some(entry) = self.players.read().await.get(SNAPCAST_PLAYER_ID)
-            && let PlayerHandle::Snapcast(player) = &entry.handle {
-                player.set_dsp(eq);
-            }
+            && let PlayerHandle::Snapcast(player) = &entry.handle
+        {
+            player.set_dsp(eq);
+        }
     }
 
     /// Bring up the runtime entry for a persisted player record.
@@ -909,13 +913,14 @@ impl MpdPlayer {
                 };
                 let mut guard = self.connection.lock().await;
                 if let Ok(connection) = ensure_connected(&mut guard, &self.addr).await
-                    && connection.load_queue(&uris).await.is_ok() {
-                        self.online.store(true, Ordering::Relaxed);
-                        if let Ok(status) = connection.read_status().await {
-                            self.expected_playlist_version
-                                .store(status.playlist_version, Ordering::Relaxed);
-                        }
+                    && connection.load_queue(&uris).await.is_ok()
+                {
+                    self.online.store(true, Ordering::Relaxed);
+                    if let Ok(status) = connection.read_status().await {
+                        self.expected_playlist_version
+                            .store(status.playlist_version, Ordering::Relaxed);
                     }
+                }
             }
             Ok(None) => {
                 // No server queue yet: adopt MPD's current queue (mirror its state — it
@@ -1180,7 +1185,6 @@ impl MpdPlayer {
                     != self.expected_playlist_version.load(Ordering::Relaxed);
 
             let status = if drifted {
-                
                 {
                     let mut guard = self.connection.lock().await;
                     let connection = ensure_connected(&mut guard, &self.addr).await?;
@@ -1308,13 +1312,14 @@ async fn enrich_state(state: &mut PlaybackState, database: &Database) {
                 }
             }
         } else if item.artwork_url.is_none()
-            && let Ok(Some(track)) = database.track(&track_id).await {
-                item.artwork_url = database
-                    .album_artwork_url(&track.album_id)
-                    .await
-                    .ok()
-                    .flatten();
-            }
+            && let Ok(Some(track)) = database.track(&track_id).await
+        {
+            item.artwork_url = database
+                .album_artwork_url(&track.album_id)
+                .await
+                .ok()
+                .flatten();
+        }
     }
 }
 
@@ -2379,8 +2384,13 @@ impl SnapcastPlayer {
             let position = state.position;
             let item = position.and_then(|index| state.queue.get(index).cloned());
             let elapsed = state.elapsed_seconds.unwrap_or(0.0);
-            let next = next_index(position, state.queue.len(), state.repeat, active_shuffle(&state))
-                .and_then(|index| state.queue.get(index).cloned());
+            let next = next_index(
+                position,
+                state.queue.len(),
+                state.repeat,
+                active_shuffle(&state),
+            )
+            .and_then(|index| state.queue.get(index).cloned());
             (state.status, position, item, elapsed, next)
         };
 
@@ -2522,17 +2532,25 @@ impl SnapcastPlayer {
     async fn on_advanced(&self) {
         let (new_position, new_track_id, next_item) = {
             let mut state = self.state.lock().await;
-            let new_position =
-                next_index(state.position, state.queue.len(), state.repeat, active_shuffle(&state));
+            let new_position = next_index(
+                state.position,
+                state.queue.len(),
+                state.repeat,
+                active_shuffle(&state),
+            );
             state.position = new_position;
             state.elapsed_seconds = Some(0.0);
             state.duration_seconds = None;
             let new_track_id = new_position
                 .and_then(|index| state.queue.get(index))
                 .and_then(|item| item.track_id.clone());
-            let next =
-                next_index(new_position, state.queue.len(), state.repeat, active_shuffle(&state))
-                    .and_then(|index| state.queue.get(index).cloned());
+            let next = next_index(
+                new_position,
+                state.queue.len(),
+                state.repeat,
+                active_shuffle(&state),
+            )
+            .and_then(|index| state.queue.get(index).cloned());
             (new_position, new_track_id, next)
         };
         {
@@ -2543,10 +2561,11 @@ impl SnapcastPlayer {
         }
         // Best-effort: set the seek-bar duration for the new current track.
         if let Some(track_id) = &new_track_id
-            && let Ok(Some(track)) = self.database.track(track_id).await {
-                let mut state = self.state.lock().await;
-                state.duration_seconds = track.duration_seconds;
-            }
+            && let Ok(Some(track)) = self.database.track(track_id).await
+        {
+            let mut state = self.state.lock().await;
+            state.duration_seconds = track.duration_seconds;
+        }
         self.broadcast().await;
         self.persist_playback().await;
         self.preload(next_item).await;
@@ -2575,9 +2594,10 @@ impl SnapcastPlayer {
             }
             let mut elapsed = state.elapsed_seconds.unwrap_or(0.0) + 1.0;
             if let Some(duration) = state.duration_seconds
-                && elapsed > duration {
-                    elapsed = duration;
-                }
+                && elapsed > duration
+            {
+                elapsed = duration;
+            }
             state.elapsed_seconds = Some(elapsed);
             (elapsed, state.duration_seconds, state.playback())
         };
@@ -3487,10 +3507,17 @@ mod tests {
     fn build_shuffle_order_is_a_permutation_with_current_first() {
         let order = build_shuffle_order(6, Some(3), 0xC0FFEE);
         assert_eq!(order.len(), 6);
-        assert_eq!(order[0], 3, "the current track leads so playback continues from it");
+        assert_eq!(
+            order[0], 3,
+            "the current track leads so playback continues from it"
+        );
         let mut sorted = order.clone();
         sorted.sort_unstable();
-        assert_eq!(sorted, vec![0, 1, 2, 3, 4, 5], "every index appears exactly once");
+        assert_eq!(
+            sorted,
+            vec![0, 1, 2, 3, 4, 5],
+            "every index appears exactly once"
+        );
     }
 
     #[test]
@@ -3500,7 +3527,11 @@ mod tests {
         let a = build_shuffle_order(8, None, 42);
         let b = build_shuffle_order(8, None, 42);
         assert_eq!(a, b);
-        assert_ne!(a, vec![0, 1, 2, 3, 4, 5, 6, 7], "shuffle must reorder the queue");
+        assert_ne!(
+            a,
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            "shuffle must reorder the queue"
+        );
     }
 
     fn shuffled_state(order: Vec<usize>, position: usize, repeat: RepeatMode) -> QueueState {
@@ -3520,11 +3551,19 @@ mod tests {
         // BUG-05: with shuffle on, next/prev must walk the shuffled order, not queue order.
         let mut state = shuffled_state(vec![0, 2, 1, 3], 0, RepeatMode::Off);
         advance(&mut state, false);
-        assert_eq!(state.position, Some(2), "next after 0 is the next in shuffle order");
+        assert_eq!(
+            state.position,
+            Some(2),
+            "next after 0 is the next in shuffle order"
+        );
         advance(&mut state, false);
         assert_eq!(state.position, Some(1));
         step_previous(&mut state);
-        assert_eq!(state.position, Some(2), "previous walks the shuffle order backwards");
+        assert_eq!(
+            state.position,
+            Some(2),
+            "previous walks the shuffle order backwards"
+        );
     }
 
     #[test]
@@ -3595,7 +3634,11 @@ mod tests {
         state.elapsed_seconds = Some(30.0);
         state.duration_seconds = Some(200.0);
         remove_queue_item(&mut state, 1);
-        assert_eq!(state.position, Some(1), "the item that shifted into slot 1 now plays");
+        assert_eq!(
+            state.position,
+            Some(1),
+            "the item that shifted into slot 1 now plays"
+        );
         assert_eq!(state.duration_seconds, None, "stale duration cleared");
         assert_eq!(state.elapsed_seconds, Some(0.0));
     }
@@ -3624,7 +3667,11 @@ mod tests {
     #[test]
     fn peek_next_index_predicts_the_prefetch_hint() {
         let base = |position, repeat, shuffle, order: &[usize]| QueueState {
-            queue: vec![QueueItem::default(), QueueItem::default(), QueueItem::default()],
+            queue: vec![
+                QueueItem::default(),
+                QueueItem::default(),
+                QueueItem::default(),
+            ],
             position: Some(position),
             repeat,
             shuffle,
@@ -3632,15 +3679,30 @@ mod tests {
             ..Default::default()
         };
         // Linear: advance; stop at the end with no repeat; wrap with repeat-all.
-        assert_eq!(peek_next_index(&base(0, RepeatMode::Off, false, &[])), Some(1));
+        assert_eq!(
+            peek_next_index(&base(0, RepeatMode::Off, false, &[])),
+            Some(1)
+        );
         assert_eq!(peek_next_index(&base(2, RepeatMode::Off, false, &[])), None);
-        assert_eq!(peek_next_index(&base(2, RepeatMode::All, false, &[])), Some(0));
+        assert_eq!(
+            peek_next_index(&base(2, RepeatMode::All, false, &[])),
+            Some(0)
+        );
         // Repeat-one: the same track plays next.
-        assert_eq!(peek_next_index(&base(1, RepeatMode::One, false, &[])), Some(1));
+        assert_eq!(
+            peek_next_index(&base(1, RepeatMode::One, false, &[])),
+            Some(1)
+        );
         // Shuffle, mid-cycle: follow the shuffled order.
-        assert_eq!(peek_next_index(&base(1, RepeatMode::Off, true, &[1, 0, 2])), Some(0));
+        assert_eq!(
+            peek_next_index(&base(1, RepeatMode::Off, true, &[1, 0, 2])),
+            Some(0)
+        );
         // Shuffle, last in the cycle under repeat-all: unpredictable (advance reshuffles).
-        assert_eq!(peek_next_index(&base(2, RepeatMode::All, true, &[1, 0, 2])), None);
+        assert_eq!(
+            peek_next_index(&base(2, RepeatMode::All, true, &[1, 0, 2])),
+            None
+        );
         // No position / empty queue: nothing to prefetch.
         let mut none_pos = base(0, RepeatMode::All, false, &[]);
         none_pos.position = None;

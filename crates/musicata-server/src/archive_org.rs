@@ -208,7 +208,9 @@ pub fn parse_item(json: &str, identifier: &str) -> anyhow::Result<ArchiveItem> {
         .collect();
 
     Ok(ArchiveItem {
-        title: coerce_string(doc.metadata.title).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+        title: coerce_string(doc.metadata.title)
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty()),
         tracks,
     })
 }
@@ -321,7 +323,11 @@ mod tests {
         // so two tracks remain.
         assert_eq!(item.tracks.len(), 2);
 
-        let opener = item.tracks.iter().find(|t| t.title == "Opener").expect("opener");
+        let opener = item
+            .tracks
+            .iter()
+            .find(|t| t.title == "Opener")
+            .expect("opener");
         assert_eq!(opener.id, "gd77-d1t01.flac"); // FLAC preferred over MP3
         assert_eq!(
             opener.stream_url,
@@ -368,8 +374,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "hits the network; set MUSICATA_ARCHIVE_ITEM"]
     async fn archive_live_browse() {
-        let identifier =
-            std::env::var("MUSICATA_ARCHIVE_ITEM").expect("set MUSICATA_ARCHIVE_ITEM");
+        let identifier = std::env::var("MUSICATA_ARCHIVE_ITEM").expect("set MUSICATA_ARCHIVE_ITEM");
         let record = SourceRecord {
             id: String::new(),
             kind: "archive".into(),

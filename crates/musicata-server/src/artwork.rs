@@ -64,7 +64,10 @@ impl ArtworkCache {
         // ("No such file or directory"), dropping that cache entry. The rename into `path` stays
         // atomic, so a reader never sees a partial file.
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = parent.join(format!(".{key}.{extension}.{}.{seq}.tmp", std::process::id()));
+        let tmp = parent.join(format!(
+            ".{key}.{extension}.{}.{seq}.tmp",
+            std::process::id()
+        ));
         if let Err(error) = fs::write(&tmp, bytes).await {
             tracing::warn!(%error, "artwork cache: write failed");
             return;
@@ -125,7 +128,9 @@ mod tests {
             for _ in 0..4 {
                 let cache = cache.clone();
                 tasks.push(tokio::spawn(async move {
-                    cache.put("abcdef", ext, format!("bytes-{ext}").as_bytes()).await;
+                    cache
+                        .put("abcdef", ext, format!("bytes-{ext}").as_bytes())
+                        .await;
                 }));
             }
         }

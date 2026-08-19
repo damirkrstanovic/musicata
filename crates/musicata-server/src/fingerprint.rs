@@ -42,8 +42,7 @@ const ACOUSTID_MIN_INTERVAL: Duration = Duration::from_millis(340);
 /// bytes, plus its duration in whole seconds. Decodes up to [`FINGERPRINT_SECONDS`].
 /// `extension` (e.g. `flac`) hints the demuxer. Synchronous + CPU-heavy.
 pub fn compute_fingerprint(audio: &[u8], extension: &str) -> Result<(String, u32), String> {
-    let (samples, sample_rate, channels, full_duration_seconds) =
-        decode_samples(audio, extension)?;
+    let (samples, sample_rate, channels, full_duration_seconds) = decode_samples(audio, extension)?;
     if sample_rate == 0 || channels == 0 {
         return Err("decoded audio had no sample rate / channels".to_string());
     }
@@ -99,10 +98,8 @@ fn decode_samples(
     let track_id = track.id;
     // The full track duration from the container, independent of how much we decode for
     // the fingerprint (which stops at FINGERPRINT_SECONDS).
-    let full_duration_seconds = match (
-        track.codec_params.n_frames,
-        track.codec_params.sample_rate,
-    ) {
+    let full_duration_seconds = match (track.codec_params.n_frames, track.codec_params.sample_rate)
+    {
         (Some(frames), Some(rate)) if rate > 0 => Some((frames / u64::from(rate)) as u32),
         _ => None,
     };

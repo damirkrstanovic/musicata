@@ -85,7 +85,10 @@ pub fn opensubsonic_provider_id(base_url: &str) -> String {
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(base_url);
-    format!("opensubsonic:{}", without_scheme.trim_end_matches('/').to_lowercase())
+    format!(
+        "opensubsonic:{}",
+        without_scheme.trim_end_matches('/').to_lowercase()
+    )
 }
 
 /// Stable id of the built-in internet-radio source. Like `local-disk`, it is always

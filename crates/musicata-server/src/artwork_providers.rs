@@ -613,13 +613,19 @@ mod tests {
     #[test]
     fn image_magic_bytes_accept_images_reject_others() {
         // ISS-28: validate by content, so an HTML/JSON error page isn't cached as art.
-        assert_eq!(image_extension_from_magic(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
+        assert_eq!(
+            image_extension_from_magic(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("jpg")
+        );
         assert_eq!(
             image_extension_from_magic(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A]),
             Some("png")
         );
         assert_eq!(image_extension_from_magic(b"GIF89a..."), Some("gif"));
-        assert_eq!(image_extension_from_magic(b"RIFF\0\0\0\0WEBPVP8 "), Some("webp"));
+        assert_eq!(
+            image_extension_from_magic(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some("webp")
+        );
         assert_eq!(image_extension_from_magic(b"<!DOCTYPE html><html>"), None);
         assert_eq!(image_extension_from_magic(b"{\"error\":\"nope\"}"), None);
         assert_eq!(image_extension_from_magic(b""), None);
@@ -637,7 +643,11 @@ mod tests {
         });
         let result = parse_itunes(&value, &query()).expect("match");
         assert_eq!(result.image_url, "https://is/y/source.jpg", "URL unchanged");
-        assert_eq!(result.width, Some(100), "reports the actual 100px size, not 600");
+        assert_eq!(
+            result.width,
+            Some(100),
+            "reports the actual 100px size, not 600"
+        );
     }
 
     #[test]
@@ -673,7 +683,9 @@ mod tests {
                 { "name": "Azra", "picture_xl": "https://e-cdn/artist/azra-xl.jpg" }
             ]
         });
-        let query = ArtistArtworkQuery { name: "Azra".to_string() };
+        let query = ArtistArtworkQuery {
+            name: "Azra".to_string(),
+        };
         let result = parse_deezer_artist(&value, &query).expect("match");
         assert_eq!(result.provider, "deezer");
         assert_eq!(result.image_url, "https://e-cdn/artist/azra-xl.jpg");
@@ -685,7 +697,9 @@ mod tests {
         let silhouette = serde_json::json!({
             "data": [{ "name": "Azra", "picture_xl": "https://e-cdn/artist//xl.jpg" }]
         });
-        let query = ArtistArtworkQuery { name: "Azra".to_string() };
+        let query = ArtistArtworkQuery {
+            name: "Azra".to_string(),
+        };
         assert!(parse_deezer_artist(&silhouette, &query).is_none());
 
         // …and a name that doesn't match is skipped.
