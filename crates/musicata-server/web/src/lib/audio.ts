@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Drives the browser <audio> element from playback state and reports its position back to
 // the server. The server then broadcasts ~1/s `type:"progress"` ticks to all sockets, which
 // feed the hot path. Only one tab outputs at a time (claimed via localStorage).

@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { onDestroy } from "svelte";
   import { api, ApiError, type ExportStatus } from "../lib/api";
 

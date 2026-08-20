@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Decode arbitrary audio bytes to **mono f32 at the model's sample rate** (16 kHz). The PANNs
 //! model takes a raw waveform (the spectrogram is inside the ONNX graph), so this is the whole
 //! preprocessing step. Mirrors the server's Snapcast decode loop (symphonia + rubato).

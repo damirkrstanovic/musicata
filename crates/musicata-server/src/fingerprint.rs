@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Audio fingerprinting via Chromaprint + AcoustID — identify a track from its audio
 //! and resolve its MusicBrainz ids, so the id-exact artwork providers (Cover Art
 //! Archive, fanart.tv) and metadata enrichment work even for untagged files.

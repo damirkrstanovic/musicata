@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! On-disk cache of cover-art bytes.
 //!
 //! Local-disk covers are already fast to read, but a network source (e.g. SMB) would

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Upstream **OpenSubsonic client** provider — consume another Subsonic/Navidrome/Gonic/
 //! Funkwhale server as a music source (the inverse of [`crate::subsonic`], which *serves* the
 //! Subsonic API).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Library export / import: a single zip holding a consistent database snapshot
 //! (`musicata.db`) plus the acquired-artwork cache (`artwork/…`). This is Musicata's *state*
 //! for migrating to another machine or backing up — not the music files themselves, which

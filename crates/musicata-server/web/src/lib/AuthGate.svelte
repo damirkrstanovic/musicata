@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import type { Component } from "svelte";
   import { onMount } from "svelte";
   import { session } from "./session.svelte";

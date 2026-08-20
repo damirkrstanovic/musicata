@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Internet Archive source: a browse-only ([`ProviderCapabilities::STREAM_ONLY`]) provider
 //! over the audio files of one Archive.org item.
 //!

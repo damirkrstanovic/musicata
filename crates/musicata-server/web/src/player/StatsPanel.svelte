@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { statsPanel } from "../lib/statsPanel.svelte";
   import { api, type HistoryStats } from "../lib/api";
 

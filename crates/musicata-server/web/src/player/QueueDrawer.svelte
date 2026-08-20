@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { player } from "../lib/player.svelte";
   import { autoplay } from "../lib/autoplay.svelte";
   import { sendCommand } from "../lib/commands";

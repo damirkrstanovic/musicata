@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Headphone/EQ correction model + an AutoEq / REW "ParametricEQ.txt" parser.
 // A profile is a preamp (dB, usually negative for headroom) plus a cascade of biquad bands.
 // It compiles to Web Audio `BiquadFilterNode`s in `BrowserAudio` (see lib/audio.ts). Sourced

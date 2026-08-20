@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { api, ApiError } from "../lib/api";
   import type { SnapcastStatus } from "../types/SnapcastStatus";
   import type { SnapClient } from "../types/SnapClient";

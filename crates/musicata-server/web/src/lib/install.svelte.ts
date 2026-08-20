@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // PWA install affordance. Two paths: capture the deferred `beforeinstallprompt` (Chrome/Android)
 // so we can offer an in-app "Install" button, and detect iOS Safari — which never fires that
 // event — to show a one-time "Add to Home Screen" hint. In-product UI only, no native popups.

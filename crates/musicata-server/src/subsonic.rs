@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! OpenSubsonic API (`/rest`).
 //!
 //! Implements the subset of the Subsonic / OpenSubsonic REST API needed for a

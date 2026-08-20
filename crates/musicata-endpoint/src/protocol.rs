@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The wire contract with the server's player WebSocket, and the pure decision logic that
 //! turns an incoming `PlaybackState` into an audio action. Kept free of audio/IO so it can be
 //! unit-tested without a sound device.

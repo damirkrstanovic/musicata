@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // The current "mix" — a seed-based radio (the seed track plus similar/sounds-like tracks). Held
 // here so the Mix view can show what was generated, instead of the tracks vanishing into the
 // queue. Transient (the latest mix); replaced each time you start a new one.

@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { player } from "../lib/player.svelte";
   import { dsp } from "../lib/dsp.svelte";
   import { audioDevices } from "../lib/audioDevices.svelte";

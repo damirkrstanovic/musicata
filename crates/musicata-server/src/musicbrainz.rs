@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 use musicata_core::{Album, Track};
 use serde::Serialize;
 use serde_json::Value;

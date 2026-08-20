@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Server-side decode of a library track to the fixed PCM format snapserver consumes.
 //!
 //! Snapcast broadcasts one continuous PCM stream per zone, so — unlike every other

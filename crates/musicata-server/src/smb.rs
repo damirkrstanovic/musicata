@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! SMB/CIFS music source — reads a network share directly over the wire (pure
 //! Rust, no kernel mount, no libsmbclient) via the `smb` crate.
 //!

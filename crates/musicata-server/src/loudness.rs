@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! EBU R128 loudness analysis for volume leveling. `symphonia` decodes the whole track and
 //! `ebur128` measures its integrated loudness (LUFS) + true-peak (dBTP); the playback path
 //! turns those into a per-track gain so quiet and loud tracks play at the same level. Pure,

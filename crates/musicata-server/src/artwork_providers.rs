@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Pluggable artwork providers — fetch a missing album cover from an external API.
 //!
 //! Each provider is a small synchronous `ureq` client (like [`crate::musicbrainz`]);

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! snapserver lifecycle + the single "Musicata" pipe stream.
 //!
 //! Snapcast broadcasts a continuous PCM stream to N synchronized clients (rooms). We run

@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { api, type SmartPlaylistDetail } from "../lib/api";
   import { playTracks } from "../lib/playback";
   import TrackList from "./TrackList.svelte";

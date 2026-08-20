@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { untrack } from "svelte";
   import { api } from "../lib/api";
   import type { Artist } from "../types/Artist";

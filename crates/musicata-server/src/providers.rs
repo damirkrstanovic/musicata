@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Provider registry: one unified handle over every kind of music source.
 //!
 //! Sources are dispatched by an enum (`ProviderHandle`) rather than `dyn`, the same

@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { api, type PlaylistDetail } from "../lib/api";
   import { playTracks } from "../lib/playback";
   import { confirmAction } from "../lib/modal";

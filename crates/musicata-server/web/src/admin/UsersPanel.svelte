@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { api, ApiError, type SessionUser } from "../lib/api";
   import { session } from "../lib/session.svelte";
   import { confirmAction, promptText } from "../lib/modal";

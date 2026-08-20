@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import type { Activity } from "../types/Activity";
 
 /** Subscribe to the server's activity feed over WebSocket, reconnecting with a 3s backoff.

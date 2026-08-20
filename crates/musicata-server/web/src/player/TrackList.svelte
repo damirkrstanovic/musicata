@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import type { TrackRow } from "../lib/api";
   import { formatTime } from "../lib/format";
   import { playTracks, startAudioRadio } from "../lib/playback";

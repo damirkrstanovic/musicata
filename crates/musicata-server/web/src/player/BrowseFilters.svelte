@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { browse } from "../lib/browse.svelte";
 
   // Lazy-load the facet index the first time the filters render.

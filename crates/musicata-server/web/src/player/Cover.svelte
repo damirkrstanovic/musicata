@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   // A robust cover image: shows a monogram immediately, lazily loads the artwork via an
   // IntersectionObserver (more reliable than native `loading="lazy"` for dynamically-rendered
   // grids), fades it in on load, and on error/abort retries a few times before settling on the

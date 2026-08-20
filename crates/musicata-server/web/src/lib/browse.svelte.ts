@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // The active library filter (browse facets) + the facet index. LibraryGrid reads the filter
 // and refetches when it changes.
 import { api, type BrowseIndex } from "./api";

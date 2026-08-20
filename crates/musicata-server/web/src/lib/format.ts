@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 export function pct(part: number, total: number): number {
   return total ? Math.round((part / total) * 100) : 0;
 }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The ONNX model: a raw-waveform audio model (PANNs CNN14, 16 kHz) that outputs a 2048-d
 //! `embedding` (for similarity) and 527 AudioSet `clip_scores` (mapped to human-readable tags).
 

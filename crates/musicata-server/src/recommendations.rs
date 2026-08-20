@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Track similarity + radio seeding for "Start radio from this" and continuous play.
 //!
 //! Two layers, first-hit-wins: **ListenBrainz Labs** `similar-recordings` (MBID-in/MBID-out,

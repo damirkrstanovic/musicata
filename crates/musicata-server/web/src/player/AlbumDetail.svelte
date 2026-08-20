@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { api, type AlbumDetail } from "../lib/api";
   import Cover from "./Cover.svelte";
   import { playTracks } from "../lib/playback";

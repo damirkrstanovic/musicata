@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The audio side: fetch a stream and play it through the default output device with rodio,
 //! tracking elapsed time and end-of-track. Single-threaded — owned by the main control loop.
 

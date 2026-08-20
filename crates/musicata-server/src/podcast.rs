@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Podcast RSS source: a browse-only ([`ProviderCapabilities::STREAM_ONLY`]) provider
 //! whose catalogue is the episodes of one podcast feed.
 //!

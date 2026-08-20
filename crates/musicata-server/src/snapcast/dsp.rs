@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! In-process EQ for the server-side Snapcast PCM stream.
 //!
 //! The same correction model as the browser Web Audio EQ — a preamp + a cascade of RBJ-cookbook

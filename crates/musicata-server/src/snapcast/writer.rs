@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The FIFO writer: a dedicated OS thread that streams decoded PCM into the named
 //! pipe snapserver reads. snapserver paces its pipe reads to real time (see
 //! `../snapcast` `asio_stream.hpp` `nextTick_`), so our **blocking writes backpressure

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! snapserver JSON-RPC control client (TCP, newline-delimited messages on port 1705).
 //!
 //! Used to enumerate the connected snapclients (rooms), set their per-output volume, and

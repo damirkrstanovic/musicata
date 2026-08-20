@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // A promise-based modal, mirroring the old admin.js `openModal`. A single <Modal> instance
 // (mounted in App) renders whatever is in `activeModal`; callers `await openModal(...)`.
 import { writable } from "svelte/store";

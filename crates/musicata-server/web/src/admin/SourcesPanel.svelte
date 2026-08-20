@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { api, ApiError, type SourceView } from "../lib/api";
   import { confirmAction } from "../lib/modal";
 

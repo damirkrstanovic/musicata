@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Adaptive concurrency limiter for network scans (AIMD, congestion-control style).
 //!
 //! Starts at a target concurrency and probes upward while healthy, backing off fast

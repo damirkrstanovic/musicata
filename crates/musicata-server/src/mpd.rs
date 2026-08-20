@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Minimal async client for the Music Player Daemon (MPD) control protocol.
 //!
 //! MPD speaks a line-based text protocol over TCP: the client writes a command

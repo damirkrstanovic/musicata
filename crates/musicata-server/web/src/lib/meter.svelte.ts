@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Tiny UI state for the VU meter overlay (open/closed), persisted so it stays where the user
 // left it. Levels themselves are read live from the audio graph (see lib/audio.ts `levels()`).
 const LS_KEY = "musicata-vu-open";
