@@ -28,6 +28,12 @@ RUN npm run build
 #    with a portable baseline, so the image runs on low-end NAS CPUs (e.g. Celeron J4025).
 FROM rust:1-bookworm AS build
 ENV RUSTFLAGS="-C target-cpu=x86-64-v2"
+# The commit this image was built from. `.dockerignore` excludes `.git`, so build.rs cannot ask
+# git — CI passes the revision it checked out (`--build-arg MUSICATA_GIT_SHA=$(git rev-parse
+# --short HEAD)` locally). Without it the AGPL section 13 offer in the UI shows a version with
+# no build, leaving a user unable to tell which source their instance runs.
+ARG MUSICATA_GIT_SHA=""
+ENV MUSICATA_GIT_SHA=$MUSICATA_GIT_SHA
 WORKDIR /src
 COPY . .
 COPY --from=web /web/dist crates/musicata-server/web/dist
@@ -50,8 +56,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --uid 10001 musicata
 COPY --from=build /musicata-server /usr/local/bin/musicata-server
-# The AGPL requires the license text to accompany the binary in object form too.
-COPY COPYING NOTICE /usr/share/doc/musicata/
+# The AGPL requires the license text to accompany the binary in object form too, and the
+# statically linked deps (plus the embedded web bundle) require their own attribution.
+COPY COPYING NOTICE THIRD-PARTY-NOTICES.md /usr/share/doc/musicata/
 
 # Database + artwork cache live under /data; mount a host directory there.
 ENV MUSICATA_DATABASE=/data/musicata.db

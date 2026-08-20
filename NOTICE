@@ -10,14 +10,39 @@ later version. See COPYING for the full license text.
 Third-party material redistributed in this repository
 --------------------------------------------------------------------------------
 
-Musicata's Rust and npm dependencies are fetched at build time and are not
-redistributed here; their licenses are recorded in Cargo.lock / package-lock.json
-and in the per-dependency comments in each crate's Cargo.toml. The PANNs CNN14
-ONNX model used by musicata-ml is downloaded at runtime and is likewise not
-redistributed (see docs/musicata-ml.md).
+This file covers third-party material stored in THIS REPOSITORY. Musicata's Rust
+and npm dependencies are fetched at build time and are not checked in here; their
+licenses are recorded in Cargo.lock / package-lock.json and in the per-dependency
+comments in each crate's Cargo.toml.
 
-The following third-party works ARE included in this repository and carry their
-own license terms:
+They ARE, however, compiled into every Musicata binary — the server links its Rust
+dependency tree statically and embeds the built web app — so the attribution those
+licenses require travels with the release tarball and the container images in
+THIRD-PARTY-NOTICES.md. Regenerate it with `node scripts/gen-third-party-notices.mjs`
+after changing dependencies.
+
+Two third-party works are downloaded at runtime rather than redistributed, and so
+carry no obligation here:
+
+  - The PANNs CNN14 ONNX model used by musicata-ml, fetched on first run
+    (see docs/musicata-ml.md). The model is published under the MIT license; it is a
+    third-party ONNX export of PANNs (Kong et al.), whose original release is
+    Apache-2.0.
+
+  - AutoEq headphone correction presets, fetched from the AutoEq project when a user
+    picks their headphone model in the equalizer (see docs/dsp.md). The request is made
+    by the server on the user's behalf and relayed straight to that user's browser
+    (crates/musicata-server/src/proxy.rs): nothing is written to disk or to the
+    database, so no Musicata instance accumulates a copy of the corpus, and a preset
+    comes to rest only in the profile the user chooses to save. AutoEq's own code is
+    MIT (c) 2018 Jaakko Pasanen, but its published results derive from headphone
+    measurements contributed by third parties (oratory1990, Crinacle, Rtings and
+    others), each publishing under its own terms — some non-commercial. Do not bundle
+    them into a fork's binary, and do not add a persistent cache, without first
+    checking the terms of the measurement sources they derive from.
+
+The following third-party work IS included in this repository and carries its own
+license terms:
 
 1. AudioSet class labels
    File:    crates/musicata-ml/data/audioset_labels.txt
@@ -30,35 +55,3 @@ own license terms:
    label the audio-tagging output of musicata-ml. CC BY 4.0 is one-way
    compatible with the GNU GPL family, so this material may be redistributed
    under this repository's terms; this notice provides the required attribution.
-
-2. AutoEq headphone correction presets
-   File:    crates/musicata-server/web/src/lib/autoeq-presets.json
-   Source:  AutoEq <https://github.com/jaakkopasanen/AutoEq> / <https://autoeq.app>
-   License: MIT
-
-     Copyright (c) 2018 Jaakko Pasanen
-
-     Permission is hereby granted, free of charge, to any person obtaining a copy
-     of this software and associated documentation files (the "Software"), to deal
-     in the Software without restriction, including without limitation the rights
-     to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-     copies of the Software, and to permit persons to whom the Software is
-     furnished to do so, subject to the following conditions:
-
-     The above copyright notice and this permission notice shall be included in all
-     copies or substantial portions of the Software.
-
-     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-     IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-     FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-     AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-     SOFTWARE.
-
-   Note on the underlying measurements: AutoEq's ParametricEQ results are
-   computed from headphone frequency-response measurements contributed by third
-   parties (oratory1990, Crinacle, Rtings and others), each of which publishes
-   under its own terms — some non-commercial. The bundled subset is a small,
-   curated convenience set; if you redistribute a larger set, check the terms of
-   the measurement sources it derives from.

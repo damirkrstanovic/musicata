@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Optional outbound scrobbling: submit confirmed `played` listens to ListenBrainz.
 //!
 //! A **decoupled, queue-draining** worker (see AGENTS.md): the per-player recorder enqueues a
@@ -26,13 +27,7 @@ const IDLE_POLL: Duration = Duration::from_secs(30);
 
 /// Whether outbound scrobbling is enabled (default **off**, unlike the default-on passes).
 pub async fn enabled(database: &Database) -> bool {
-    database
-        .get_setting(SETTING_SCROBBLE_ENABLED)
-        .await
-        .ok()
-        .flatten()
-        .map(|value| value == "true" || value == "1")
-        .unwrap_or(false)
+    crate::bool_setting(database, SETTING_SCROBBLE_ENABLED).await
 }
 
 async fn token(database: &Database) -> String {

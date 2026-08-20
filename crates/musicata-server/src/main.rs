@@ -20,6 +20,7 @@ mod archive_org;
 mod artwork;
 mod artwork_providers;
 mod auth;
+mod autoeq;
 mod backup;
 mod dsp;
 mod fingerprint;
@@ -33,6 +34,7 @@ mod players;
 #[cfg(feature = "provider-podcast")]
 mod podcast;
 mod providers;
+mod proxy;
 mod radiobrowser;
 mod recommendations;
 #[cfg(feature = "provider-smb")]
@@ -54,7 +56,7 @@ use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{
-        HeaderMap, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, StatusCode,
         header::{
             ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
             CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE,
@@ -401,6 +403,9 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Name the build in the log too: a support question or a security report starts with
+    // "which version is this?" (see SECURITY.md), and logs outlive a shell session.
+    tracing::info!("{}", version_line());
     tracing::info!("listening on http://{}", config.addr);
     axum::serve(
         listener,
@@ -1082,13 +1087,7 @@ async fn autoplay_loop(
     loop {
         tokio::time::sleep(AUTOPLAY_POLL).await;
         // Default on: continue unless the user explicitly turned it off.
-        let on = database
-            .get_setting(SETTING_AUTOPLAY)
-            .await
-            .ok()
-            .flatten()
-            .as_deref()
-            != Some("false");
+        let on = bool_setting(&database, SETTING_AUTOPLAY).await;
         if !on {
             continue;
         }
@@ -1177,7 +1176,7 @@ async fn loudness_pass(
     activity: &Arc<activity::ActivityLog>,
     after: Option<(String, String, String)>,
 ) -> Option<(String, String, String)> {
-    if !setting_enabled(database, SETTING_LOUDNESS).await {
+    if !bool_setting(database, SETTING_LOUDNESS).await {
         return None;
     }
     let after = after
@@ -1310,6 +1309,15 @@ async fn initial_library_fill(
 
 /// Setting keys edited in the web UI (see `crate::Database::get_setting`).
 const SETTING_ARTWORK_FETCH: &str = "artwork_fetch";
+/// Where this instance's source lives — the AGPL section 13 offer the UI links to. An operator
+/// running a MODIFIED Musicata points this at their own fork in /admin; there is deliberately
+/// nothing to rebuild, because a license obligation must not require a build toolchain.
+const SETTING_SOURCE_URL: &str = "source_url";
+/// Used when the setting is unset — the right answer for an unmodified build.
+const DEFAULT_SOURCE_URL: &str = "https://github.com/damirkrstanovic/musicata";
+/// The commit this binary was built from, stamped by build.rs. Empty when the build had no git
+/// checkout (a container build; those carry the revision as an OCI label instead).
+const GIT_SHA: &str = env!("MUSICATA_GIT_SHA");
 const SETTING_FANART_TV_KEY: &str = "fanart_tv_key";
 const SETTING_FINGERPRINT: &str = "fingerprint_enabled";
 const SETTING_MB_ENRICH: &str = "musicbrainz_enrich_enabled";
@@ -1319,20 +1327,151 @@ const SETTING_LOUDNESS: &str = "loudness_analysis_enabled";
 /// Records listening history (plays/skips). Default on; turning it off stops recording new
 /// listens (existing ones stay until cleared). The privacy switch (see `players::record_action`).
 pub(crate) const SETTING_HISTORY_ENABLED: &str = "history_enabled";
+/// Snapcast multi-room output, and whether its control port requires auth. Named constants
+/// rather than inline literals so they can appear in `BOOL_SETTINGS` and can't drift.
+const SETTING_SNAPCAST_ENABLED: &str = "snapcast.enabled";
+const SETTING_SNAPCAST_AUTH: &str = "snapcast.auth_enabled";
+const SETTING_SNAPCAST_MANAGE_SERVER: &str = "snapcast.manage_server";
+const SETTING_SNAPCAST_AIRPLAY: &str = "snapcast.airplay_enabled";
+const SETTING_SNAPCAST_SPOTIFY: &str = "snapcast.spotify_enabled";
 
-/// Read a default-on boolean setting (toggling it in the UI takes effect next pass).
-pub(crate) async fn setting_enabled(database: &Database, key: &str) -> bool {
-    database
-        .get_setting(key)
-        .await
-        .ok()
-        .flatten()
-        .map(|value| value != "false" && value != "0")
-        .unwrap_or(true)
+/// Every boolean setting, with the value that applies when the user has never touched it.
+///
+/// **This table is the documentation.** It is also the only place a default is declared, so a
+/// default cannot differ between two readers of the same key — which is exactly what used to
+/// happen: five hand-rolled parsers, three notions of a "truthy" string, and two different
+/// answers for an absent row, decided by whichever helper a caller happened to reach for.
+///
+/// Adding a boolean setting means adding a row here. That is deliberate friction: choosing a
+/// default is a product decision — especially for anything that talks to the network — and it
+/// belongs in a diff a reviewer can see, not in the choice of a function name.
+pub(crate) struct BoolSetting {
+    pub key: &'static str,
+    pub default: bool,
+    /// Why this default. Keep it to one line; it is what a future reader gets.
+    pub doc: &'static str,
+}
+
+pub(crate) const BOOL_SETTINGS: &[BoolSetting] = &[
+    BoolSetting {
+        key: SETTING_ARTWORK_FETCH,
+        default: true,
+        doc: "Fetch missing covers from external providers. On: an empty library grid is the \
+              thing users complain about first.",
+    },
+    BoolSetting {
+        key: SETTING_FINGERPRINT,
+        default: true,
+        doc: "Identify untagged tracks via AcoustID. On: it only runs on files whose tags are \
+              already unusable, so it can rarely make things worse.",
+    },
+    BoolSetting {
+        key: SETTING_MB_ENRICH,
+        default: true,
+        doc: "Apply MusicBrainz metadata to fingerprinted tracks. On: DB-only, never writes \
+              to files.",
+    },
+    BoolSetting {
+        key: SETTING_LOUDNESS,
+        default: true,
+        doc: "Scan-time EBU R128 analysis. On: it is local CPU only, and the apply side is a \
+              separate client-side toggle.",
+    },
+    BoolSetting {
+        key: SETTING_HISTORY_ENABLED,
+        default: true,
+        doc: "Record plays/skips. On: local-only, and the recommendation features are empty \
+              without it. This is the privacy switch.",
+    },
+    BoolSetting {
+        key: SETTING_AUTOPLAY,
+        default: true,
+        doc: "Keep playing past the end of the queue. On: matches what every other player does.",
+    },
+    BoolSetting {
+        key: scrobble::SETTING_SCROBBLE_ENABLED,
+        default: false,
+        doc: "Submit listens to ListenBrainz. Off: it sends listening data off the machine, \
+              and needs a token anyway.",
+    },
+    BoolSetting {
+        key: ml::SETTING_ML_ENABLED,
+        default: false,
+        doc: "Audio-ML analysis. Off: needs the separate musicata-ml service running.",
+    },
+    BoolSetting {
+        key: SETTING_SNAPCAST_ENABLED,
+        default: false,
+        doc: "Snapcast multi-room output. Off: needs snapserver/snapclient installed.",
+    },
+    BoolSetting {
+        key: SETTING_SNAPCAST_AUTH,
+        default: false,
+        doc: "Require auth on the Snapcast control port. Off: matches snapserver's own default.",
+    },
+    BoolSetting {
+        key: SETTING_SNAPCAST_MANAGE_SERVER,
+        default: true,
+        doc: "Let Musicata start/stop snapserver itself. On: the alternative is the user \
+              running it by hand. No UI writes this — it is a database-only escape hatch for \
+              someone who manages snapserver externally.",
+    },
+    BoolSetting {
+        key: SETTING_SNAPCAST_AIRPLAY,
+        default: false,
+        doc: "AirPlay cast-in via shairport-sync. Off: needs that binary installed.",
+    },
+    BoolSetting {
+        key: SETTING_SNAPCAST_SPOTIFY,
+        default: false,
+        doc: "Spotify Connect cast-in via librespot. Off: needs that binary installed.",
+    },
+];
+
+/// The registry entry for `key`.
+///
+/// Panics on an unregistered key, which can only happen if someone adds a setting without
+/// adding it to [`BOOL_SETTINGS`] — a bug to catch in the first test run, not to paper over
+/// with a silent `false` that would quietly disable a feature in production.
+fn bool_setting_entry(key: &str) -> &'static BoolSetting {
+    BOOL_SETTINGS
+        .iter()
+        .find(|setting| setting.key == key)
+        .unwrap_or_else(|| panic!("boolean setting {key:?} is missing from BOOL_SETTINGS"))
+}
+
+/// The declared default for `key`.
+fn bool_setting_default(key: &str) -> bool {
+    bool_setting_entry(key).default
+}
+
+/// Read a boolean setting, falling back to its declared default when the user has never set it.
+///
+/// A database error is **logged, not swallowed**. The old readers collapsed `Result<Option<_>>`
+/// with `.ok().flatten()`, which made "the query failed" indistinguishable from "never set" —
+/// so a locked database silently reverted every toggle to its default with no trace.
+pub(crate) async fn bool_setting(database: &Database, key: &str) -> bool {
+    match database.get_bool_setting(key).await {
+        Ok(Some(value)) => value,
+        Ok(None) => bool_setting_default(key),
+        Err(error) => {
+            // Say what the operator is now getting and why, so a database hiccup that silently
+            // changes behaviour is at least legible in the log.
+            let entry = bool_setting_entry(key);
+            tracing::warn!(
+                key,
+                default = entry.default,
+                rationale = entry.doc,
+                %error,
+                "reading boolean setting failed; falling back to its default"
+            );
+            entry.default
+        }
+    }
 }
 
 async fn artwork_fetch_enabled(database: &Database) -> bool {
-    setting_enabled(database, SETTING_ARTWORK_FETCH).await
+    bool_setting(database, SETTING_ARTWORK_FETCH).await
 }
 
 /// Bump when the artist/album id derivation changes (normalization, MBID-first) so an
@@ -1726,7 +1865,7 @@ async fn fingerprint_pass(
     providers: &Arc<RwLock<ProviderRegistry>>,
     activity: &Arc<activity::ActivityLog>,
 ) -> usize {
-    if !setting_enabled(database, SETTING_FINGERPRINT).await {
+    if !bool_setting(database, SETTING_FINGERPRINT).await {
         return 0;
     }
     // Until the project compiles in its AcoustID application key, the feature no-ops.
@@ -1927,12 +2066,8 @@ async fn snapcast_settings_from_db(
 ) -> anyhow::Result<snapcast::SnapcastSettings> {
     let mut settings = snapcast::SnapcastSettings::default();
     let get = |key: &'static str| database.get_setting(key);
-    if let Some(value) = get("snapcast.enabled").await? {
-        settings.enabled = value == "true";
-    }
-    if let Some(value) = get("snapcast.manage_server").await? {
-        settings.manage_server = value == "true";
-    }
+    settings.enabled = bool_setting(database, SETTING_SNAPCAST_ENABLED).await;
+    settings.manage_server = bool_setting(database, SETTING_SNAPCAST_MANAGE_SERVER).await;
     if let Some(value) = get("snapcast.server_binary").await?
         && !value.is_empty()
     {
@@ -1963,17 +2098,13 @@ async fn snapcast_settings_from_db(
     {
         settings.http_port = port;
     }
-    if let Some(value) = get("snapcast.auth_enabled").await? {
-        settings.auth_enabled = value == "true";
-    }
+    settings.auth_enabled = bool_setting(database, SETTING_SNAPCAST_AUTH).await;
     if let Some(value) = get("snapcast.server_host").await?
         && !value.is_empty()
     {
         settings.server_host = value;
     }
-    if let Some(value) = get("snapcast.airplay_enabled").await? {
-        settings.airplay_enabled = value == "true";
-    }
+    settings.airplay_enabled = bool_setting(database, SETTING_SNAPCAST_AIRPLAY).await;
     if let Some(value) = get("snapcast.airplay_binary").await?
         && !value.is_empty()
     {
@@ -1984,9 +2115,7 @@ async fn snapcast_settings_from_db(
     {
         settings.airplay_device_name = value;
     }
-    if let Some(value) = get("snapcast.spotify_enabled").await? {
-        settings.spotify_enabled = value == "true";
-    }
+    settings.spotify_enabled = bool_setting(database, SETTING_SNAPCAST_SPOTIFY).await;
     if let Some(value) = get("snapcast.spotify_binary").await?
         && !value.is_empty()
     {
@@ -2078,7 +2207,7 @@ async fn musicbrainz_search_pass(
     database: &Database,
     activity: &Arc<activity::ActivityLog>,
 ) -> bool {
-    if !setting_enabled(database, SETTING_MB_ENRICH).await {
+    if !bool_setting(database, SETTING_MB_ENRICH).await {
         return false;
     }
     let targets = match database
@@ -2200,7 +2329,7 @@ async fn musicbrainz_enrich_pass(
     database: &Database,
     activity: &Arc<activity::ActivityLog>,
 ) -> bool {
-    if !setting_enabled(database, SETTING_MB_ENRICH).await {
+    if !bool_setting(database, SETTING_MB_ENRICH).await {
         return false;
     }
 
@@ -2332,6 +2461,7 @@ fn app(
         .route("/admin", get(svelte_admin))
         .route("/assets/{*path}", get(svelte_asset))
         .route("/api/health", get(health))
+        .route("/api/about", get(about))
         .route("/api/library/summary", get(library_summary))
         .route("/api/library/rescan", post(rescan_library))
         .route(
@@ -2406,11 +2536,19 @@ fn app(
         .route("/api/radio", get(list_radio).post(create_radio))
         .route("/api/radio/directory", get(radio_directory))
         .route("/api/radio/{id}", patch(update_radio).delete(delete_radio))
+        .route("/api/radio/{id}/stream", get(stream_radio_station))
+        // AutoEq headphone corrections, relayed rather than fetched by the page (crate::autoeq).
+        .route("/api/autoeq/index", get(autoeq_index))
+        .route("/api/autoeq/preset", get(autoeq_preset))
         .route("/api/sources", get(list_sources).post(create_source))
         .route("/api/sources/{id}", delete(delete_source))
         .route("/api/sources/{id}/rescan", post(rescan_source))
         .route("/api/sources/{id}/browse", get(browse_source))
         .route("/api/sources/{id}/resolve", get(resolve_source))
+        // Relay a browse-only source's item (podcast enclosure, Archive file) and a radio
+        // station through this origin, so the CSP can forbid the page loading media from
+        // anywhere else. See crate::proxy.
+        .route("/api/sources/{id}/stream", get(stream_source_item))
         .route("/api/activity", get(list_activity))
         .route("/api/activity/ws", get(activity_ws))
         .route("/api/settings", get(get_settings).patch(update_settings))
@@ -2498,7 +2636,58 @@ fn app(
             }
         }))
         .layer(middleware::from_fn(log_request))
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Everything the page may load comes from this origin. That is the whole policy, and it is
+/// enforceable only because nothing in the web app talks to the internet directly any more:
+/// radio, podcast enclosures, Internet Archive files and AutoEq presets are all relayed by the
+/// server (see [`crate::proxy`]), and artwork was already served from `/api/albums/…`.
+///
+/// The consequence worth knowing: **adding a third-party URL to a page will now break it**, and
+/// the fix is to relay it, not to widen this header. That is the point — an XSS that slips past
+/// Svelte's escaping still has nowhere to send what it steals.
+///
+/// - `style-src` keeps `'unsafe-inline'` for the handful of `style=` attributes that carry
+///   computed values (progress widths); Svelte's component styles are static CSS files.
+/// - `media-src`/`img-src` are `'self'` — every stream and cover is proxied or local.
+/// - `frame-ancestors 'none'` blocks clickjacking; `object-src 'none'` kills plugin embeds;
+///   `base-uri 'self'` stops an injected `<base>` from re-pointing every relative URL.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+     script-src 'self'; \
+     style-src 'self' 'unsafe-inline'; \
+     img-src 'self' data: blob:; \
+     media-src 'self' blob:; \
+     connect-src 'self'; \
+     worker-src 'self' blob:; \
+     manifest-src 'self'; \
+     font-src 'self'; \
+     object-src 'none'; \
+     base-uri 'self'; \
+     form-action 'self'; \
+     frame-ancestors 'none'";
+
+/// Attach the CSP and the companion headers that don't need per-route knowledge.
+///
+/// `nosniff` matters more than usual here: the artwork and stream routes relay bytes whose
+/// type an upstream declared, and without it a browser may re-interpret one as script.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
 }
 
 async fn log_request(request: Request, next: Next) -> Response {
@@ -2571,6 +2760,60 @@ async fn fallback(uri: axum::http::Uri) -> Response {
         return web_asset(path, APP_SHELL_CACHE);
     }
     AppError::not_found("route not found").into_response()
+}
+
+/// The effective section 13 source URL: the operator's setting, else upstream.
+async fn source_url(database: &musicata_storage::Database) -> String {
+    database
+        .get_setting(SETTING_SOURCE_URL)
+        .await
+        .ok()
+        .flatten()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| DEFAULT_SOURCE_URL.to_string())
+}
+
+/// Identifies this build for `--version` and for security reports (see SECURITY.md).
+fn version_line() -> String {
+    if GIT_SHA.is_empty() {
+        format!("musicata-server {}", env!("CARGO_PKG_VERSION"))
+    } else {
+        format!("musicata-server {} ({GIT_SHA})", env!("CARGO_PKG_VERSION"))
+    }
+}
+
+/// What `musicata-server --version` prints.
+fn version_string() -> String {
+    format!(
+        "{}\nAGPL-3.0-or-later; comes with ABSOLUTELY NO WARRANTY.\nUpstream source: {DEFAULT_SOURCE_URL}",
+        version_line()
+    )
+}
+
+/// Who this instance is and where to get its source. **Open** (no session required): AGPL
+/// section 13 entitles everyone who reaches Musicata over the network to its source, which
+/// includes visitors sitting at the login screen, so the offer cannot live behind auth.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+struct About {
+    name: String,
+    version: String,
+    /// Commit this binary was built from; empty when the build had no git checkout.
+    commit: String,
+    license: String,
+    /// Where to get *this* instance's source — operator-configurable in /admin.
+    source_url: String,
+}
+
+async fn about(State(state): State<AppState>) -> Json<About> {
+    Json(About {
+        name: "Musicata".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        commit: GIT_SHA.to_string(),
+        license: "AGPL-3.0-or-later".to_string(),
+        source_url: source_url(&state.database).await,
+    })
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
@@ -3196,14 +3439,7 @@ struct AutoplayState {
 /// queue topped up with similar tracks.
 async fn get_autoplay(State(state): State<AppState>) -> Json<AutoplayState> {
     // Default on: enabled unless explicitly turned off (matches the autoplay loop).
-    let enabled = state
-        .database
-        .get_setting(SETTING_AUTOPLAY)
-        .await
-        .ok()
-        .flatten()
-        .as_deref()
-        != Some("false");
+    let enabled = bool_setting(&state.database, SETTING_AUTOPLAY).await;
     Json(AutoplayState { enabled })
 }
 
@@ -3213,10 +3449,7 @@ async fn set_autoplay(
 ) -> Result<Json<AutoplayState>, AppError> {
     state
         .database
-        .set_setting(
-            SETTING_AUTOPLAY,
-            if body.enabled { "true" } else { "false" },
-        )
+        .set_bool_setting(SETTING_AUTOPLAY, body.enabled)
         .await
         .map_err(db_error)?;
     Ok(Json(body))
@@ -4374,12 +4607,15 @@ struct AppSettings {
     scrobble_enabled: bool,
     /// ListenBrainz user token for scrobbling (empty = unset).
     listenbrainz_token: String,
+    /// Source URL offered to users under AGPL section 13 (effective value: setting, else
+    /// upstream) — repoint it at your fork when you run modified code.
+    source_url: String,
 }
 
 async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>, AppError> {
     let artwork_fetch = artwork_fetch_enabled(&state.database).await;
-    let fingerprint_enabled = setting_enabled(&state.database, SETTING_FINGERPRINT).await;
-    let musicbrainz_enrich_enabled = setting_enabled(&state.database, SETTING_MB_ENRICH).await;
+    let fingerprint_enabled = bool_setting(&state.database, SETTING_FINGERPRINT).await;
+    let musicbrainz_enrich_enabled = bool_setting(&state.database, SETTING_MB_ENRICH).await;
     let fanart_tv_key = state
         .database
         .get_setting(SETTING_FANART_TV_KEY)
@@ -4396,7 +4632,8 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
         .await
         .map_err(db_error)?
         .unwrap_or_else(|| "02:00".to_string());
-    let history_enabled = setting_enabled(&state.database, SETTING_HISTORY_ENABLED).await;
+    let history_enabled = bool_setting(&state.database, SETTING_HISTORY_ENABLED).await;
+    let source_url = source_url(&state.database).await;
     let scrobble_enabled = scrobble::enabled(&state.database).await;
     let listenbrainz_token = state
         .database
@@ -4415,6 +4652,7 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
         history_enabled,
         scrobble_enabled,
         listenbrainz_token,
+        source_url,
     }))
 }
 
@@ -4430,6 +4668,7 @@ struct SettingsUpdate {
     history_enabled: Option<bool>,
     scrobble_enabled: Option<bool>,
     listenbrainz_token: Option<String>,
+    source_url: Option<String>,
 }
 
 async fn update_settings(
@@ -4439,10 +4678,7 @@ async fn update_settings(
     if let Some(enabled) = update.artwork_fetch {
         state
             .database
-            .set_setting(
-                SETTING_ARTWORK_FETCH,
-                if enabled { "true" } else { "false" },
-            )
+            .set_bool_setting(SETTING_ARTWORK_FETCH, enabled)
             .await
             .map_err(db_error)?;
     }
@@ -4456,24 +4692,21 @@ async fn update_settings(
     if let Some(enabled) = update.fingerprint_enabled {
         state
             .database
-            .set_setting(SETTING_FINGERPRINT, if enabled { "true" } else { "false" })
+            .set_bool_setting(SETTING_FINGERPRINT, enabled)
             .await
             .map_err(db_error)?;
     }
     if let Some(enabled) = update.musicbrainz_enrich_enabled {
         state
             .database
-            .set_setting(SETTING_MB_ENRICH, if enabled { "true" } else { "false" })
+            .set_bool_setting(SETTING_MB_ENRICH, enabled)
             .await
             .map_err(db_error)?;
     }
     if let Some(enabled) = update.ml_enabled {
         state
             .database
-            .set_setting(
-                ml::SETTING_ML_ENABLED,
-                if enabled { "true" } else { "false" },
-            )
+            .set_bool_setting(ml::SETTING_ML_ENABLED, enabled)
             .await
             .map_err(db_error)?;
     }
@@ -4494,20 +4727,14 @@ async fn update_settings(
     if let Some(enabled) = update.history_enabled {
         state
             .database
-            .set_setting(
-                SETTING_HISTORY_ENABLED,
-                if enabled { "true" } else { "false" },
-            )
+            .set_bool_setting(SETTING_HISTORY_ENABLED, enabled)
             .await
             .map_err(db_error)?;
     }
     if let Some(enabled) = update.scrobble_enabled {
         state
             .database
-            .set_setting(
-                scrobble::SETTING_SCROBBLE_ENABLED,
-                if enabled { "true" } else { "false" },
-            )
+            .set_bool_setting(scrobble::SETTING_SCROBBLE_ENABLED, enabled)
             .await
             .map_err(db_error)?;
     }
@@ -4515,6 +4742,21 @@ async fn update_settings(
         state
             .database
             .set_setting(scrobble::SETTING_LISTENBRAINZ_TOKEN, token.trim())
+            .await
+            .map_err(db_error)?;
+    }
+    if let Some(url) = update.source_url {
+        // A section 13 offer that isn't a working link is worse than none, so reject anything
+        // that can't be followed. Empty clears the override and falls back to upstream.
+        let url = url.trim();
+        if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(AppError::bad_request(
+                "source URL must start with http:// or https://",
+            ));
+        }
+        state
+            .database
+            .set_setting(SETTING_SOURCE_URL, url)
             .await
             .map_err(db_error)?;
     }
@@ -4584,13 +4826,7 @@ fn snapcast_routes() -> Router<AppState> {
 /// Whether the Snapcast subsystem is enabled in settings (default off).
 #[cfg(feature = "snapcast")]
 async fn snapcast_enabled_setting(database: &Database) -> bool {
-    database
-        .get_setting("snapcast.enabled")
-        .await
-        .ok()
-        .flatten()
-        .as_deref()
-        == Some("true")
+    bool_setting(database, SETTING_SNAPCAST_ENABLED).await
 }
 
 #[cfg(feature = "snapcast")]
@@ -4635,14 +4871,7 @@ struct SnapcastStatus {
 #[cfg(feature = "snapcast")]
 async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastStatus>, AppError> {
     let enabled = snapcast_enabled_setting(&state.database).await;
-    let auth_enabled = state
-        .database
-        .get_setting("snapcast.auth_enabled")
-        .await
-        .ok()
-        .flatten()
-        .as_deref()
-        == Some("true");
+    let auth_enabled = bool_setting(&state.database, SETTING_SNAPCAST_AUTH).await;
     let server_host = snapcast_server_host(&state.database).await;
     let active_input = snapcast_active_input(&state.database).await;
     let manager = state.players.snapcast_manager().await;
@@ -4656,18 +4885,8 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
         inputs = control.streams().await.unwrap_or_default();
     }
     let setting = |key: &'static str| state.database.get_setting(key);
-    let airplay_enabled = setting("snapcast.airplay_enabled")
-        .await
-        .ok()
-        .flatten()
-        .as_deref()
-        == Some("true");
-    let spotify_enabled = setting("snapcast.spotify_enabled")
-        .await
-        .ok()
-        .flatten()
-        .as_deref()
-        == Some("true");
+    let airplay_enabled = bool_setting(&state.database, SETTING_SNAPCAST_AIRPLAY).await;
+    let spotify_enabled = bool_setting(&state.database, SETTING_SNAPCAST_SPOTIFY).await;
     let airplay_binary = setting("snapcast.airplay_binary")
         .await
         .ok()
@@ -4720,14 +4939,14 @@ async fn snapcast_update(
     if let Some(enabled) = update.enabled {
         state
             .database
-            .set_setting("snapcast.enabled", if enabled { "true" } else { "false" })
+            .set_bool_setting(SETTING_SNAPCAST_ENABLED, enabled)
             .await
             .map_err(db_error)?;
     }
     if let Some(auth) = update.auth_enabled {
         state
             .database
-            .set_setting("snapcast.auth_enabled", if auth { "true" } else { "false" })
+            .set_bool_setting(SETTING_SNAPCAST_AUTH, auth)
             .await
             .map_err(db_error)?;
     }
@@ -4744,20 +4963,14 @@ async fn snapcast_update(
     if let Some(airplay) = update.airplay_enabled {
         state
             .database
-            .set_setting(
-                "snapcast.airplay_enabled",
-                if airplay { "true" } else { "false" },
-            )
+            .set_bool_setting(SETTING_SNAPCAST_AIRPLAY, airplay)
             .await
             .map_err(db_error)?;
     }
     if let Some(spotify) = update.spotify_enabled {
         state
             .database
-            .set_setting(
-                "snapcast.spotify_enabled",
-                if spotify { "true" } else { "false" },
-            )
+            .set_bool_setting(SETTING_SNAPCAST_SPOTIFY, spotify)
             .await
             .map_err(db_error)?;
     }
@@ -5249,11 +5462,38 @@ async fn browse_source(
         .await
         .get(&id)
         .ok_or_else(|| AppError::not_found(format!("unknown source: {id}")))?;
-    let entries = handle
+    let mut entries = handle
         .browse()
         .await
         .map_err(|error| AppError::bad_request(error.to_string()))?;
+    // Hand the client a URL on this origin instead of the upstream one. Browse-only providers
+    // carry the real enclosure/file URL inline; the page must not load media from it directly
+    // (the CSP forbids it), so point every playable entry at the relay keyed by its own id.
+    for entry in &mut entries {
+        if entry.stream_url.is_some() {
+            entry.stream_url = Some(format!(
+                "/api/sources/{}/stream?item={}",
+                urlencoding_encode(&id),
+                urlencoding_encode(&entry.id)
+            ));
+        }
+    }
     Ok(Json(BrowseResponse { entries }))
+}
+
+/// Percent-encode a path/query component. Only the characters that would change how a URL
+/// parses are escaped, which keeps ids readable in logs and the network tab.
+fn urlencoding_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 #[derive(Debug, Deserialize)]
@@ -5280,6 +5520,108 @@ async fn resolve_source(
         .await
         .map_err(|error| AppError::bad_request(error.to_string()))?;
     Ok(Json(spec))
+}
+
+/// Turn a relayed upstream response into ours: pass its status and the headers `<audio>` needs
+/// to seek, and stream the body. `fallback_content_type` covers an upstream that omits one —
+/// a browser given no type on an audio response may refuse to play it.
+fn proxied_response(
+    relayed: proxy::ProxiedResponse,
+    fallback_content_type: &str,
+) -> Result<Response, AppError> {
+    let mut builder = Response::builder()
+        .status(StatusCode::from_u16(relayed.status).unwrap_or(StatusCode::OK))
+        .header(ACCEPT_RANGES, "bytes");
+    let mut saw_content_type = false;
+    for (name, value) in &relayed.headers {
+        if name.eq_ignore_ascii_case("content-type") {
+            saw_content_type = true;
+        }
+        builder = builder.header(name, value);
+    }
+    if !saw_content_type {
+        builder = builder.header(CONTENT_TYPE, fallback_content_type);
+    }
+    builder
+        .body(Body::from_stream(relayed.stream))
+        .map_err(AppError::from)
+}
+
+/// Stream an item of a browse-only source (a podcast enclosure, an Internet Archive file)
+/// through the server, so the browser only ever loads audio from this origin. The client names
+/// the source and item; the URL is resolved here, never supplied by the caller.
+async fn stream_source_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ResolveQuery>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let handle = state
+        .providers
+        .read()
+        .await
+        .get(&id)
+        .ok_or_else(|| AppError::not_found(format!("unknown source: {id}")))?;
+    let spec = handle
+        .resolve(&query.item)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+
+    let range = headers.get(RANGE).and_then(|value| value.to_str().ok());
+    let relayed = proxy::fetch(&spec.url, range)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    proxied_response(
+        relayed,
+        spec.content_type.as_deref().unwrap_or("audio/mpeg"),
+    )
+}
+
+/// Stream an internet-radio station through the server. Same reasoning as
+/// [`stream_source_item`]; the station's URL comes from the database, not the request.
+async fn stream_radio_station(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let station = state
+        .database
+        .radio_station(&id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| AppError::not_found(format!("unknown radio station: {id}")))?;
+
+    let range = headers.get(RANGE).and_then(|value| value.to_str().ok());
+    let relayed = proxy::fetch(&station.stream_url, range)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    proxied_response(relayed, "audio/mpeg")
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoEqPresetQuery {
+    /// A `results/`-relative directory, exactly as AutoEq's `INDEX.md` spells it.
+    path: String,
+}
+
+/// The AutoEq model index, relayed. The browser can't fetch it directly under our CSP, and
+/// routing it here also keeps the user's IP from reaching a third party they didn't configure.
+async fn autoeq_index() -> Result<Response, AppError> {
+    let relayed = proxy::fetch(&autoeq::index_url(), None)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    proxied_response(relayed, "text/markdown; charset=utf-8")
+}
+
+/// One model's ParametricEQ file, relayed. [`autoeq::preset_url`] is what stops this from
+/// being an open proxy — the caller names a model, never a URL.
+async fn autoeq_preset(Query(query): Query<AutoEqPresetQuery>) -> Result<Response, AppError> {
+    let url = autoeq::preset_url(&query.path)
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let relayed = proxy::fetch(&url, None)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    proxied_response(relayed, "text/plain; charset=utf-8")
 }
 
 #[derive(Debug, Deserialize)]
@@ -7028,9 +7370,13 @@ impl ConfigOverrides {
                         .ok_or_else(|| anyhow!("--reset-admin requires a username"))?;
                     overrides.reset_admin = Some(value);
                 }
+                "--version" | "-V" => {
+                    println!("{}", version_string());
+                    std::process::exit(0);
+                }
                 "--help" | "-h" => {
                     println!(
-                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan] [--no-incremental-rescan] [--scan-once] [--no-scan] [--mpd HOST:PORT[,HOST:PORT]] [--public-url URL] [--subsonic-user USER] [--subsonic-password PASS] [--reset-admin USERNAME]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN, MUSICATA_INCREMENTAL_RESCAN, MUSICATA_SCAN_ONCE, MUSICATA_NO_SCAN, MUSICATA_MPD, MUSICATA_PUBLIC_URL, MUSICATA_SUBSONIC_USER, MUSICATA_SUBSONIC_PASSWORD\nConfig file keys: library, database, addr, rescan, incremental_rescan, scan_once, no_scan, mpd, public_url, subsonic_user, subsonic_password\n--reset-admin USERNAME: set USERNAME's password (read from stdin), creating an admin if absent, then exit — locked-out recovery.\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
+                        "Usage: musicata-server [--config PATH] [--library PATH] [--database PATH] [--addr HOST:PORT] [--rescan] [--no-incremental-rescan] [--scan-once] [--no-scan] [--mpd HOST:PORT[,HOST:PORT]] [--public-url URL] [--subsonic-user USER] [--subsonic-password PASS] [--reset-admin USERNAME] [--version]\n\nConfig precedence: defaults < config file < environment < CLI\nEnvironment: MUSICATA_CONFIG, MUSICATA_LIBRARY, MUSICATA_DATABASE, MUSICATA_ADDR, MUSICATA_RESCAN, MUSICATA_INCREMENTAL_RESCAN, MUSICATA_SCAN_ONCE, MUSICATA_NO_SCAN, MUSICATA_MPD, MUSICATA_PUBLIC_URL, MUSICATA_SUBSONIC_USER, MUSICATA_SUBSONIC_PASSWORD\nConfig file keys: library, database, addr, rescan, incremental_rescan, scan_once, no_scan, mpd, public_url, subsonic_user, subsonic_password\n--reset-admin USERNAME: set USERNAME's password (read from stdin), creating an admin if absent, then exit — locked-out recovery.\n--version / -V: print the version, build commit and license, then exit.\nDefaults: --library testdata --database .musicata/musicata.db --addr 127.0.0.1:3030"
                     );
                     std::process::exit(0);
                 }
@@ -7181,9 +7527,61 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ARTWORK_CACHE_CONTROL, Config, PlayerManager, ProviderHandle, ProviderRegistry,
-        acoustid_lookup_duration, app, artwork_etag, normalize_size, parse_range, resize_to_jpeg,
+        ARTWORK_CACHE_CONTROL, BOOL_SETTINGS, Config, DEFAULT_SOURCE_URL, PlayerManager,
+        ProviderHandle, ProviderRegistry, acoustid_lookup_duration, app, artwork_etag,
+        bool_setting_default, normalize_size, parse_range, resize_to_jpeg,
     };
+
+    /// The registry is the single declaration of every boolean setting's default *and* its
+    /// documentation. Both matter: a duplicate key would make one of two rows unreachable, and
+    /// an undocumented default is how the old five-parser mess started — a value nobody could
+    /// justify because nobody had written down why.
+    #[test]
+    fn bool_settings_registry_is_well_formed() {
+        let mut seen = std::collections::HashSet::new();
+        for setting in BOOL_SETTINGS {
+            assert!(
+                seen.insert(setting.key),
+                "duplicate boolean setting key: {}",
+                setting.key
+            );
+            assert!(
+                !setting.doc.trim().is_empty(),
+                "{} has no documented rationale for its default",
+                setting.key
+            );
+            // Every key resolves to its own row — the lookup `bool_setting` relies on.
+            assert_eq!(bool_setting_default(setting.key), setting.default);
+        }
+        // The ten toggles that existed when the string settings were retired. A new one is
+        // welcome; bumping this number is the moment to confirm the default was chosen, and
+        // that a network-touching feature is not being switched on for everyone by accident.
+        assert_eq!(BOOL_SETTINGS.len(), 13);
+    }
+
+    /// The defaults themselves, pinned. These are the values every existing installation gets
+    /// on upgrade for a setting it has never touched, so a change here is a change to what
+    /// people's servers do — it should never be quiet.
+    #[test]
+    fn bool_setting_defaults_are_what_we_intend() {
+        for (key, expected) in [
+            ("artwork_fetch", true),
+            ("fingerprint_enabled", true),
+            ("musicbrainz_enrich_enabled", true),
+            ("loudness_analysis_enabled", true),
+            ("history_enabled", true),
+            ("autoplay", true),
+            ("scrobble_enabled", false),
+            ("ml_enabled", false),
+            ("snapcast.enabled", false),
+            ("snapcast.auth_enabled", false),
+            ("snapcast.manage_server", true),
+            ("snapcast.airplay_enabled", false),
+            ("snapcast.spotify_enabled", false),
+        ] {
+            assert_eq!(bool_setting_default(key), expected, "default for {key}");
+        }
+    }
     use axum::{
         body::{Body, to_bytes},
         http::{
@@ -8287,6 +8685,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(users_denied.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// AGPL section 13: the source offer is owed to everyone who reaches this instance over the
+    /// network, so `/api/about` stays open once the gate closes — and an operator running a fork
+    /// must be able to repoint it from the Settings page, with no rebuild.
+    #[tokio::test]
+    async fn about_is_open_and_its_source_url_is_configurable() {
+        let fixture = TestFixture::new("about-source");
+        let app = fixture.app().await;
+
+        // Create the first admin so auth enforcement is on, and keep the session cookie.
+        let setup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/setup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"password123"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = setup
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|raw| raw.split(';').next())
+            .expect("session cookie")
+            .to_string();
+
+        // Read /api/about with NO session — a visitor stuck at the login screen must still be
+        // offered the source, and told which build is answering them.
+        let about = |app: axum::Router| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/about")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "/api/about must be open");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+
+        let anonymous = about(app.clone()).await;
+        assert_eq!(anonymous["source_url"], DEFAULT_SOURCE_URL);
+        assert_eq!(anonymous["license"], "AGPL-3.0-or-later");
+        assert_eq!(anonymous["version"], env!("CARGO_PKG_VERSION"));
+
+        // A fork repoints it from /admin — a field edit, not a rebuild.
+        let patch = |app: axum::Router, cookie: String, body: &'static str| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        let saved = patch(
+            app.clone(),
+            cookie.clone(),
+            r#"{"source_url":"https://example.invalid/my-fork"}"#,
+        )
+        .await;
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert_eq!(
+            about(app.clone()).await["source_url"],
+            "https://example.invalid/my-fork",
+            "the anonymous offer follows the configured fork"
+        );
+
+        // A value that can't be followed is worse than none: reject it, keeping the old one.
+        let rejected = patch(app.clone(), cookie.clone(), r#"{"source_url":"my-fork"}"#).await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            about(app.clone()).await["source_url"],
+            "https://example.invalid/my-fork",
+            "a rejected update must not clobber the working offer"
+        );
+
+        // Clearing it falls back to upstream — the right answer for an unmodified build.
+        let cleared = patch(app.clone(), cookie, r#"{"source_url":"  "}"#).await;
+        assert_eq!(cleared.status(), StatusCode::OK);
+        assert_eq!(about(app).await["source_url"], DEFAULT_SOURCE_URL);
     }
 
     /// A per-player endpoint token (M10) authenticates that player's own channels without a
@@ -10236,7 +10730,13 @@ mod tests {
             .find(|entry| entry["id"] == station_id)
             .expect("browsed station");
         assert_eq!(entry["title"], "Groove Salad");
-        assert_eq!(entry["stream_url"], "http://ice.somafm.com/groovesalad");
+        // Browse hands the *client* a URL on this origin, never the upstream one: the page is
+        // served under a CSP that permits media from 'self' only, so anything playable must go
+        // through the relay. The upstream URL stays server-side (see the resolve check below).
+        assert_eq!(
+            entry["stream_url"],
+            format!("/api/sources/radio/stream?item={station_id}")
+        );
         assert_eq!(entry["is_container"], false);
 
         // resolve turns the station id into a playable StreamSpec.
@@ -10256,6 +10756,8 @@ mod tests {
             .await,
         )
         .unwrap();
+        // resolve is the server-side lookup the relay itself uses, so it still yields the real
+        // upstream URL — that asymmetry with browse above is the whole design.
         assert_eq!(resolved["url"], "http://ice.somafm.com/groovesalad");
         assert_eq!(resolved["title"], "Groove Salad");
 

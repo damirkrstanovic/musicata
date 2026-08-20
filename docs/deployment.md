@@ -94,10 +94,15 @@ Tagged releases attach Linux binaries for x86_64 and aarch64.
    [latest release](https://github.com/damirkrstanovic/musicata/releases/latest):
 
    ```sh
-   tar -xzf musicata-x86_64-unknown-linux-musl.tar.gz
-   cd musicata-x86_64-unknown-linux-musl
+   tar -xzf musicata-x86_64-linux.tar.gz
+   cd musicata-x86_64-linux
    ./musicata-server --library /path/to/music --addr 0.0.0.0:3030
    ```
+
+   Pick the archive that matches the machine: `musicata-x86_64-linux` (any 64-bit Intel/AMD,
+   including low-power NAS CPUs), `musicata-x86_64-v3-linux` (AVX2 — faster fingerprinting on
+   post-2015 CPUs, **SIGILLs on older ones**), or `musicata-aarch64-linux` (ARM). Each archive
+   also carries `musicata.service`, `COPYING`, `NOTICE` and `THIRD-PARTY-NOTICES.md`.
 
 2. Open `http://<host>:3030`, create the admin account, then add music sources and players
    from the **/admin** Settings page.

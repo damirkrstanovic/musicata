@@ -4,8 +4,8 @@ A living knowledge base: for each hard problem Musicata hits, how the reference
 projects (Roon, Jellyfin, Navidrome, beets, Picard, Music Assistant, Mopidy) solve
 it, and what we adopted — with pointers to our code. Covers: provider/plugin
 ecosystem, incremental scanning, OpenSubsonic, SMB access, background-work UX,
-metadata sourcing & conflict resolution, and discography completeness ("what am I
-missing"). When you tackle one of these areas, read the
+metadata sourcing & conflict resolution, discography completeness ("what am I
+missing"), and the browser/third-party-origin boundary (CSP + the media relay). When you tackle one of these areas, read the
 relevant section first instead of re-deriving it. When you learn something new from
 another project, add it here.
 
@@ -724,6 +724,73 @@ Marley"). It's lossy and hard to undo.
 
 ---
 
+## 12. Third-party origins in the browser — CSP and the media relay
+
+**Problem:** the web app needs things that live on other hosts — internet-radio streams,
+podcast enclosures, Internet Archive files, AutoEq presets. Let the page fetch them directly
+and it is simple and costs the server nothing; relay them through the server and you pay
+bandwidth and hold a connection per listener. Which way, and what does it cost?
+
+**How others solve it — nobody runs a real CSP:**
+
+- **Navidrome** hands the browser the **raw upstream URL**: `getInternetRadioStations` returns
+  `StreamUrl` verbatim (`server/subsonic/radio.go`), and the UI feeds it straight to the player
+  (`ui/src/reducers/playerReducer.js:53`, `musicSrc: item.streamUrl`). Its `secureMiddleware()`
+  (`server/middlewares.go:104`) ships `ContentTypeNosniff`, `FrameDeny`, `ReferrerPolicy:
+  same-origin` and a `PermissionsPolicy` — but the CSP line is **commented out**, and even the
+  commented version is only `script-src 'self' 'unsafe-inline'`, never `default-src`. It does
+  proxy radio *artwork* (`core/artwork/reader_radio.go`), but that reads a locally uploaded
+  file — not a remote fetch.
+- **Jellyfin** sets **no CSP at all** (nothing in the server source). But it *does* relay remote
+  HTTP media, and its shape is the one to copy: forward the client's `Range` upstream, send with
+  `HttpCompletionOption.ResponseHeadersRead` so the body streams instead of buffering, and pass
+  the upstream status through (`Jellyfin.Api/Helpers/FileStreamResponseHelpers.cs:45-57`).
+
+So the prior art splits: Navidrome optimizes for zero server cost, Jellyfin already has the
+relay machinery but no policy forcing its use.
+
+**The fact that decides it — mixed content, not the CSP.** `SECURITY.md` tells users to put
+Musicata behind a TLS reverse proxy for anything beyond the LAN. On an `https://` page an
+`<audio src="http://…">` is mixed content: Chrome auto-upgrades it and fails when the upstream
+has no TLS. **Measured against the Radio Browser directory: 221 of the top 300 stations by
+votes (73%) are plain `http://`.** Handing the browser a raw URL therefore breaks roughly
+three quarters of internet radio in the deployment we recommend — a bug Navidrome's approach
+has and does not handle (no mixed-content handling anywhere in its tree). Relaying makes every
+stream same-origin, so it inherits the page's scheme and simply works.
+
+**What Musicata does:** everything the page needs from the internet is relayed by
+`crates/musicata-server/src/proxy.rs` — radio (`/api/radio/{id}/stream`), podcast/Archive items
+(`/api/sources/{id}/stream`), AutoEq (`/api/autoeq/*`). The relay is Jellyfin's shape in Rust:
+`ureq` on `spawn_blocking`, `Range` forwarded, upstream status passed through, body streamed in
+64 KB chunks over a depth-4 bounded `mpsc` (backpressure — a live radio stream must never
+buffer unboundedly), nothing written to disk or DB. That lets every response carry
+`default-src 'self'` with **no `https:` escape hatch in `media-src` or `connect-src`**, which
+neither reference project attempts.
+
+Two rules make a relay safe, and they are the whole security argument: **the client names
+*what* it wants, never *where* to fetch it** (radio and source items resolve their URL
+server-side from the DB; AutoEq takes only a path suffix against a hardcoded base — see
+`autoeq::preset_url`, whose tests are the guard), and **it streams without storing**, so an
+instance never accumulates a copy of a third-party corpus (see NOTICE on the AutoEq
+measurement terms).
+
+**Costs, accepted knowingly:** radio bandwidth doubles (in and back out) and the server holds
+one upstream connection per listener — negligible for a household (a 128 kbps stream is
+~16 KB/s), and the reason to revisit if Musicata ever serves many concurrent listeners. It also
+adds an SSRF surface: an authenticated user who can add a radio station makes the *server*
+fetch a URL of their choosing, and a podcast feed's author can do the same without any user
+acting maliciously. Private ranges are deliberately **not** blocked — a LAN-first server has
+legitimate private-address media (a local Icecast, a NAS over HTTP), and filtering them to
+stop a trusted user reaching a host they were trusted with anyway is not a trade that pays.
+This is an accepted, documented risk of the LAN-first model, not an oversight; see the threat
+model in `SECURITY.md`. It is one of the concrete reasons Musicata must not be exposed to the
+internet.
+
+**Bonus the relay buys for free:** the user's IP never reaches the radio station, the podcast
+host, or GitHub — only the operator's server talks to them.
+
+---
+
 ## Conventions these led to
 
 - **Enum dispatch over `dyn`** for provider/player handles (async methods, object
@@ -738,3 +805,7 @@ Marley"). It's lossy and hard to undo.
 - **Stream media bytes, never whole-buffer** — pipe a network source in bounded chunks
   with backpressure so playback starts on the first read; size the chunk to the
   source (round-trip-bound SMB wants ~1 MiB, not 80 KiB). See §10.
+- **The browser talks only to us; the server talks to the internet** — every third-party
+  fetch is relayed so `default-src 'self'` can hold with no escape hatch. Not just a security
+  choice: 73% of radio streams are plain `http://`, which a TLS deployment would block as
+  mixed content if the page fetched them directly. See §12.

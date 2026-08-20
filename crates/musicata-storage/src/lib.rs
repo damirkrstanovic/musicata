@@ -390,6 +390,13 @@ impl Database {
             set_user_version(&self.pool, 33).await?;
         }
 
+        if version < 34 {
+            for statement in MIGRATION_034_BOOL_SETTINGS {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 34).await?;
+        }
+
         Ok(())
     }
 
@@ -3111,6 +3118,34 @@ impl Database {
         })
     }
 
+    /// Read a boolean setting. `None` means no row — the caller applies the documented
+    /// default (see `BOOL_SETTINGS` in the server). There is no parsing and no notion of a
+    /// "truthy" string: the column is `INTEGER CHECK (value IN (0, 1))`, so the only values
+    /// that can be here are the two that mean something.
+    pub async fn get_bool_setting(&self, key: &str) -> Result<Option<bool>> {
+        let row = sqlx::query("SELECT value FROM bool_settings WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            Some(row) => Some(row.try_get::<i64, _>("value")? != 0),
+            None => None,
+        })
+    }
+
+    /// Store (upsert) a boolean setting.
+    pub async fn set_bool_setting(&self, key: &str, value: bool) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO bool_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(i64::from(value))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Store (upsert) a setting value.
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         sqlx::query(
@@ -5729,6 +5764,56 @@ const MIGRATION_020_SETTINGS: &[&str] = &["CREATE TABLE IF NOT EXISTS settings (
         value TEXT NOT NULL
     )"];
 
+// Boolean settings, stored as booleans. `settings` is a string key/value store, so every
+// on/off toggle used to live there as text — and each reader invented its own idea of what
+// counted as true: one treated anything but "false"/"0" as on, another accepted only "true",
+// a third only "true"/"1". Five readers, three notions of truthy, two different defaults for
+// an absent row. A value of "" or "no" meant *enabled* to one reader and *disabled* to
+// another, from the same row.
+//
+// The fix is to let the database enforce the type rather than each caller guess it: a
+// dedicated table whose value is INTEGER 0/1 with a CHECK, so a bad value can't be written in
+// the first place. Defaults for absent rows are declared once, in the server's BOOL_SETTINGS
+// registry; there is no parsing left anywhere.
+//
+// The data migration preserves each key's *existing* behaviour rather than imposing the new
+// uniform rule retroactively — a row that read as "on" before must still read as "on" after,
+// so an upgrade changes nothing the user can observe. The three CASE groups below mirror the
+// three parsers that were in use. Migrated rows are removed from `settings` so there is one
+// home per key and no chance of the two disagreeing later.
+const MIGRATION_034_BOOL_SETTINGS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS bool_settings (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL CHECK (value IN (0, 1))
+    )",
+    // Group 1 — read by the old `setting_enabled`: on unless explicitly "false" or "0".
+    "INSERT OR IGNORE INTO bool_settings (key, value)
+     SELECT key, CASE WHEN value IN ('false', '0') THEN 0 ELSE 1 END
+     FROM settings
+     WHERE key IN ('loudness_analysis_enabled', 'artwork_fetch', 'fingerprint_enabled',
+                   'musicbrainz_enrich_enabled', 'history_enabled')",
+    // Group 2 — the autoplay loop: on unless exactly "false".
+    "INSERT OR IGNORE INTO bool_settings (key, value)
+     SELECT key, CASE WHEN value = 'false' THEN 0 ELSE 1 END
+     FROM settings
+     WHERE key = 'autoplay'",
+    // Group 3 — opt-in toggles: on only for an explicit true. `scrobble_enabled` also
+    // accepted "1"; the others accepted only "true". Accepting both here is strictly more
+    // permissive than the strictest old reader, which can only preserve an "on" state.
+    "INSERT OR IGNORE INTO bool_settings (key, value)
+     SELECT key, CASE WHEN value IN ('true', '1') THEN 1 ELSE 0 END
+     FROM settings
+     WHERE key IN ('scrobble_enabled', 'ml_enabled', 'snapcast.enabled',
+                   'snapcast.auth_enabled', 'snapcast.manage_server',
+                   'snapcast.airplay_enabled', 'snapcast.spotify_enabled')",
+    "DELETE FROM settings
+     WHERE key IN ('loudness_analysis_enabled', 'artwork_fetch', 'fingerprint_enabled',
+                   'musicbrainz_enrich_enabled', 'history_enabled', 'autoplay',
+                   'scrobble_enabled', 'ml_enabled', 'snapcast.enabled',
+                   'snapcast.auth_enabled', 'snapcast.manage_server',
+                   'snapcast.airplay_enabled', 'snapcast.spotify_enabled')",
+];
+
 // AcoustID audio-fingerprint results: MusicBrainz ids resolved by fingerprinting a
 // track's audio (for files whose tags carry no MBIDs). Like acquired_album_artwork,
 // deliberately **no foreign key** — `save_library` rewrites tracks/observations every
@@ -6244,6 +6329,107 @@ mod tests {
             .await
             .expect("load library")
             .is_some()
+    }
+
+    /// Migration 034 moved every on/off toggle out of the string `settings` table into
+    /// `bool_settings`. The rule it must obey: an upgrade changes nothing the user can
+    /// observe. Each old reader had its own idea of "true", so the migration translates per
+    /// key — this pins that translation, because getting it wrong silently flips a feature on
+    /// or off on somebody's server.
+    #[tokio::test]
+    async fn migration_034_preserves_each_old_readers_semantics() {
+        let db_path = temp_db_path("bool-settings-migration");
+        {
+            let database = Database::connect(&db_path).await.expect("connect");
+            // Put the pre-migration rows back as strings and rewind past 034.
+            sqlx::query("DELETE FROM bool_settings")
+                .execute(&database.pool)
+                .await
+                .expect("clear");
+            for (key, value) in [
+                // Group 1 (old `setting_enabled`): on unless "false"/"0".
+                ("artwork_fetch", "false"),
+                ("fingerprint_enabled", "0"),
+                ("musicbrainz_enrich_enabled", "true"),
+                // "" and "no" were *enabled* under this reader's deny-list — the surprising
+                // case, and precisely why the reader-decides-truthiness design had to go.
+                ("history_enabled", ""),
+                ("loudness_analysis_enabled", "no"),
+                // Group 2 (autoplay): on unless exactly "false".
+                ("autoplay", "0"),
+                // Group 3 (opt-in): on only for an explicit true.
+                ("scrobble_enabled", "1"),
+                ("ml_enabled", "true"),
+                ("snapcast.enabled", "yes"),
+                ("snapcast.auth_enabled", "false"),
+            ] {
+                sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)")
+                    .bind(key)
+                    .bind(value)
+                    .execute(&database.pool)
+                    .await
+                    .expect("seed legacy row");
+            }
+            sqlx::query("PRAGMA user_version = 33")
+                .execute(&database.pool)
+                .await
+                .expect("rewind");
+        }
+
+        let database = Database::connect(&db_path).await.expect("re-migrate");
+        for (key, expected) in [
+            ("artwork_fetch", false),
+            ("fingerprint_enabled", false),
+            ("musicbrainz_enrich_enabled", true),
+            ("history_enabled", true), // "" was truthy to the old deny-list reader
+            ("loudness_analysis_enabled", true), // so was "no"
+            ("autoplay", true),        // "0" was NOT "false", so autoplay stayed on
+            ("scrobble_enabled", true),
+            ("ml_enabled", true),
+            ("snapcast.enabled", false), // "yes" never satisfied `== "true"`
+            ("snapcast.auth_enabled", false),
+        ] {
+            assert_eq!(
+                database.get_bool_setting(key).await.expect("read"),
+                Some(expected),
+                "{key} changed meaning across the migration"
+            );
+        }
+
+        // One home per key: the string rows are gone, so the two tables can never disagree.
+        for key in ["artwork_fetch", "autoplay", "snapcast.enabled"] {
+            assert_eq!(database.get_setting(key).await.expect("read"), None);
+        }
+    }
+
+    /// The column is typed, so a value that isn't a boolean cannot be stored at all — the
+    /// guarantee that makes every reader agree without parsing anything.
+    #[tokio::test]
+    async fn bool_settings_rejects_a_non_boolean_value() {
+        let db_path = temp_db_path("bool-settings-check");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let bad = sqlx::query("INSERT INTO bool_settings (key, value) VALUES ('x', 2)")
+            .execute(&database.pool)
+            .await;
+        assert!(bad.is_err(), "CHECK constraint should reject 2");
+
+        database.set_bool_setting("x", true).await.expect("set");
+        assert_eq!(
+            database.get_bool_setting("x").await.expect("get"),
+            Some(true)
+        );
+        database
+            .set_bool_setting("x", false)
+            .await
+            .expect("overwrite");
+        assert_eq!(
+            database.get_bool_setting("x").await.expect("get"),
+            Some(false)
+        );
+        assert_eq!(
+            database.get_bool_setting("absent").await.expect("get"),
+            None
+        );
     }
 
     #[tokio::test]

@@ -116,7 +116,8 @@ open-source correction stack (REW / DRC-FIR / AutoEq), the phone-app landscape
 ## AutoEq — zero-effort headphone correction (the first feature)
 
 Every headphone colours the sound; labs measure each model's deviation from neutral.
-[AutoEq](https://github.com/jaakkopasanen/AutoEq) (MIT) aggregates those measurements for
+[AutoEq](https://github.com/jaakkopasanen/AutoEq) (its own code is MIT; the measurements it
+aggregates are not — see below) aggregates those measurements for
 **thousands of models** and precomputes the EQ that corrects each toward a preferred target
 (Harman). **The user picks their headphone model and gets a ready-made preset — no mic, no
 measurement, no room**, because headphones of one model measure consistently (unlike rooms,
@@ -335,10 +336,25 @@ per-player volume already in `PlaybackState.volume`; the proven
   ~thousands-of-models DB is a size decision — defer; curated + import covers the MVP.)
 - A small `ParametricEQ.txt` parser (`Preamp` + `Filter N: ON PK Fc … Gain … Q …`) → bands;
   unit-tested. This is the shared importer for both the picker and the paste box.
-  > **As built:** there is no `GET /api/dsp/headphones?q=` endpoint and no Rust parser. The
-  > AutoEq presets ship as a **bundled client asset** `web/src/lib/autoeq-presets.json`, and the
-  > `ParametricEQ.txt` parser is **TypeScript** in `web/src/lib/dsp.ts` — the picker and paste
-  > box both run client-side against that asset.
+  > **As built:** there is no Rust parser — the `ParametricEQ.txt` parser is **TypeScript** in
+  > `web/src/lib/dsp.ts`, shared by the picker and the paste box. Nothing is bundled: the picker
+  > asks the server for AutoEq's `results/INDEX.md` once (`GET /api/autoeq/index`) and then the
+  > chosen model's file (`GET /api/autoeq/preset?path=…`), and the server fetches both upstream
+  > and relays them (`src/proxy.rs`, `src/autoeq.rs`). It needs an internet connection; the
+  > paste box does not.
+  >
+  > **Why the server fetches it, not the page:** the app is served under `default-src 'self'`,
+  > so the browser cannot reach `raw.githubusercontent.com` at all — see the CSP note in
+  > `src/main.rs`. Relaying also keeps the user's IP off the measurement host's logs. The client
+  > names a *model*, never a URL; `autoeq::preset_url` rejects anything that would escape the
+  > fixed `results/` base, which is what stops the endpoint being an open proxy on the LAN.
+  >
+  > **Why not bundled:** AutoEq's *code* is MIT, but its published results are computed from
+  > headphone measurements contributed by oratory1990, Crinacle, Rtings and others, each under
+  > its own terms — some non-commercial. Shipping them inside an AGPL-3.0 binary would impose a
+  > further restriction the license forbids. The relay stores nothing — no disk, no DB — so an
+  > instance never accumulates a copy of the corpus. **Do not add a cache here** without
+  > checking the measurement sources' terms. See NOTICE.
 
 ### Phase 4 — Room correction (convolution) in the browser
 

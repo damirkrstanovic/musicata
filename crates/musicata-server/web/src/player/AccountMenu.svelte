@@ -1,15 +1,21 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   // Bottom-left profile control for the player: who's signed in, plus a link to the admin page
   // (admins only), self-service password change, Subsonic-token reveal, and sign out — reusing
   // the shared modal primitives (no new overlay). The menu opens upward since it sits at the
   // bottom of the sidebar.
-  import { api, ApiError } from "../lib/api";
+  import { api, ApiError, type About } from "../lib/api";
   import { session } from "../lib/session.svelte";
   import { openModal } from "../lib/modal";
 
   // AGPL section 13: anyone interacting with Musicata over a network must be offered its
-  // source. If you run a MODIFIED Musicata, repoint this at your own fork.
-  const SOURCE_URL = "https://github.com/damirkrstanovic/musicata";
+  // source. The URL is a setting (/admin → About & source), so running a fork is a field edit,
+  // not a rebuild; the build shown beside it says which source this instance actually runs.
+  let about = $state<About | null>(null);
+  api
+    .about()
+    .then((info) => (about = info))
+    .catch(() => {});
 
   let open = $state(false);
 
@@ -59,7 +65,12 @@
       {/if}
       <button type="button" class="item" onclick={changePassword}>Change password</button>
       <button type="button" class="item" onclick={showToken}>Subsonic token</button>
-      <a class="item" href={SOURCE_URL} target="_blank" rel="noopener noreferrer">Source code</a>
+      {#if about}
+        <a class="item source" href={about.source_url} target="_blank" rel="noopener noreferrer">
+          <span>Source code</span>
+          <span class="build">{about.version}{about.commit ? ` · ${about.commit}` : ""}</span>
+        </a>
+      {/if}
       <button type="button" class="item danger" onclick={() => session.logout()}>Sign out</button>
     </div>
   {/if}
@@ -144,5 +155,18 @@
   }
   .account-menu .item.danger {
     color: #e06b6b;
+  }
+  /* The source row carries the running build, so a user offered the source under AGPL
+     section 13 can tell which commit this instance is actually running. */
+  .account-menu .item.source {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  .account-menu .item.source .build {
+    font-size: 0.7rem;
+    opacity: 0.55;
+    white-space: nowrap;
   }
 </style>

@@ -1,34 +1,56 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { dsp, type LevelingMode } from "../lib/dsp.svelte";
   import { audioDevices } from "../lib/audioDevices.svelte";
   import { api } from "../lib/api";
   import { parseParametricEq } from "../lib/dsp";
   import { responseCurveDb, logFreqs } from "../lib/eqcurve";
-  // Curated ParametricEQ presets from the AutoEq project (MIT, (c) 2018 Jaakko Pasanen).
-  // See NOTICE for the full notice and a caveat on the underlying measurement data.
-  import autoeqPresets from "../lib/autoeq-presets.json";
+  import { loadIndex, searchIndex, fetchPreset, type AutoEqEntry } from "../lib/autoeq";
 
   function addOutput() {
     audioDevices.addPreset(audioDevices.presets.length === 0 ? "Speakers" : "Headphones");
     audioDevices.refreshDevices();
   }
 
-  // AutoEq headphone picker: search the bundled curated set of real ParametricEQ presets,
-  // parse the chosen one (reusing the import parser), and save it as a headphones profile.
-  const HP_MODELS = Object.keys(autoeqPresets as Record<string, string>).sort();
+  // AutoEq headphone picker. The model index and the chosen preset are both fetched by the
+  // browser from the AutoEq project on demand — Musicata bundles neither, so the measurement
+  // sources' terms stay between the user and AutoEq (see lib/autoeq.ts and NOTICE). The chosen
+  // preset is parsed with the same importer as the paste box and saved as a headphones profile.
+  let hpEntries = $state<AutoEqEntry[]>([]);
+  let hpLoading = $state(false);
+  let hpError = $state("");
   let hpSearch = $state("");
-  const hpMatches = $derived(
-    hpSearch.trim()
-      ? HP_MODELS.filter((m) => m.toLowerCase().includes(hpSearch.trim().toLowerCase())).slice(0, 8)
-      : [],
-  );
-  async function pickHeadphone(model: string) {
-    const text = (autoeqPresets as Record<string, string>)[model];
-    const prof = parseParametricEq(text, model);
-    if (prof.bands.length === 0) return;
-    prof.kind = "headphones";
-    await dsp.saveProfile(prof);
-    hpSearch = "";
+  const hpMatches = $derived(searchIndex(hpEntries, hpSearch));
+
+  // Fetch the index once, when the picker is first expanded, so matches are ready by the time
+  // a model name has been typed. A failed load leaves hpEntries empty, so reopening retries.
+  async function ensureIndex() {
+    if (hpEntries.length > 0 || hpLoading) return;
+    hpLoading = true;
+    hpError = "";
+    try {
+      hpEntries = await loadIndex();
+    } catch {
+      hpError = "Can't reach AutoEq. Check your connection, or paste a preset below.";
+    } finally {
+      hpLoading = false;
+    }
+  }
+
+  async function pickHeadphone(entry: AutoEqEntry) {
+    hpError = "";
+    try {
+      const prof = parseParametricEq(await fetchPreset(entry), entry.name);
+      if (prof.bands.length === 0) {
+        hpError = "That preset had no usable filters. Try another measurement, or paste one below.";
+        return;
+      }
+      prof.kind = "headphones";
+      await dsp.saveProfile(prof);
+      hpSearch = "";
+    } catch {
+      hpError = "Couldn't download that preset from AutoEq. Try again, or paste one below.";
+    }
   }
 
   // Room correction: a speakers profile (no EQ bands needed) that carries a measured WAV
@@ -263,11 +285,12 @@
       {/if}
     </details>
 
-    <details class="eq-import">
+    <details class="eq-import" ontoggle={(e) => e.currentTarget.open && ensureIndex()}>
       <summary>Pick your headphone (AutoEq)</summary>
       <p class="eq-note">
-        Zero-effort correction — pick your model and it's applied instantly (real AutoEq presets;
-        a preference target, so nudge the bass to taste). Not listed? Use the paste box below.
+        Zero-effort correction — pick your model and it's applied instantly. Presets are
+        downloaded from the AutoEq project as you pick them, so this needs an internet
+        connection. They target a preference curve, so nudge the bass to taste.
       </p>
       <input
         class="eq-name"
@@ -275,16 +298,24 @@
         placeholder="Search headphones (e.g. HD 600)"
         bind:value={hpSearch}
       />
+      {#if hpError}
+        <p class="eq-error">{hpError}</p>
+      {:else if hpLoading}
+        <p class="eq-note">Loading the AutoEq model list…</p>
+      {/if}
       {#if hpMatches.length > 0}
         <ul class="hp-matches">
-          {#each hpMatches as model (model)}
+          {#each hpMatches as entry (entry.path)}
             <li>
-              <button type="button" onclick={() => pickHeadphone(model)}>{model}</button>
+              <button type="button" onclick={() => pickHeadphone(entry)}>
+                <span class="hp-model">{entry.name}</span>
+                <span class="hp-source">{entry.source}{entry.rig ? ` · ${entry.rig}` : ""}</span>
+              </button>
             </li>
           {/each}
         </ul>
-      {:else if hpSearch.trim()}
-        <p class="eq-note">No match in the bundled set — paste its ParametricEQ below.</p>
+      {:else if hpSearch.trim() && !hpLoading && !hpError}
+        <p class="eq-note">No match — paste its ParametricEQ below.</p>
       {/if}
     </details>
 
@@ -327,6 +358,13 @@
     padding: 0.4rem 0.55rem;
     font-size: 0.82rem;
     cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .hp-source {
+    font-size: 0.72rem;
+    opacity: 0.62;
   }
   .hp-matches button:hover {
     background: rgba(212, 175, 55, 0.14);

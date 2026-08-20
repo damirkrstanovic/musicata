@@ -22,6 +22,9 @@
 #    linked against glibc >= 2.38 (`__isoc23_*` symbols), so it won't link on bookworm (2.36).
 FROM rust:1-trixie AS build
 ENV RUSTFLAGS="-C target-cpu=x86-64-v2"
+# See Dockerfile: `.dockerignore` excludes `.git`, so the revision is passed in by CI.
+ARG MUSICATA_GIT_SHA=""
+ENV MUSICATA_GIT_SHA=$MUSICATA_GIT_SHA
 WORKDIR /src
 COPY . .
 # Cache the cargo registry + target/ across builds so deps aren't recompiled and ORT isn't
@@ -46,8 +49,9 @@ RUN apt-get update \
     && useradd --system --no-create-home --uid 10001 musicata
 COPY --from=build /musicata-ml /usr/local/bin/musicata-ml
 COPY --from=build /ort/ /usr/local/lib/
-# The AGPL requires the license text to accompany the binary in object form too.
-COPY COPYING NOTICE /usr/share/doc/musicata/
+# The AGPL requires the license text to accompany the binary in object form too, and the
+# statically linked deps require their own attribution.
+COPY COPYING NOTICE THIRD-PARTY-NOTICES.md /usr/share/doc/musicata/
 RUN ldconfig
 ENV LD_LIBRARY_PATH=/usr/local/lib
 

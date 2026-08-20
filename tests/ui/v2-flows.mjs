@@ -73,9 +73,17 @@ await new Promise((r) => (ws.onopen = r));
 let id = 0;
 const pending = new Map();
 const exceptions = [];
+// The app is served under a strict Content-Security-Policy (`default-src 'self'`), which is
+// enforceable only because every internet fetch was moved behind the API. A violation is NOT a
+// Runtime exception — Chrome reports it in the Log domain — so watch for it explicitly.
+// Without this, a blocked image or media load degrades silently and the suite still passes.
+const cspViolations = [];
 ws.addEventListener("message", (e) => {
   const m = JSON.parse(e.data);
   if (m.id && pending.has(m.id)) (pending.get(m.id)(m.result), pending.delete(m.id));
+  if (m.method === "Log.entryAdded" && m.params.entry?.source === "security") {
+    cspViolations.push(m.params.entry.text);
+  }
   if (m.method === "Runtime.exceptionThrown") {
     const d = m.params.exceptionDetails;
     // Ignore errors thrown by browser extensions injected into the page (chrome-extension://…):
@@ -104,6 +112,7 @@ async function waitUntil(boolExpr, budgetMs, pollMs = 50) {
 }
 
 await send("Runtime.enable");
+await send("Log.enable"); // CSP violations arrive as Log.entryAdded, not Runtime exceptions.
 await send("Page.enable");
 // A real viewport so the app's internal scrollers engage (scroll-driven infinite scroll).
 await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
@@ -168,6 +177,7 @@ if (MODE === "scale") {
   }
   check("album artwork renders (img bytes loaded)", coverLoaded > 0, `loaded=${coverLoaded}`);
   check("no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
+  check("no CSP violations", cspViolations.length === 0, cspViolations.slice(0, 3).join(" | "));
   console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);
   ws.close();
   process.exit(failures ? 1 : 0);
@@ -334,12 +344,18 @@ await js(`(()=>{
   const d=[...document.querySelectorAll('details.eq-import')].find(x=>x.querySelector('summary')?.textContent.includes('Pick your headphone'));
   if(d){ d.open=true; const i=d.querySelector('input'); if(i){ i.value='HD 600'; i.dispatchEvent(new Event('input',{bubbles:true})); } }
 })()`);
-await sleep(400);
+// The ~850 KB index and the chosen preset are both fetched through the server now (the CSP
+// forbids the page reaching AutoEq directly), so wait on the condition rather than assuming a
+// fixed latency — the relay adds a hop and a cold TLS handshake on the first call.
+const hpListed = await waitUntil(`document.querySelectorAll('.hp-matches button').length > 0`, 15000);
+check("autoeq index loads through the API", hpListed !== Infinity, await js(`document.querySelector('.eq-import .eq-note.error')?.textContent || 'no matches rendered'`));
 await js(`[...document.querySelectorAll('.hp-matches button')].find(b=>b.textContent.includes('HD 600'))?.click()`);
-await sleep(900);
 check(
   "autoeq picker saves a headphone profile",
-  await js(`[...document.querySelectorAll('.eq-field select option')].some(o=>o.textContent.includes('HD 600'))`),
+  await waitUntil(
+    `[...document.querySelectorAll('.eq-field select option')].some(o=>o.textContent.includes('HD 600'))`,
+    15000,
+  ) !== Infinity,
 );
 
 await js(`(()=>{const s=document.querySelector('.eq-field select'); if(s){s.value=''; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
@@ -537,6 +553,7 @@ const r2 = await js(`document.querySelector('.seek-row .time')?.textContent`);
 check("restart resume actually plays on this tab (elapsed advances)", !!r1 && r1 !== r2, `${r1} -> ${r2}`);
 
 check("no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
+check("no CSP violations", cspViolations.length === 0, cspViolations.slice(0, 3).join(" | "));
 console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);
 ws.close();
 process.exit(failures ? 1 : 0);

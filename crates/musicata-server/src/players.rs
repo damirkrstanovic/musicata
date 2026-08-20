@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Player registry, zones, and the MPD-backed player provider.
 //!
 //! Players are *registered* with the server (reported in, e.g. from the web UI)
@@ -289,7 +290,7 @@ async fn record_action(database: &Database, player_id: &str, action: ListenActio
         return;
     }
     // Privacy switch: when history recording is off, drop the event (plays and skips alike).
-    if !crate::setting_enabled(database, crate::SETTING_HISTORY_ENABLED).await {
+    if !crate::bool_setting(database, crate::SETTING_HISTORY_ENABLED).await {
         return;
     }
     let writes: Vec<(&str, ListenKind)> = match &action {

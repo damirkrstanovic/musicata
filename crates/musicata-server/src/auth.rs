@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Multi-user authentication: argon2 password hashing, opaque cookie sessions, a per-user API
 //! token (for Subsonic / programmatic clients), and the middleware that guards `/api/*`.
 //!
@@ -209,11 +210,14 @@ fn is_admin_path(path: &str) -> bool {
         || path == "/api/history"
 }
 
-/// Always-open endpoints (the SPA must reach these before a session exists).
+/// Always-open endpoints (the SPA must reach these before a session exists). `/api/about`
+/// is open by obligation, not convenience: AGPL section 13 owes the source offer to everyone
+/// who interacts with this instance over the network, including whoever is looking at the
+/// login screen — so it must not sit behind the session gate.
 fn is_open_path(path: &str) -> bool {
     matches!(
         path,
-        "/api/health" | "/api/auth/status" | "/api/auth/login" | "/api/auth/setup"
+        "/api/health" | "/api/about" | "/api/auth/status" | "/api/auth/login" | "/api/auth/setup"
     )
 }
 

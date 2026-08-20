@@ -56,6 +56,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # build.rs stamps this into the binary, so `--version` and the in-app AGPL section 13
+          # source offer name the commit. `.dockerignore` excludes `.git`, so it can't be
+          # derived inside the build.
+          build-args: |
+            MUSICATA_GIT_SHA=${{ github.sha }}
           # Layer cache across runs (the cargo cache mounts inside the build RUN don't persist in
           # CI, so a source change recompiles from scratch — acceptable for a release workflow).
           cache-from: type=gha,scope=${{ matrix.image }}

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The audio-ML worker (M7). A **scheduled** background task (unlike the always-draining
 //! workers): off by default, it runs at a user-set daily local time (default 02:00) — sending
 //! un-analyzed tracks to the optional `musicata-ml` service over HTTP and storing the returned
@@ -42,9 +43,10 @@ struct ServiceTag {
     score: f32,
 }
 
-/// Whether ML analysis is enabled (default **off** — opt-in).
+/// Whether ML analysis is enabled. The default lives in `BOOL_SETTINGS` (off — opt-in), not
+/// here, so every reader of this key agrees on it.
 pub async fn enabled(database: &Database) -> bool {
-    matches!(database.get_setting(SETTING_ML_ENABLED).await, Ok(Some(v)) if v == "true")
+    crate::bool_setting(database, SETTING_ML_ENABLED).await
 }
 
 /// The default analysis-service URL when the user hasn't set one: `MUSICATA_ML_SERVICE_URL` (the
