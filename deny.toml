@@ -1,0 +1,47 @@
+# cargo-deny: enforce that every crate compiled into a Musicata binary carries a license
+# compatible with AGPL-3.0-or-later.
+#
+# THIRD-PARTY-NOTICES.md answers "who do we credit?" — mechanically, from each crate's own
+# metadata. This file answers the question that actually needs judgment: "is this license
+# allowed here at all?" The judgment is made once, as the allow list below; after that CI
+# enforces it. A new dependency under anything unlisted fails the build, which is the one
+# moment a human should be thinking about licenses.
+#
+# Run locally:  cargo deny check licenses
+
+[graph]
+# Check every optional feature and both non-default workspace members (musicata-ml,
+# musicata-endpoint), so a license problem can't hide behind a feature flag.
+all-features = true
+
+[licenses]
+# Every identifier below appears in the current dependency tree (see THIRD-PARTY-NOTICES.md).
+# All are one-way compatible into AGPL-3.0: permissive, or MPL-2.0, which is explicitly
+# GPL-compatible via its secondary-license clause.
+#
+# Adding to this list is a deliberate act. Before you do, check that the license is actually
+# compatible with the AGPL — https://www.gnu.org/licenses/license-list.html is the reference.
+# Notably NOT compatible and never to be added: SSPL, BUSL, Elastic, CC-BY-NC-*, and the
+# original (pre-3.0) OpenSSL license.
+allow = [
+    "0BSD",
+    "AGPL-3.0-or-later",         # Musicata's own workspace crates
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# A crate whose license text doesn't closely match the canonical SPDX text is treated as
+# unlicensed rather than guessed at.
+confidence-threshold = 0.8

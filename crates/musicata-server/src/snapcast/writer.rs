@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The FIFO writer: a dedicated OS thread that streams decoded PCM into the named
 //! pipe snapserver reads. snapserver paces its pipe reads to real time (see
 //! `../snapcast` `asio_stream.hpp` `nextTick_`), so our **blocking writes backpressure
@@ -109,7 +110,14 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
         loop {
             match rx.try_recv() {
                 Ok(msg) => {
-                    if !apply(msg, &mut current, &mut next, &mut playing, &mut volume, &mut eq) {
+                    if !apply(
+                        msg,
+                        &mut current,
+                        &mut next,
+                        &mut playing,
+                        &mut volume,
+                        &mut eq,
+                    ) {
                         return;
                     }
                 }
@@ -124,7 +132,14 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
             clock = None;
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(msg) => {
-                    if !apply(msg, &mut current, &mut next, &mut playing, &mut volume, &mut eq) {
+                    if !apply(
+                        msg,
+                        &mut current,
+                        &mut next,
+                        &mut playing,
+                        &mut volume,
+                        &mut eq,
+                    ) {
                         return;
                     }
                 }
@@ -153,7 +168,8 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
             } else {
                 let f = factor as f64;
                 for frame in chunk.chunks(CHANNELS) {
-                    let (mut l, mut r) = (frame[0] as f64, frame.get(1).copied().unwrap_or(0) as f64);
+                    let (mut l, mut r) =
+                        (frame[0] as f64, frame.get(1).copied().unwrap_or(0) as f64);
                     if let Some(eq) = eq.as_mut() {
                         (l, r) = eq.process_frame(l, r);
                     }

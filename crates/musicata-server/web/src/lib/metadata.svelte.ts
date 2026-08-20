@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // The track metadata editor: opens a review for a track, lets the user approve/reject each
 // source's field observations (which the server folds into the canonical metadata).
 import {

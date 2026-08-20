@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Output presets + the speakers/headphones switcher (the "home-office" case). An OutputPreset
 // binds a physical sink + a server DSP profile + a remembered volume. These live per-browser in
 // localStorage because output device IDs are browser/machine-scoped and not portable (the DSP

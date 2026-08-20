@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! A small in-memory log of long-running activities (library scans, rescans, …)
 //! so the admin page can show what's happening now and why something failed.
 //!

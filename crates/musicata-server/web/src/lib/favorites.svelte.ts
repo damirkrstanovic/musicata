@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Tracks the set of favorited track ids so any track row can show its heart state, with an
 // optimistic toggle. Loaded once on startup.
 import { api } from "./api";

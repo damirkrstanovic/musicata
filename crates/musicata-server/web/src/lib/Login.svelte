@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { ApiError } from "./api";
+  // SPDX-License-Identifier: AGPL-3.0-or-later
+  import { api, ApiError, type About } from "./api";
   import { session } from "./session.svelte";
 
   // "setup" creates the first admin account; "login" signs in to an existing one.
@@ -11,6 +12,15 @@
   let error = $state("");
 
   const isSetup = $derived(mode === "setup");
+
+  // AGPL section 13 owes the source offer to everyone who reaches this instance over the
+  // network — which includes whoever is looking at this screen, before any session exists.
+  // `/api/about` is open for exactly that reason.
+  let about = $state<About | null>(null);
+  api
+    .about()
+    .then((info) => (about = info))
+    .catch(() => {});
 
   async function submit(event: SubmitEvent) {
     event.preventDefault();
@@ -56,17 +66,36 @@
       {isSetup ? "Create account" : "Sign in"}
     </button>
   </form>
+  {#if about}
+    <p class="login-about">
+      {about.name}
+      {about.version}{about.commit ? ` (${about.commit})` : ""} · {about.license} ·
+      <a href={about.source_url} target="_blank" rel="noopener noreferrer">Source code</a>
+    </p>
+  {/if}
 </div>
 
 <style>
   .login-shell {
     min-height: 100vh;
     min-height: 100dvh;
-    display: grid;
-    place-items: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
     padding: 1.5rem;
     background: #16181d;
     color: #e9ecf1;
+  }
+  .login-about {
+    margin: 0;
+    font-size: 0.75rem;
+    color: #78808d;
+    text-align: center;
+  }
+  .login-about a {
+    color: inherit;
   }
   .login-card {
     width: 100%;

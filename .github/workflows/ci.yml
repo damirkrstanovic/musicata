@@ -1,0 +1,65 @@
+name: ci
+
+# Run the test suite on every PR and on main. The `pre-commit` hook runs the same checks (plus
+# the UI smoke suite), but it is opt-in — `git config core.hooksPath .githooks` — so a
+# contributor's first PR arrives unverified without this.
+#
+# Only the default workspace members are built: `musicata-endpoint` (ALSA) and `musicata-ml`
+# (ONNX Runtime) carry heavy native dependencies and are deliberately excluded, exactly as a
+# plain `cargo test` excludes them locally.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      # build.rs runs the Vite build on every `cargo build`. Do it once here, then set
+      # MUSICATA_SKIP_WEB_BUILD so the two cargo invocations below reuse this dist/.
+      - name: Build web assets
+        working-directory: crates/musicata-server/web
+        run: npm ci && npm run build
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Test
+        env:
+          MUSICATA_SKIP_WEB_BUILD: "1"
+        run: cargo test
+
+      # The minimal build drops the SMB dependency and gates out the OpenSubsonic, podcast,
+      # Archive and Snapcast code paths. It breaks on a mis-scoped `#[cfg]` long before anyone
+      # tries to ship it, so it is worth its own run.
+      - name: Test (--no-default-features)
+        env:
+          MUSICATA_SKIP_WEB_BUILD: "1"
+        run: cargo test --no-default-features -p musicata-server
+
+  web:
+    name: svelte-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+      - working-directory: crates/musicata-server/web
+        run: npm ci && npm run check

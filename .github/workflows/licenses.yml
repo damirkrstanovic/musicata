@@ -1,0 +1,79 @@
+name: licenses
+
+# Guard the two license obligations that no other check covers.
+#
+# 1. THIRD-PARTY-NOTICES.md must describe the binary it ships beside. It is generated from
+#    Cargo.lock + the built web bundle, but nothing regenerates it automatically — and
+#    release.yml copies whatever is in the tree into the tarball and both images. A dependency
+#    bump that lands without a regenerated file ships attribution that is silently wrong, which
+#    for MIT/BSD/ISC deps ("shall be included in all copies") is the actual breach. So:
+#    regenerate here and fail if the result differs from what is committed.
+#
+# 2. Every crate compiled in must carry a license compatible with AGPL-3.0-or-later.
+#    cargo-deny enforces the allow list in deny.toml, so an incompatible dependency fails a PR
+#    instead of being discovered after a release.
+#
+# Runs on tags too: a tag push doesn't go through PR checks, and that is exactly the moment
+# stale notices would ship.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  notices:
+    name: third-party notices are current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The generator reads each crate's own LICENSE/COPYING/NOTICE out of the registry cache
+      # and fails loudly if any crate in Cargo.lock is missing, rather than omitting it. Plain
+      # `cargo fetch` resolves the default members; the two opt-in crates are fetched by
+      # manifest path so their trees (ort, rodio/cpal) are cached too.
+      - name: Fetch crate sources
+        run: |
+          cargo fetch
+          cargo fetch --manifest-path crates/musicata-ml/Cargo.toml
+          cargo fetch --manifest-path crates/musicata-endpoint/Cargo.toml
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      # The npm side of the inventory is read out of the *built* bundle (Workbox stamps its
+      # package versions into the service worker), so dist/ has to exist before generating.
+      - name: Build web assets
+        working-directory: crates/musicata-server/web
+        run: npm ci && npm run build
+
+      - name: Regenerate THIRD-PARTY-NOTICES.md
+        run: node scripts/gen-third-party-notices.mjs
+
+      - name: Fail if it differs from the committed file
+        run: |
+          if ! git diff --exit-code --stat THIRD-PARTY-NOTICES.md; then
+            echo "::error file=THIRD-PARTY-NOTICES.md::Out of date. Run 'node scripts/gen-third-party-notices.mjs' and commit the result."
+            git diff -- THIRD-PARTY-NOTICES.md | head -200
+            exit 1
+          fi
+
+  deny:
+    name: dependency licenses are AGPL-compatible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # --all-features (set in deny.toml) covers the optional providers and both non-default
+      # workspace members, so a license problem can't hide behind a feature flag.
+      - run: cargo deny check licenses

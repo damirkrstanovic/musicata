@@ -27,7 +27,20 @@ fields/endpoints are additive within a version.
 
 `/api/*` requires authentication once an account exists. Until the first user is
 created the server runs in **setup mode** and the API is open. These paths are always
-open: `/api/health`, `/api/auth/status`, `/api/auth/login`, `/api/auth/setup`.
+open: `/api/health`, `/api/about`, `/api/auth/status`, `/api/auth/login`, `/api/auth/setup`.
+
+`/api/about` is open by obligation rather than convenience — AGPL section 13 owes the source
+offer to everyone who reaches this instance over the network, including a visitor sitting at the
+login screen:
+
+```json
+{ "name": "Musicata", "version": "1.0.1", "commit": "acf52b3",
+  "license": "AGPL-3.0-or-later", "source_url": "https://github.com/damirkrstanovic/musicata" }
+```
+
+`source_url` is the `source_url` setting when set, else upstream; `commit` is empty when the
+build had no git checkout. The web app shows both on the sign-in screen and in the player's
+account menu.
 
 Authenticate with any of:
 
@@ -48,6 +61,7 @@ Authenticate with any of:
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
+| GET | `/api/about` | Name, version, build commit, license, and this instance's source URL — the AGPL §13 offer. (open) |
 | GET | `/api/auth/status` | Whether setup is needed and who (if anyone) is signed in. (open) |
 | POST | `/api/auth/setup` | Create the first admin account (setup mode only). (open) |
 | POST | `/api/auth/login` | Sign in; sets the `musicata_session` cookie. (open) |
@@ -97,6 +111,7 @@ network sources are added at runtime and persisted.
 | POST | `/api/sources/{id}/rescan` | Rescan all sources and persist the merged library. |
 | GET | `/api/sources/{id}/browse` | Browse a source's hierarchy (for browse-only providers like radio). |
 | GET | `/api/sources/{id}/resolve` | Resolve a browse entry to a streamable track. |
+| GET | `/api/sources/{id}/stream?item=` | **Relay** a browse-only item's audio (podcast enclosure, Archive file) through this origin. `browse` returns this URL rather than the upstream one — the web app is served under `default-src 'self'`, so it may not load media from anywhere else. The upstream URL is resolved server-side and never accepted from the caller. |
 
 SMB shares are read directly over the wire in pure Rust (no kernel mount);
 streaming fetches only the requested byte range.
@@ -224,6 +239,7 @@ event stream keeps it alive.
 | GET/POST | `/api/radio` | List internet-radio stations / add one. |
 | GET | `/api/radio/directory` | Browse the Radio Browser directory. |
 | PATCH/DELETE | `/api/radio/{id}` | Edit / remove a station. |
+| GET | `/api/radio/{id}/stream` | **Relay** the station's audio through this origin (same reason as above). The station's real URL stays server-side; `GET /api/radio` still returns it, for editing. |
 | GET | `/api/tracks/{id}/radio` | A track-seeded radio (similar tracks). |
 | GET | `/api/tracks/{id}/similar?limit=` | "Sounds like this" — tracks whose **audio embedding** is nearest the seed (cosine KNN over the musicata-ml `vec0` index), nearest first. `{ track_ids }`. Empty if the seed hasn't been analyzed; distinct from `/radio` (which is ListenBrainz/metadata-based). |
 | GET | `/api/tracks/{id}/audio-radio?limit=` | A **diverse** audio station from the seed: sonically-similar tracks **interleaved across artists** (no artist back-to-back, capped share) so it varies instead of repeating one artist. `{ track_ids }` with the seed first. The DJ version of `/similar`. |
@@ -271,6 +287,31 @@ EQ + room/headphone correction profiles. Authenticated (not admin-only).
 | GET | `/api/dsp/profiles` | List DSP profiles. |
 | PUT/DELETE | `/api/dsp/profiles/{id}` | Upsert / delete a profile. |
 | GET/POST/DELETE | `/api/dsp/profiles/{id}/impulse` | Get / upload (WAV) / delete a profile's impulse response. |
+| GET | `/api/autoeq/index` | **Relay** AutoEq's `results/INDEX.md` (the model list). |
+| GET | `/api/autoeq/preset?path=` | **Relay** one model's `ParametricEQ.txt`. `path` is a `results/`-relative directory exactly as `INDEX.md` spells it; the filename is derived server-side and anything that would escape that base is a 400. |
+
+Nothing from these two is stored — the response is streamed through (see `NOTICE` on the
+measurement sources' terms).
+
+### Content-Security-Policy
+
+Every response carries `default-src 'self'` (plus `nosniff` and `no-referrer`). The web app
+therefore cannot reach any third-party origin directly: internet radio, podcast enclosures,
+Internet Archive files and AutoEq presets are all fetched by the server and relayed
+(`src/proxy.rs`). **Adding a third-party URL to a page will break it**, and the fix is to relay
+it through an endpoint, not to widen the policy — an XSS that gets past Svelte's escaping then
+has nowhere to send what it reads. `scripts/ui-smoke.sh` fails on any CSP violation.
+
+### Audio ML (embeddings & tags)
+
+Drives the optional `musicata-ml` service (see [musicata-ml.md](musicata-ml.md)). Enabled and
+pointed at a service URL from **/admin → Settings**; the analysis itself runs on its own
+background worker.
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET | `/api/ml/status` | Whether analysis is enabled, plus `analyzed` / `total` track counts. |
+| POST | `/api/ml/analyze` | Wake the analysis worker now instead of waiting for its schedule. Returns `202 Accepted`. |
 
 ### Snapcast (feature-gated)
 

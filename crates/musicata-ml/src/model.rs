@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The ONNX model: a raw-waveform audio model (PANNs CNN14, 16 kHz) that outputs a 2048-d
 //! `embedding` (for similarity) and 527 AudioSet `clip_scores` (mapped to human-readable tags).
 
@@ -7,6 +8,8 @@ use ort::value::Tensor;
 use serde::Serialize;
 
 /// AudioSet's 527 class display names, in the model's output order. Bundled at build time.
+/// Taken from Google's AudioSet ontology, licensed CC BY 4.0 — see NOTICE for the required
+/// attribution.
 const LABELS: &str = include_str!("../data/audioset_labels.txt");
 
 pub struct AudioModel {

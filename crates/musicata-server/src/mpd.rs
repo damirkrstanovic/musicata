@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Minimal async client for the Music Player Daemon (MPD) control protocol.
 //!
 //! MPD speaks a line-based text protocol over TCP: the client writes a command
@@ -150,7 +151,6 @@ fn seekcur_arg(position_seconds: f64) -> String {
 }
 
 impl MpdConnection {
-
     pub async fn set_volume(&mut self, volume: u8) -> Result<()> {
         self.command(&format!("setvol {}", volume.min(100))).await?;
         Ok(())

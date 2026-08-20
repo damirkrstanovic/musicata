@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { api, ApiError, type AppSettings } from "../lib/api";
+  // SPDX-License-Identifier: AGPL-3.0-or-later
+  import { api, ApiError, type About, type AppSettings } from "../lib/api";
 
   let settings = $state<AppSettings>({
     artwork_fetch: false,
@@ -12,7 +13,13 @@
     history_enabled: true,
     scrobble_enabled: false,
     listenbrainz_token: "",
+    source_url: "",
   });
+  let about = $state<About | null>(null);
+  api
+    .about()
+    .then((info) => (about = info))
+    .catch(() => {});
   let status = $state("");
   let error = $state(false);
   let busy = $state(false);
@@ -185,6 +192,30 @@
       <span>ListenBrainz token</span>
       <input bind:value={settings.listenbrainz_token} placeholder="user token" />
     </label>
+    <div class="field-actions">
+      <button type="submit" class="primary-button" disabled={busy}>Save</button>
+      <span class="form-status" class:error>{status}</span>
+    </div>
+  </form>
+
+  <div class="admin-panel-head"><h2>About &amp; source</h2></div>
+  <p class="admin-hint">
+    Musicata is free software under the AGPL. If you run a <strong>modified</strong> build, section
+    13 of that license requires you to offer your users its source — so point the link below at
+    your fork. It shows on the sign-in screen and in the player's account menu. Clear it to offer
+    the upstream project instead.
+  </p>
+  <form class="field-form" onsubmit={save}>
+    <label class="field">
+      <span>Source code URL</span>
+      <input bind:value={settings.source_url} placeholder="https://github.com/…" />
+    </label>
+    {#if about}
+      <p class="admin-hint">
+        Running {about.name}
+        {about.version}{about.commit ? ` (${about.commit})` : ""} · {about.license}
+      </p>
+    {/if}
     <div class="field-actions">
       <button type="submit" class="primary-button" disabled={busy}>Save</button>
       <span class="form-status" class:error>{status}</span>

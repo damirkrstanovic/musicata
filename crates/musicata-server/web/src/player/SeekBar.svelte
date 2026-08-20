@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   // Reads only `player.elapsed`/`player.duration` — the hot-path signals. A progress tick
   // mutates those alone, so only this row's text + thumb move; nothing else in the footer
   // re-renders. While dragging, the thumb tracks the pointer (not the server echo).

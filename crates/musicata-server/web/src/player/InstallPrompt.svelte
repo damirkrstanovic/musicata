@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   // A slim, dismissable top banner offering PWA install: a one-tap "Install" on Chrome/Android,
   // or "Add to Home Screen" instructions on iOS Safari (which has no install API).
   import { install } from "../lib/install.svelte";

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // A `use:onVisible` action: calls `callback` whenever the node scrolls near the viewport.
 // Used as an infinite-scroll sentinel at the end of a list.
 export function onVisible(node: HTMLElement, callback: () => void) {

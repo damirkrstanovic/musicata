@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // navigator.mediaSession glue: OS now-playing metadata, the lock-screen scrubber, and the
 // hardware/notification transport buttons (which dispatch PlayerCommands).
 import type { PlaybackState } from "../types/PlaybackState";

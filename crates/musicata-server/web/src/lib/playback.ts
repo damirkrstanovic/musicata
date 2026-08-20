@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Bridges the views to the audio output: a view hands over a track list + start index, and
 // we claim output, prime play() in the click gesture (autoplay), and issue the command.
 import type { BrowserAudio } from "./audio";

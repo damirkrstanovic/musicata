@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Tiny UI state for the Listening-stats overlay (open/closed). The figures themselves are
 // fetched fresh from GET /api/history/stats when the panel opens (see StatsPanel.svelte).
 class StatsPanel {

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Synchronized multi-room playback via Snapcast (feature `snapcast`).
 //!
 //! Unlike every other Musicata playback path — where the endpoint fetches a per-track URL

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! snapserver lifecycle + the single "Musicata" pipe stream.
 //!
 //! Snapcast broadcasts a continuous PCM stream to N synchronized clients (rooms). We run
@@ -195,10 +196,11 @@ impl Drop for SnapcastManager {
         // Best-effort: if `shutdown` wasn't called, kill the child so we don't leak a
         // snapserver process.
         if let Ok(mut guard) = self.child.try_lock()
-            && let Some(child) = guard.as_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            && let Some(child) = guard.as_mut()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 

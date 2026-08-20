@@ -1,0 +1,57 @@
+Musicata
+Copyright (C) 2026 Damir Krstanović
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See COPYING for the full license text.
+
+--------------------------------------------------------------------------------
+Third-party material redistributed in this repository
+--------------------------------------------------------------------------------
+
+This file covers third-party material stored in THIS REPOSITORY. Musicata's Rust
+and npm dependencies are fetched at build time and are not checked in here; their
+licenses are recorded in Cargo.lock / package-lock.json and in the per-dependency
+comments in each crate's Cargo.toml.
+
+They ARE, however, compiled into every Musicata binary — the server links its Rust
+dependency tree statically and embeds the built web app — so the attribution those
+licenses require travels with the release tarball and the container images in
+THIRD-PARTY-NOTICES.md. Regenerate it with `node scripts/gen-third-party-notices.mjs`
+after changing dependencies.
+
+Two third-party works are downloaded at runtime rather than redistributed, and so
+carry no obligation here:
+
+  - The PANNs CNN14 ONNX model used by musicata-ml, fetched on first run
+    (see docs/musicata-ml.md). The model is published under the MIT license; it is a
+    third-party ONNX export of PANNs (Kong et al.), whose original release is
+    Apache-2.0.
+
+  - AutoEq headphone correction presets, fetched from the AutoEq project when a user
+    picks their headphone model in the equalizer (see docs/dsp.md). The request is made
+    by the server on the user's behalf and relayed straight to that user's browser
+    (crates/musicata-server/src/proxy.rs): nothing is written to disk or to the
+    database, so no Musicata instance accumulates a copy of the corpus, and a preset
+    comes to rest only in the profile the user chooses to save. AutoEq's own code is
+    MIT (c) 2018 Jaakko Pasanen, but its published results derive from headphone
+    measurements contributed by third parties (oratory1990, Crinacle, Rtings and
+    others), each publishing under its own terms — some non-commercial. Do not bundle
+    them into a fork's binary, and do not add a persistent cache, without first
+    checking the terms of the measurement sources they derive from.
+
+The following third-party work IS included in this repository and carries its own
+license terms:
+
+1. AudioSet class labels
+   File:    crates/musicata-ml/data/audioset_labels.txt
+   Source:  Google AudioSet ontology <https://research.google.com/audioset/>
+   License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+            <https://creativecommons.org/licenses/by/4.0/>
+
+   The 527 class display names are taken, unmodified and in the model's output
+   order, from the AudioSet ontology published by Google LLC. They are used to
+   label the audio-tagging output of musicata-ml. CC BY 4.0 is one-way
+   compatible with the GNU GPL family, so this material may be redistributed
+   under this repository's terms; this notice provides the required attribution.

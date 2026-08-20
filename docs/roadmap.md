@@ -769,7 +769,7 @@ Tasks:
   the queue model) beyond the Snapcast case. **Gapless follow-up:** the endpoint now plays
   consecutive library tracks with no audible gap — the server broadcasts a repeat/shuffle-aware
   `next_up` hint and the endpoint prefetches+appends the next track to one persistent rodio sink
-  (design: `docs/superpowers/specs/2026-06-30-gapless-native-endpoint-design.md`).
+  (design: `docs/gapless-endpoint.md`).
 - [x] Introduce authentication between the server and players/endpoints (the
   *endpoint→server* direction). **Shipped** — see [player-auth.md](player-auth.md). A per-player
   bearer token is issued at registration (`POST /api/players {"issue_token":true}` → `auth_token`
@@ -853,10 +853,10 @@ polish remain.
   toggle that swaps profile + sink (`AudioContext.setSinkId`, feature-detected — Safari/FF fall
   back to the OS default) + remembered per-output volume (a safety feature). Verified by smoke
   (switch applies the remembered volume).
-- [x] **Phase 3 — AutoEq headphone profiles.** Bundled a curated set of **19 popular models'
-  real ParametricEQ presets** (MIT, fetched verbatim from the AutoEq project →
-  `web/src/lib/autoeq-presets.json`) + a searchable model picker → instant zero-mic correction;
-  paste-import covers the long tail.
+- [x] **Phase 3 — AutoEq headphone profiles.** A searchable picker over **AutoEq's full model
+  list**, fetched by the browser on demand (`web/src/lib/autoeq.ts`) rather than bundled — the
+  measurements AutoEq aggregates carry their own terms, so Musicata redistributes none of them
+  (see NOTICE) → instant zero-mic correction; paste-import covers offline use and the long tail.
 - [x] **Phase 4 — room correction in the browser.** A `ConvolverNode` (`normalize=false`) loading
   a user-uploaded WAV impulse response (stored as a file, served by `/api/dsp/profiles/{id}/impulse`);
   stereo only. Missing/undecodable IR skips convolution rather than silencing.

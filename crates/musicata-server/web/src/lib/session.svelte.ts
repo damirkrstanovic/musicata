@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // The signed-in user, shared across the app. Drives the auth gate: setup (no accounts yet) →
 // login → app. A 401 from any request (dispatched by api.ts) drops us back to the login screen.
 import { api, type SessionUser } from "./api";

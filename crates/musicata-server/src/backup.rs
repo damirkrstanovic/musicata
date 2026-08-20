@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Library export / import: a single zip holding a consistent database snapshot
 //! (`musicata.db`) plus the acquired-artwork cache (`artwork/…`). This is Musicata's *state*
 //! for migrating to another machine or backing up — not the music files themselves, which
@@ -46,7 +47,11 @@ pub fn staged_artwork(artwork_dir: &Path) -> PathBuf {
 }
 
 /// Build the export zip: the DB snapshot as `musicata.db`, the artwork tree under `artwork/`.
-pub fn create_archive(db_snapshot: &Path, artwork_dir: &Path, dest_zip: &Path) -> anyhow::Result<()> {
+pub fn create_archive(
+    db_snapshot: &Path,
+    artwork_dir: &Path,
+    dest_zip: &Path,
+) -> anyhow::Result<()> {
     let file = std::fs::File::create(dest_zip)
         .with_context(|| format!("create {}", dest_zip.display()))?;
     let mut zip = zip::ZipWriter::new(file);
@@ -105,9 +110,13 @@ fn sanitize_relative(rel: &str) -> Option<PathBuf> {
 }
 
 /// Unpack an uploaded export zip into the staging paths. Replaces any prior staging.
-pub fn extract_import(zip_bytes: &[u8], db_import: &Path, artwork_import: &Path) -> anyhow::Result<()> {
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
-        .context("not a valid zip archive")?;
+pub fn extract_import(
+    zip_bytes: &[u8],
+    db_import: &Path,
+    artwork_import: &Path,
+) -> anyhow::Result<()> {
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).context("not a valid zip archive")?;
 
     let _ = std::fs::remove_file(db_import);
     let _ = std::fs::remove_dir_all(artwork_import);

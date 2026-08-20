@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Decode arbitrary audio bytes to **mono f32 at the model's sample rate** (16 kHz). The PANNs
 //! model takes a raw waveform (the spectrogram is inside the ONNX graph), so this is the whole
 //! preprocessing step. Mirrors the server's Snapcast decode loop (symphonia + rubato).
@@ -119,8 +120,8 @@ fn resample_mono(input: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
         .map_err(|error| anyhow!("resampler init: {error}"))?;
     let needed = resampler.process_all_needed_output_len(frames_in);
     let mut output = vec![0.0f32; needed];
-    let in_adapter =
-        InterleavedSlice::new(input, 1, frames_in).map_err(|error| anyhow!("input adapter: {error}"))?;
+    let in_adapter = InterleavedSlice::new(input, 1, frames_in)
+        .map_err(|error| anyhow!("input adapter: {error}"))?;
     let mut out_adapter = InterleavedSlice::new_mut(&mut output, 1, needed)
         .map_err(|error| anyhow!("output adapter: {error}"))?;
     let (_in, out_frames) = resampler

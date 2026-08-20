@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// Musicata — a local-first music server + web controller.
+// Copyright (C) 2026 Damir Krstanović
+//
+// This program is free software: you can redistribute it and/or modify it under the terms of
+// the GNU Affero General Public License as published by the Free Software Foundation, either
+// version 3 of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+// See the GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License along with this
+// program. If not, see <https://www.gnu.org/licenses/>.
+
 //! Core domain and provider interfaces for Musicata.
 //!
 //! The initial implementation ships a local-disk provider, but the domain model
@@ -924,7 +940,10 @@ pub fn build_track(
         && file.file_size_bytes.is_some()
         && file.file_size_bytes == previous.file_size_bytes
         && file.modified_at_unix_seconds == previous.modified_at_unix_seconds
-        && content_hash_allows_reuse(file.content_hash.as_deref(), previous.content_hash.as_deref())
+        && content_hash_allows_reuse(
+            file.content_hash.as_deref(),
+            previous.content_hash.as_deref(),
+        )
     {
         let mut track = previous.clone();
         track.path = path;
@@ -2060,9 +2079,11 @@ fn infer_track_metadata(root: &Path, path: &Path) -> TrackMetadata {
 
 fn parse_album_dir(album_dir: &str) -> (Option<u16>, String) {
     if let Some((year, title)) = album_dir.split_once(" - ")
-        && year.len() == 4 && year.chars().all(|char| char.is_ascii_digit()) {
-            return (year.parse().ok(), clean_title(title));
-        }
+        && year.len() == 4
+        && year.chars().all(|char| char.is_ascii_digit())
+    {
+        return (year.parse().ok(), clean_title(title));
+    }
 
     (None, clean_title(album_dir))
 }
@@ -2578,7 +2599,10 @@ mod tests {
         assert!(!same_artist("The The", "The Beatles"));
         // Leading "the " is only stripped as a whole word — not inside a word.
         assert_eq!(normalize_artist_key("Therion"), "therion");
-        assert_eq!(normalize_artist_key("Theatre of Tragedy"), "theatre of tragedy");
+        assert_eq!(
+            normalize_artist_key("Theatre of Tragedy"),
+            "theatre of tragedy"
+        );
         assert!(!same_artist("Therion", "ion"));
         // No transliteration across scripts.
         assert!(!same_artist("Сергей", "Sergei"));
@@ -2896,12 +2920,30 @@ mod tests {
     fn scanner_merges_normalized_artist_variants() {
         // Files >1MB so the walk doesn't hash; folder/filename metadata gives the artist.
         let files = vec![
-            (PathBuf::from("/A/01 - Beyoncé - Hold Up.mp3"), vec![1u8; 1_200_000]),
-            (PathBuf::from("/A/02 - Beyonce - Sorry.mp3"), vec![2u8; 1_200_000]),
-            (PathBuf::from("/A/03 - The Beatles - Come Together.mp3"), vec![3u8; 1_200_000]),
-            (PathBuf::from("/A/04 - Beatles - Something.mp3"), vec![4u8; 1_200_000]),
-            (PathBuf::from("/A/05 - Fela Kuti - Zombie.mp3"), vec![5u8; 1_200_000]),
-            (PathBuf::from("/A/06 - Fela Anikulapo Kuti - Water.mp3"), vec![6u8; 1_200_000]),
+            (
+                PathBuf::from("/A/01 - Beyoncé - Hold Up.mp3"),
+                vec![1u8; 1_200_000],
+            ),
+            (
+                PathBuf::from("/A/02 - Beyonce - Sorry.mp3"),
+                vec![2u8; 1_200_000],
+            ),
+            (
+                PathBuf::from("/A/03 - The Beatles - Come Together.mp3"),
+                vec![3u8; 1_200_000],
+            ),
+            (
+                PathBuf::from("/A/04 - Beatles - Something.mp3"),
+                vec![4u8; 1_200_000],
+            ),
+            (
+                PathBuf::from("/A/05 - Fela Kuti - Zombie.mp3"),
+                vec![5u8; 1_200_000],
+            ),
+            (
+                PathBuf::from("/A/06 - Fela Anikulapo Kuti - Water.mp3"),
+                vec![6u8; 1_200_000],
+            ),
         ];
         let fs = FakeFs::new(files);
         let library = scan_source(&fs, "src").expect("scan");
@@ -2923,8 +2965,14 @@ mod tests {
     #[test]
     fn regroup_applies_artist_aliases() {
         let files = vec![
-            (PathBuf::from("/A/01 - Fela Kuti - Zombie.mp3"), vec![1u8; 1_200_000]),
-            (PathBuf::from("/A/02 - Fela Anikulapo Kuti - Water.mp3"), vec![2u8; 1_200_000]),
+            (
+                PathBuf::from("/A/01 - Fela Kuti - Zombie.mp3"),
+                vec![1u8; 1_200_000],
+            ),
+            (
+                PathBuf::from("/A/02 - Fela Anikulapo Kuti - Water.mp3"),
+                vec![2u8; 1_200_000],
+            ),
         ];
         let fs = FakeFs::new(files);
         let library = scan_source(&fs, "src").expect("scan");
@@ -2952,8 +3000,14 @@ mod tests {
     #[test]
     fn regroup_matches_scanner_ids() {
         let files = vec![
-            (PathBuf::from("/A/01 - Beyoncé - Hold Up.mp3"), vec![1u8; 1_200_000]),
-            (PathBuf::from("/A/02 - Beatles - Something.mp3"), vec![2u8; 1_200_000]),
+            (
+                PathBuf::from("/A/01 - Beyoncé - Hold Up.mp3"),
+                vec![1u8; 1_200_000],
+            ),
+            (
+                PathBuf::from("/A/02 - Beatles - Something.mp3"),
+                vec![2u8; 1_200_000],
+            ),
         ];
         let fs = FakeFs::new(files);
         let library = scan_source(&fs, "src").expect("scan");
@@ -2962,8 +3016,7 @@ mod tests {
             .iter()
             .map(|t| (t.id.clone(), (t.artist_id.clone(), t.album_id.clone())))
             .collect();
-        let regrouped =
-            regroup_library_with_overrides(library, &BTreeMap::new(), &BTreeMap::new());
+        let regrouped = regroup_library_with_overrides(library, &BTreeMap::new(), &BTreeMap::new());
         for track in &regrouped.tracks {
             assert_eq!(
                 before[&track.id],

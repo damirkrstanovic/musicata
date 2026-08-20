@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! SMB/CIFS music source — reads a network share directly over the wire (pure
 //! Rust, no kernel mount, no libsmbclient) via the `smb` crate.
 //!
@@ -518,23 +519,21 @@ impl SmbProvider {
     ) -> anyhow::Result<impl futures::Stream<Item = io::Result<Vec<u8>>> + Send + 'static> {
         let (slot, client) = self.pool.get().await?;
         let unc = self.config.item_unc(item_id)?;
-        let resource = match tokio::time::timeout(
-            READ_TIMEOUT,
-            client.create_file(&unc, &open_read_args()),
-        )
-        .await
-        {
-            Ok(Ok(resource)) => resource,
-            Ok(Err(error)) => {
-                // The connection may be dead — drop this slot so the next call reconnects.
-                self.pool.invalidate(slot).await;
-                return Err(anyhow!("open {item_id}: {error}"));
-            }
-            Err(_) => {
-                self.pool.invalidate(slot).await;
-                return Err(anyhow!("open {item_id}: timed out"));
-            }
-        };
+        let resource =
+            match tokio::time::timeout(READ_TIMEOUT, client.create_file(&unc, &open_read_args()))
+                .await
+            {
+                Ok(Ok(resource)) => resource,
+                Ok(Err(error)) => {
+                    // The connection may be dead — drop this slot so the next call reconnects.
+                    self.pool.invalidate(slot).await;
+                    return Err(anyhow!("open {item_id}: {error}"));
+                }
+                Err(_) => {
+                    self.pool.invalidate(slot).await;
+                    return Err(anyhow!("open {item_id}: timed out"));
+                }
+            };
         let Resource::File(file) = resource else {
             return Err(anyhow!("{item_id} is not a file"));
         };
@@ -568,7 +567,9 @@ impl SmbProvider {
                     }
                     Err(_) => {
                         let _ = tx
-                            .send(Err(io::Error::other(format!("smb read {label}: timed out"))))
+                            .send(Err(io::Error::other(format!(
+                                "smb read {label}: timed out"
+                            ))))
                             .await;
                         pool.invalidate(slot).await;
                         break;
@@ -585,22 +586,20 @@ impl SmbProvider {
     pub async fn read_file(&self, item_id: &str) -> anyhow::Result<Vec<u8>> {
         let (slot, client) = self.pool.get().await?;
         let unc = self.config.item_unc(item_id)?;
-        let resource = match tokio::time::timeout(
-            READ_TIMEOUT,
-            client.create_file(&unc, &open_read_args()),
-        )
-        .await
-        {
-            Ok(Ok(resource)) => resource,
-            Ok(Err(error)) => {
-                self.pool.invalidate(slot).await;
-                return Err(anyhow!("open {item_id}: {error}"));
-            }
-            Err(_) => {
-                self.pool.invalidate(slot).await;
-                return Err(anyhow!("open {item_id}: timed out"));
-            }
-        };
+        let resource =
+            match tokio::time::timeout(READ_TIMEOUT, client.create_file(&unc, &open_read_args()))
+                .await
+            {
+                Ok(Ok(resource)) => resource,
+                Ok(Err(error)) => {
+                    self.pool.invalidate(slot).await;
+                    return Err(anyhow!("open {item_id}: {error}"));
+                }
+                Err(_) => {
+                    self.pool.invalidate(slot).await;
+                    return Err(anyhow!("open {item_id}: timed out"));
+                }
+            };
         let Resource::File(file) = resource else {
             return Err(anyhow!("{item_id} is not a file"));
         };
@@ -644,7 +643,10 @@ impl SmbProvider {
     /// pass. Uses its own dedicated connection (a watch is long-lived and must not tie up the
     /// serving pool). Returns `Err` on a connection failure so the caller can reconnect (and do a
     /// catch-up scan for anything missed during the gap); an idle window just re-arms the watch.
-    pub async fn watch_changes(&self, tx: tokio::sync::mpsc::UnboundedSender<()>) -> anyhow::Result<()> {
+    pub async fn watch_changes(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> anyhow::Result<()> {
         let client = new_client();
         connect_share(&client, &self.config).await?;
         let unc = self.config.item_unc("")?;

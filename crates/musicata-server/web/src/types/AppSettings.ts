@@ -47,4 +47,9 @@ scrobble_enabled: boolean,
 /**
  * ListenBrainz user token for scrobbling (empty = unset).
  */
-listenbrainz_token: string, };
+listenbrainz_token: string, 
+/**
+ * Source URL offered to users under AGPL section 13 (effective value: setting, else
+ * upstream) — repoint it at your fork when you run modified code.
+ */
+source_url: string, };

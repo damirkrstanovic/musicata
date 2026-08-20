@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   // The current "mix": a seed-based radio (sounds-like / similar). Shows what was generated so it
   // isn't invisible in the queue, and lets you replay it. Populated by startRadio/startAudioRadio.
   import { radioMix } from "../lib/radioMix.svelte";

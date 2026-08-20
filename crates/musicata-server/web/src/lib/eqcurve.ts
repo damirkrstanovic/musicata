@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Analytic magnitude response of an EqProfile's biquad cascade, for the EQ frequency-curve
 // visualization. Uses the RBJ cookbook formulas (the same ones Web Audio's BiquadFilterNode
 // is based on), so the drawn curve matches what's applied. Pure math — no AudioContext needed,

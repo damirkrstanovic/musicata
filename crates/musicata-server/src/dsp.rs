@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Server-stored DSP profiles (EQ + optional room correction), so a user's correction follows
 //! them across browsers/devices instead of living in one browser's `localStorage`.
 //!
@@ -69,7 +70,9 @@ async fn load_profiles(db: &Database) -> Vec<DspProfile> {
 
 async fn store_profiles(db: &Database, profiles: &[DspProfile]) -> Result<(), AppError> {
     let json = serde_json::to_string(profiles).map_err(|e| AppError::internal(e.to_string()))?;
-    db.set_setting(DSP_PROFILES_KEY, &json).await.map_err(db_error)
+    db.set_setting(DSP_PROFILES_KEY, &json)
+        .await
+        .map_err(db_error)
 }
 
 /// One profile by id (for the server-side Snapcast EQ — see `apply_snapcast_dsp` in main.rs).

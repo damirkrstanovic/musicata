@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// Musicata — a local-first music server + web controller.
+// Copyright (C) 2026 Damir Krstanović
+//
+// This program is free software: you can redistribute it and/or modify it under the terms of
+// the GNU Affero General Public License as published by the Free Software Foundation, either
+// version 3 of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+// See the GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License along with this
+// program. If not, see <https://www.gnu.org/licenses/>.
+
 use anyhow::{Context, Result};
 use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, BrowseTextFacet, BrowseYearFacet, Library,
@@ -372,6 +388,13 @@ impl Database {
             )
             .await?;
             set_user_version(&self.pool, 33).await?;
+        }
+
+        if version < 34 {
+            for statement in MIGRATION_034_BOOL_SETTINGS {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 34).await?;
         }
 
         Ok(())
@@ -1358,11 +1381,12 @@ impl Database {
     }
 
     pub async fn artist(&self, id: &str) -> Result<Option<Artist>> {
-        let row =
-            sqlx::query("SELECT id, name, album_count, track_count, artwork_url FROM artists WHERE id = ?1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row = sqlx::query(
+            "SELECT id, name, album_count, track_count, artwork_url FROM artists WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(|row| artist_from_row(&row)).transpose()
     }
 
@@ -1797,7 +1821,10 @@ impl Database {
     }
 
     /// The acquired-image record for an artist, if any (used by the serve handler).
-    pub async fn acquired_artist_artwork(&self, artist_id: &str) -> Result<Option<AcquiredArtwork>> {
+    pub async fn acquired_artist_artwork(
+        &self,
+        artist_id: &str,
+    ) -> Result<Option<AcquiredArtwork>> {
         let Some(row) = sqlx::query(
             "SELECT provider, remote_url, cache_key, ext, width, status
              FROM acquired_artist_artwork WHERE artist_id = ?1",
@@ -2285,7 +2312,9 @@ impl Database {
 
     /// How many tracks have an embedding (for `/admin` status).
     pub async fn embedding_count(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM track_features").fetch_one(&self.pool).await?)
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM track_features")
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     /// The `k` tracks most similar to `seed_track_id` by audio embedding (KNN over the vec0
@@ -2360,7 +2389,10 @@ impl Database {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!("SELECT id, artist_name FROM tracks WHERE id IN ({placeholders})");
         let mut query = sqlx::query(&sql);
         for id in ids {
@@ -2465,7 +2497,8 @@ impl Database {
             let duration: Option<f64> = row.try_get("duration")?;
             if current.as_deref() != Some(album_id.as_str()) {
                 if let Some(id) = current.take() {
-                    self.store_album_loudness(&id, &batch, now_unix_seconds).await?;
+                    self.store_album_loudness(&id, &batch, now_unix_seconds)
+                        .await?;
                     written += 1;
                 }
                 current = Some(album_id);
@@ -2474,7 +2507,8 @@ impl Database {
             batch.push((lufs, duration, peak));
         }
         if let Some(id) = current.take() {
-            self.store_album_loudness(&id, &batch, now_unix_seconds).await?;
+            self.store_album_loudness(&id, &batch, now_unix_seconds)
+                .await?;
             written += 1;
         }
         Ok(written)
@@ -2679,7 +2713,10 @@ impl Database {
             return Ok(Vec::new());
         }
         let lowered: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
-        let placeholders = (1..=lowered.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+        let placeholders = (1..=lowered.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let query = format!(
             "SELECT lower(t.artist_name) AS aname, t.id AS id
              FROM tracks t
@@ -2706,7 +2743,9 @@ impl Database {
         .bind(since_unix_seconds)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(|row| Ok(row.try_get("track_id")?)).collect()
+        rows.iter()
+            .map(|row| Ok(row.try_get("track_id")?))
+            .collect()
     }
 
     /// Track ids the listener skips more than they finish — the "skip penalty" set radio and
@@ -2724,7 +2763,9 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(|row| Ok(row.try_get("track_id")?)).collect()
+        rows.iter()
+            .map(|row| Ok(row.try_get("track_id")?))
+            .collect()
     }
 
     /// Local content similarity fallback (no network): tracks sharing a genre with the seed or
@@ -3033,8 +3074,7 @@ impl Database {
             let artist_name: Option<String> = row.try_get("artist_name")?;
             let album_title: Option<String> = row.try_get("album_title")?;
             let album_artist_name: Option<String> = row.try_get("album_artist_name")?;
-            let track_number =
-                optional_i64_to_u16(row.try_get("track_number")?, "track_number")?;
+            let track_number = optional_i64_to_u16(row.try_get("track_number")?, "track_number")?;
             let disc_number = optional_i64_to_u16(row.try_get("disc_number")?, "disc_number")?;
             let year = optional_i64_to_u16(row.try_get("year")?, "year")?;
             let over = TrackCanonicalOverride {
@@ -3076,6 +3116,34 @@ impl Database {
             Some(row) => Some(row.try_get("value")?),
             None => None,
         })
+    }
+
+    /// Read a boolean setting. `None` means no row — the caller applies the documented
+    /// default (see `BOOL_SETTINGS` in the server). There is no parsing and no notion of a
+    /// "truthy" string: the column is `INTEGER CHECK (value IN (0, 1))`, so the only values
+    /// that can be here are the two that mean something.
+    pub async fn get_bool_setting(&self, key: &str) -> Result<Option<bool>> {
+        let row = sqlx::query("SELECT value FROM bool_settings WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            Some(row) => Some(row.try_get::<i64, _>("value")? != 0),
+            None => None,
+        })
+    }
+
+    /// Store (upsert) a boolean setting.
+    pub async fn set_bool_setting(&self, key: &str, value: bool) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO bool_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(i64::from(value))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Store (upsert) a setting value.
@@ -3291,7 +3359,11 @@ impl Database {
 
     /// Store the sha256 of a player's endpoint auth token (M10). Set once at registration;
     /// `upsert_player` leaves this column alone, so a re-register keeps the token.
-    pub async fn set_player_auth_token_hash(&self, player_id: &str, token_hash: &str) -> Result<()> {
+    pub async fn set_player_auth_token_hash(
+        &self,
+        player_id: &str,
+        token_hash: &str,
+    ) -> Result<()> {
         sqlx::query("UPDATE players SET auth_token_hash = ?2 WHERE id = ?1")
             .bind(player_id)
             .bind(token_hash)
@@ -3315,12 +3387,13 @@ impl Database {
     /// The stored sha256 of a player's endpoint auth token, or `None` if it has none (the
     /// common case — server-initiated players carry no token).
     pub async fn player_auth_token_hash(&self, player_id: &str) -> Result<Option<String>> {
-        let hash: Option<String> =
-            sqlx::query_scalar::<_, Option<String>>("SELECT auth_token_hash FROM players WHERE id = ?1")
-                .bind(player_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .flatten();
+        let hash: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT auth_token_hash FROM players WHERE id = ?1",
+        )
+        .bind(player_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
         Ok(hash)
     }
 
@@ -3775,7 +3848,9 @@ impl Database {
     /// Deletes the entire listening history, returning the number of rows removed.
     /// Used by the user-facing "clear history" action (distinct from the rolling prune).
     pub async fn clear_listens(&self) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM listens").execute(&self.pool).await?;
+        let result = sqlx::query("DELETE FROM listens")
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected())
     }
 
@@ -3900,11 +3975,7 @@ impl Database {
 
     /// Favorited tracks with no confirmed listen since `since_unix` — starred music
     /// you've drifted away from (rediscovery). Most-recently favorited first.
-    pub async fn forgotten_favorites(
-        &self,
-        limit: usize,
-        since_unix: i64,
-    ) -> Result<Vec<Track>> {
+    pub async fn forgotten_favorites(&self, limit: usize, since_unix: i64) -> Result<Vec<Track>> {
         let columns = track_columns("t");
         let sql = format!(
             "SELECT {columns}
@@ -4383,7 +4454,10 @@ impl Database {
         unreachable!("the final attempt returns Ok or Err")
     }
 
-    async fn replace_activities_once(&self, activities: &[ActivityRecord]) -> Result<(), sqlx::Error> {
+    async fn replace_activities_once(
+        &self,
+        activities: &[ActivityRecord],
+    ) -> Result<(), sqlx::Error> {
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         let result = async {
@@ -4645,7 +4719,10 @@ pub const AUDIO_EMBEDDING_DIM: usize = 2048;
 
 /// Serialize an embedding to the little-endian f32 blob that `vec0` stores.
 fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
-    embedding.iter().flat_map(|value| value.to_le_bytes()).collect()
+    embedding
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
 }
 
 /// Turn similarity-ranked `(id, artist)` candidates (nearest first) into a varied station of up
@@ -4660,7 +4737,11 @@ fn diversify(ranked: &[(String, String)], limit: usize) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();
     let mut queues: HashMap<String, VecDeque<String>> = HashMap::new();
     for (id, artist) in ranked {
-        let key = if artist.is_empty() { id.clone() } else { artist.clone() };
+        let key = if artist.is_empty() {
+            id.clone()
+        } else {
+            artist.clone()
+        };
         if !queues.contains_key(&key) {
             order.push(key.clone());
         }
@@ -5683,6 +5764,56 @@ const MIGRATION_020_SETTINGS: &[&str] = &["CREATE TABLE IF NOT EXISTS settings (
         value TEXT NOT NULL
     )"];
 
+// Boolean settings, stored as booleans. `settings` is a string key/value store, so every
+// on/off toggle used to live there as text — and each reader invented its own idea of what
+// counted as true: one treated anything but "false"/"0" as on, another accepted only "true",
+// a third only "true"/"1". Five readers, three notions of truthy, two different defaults for
+// an absent row. A value of "" or "no" meant *enabled* to one reader and *disabled* to
+// another, from the same row.
+//
+// The fix is to let the database enforce the type rather than each caller guess it: a
+// dedicated table whose value is INTEGER 0/1 with a CHECK, so a bad value can't be written in
+// the first place. Defaults for absent rows are declared once, in the server's BOOL_SETTINGS
+// registry; there is no parsing left anywhere.
+//
+// The data migration preserves each key's *existing* behaviour rather than imposing the new
+// uniform rule retroactively — a row that read as "on" before must still read as "on" after,
+// so an upgrade changes nothing the user can observe. The three CASE groups below mirror the
+// three parsers that were in use. Migrated rows are removed from `settings` so there is one
+// home per key and no chance of the two disagreeing later.
+const MIGRATION_034_BOOL_SETTINGS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS bool_settings (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL CHECK (value IN (0, 1))
+    )",
+    // Group 1 — read by the old `setting_enabled`: on unless explicitly "false" or "0".
+    "INSERT OR IGNORE INTO bool_settings (key, value)
+     SELECT key, CASE WHEN value IN ('false', '0') THEN 0 ELSE 1 END
+     FROM settings
+     WHERE key IN ('loudness_analysis_enabled', 'artwork_fetch', 'fingerprint_enabled',
+                   'musicbrainz_enrich_enabled', 'history_enabled')",
+    // Group 2 — the autoplay loop: on unless exactly "false".
+    "INSERT OR IGNORE INTO bool_settings (key, value)
+     SELECT key, CASE WHEN value = 'false' THEN 0 ELSE 1 END
+     FROM settings
+     WHERE key = 'autoplay'",
+    // Group 3 — opt-in toggles: on only for an explicit true. `scrobble_enabled` also
+    // accepted "1"; the others accepted only "true". Accepting both here is strictly more
+    // permissive than the strictest old reader, which can only preserve an "on" state.
+    "INSERT OR IGNORE INTO bool_settings (key, value)
+     SELECT key, CASE WHEN value IN ('true', '1') THEN 1 ELSE 0 END
+     FROM settings
+     WHERE key IN ('scrobble_enabled', 'ml_enabled', 'snapcast.enabled',
+                   'snapcast.auth_enabled', 'snapcast.manage_server',
+                   'snapcast.airplay_enabled', 'snapcast.spotify_enabled')",
+    "DELETE FROM settings
+     WHERE key IN ('loudness_analysis_enabled', 'artwork_fetch', 'fingerprint_enabled',
+                   'musicbrainz_enrich_enabled', 'history_enabled', 'autoplay',
+                   'scrobble_enabled', 'ml_enabled', 'snapcast.enabled',
+                   'snapcast.auth_enabled', 'snapcast.manage_server',
+                   'snapcast.airplay_enabled', 'snapcast.spotify_enabled')",
+];
+
 // AcoustID audio-fingerprint results: MusicBrainz ids resolved by fingerprinting a
 // track's audio (for files whose tags carry no MBIDs). Like acquired_album_artwork,
 // deliberately **no foreign key** — `save_library` rewrites tracks/observations every
@@ -5766,13 +5897,11 @@ const MIGRATION_029_ALBUM_LOUDNESS: &[&str] = &["CREATE TABLE IF NOT EXISTS albu
 // service (ListenBrainz). A decoupled queue so the submit loop drains at its own pace and a
 // network outage never stalls playback/recording. No FK (`track_id` is stable; the row carries
 // enough to resolve the track at submit time). Rows are deleted once accepted upstream.
-const MIGRATION_032_SCROBBLE_QUEUE: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS scrobble_queue (
+const MIGRATION_032_SCROBBLE_QUEUE: &[&str] = &["CREATE TABLE IF NOT EXISTS scrobble_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         track_id TEXT NOT NULL,
         listened_at_unix_seconds INTEGER NOT NULL
-    )",
-];
+    )"];
 
 const MIGRATION_031_AUDIO_EMBEDDING: &[&str] = &[
     "CREATE VIRTUAL TABLE IF NOT EXISTS track_embedding USING vec0(
@@ -5847,8 +5976,8 @@ const MIGRATION_023_LISTEN_EVENT_KIND: &[&str] =
 // artist MBIDs): `acquired_artist_artwork` mirrors `acquired_album_artwork` — no foreign
 // key, `artist_id` stable across rescans, `status` is `acquired` or `not_found`.
 // The `artwork_url` column is added idempotently via `ensure_column` in `migrate`.
-const MIGRATION_024_ARTIST_ARTWORK: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS acquired_artist_artwork (
+const MIGRATION_024_ARTIST_ARTWORK: &[&str] =
+    &["CREATE TABLE IF NOT EXISTS acquired_artist_artwork (
         artist_id TEXT PRIMARY KEY,
         provider TEXT NOT NULL,
         remote_url TEXT,
@@ -5857,8 +5986,7 @@ const MIGRATION_024_ARTIST_ARTWORK: &[&str] = &[
         width INTEGER,
         status TEXT NOT NULL,
         acquired_at_unix_seconds INTEGER NOT NULL
-    )",
-];
+    )"];
 
 // User-curated artist merges: "treat these name variants as one artist". Keyed by the
 // NORMALIZED name key (`musicata_core::normalize_artist_key`), not the hash id, so a merge
@@ -6203,6 +6331,107 @@ mod tests {
             .is_some()
     }
 
+    /// Migration 034 moved every on/off toggle out of the string `settings` table into
+    /// `bool_settings`. The rule it must obey: an upgrade changes nothing the user can
+    /// observe. Each old reader had its own idea of "true", so the migration translates per
+    /// key — this pins that translation, because getting it wrong silently flips a feature on
+    /// or off on somebody's server.
+    #[tokio::test]
+    async fn migration_034_preserves_each_old_readers_semantics() {
+        let db_path = temp_db_path("bool-settings-migration");
+        {
+            let database = Database::connect(&db_path).await.expect("connect");
+            // Put the pre-migration rows back as strings and rewind past 034.
+            sqlx::query("DELETE FROM bool_settings")
+                .execute(&database.pool)
+                .await
+                .expect("clear");
+            for (key, value) in [
+                // Group 1 (old `setting_enabled`): on unless "false"/"0".
+                ("artwork_fetch", "false"),
+                ("fingerprint_enabled", "0"),
+                ("musicbrainz_enrich_enabled", "true"),
+                // "" and "no" were *enabled* under this reader's deny-list — the surprising
+                // case, and precisely why the reader-decides-truthiness design had to go.
+                ("history_enabled", ""),
+                ("loudness_analysis_enabled", "no"),
+                // Group 2 (autoplay): on unless exactly "false".
+                ("autoplay", "0"),
+                // Group 3 (opt-in): on only for an explicit true.
+                ("scrobble_enabled", "1"),
+                ("ml_enabled", "true"),
+                ("snapcast.enabled", "yes"),
+                ("snapcast.auth_enabled", "false"),
+            ] {
+                sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)")
+                    .bind(key)
+                    .bind(value)
+                    .execute(&database.pool)
+                    .await
+                    .expect("seed legacy row");
+            }
+            sqlx::query("PRAGMA user_version = 33")
+                .execute(&database.pool)
+                .await
+                .expect("rewind");
+        }
+
+        let database = Database::connect(&db_path).await.expect("re-migrate");
+        for (key, expected) in [
+            ("artwork_fetch", false),
+            ("fingerprint_enabled", false),
+            ("musicbrainz_enrich_enabled", true),
+            ("history_enabled", true), // "" was truthy to the old deny-list reader
+            ("loudness_analysis_enabled", true), // so was "no"
+            ("autoplay", true),        // "0" was NOT "false", so autoplay stayed on
+            ("scrobble_enabled", true),
+            ("ml_enabled", true),
+            ("snapcast.enabled", false), // "yes" never satisfied `== "true"`
+            ("snapcast.auth_enabled", false),
+        ] {
+            assert_eq!(
+                database.get_bool_setting(key).await.expect("read"),
+                Some(expected),
+                "{key} changed meaning across the migration"
+            );
+        }
+
+        // One home per key: the string rows are gone, so the two tables can never disagree.
+        for key in ["artwork_fetch", "autoplay", "snapcast.enabled"] {
+            assert_eq!(database.get_setting(key).await.expect("read"), None);
+        }
+    }
+
+    /// The column is typed, so a value that isn't a boolean cannot be stored at all — the
+    /// guarantee that makes every reader agree without parsing anything.
+    #[tokio::test]
+    async fn bool_settings_rejects_a_non_boolean_value() {
+        let db_path = temp_db_path("bool-settings-check");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let bad = sqlx::query("INSERT INTO bool_settings (key, value) VALUES ('x', 2)")
+            .execute(&database.pool)
+            .await;
+        assert!(bad.is_err(), "CHECK constraint should reject 2");
+
+        database.set_bool_setting("x", true).await.expect("set");
+        assert_eq!(
+            database.get_bool_setting("x").await.expect("get"),
+            Some(true)
+        );
+        database
+            .set_bool_setting("x", false)
+            .await
+            .expect("overwrite");
+        assert_eq!(
+            database.get_bool_setting("x").await.expect("get"),
+            Some(false)
+        );
+        assert_eq!(
+            database.get_bool_setting("absent").await.expect("get"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn migrations_are_idempotent_after_crash_between_alter_and_version_bump() {
         // BUG-08: several migrations did a bare `ALTER TABLE ADD COLUMN`. If the process
@@ -6304,7 +6533,10 @@ mod tests {
             )
             .await
             .expect("record artist art");
-        database.reapply_acquired_artist_artwork().await.expect("reapply");
+        database
+            .reapply_acquired_artist_artwork()
+            .await
+            .expect("reapply");
         let again = database.search("artist", 50, 0).await.expect("search");
         assert!(
             again
@@ -6683,7 +6915,10 @@ mod tests {
         let result = database
             .set_playlist_tracks(&playlist, &["t3".into(), "__fail__".into()], 200)
             .await;
-        assert!(result.is_err(), "the mid-batch failure must surface as an error");
+        assert!(
+            result.is_err(),
+            "the mid-batch failure must surface as an error"
+        );
 
         // The original tracks survive — the whole replace rolled back.
         assert_eq!(
@@ -6726,7 +6961,11 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(loaded.playback.position, None, "negative position rejected");
-        assert_eq!(loaded.playback.volume, Some(100), "out-of-range volume clamped");
+        assert_eq!(
+            loaded.playback.volume,
+            Some(100),
+            "out-of-range volume clamped"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -6738,7 +6977,10 @@ mod tests {
         let db_path = temp_db_path("most-played-tiebreak");
         let database = Database::connect(&db_path).await.expect("connect database");
         let mut library = fixture_library();
-        database.save_library(&mut library).await.expect("save library");
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
         sqlx::query(
             "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name,
                 album_id, album_title, extension, relative_path, stream_url, path)
@@ -6751,12 +6993,22 @@ mod tests {
 
         // Both played once at the same instant → a full tie on count and recency.
         let played = ListenKind::Played;
-        database.record_listen("track_2", "p", 100, played).await.unwrap();
-        database.record_listen("track_1", "p", 100, played).await.unwrap();
+        database
+            .record_listen("track_2", "p", 100, played)
+            .await
+            .unwrap();
+        database
+            .record_listen("track_1", "p", 100, played)
+            .await
+            .unwrap();
 
         let most = database.most_played(10).await.expect("most played");
         let ids: Vec<_> = most.iter().map(|(track, _)| track.id.as_str()).collect();
-        assert_eq!(ids, ["track_1", "track_2"], "ties resolve by ascending track id");
+        assert_eq!(
+            ids,
+            ["track_1", "track_2"],
+            "ties resolve by ascending track id"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -6768,7 +7020,10 @@ mod tests {
         let db_path = temp_db_path("recording-mbid-order");
         let database = Database::connect(&db_path).await.expect("connect database");
         let mut library = fixture_library();
-        database.save_library(&mut library).await.expect("save library");
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
         sqlx::query(
             "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id, artist_name,
                 album_id, album_title, extension, relative_path, stream_url, path)
@@ -6795,7 +7050,11 @@ mod tests {
             .tracks_for_recording_mbids(&["rec-B".into(), "rec-A".into()])
             .await
             .expect("resolve mbids");
-        assert_eq!(ids, vec!["track_2", "track_1"], "output follows input order");
+        assert_eq!(
+            ids,
+            vec!["track_2", "track_1"],
+            "output follows input order"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -6862,7 +7121,11 @@ mod tests {
             .save_library(&mut library)
             .await
             .expect("save library");
-        for (id, year) in [("album_2000", 2000), ("album_2010", 2010), ("album_2020", 2020)] {
+        for (id, year) in [
+            ("album_2000", 2000),
+            ("album_2010", 2010),
+            ("album_2020", 2020),
+        ] {
             sqlx::query(
                 "INSERT INTO albums (id, title, artist_id, artist_name, year, track_count,
                     artwork_url, artwork_path) VALUES (?1, ?1, 'artist_1', 'Artist', ?2, 1, NULL, NULL)",
@@ -6875,12 +7138,18 @@ mod tests {
         }
 
         // Ascending range: 2010 and 2020 are in [2005,2025]; 2000 and 2026 excluded.
-        let (asc, _) = database.albums_by_year(2005, 2025, 50, 0).await.expect("byYear asc");
+        let (asc, _) = database
+            .albums_by_year(2005, 2025, 50, 0)
+            .await
+            .expect("byYear asc");
         let asc_ids: Vec<_> = asc.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(asc_ids, ["album_2010", "album_2020"]);
 
         // Descending direction (fromYear > toYear) reverses the order over the same range.
-        let (desc, _) = database.albums_by_year(2025, 2005, 50, 0).await.expect("byYear desc");
+        let (desc, _) = database
+            .albums_by_year(2025, 2005, 50, 0)
+            .await
+            .expect("byYear desc");
         let desc_ids: Vec<_> = desc.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(desc_ids, ["album_2020", "album_2010"]);
 
@@ -6911,9 +7180,18 @@ mod tests {
 
         // track_1 played twice, track_2 once. Newest listen is track_1 at t=300.
         let played = ListenKind::Played;
-        database.record_listen("track_1", "p", 100, played).await.unwrap();
-        database.record_listen("track_2", "p", 200, played).await.unwrap();
-        database.record_listen("track_1", "p", 300, played).await.unwrap();
+        database
+            .record_listen("track_1", "p", 100, played)
+            .await
+            .unwrap();
+        database
+            .record_listen("track_2", "p", 200, played)
+            .await
+            .unwrap();
+        database
+            .record_listen("track_1", "p", 300, played)
+            .await
+            .unwrap();
 
         // Recently played: distinct tracks, newest-listen first, each with its most
         // recent listen time (track_1's is 300, not 100).
@@ -6931,7 +7209,10 @@ mod tests {
         assert_eq!(most[1].1, 1);
 
         // A listen for a track no longer in the library is dropped by the join.
-        database.record_listen("ghost", "p", 400, played).await.unwrap();
+        database
+            .record_listen("ghost", "p", 400, played)
+            .await
+            .unwrap();
         let recent = database.recently_played(10).await.expect("recent again");
         assert!(recent.iter().all(|(track, _)| track.id != "ghost"));
 
@@ -6947,7 +7228,13 @@ mod tests {
         // The user-facing "clear history" wipes every remaining listen.
         let cleared = database.clear_listens().await.expect("clear");
         assert_eq!(cleared, 2); // track_1@300 and the ghost@400
-        assert!(database.most_played(10).await.expect("most after clear").is_empty());
+        assert!(
+            database
+                .most_played(10)
+                .await
+                .expect("most after clear")
+                .is_empty()
+        );
         assert!(database.clear_listens().await.expect("clear again") == 0);
 
         let _ = std::fs::remove_file(db_path);
@@ -7010,12 +7297,30 @@ mod tests {
         let skipped = ListenKind::Skipped;
         // Plays on days 100 (x2, one session), 99, 98 (a 3-day current streak), and an
         // isolated day 96. One skip on day 97 (excluded from plays + streak).
-        database.record_listen("t_a", "p", 100 * DAY + 1_000, played).await.unwrap();
-        database.record_listen("t_a", "p", 100 * DAY + 1_300, played).await.unwrap();
-        database.record_listen("t_a", "p", 99 * DAY + 500, played).await.unwrap();
-        database.record_listen("t_a", "p", 98 * DAY + 500, played).await.unwrap();
-        database.record_listen("t_b", "p", 96 * DAY + 500, played).await.unwrap();
-        database.record_listen("t_b", "p", 97 * DAY + 500, skipped).await.unwrap();
+        database
+            .record_listen("t_a", "p", 100 * DAY + 1_000, played)
+            .await
+            .unwrap();
+        database
+            .record_listen("t_a", "p", 100 * DAY + 1_300, played)
+            .await
+            .unwrap();
+        database
+            .record_listen("t_a", "p", 99 * DAY + 500, played)
+            .await
+            .unwrap();
+        database
+            .record_listen("t_a", "p", 98 * DAY + 500, played)
+            .await
+            .unwrap();
+        database
+            .record_listen("t_b", "p", 96 * DAY + 500, played)
+            .await
+            .unwrap();
+        database
+            .record_listen("t_b", "p", 97 * DAY + 500, skipped)
+            .await
+            .unwrap();
 
         database.set_favorite("track", "t_a", 1).await.unwrap();
         database.set_favorite("track", "t_b", 2).await.unwrap();
@@ -7065,9 +7370,11 @@ mod tests {
         let db_path = temp_db_path("album-loudness");
         let database = Database::connect(&db_path).await.expect("connect database");
 
-        for (id, album, duration) in
-            [("t1", "al_1", 100.0), ("t2", "al_1", 100.0), ("t3", "al_2", 60.0)]
-        {
+        for (id, album, duration) in [
+            ("t1", "al_1", 100.0),
+            ("t2", "al_1", 100.0),
+            ("t3", "al_2", 60.0),
+        ] {
             sqlx::query(
                 "INSERT INTO tracks (id, provider_id, provider_item_id, title, artist_id,
                     artist_name, album_id, album_title, extension, relative_path, stream_url,
@@ -7085,19 +7392,39 @@ mod tests {
             .await
             .expect("insert track");
         }
-        database.upsert_track_loudness("t1", Some(-10.0), Some(-1.5), 1).await.unwrap();
-        database.upsert_track_loudness("t2", Some(-20.0), Some(-2.0), 1).await.unwrap();
-        database.upsert_track_loudness("t3", Some(-14.0), Some(-1.0), 1).await.unwrap();
+        database
+            .upsert_track_loudness("t1", Some(-10.0), Some(-1.5), 1)
+            .await
+            .unwrap();
+        database
+            .upsert_track_loudness("t2", Some(-20.0), Some(-2.0), 1)
+            .await
+            .unwrap();
+        database
+            .upsert_track_loudness("t3", Some(-14.0), Some(-1.0), 1)
+            .await
+            .unwrap();
 
-        let written = database.recompute_album_loudness(2).await.expect("recompute");
+        let written = database
+            .recompute_album_loudness(2)
+            .await
+            .expect("recompute");
         assert_eq!(written, 2);
 
-        let (lufs, peak) = database.album_loudness("al_1").await.unwrap().expect("al_1");
+        let (lufs, peak) = database
+            .album_loudness("al_1")
+            .await
+            .unwrap()
+            .expect("al_1");
         assert!((lufs - (-12.596)).abs() < 0.01, "{lufs}");
         assert_eq!(peak, -1.5);
 
         // A single-track album equals that track's loudness.
-        let (lufs2, _) = database.album_loudness("al_2").await.unwrap().expect("al_2");
+        let (lufs2, _) = database
+            .album_loudness("al_2")
+            .await
+            .unwrap()
+            .expect("al_2");
         assert!((lufs2 - (-14.0)).abs() < 0.001, "{lufs2}");
 
         assert!(database.album_loudness("missing").await.unwrap().is_none());
@@ -7155,9 +7482,18 @@ mod tests {
         c[0] = 0.9;
         c[1] = 0.1;
 
-        database.upsert_track_embedding("a", &a, "panns", Some("1"), "[]", 1).await.unwrap();
-        database.upsert_track_embedding("b", &b, "panns", None, "[]", 1).await.unwrap();
-        database.upsert_track_embedding("c", &c, "panns", None, "[]", 1).await.unwrap();
+        database
+            .upsert_track_embedding("a", &a, "panns", Some("1"), "[]", 1)
+            .await
+            .unwrap();
+        database
+            .upsert_track_embedding("b", &b, "panns", None, "[]", 1)
+            .await
+            .unwrap();
+        database
+            .upsert_track_embedding("c", &c, "panns", None, "[]", 1)
+            .await
+            .unwrap();
         assert_eq!(database.embedding_count().await.unwrap(), 3);
 
         // Nearest to a (excluding itself): c (similar) before b (orthogonal).
@@ -7166,11 +7502,20 @@ mod tests {
         assert_eq!(ids, vec!["c", "b"]);
 
         // Re-analyzing replaces, doesn't duplicate.
-        database.upsert_track_embedding("a", &a, "panns", None, "[\"Music\"]", 2).await.unwrap();
+        database
+            .upsert_track_embedding("a", &a, "panns", None, "[\"Music\"]", 2)
+            .await
+            .unwrap();
         assert_eq!(database.embedding_count().await.unwrap(), 3);
 
         // A track with no embedding yields nothing.
-        assert!(database.similar_by_embedding("missing", 5).await.unwrap().is_empty());
+        assert!(
+            database
+                .similar_by_embedding("missing", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -7202,7 +7547,10 @@ mod tests {
         // From the start, the first two by order are A, B.
         let first = database.tracks_missing_embedding(None, 2).await.unwrap();
         assert_eq!(
-            first.iter().map(|t| t.artist_name.as_str()).collect::<Vec<_>>(),
+            first
+                .iter()
+                .map(|t| t.artist_name.as_str())
+                .collect::<Vec<_>>(),
             ["A", "B"]
         );
 
@@ -7213,7 +7561,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            rest.iter().map(|t| t.artist_name.as_str()).collect::<Vec<_>>(),
+            rest.iter()
+                .map(|t| t.artist_name.as_str())
+                .collect::<Vec<_>>(),
             ["C", "D"]
         );
 
@@ -7223,8 +7573,14 @@ mod tests {
     #[test]
     fn diversify_interleaves_and_caps_artists() {
         let ranked: Vec<(String, String)> = [
-            ("a1", "A"), ("a2", "A"), ("a3", "A"), ("b1", "B"), ("b2", "B"), ("b3", "B"),
-            ("c1", "C"), ("c2", "C"),
+            ("a1", "A"),
+            ("a2", "A"),
+            ("a3", "A"),
+            ("b1", "B"),
+            ("b2", "B"),
+            ("b3", "B"),
+            ("c1", "C"),
+            ("c2", "C"),
         ]
         .iter()
         .map(|(id, artist)| (id.to_string(), artist.to_string()))
@@ -7235,20 +7591,34 @@ mod tests {
         let radio = super::diversify(&ranked, 6);
         assert_eq!(radio.len(), 6);
         for window in radio.windows(2) {
-            assert_ne!(artist_of(&window[0]), artist_of(&window[1]), "back-to-back: {radio:?}");
+            assert_ne!(
+                artist_of(&window[0]),
+                artist_of(&window[1]),
+                "back-to-back: {radio:?}"
+            );
         }
         let first_three: std::collections::HashSet<_> =
             radio[..3].iter().map(|id| artist_of(id)).collect();
-        assert_eq!(first_three.len(), 3, "first three should be three distinct artists");
+        assert_eq!(
+            first_three.len(),
+            3,
+            "first three should be three distinct artists"
+        );
     }
 
     #[test]
     fn diversify_fills_station_when_few_artists() {
         // Only 2 artists but a 4-track station → 2 each, alternating.
-        let ranked: Vec<(String, String)> = [("a1", "A"), ("a2", "A"), ("a3", "A"), ("b1", "B"), ("b2", "B")]
-            .iter()
-            .map(|(id, artist)| (id.to_string(), artist.to_string()))
-            .collect();
+        let ranked: Vec<(String, String)> = [
+            ("a1", "A"),
+            ("a2", "A"),
+            ("a3", "A"),
+            ("b1", "B"),
+            ("b2", "B"),
+        ]
+        .iter()
+        .map(|(id, artist)| (id.to_string(), artist.to_string()))
+        .collect();
         let radio = super::diversify(&ranked, 4);
         assert_eq!(radio, vec!["a1", "b1", "a2", "b2"]);
     }
@@ -7290,7 +7660,10 @@ mod tests {
             .expect("insert track");
         }
         for (id, _, x, y) in data {
-            database.upsert_track_embedding(id, &vector(x, y), "m", None, "[]", 1).await.unwrap();
+            database
+                .upsert_track_embedding(id, &vector(x, y), "m", None, "[]", 1)
+                .await
+                .unwrap();
         }
 
         // The raw KNN would be a1,a2,a3,b1 (all A first); the radio interleaves A and B.
@@ -7298,10 +7671,17 @@ mod tests {
         assert_eq!(radio.len(), 4);
         let artist_of = |id: &str| data.iter().find(|(i, ..)| *i == id).unwrap().1;
         for window in radio.windows(2) {
-            assert_ne!(artist_of(&window[0]), artist_of(&window[1]), "back-to-back: {radio:?}");
+            assert_ne!(
+                artist_of(&window[0]),
+                artist_of(&window[1]),
+                "back-to-back: {radio:?}"
+            );
         }
         let artists: std::collections::HashSet<_> = radio.iter().map(|id| artist_of(id)).collect();
-        assert!(artists.contains(&"A") && artists.contains(&"B"), "both artists present");
+        assert!(
+            artists.contains(&"A") && artists.contains(&"B"),
+            "both artists present"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -7334,10 +7714,22 @@ mod tests {
         let played = ListenKind::Played;
         let skipped = ListenKind::Skipped;
         // t_a: a real listen at t=100 and t=200. t_b: only skips at t=150 and t=250.
-        database.record_listen("t_a", "p", 100, played).await.unwrap();
-        database.record_listen("t_a", "p", 200, played).await.unwrap();
-        database.record_listen("t_b", "p", 150, skipped).await.unwrap();
-        database.record_listen("t_b", "p", 250, skipped).await.unwrap();
+        database
+            .record_listen("t_a", "p", 100, played)
+            .await
+            .unwrap();
+        database
+            .record_listen("t_a", "p", 200, played)
+            .await
+            .unwrap();
+        database
+            .record_listen("t_b", "p", 150, skipped)
+            .await
+            .unwrap();
+        database
+            .record_listen("t_b", "p", 250, skipped)
+            .await
+            .unwrap();
 
         // most_played counts confirmed listens only — t_b's skips don't appear.
         let most = database.most_played(10).await.unwrap();
@@ -7383,7 +7775,10 @@ mod tests {
         assert!(forgotten.contains(&"t_b".to_string()));
 
         // A fresh confirmed listen at t=400 takes t_a off the forgotten list.
-        database.record_listen("t_a", "p", 400, played).await.unwrap();
+        database
+            .record_listen("t_a", "p", 400, played)
+            .await
+            .unwrap();
         let forgotten: Vec<_> = database
             .forgotten_favorites(10, 300)
             .await
@@ -7421,22 +7816,43 @@ mod tests {
         let (played, skipped) = (ListenKind::Played, ListenKind::Skipped);
         // t_skip: 3 skips vs 1 play → penalized (skips > plays, >= 2 skips).
         for t in [10, 20, 30] {
-            database.record_listen("t_skip", "p", t, skipped).await.unwrap();
+            database
+                .record_listen("t_skip", "p", t, skipped)
+                .await
+                .unwrap();
         }
-        database.record_listen("t_skip", "p", 40, played).await.unwrap();
+        database
+            .record_listen("t_skip", "p", 40, played)
+            .await
+            .unwrap();
         // t_ok: 1 skip vs 3 plays → not penalized.
-        database.record_listen("t_ok", "p", 10, skipped).await.unwrap();
+        database
+            .record_listen("t_ok", "p", 10, skipped)
+            .await
+            .unwrap();
         for t in [20, 30, 40] {
-            database.record_listen("t_ok", "p", t, played).await.unwrap();
+            database
+                .record_listen("t_ok", "p", t, played)
+                .await
+                .unwrap();
         }
         // t_one: a single skip, no plays → skips > plays but below the 2-skip floor.
-        database.record_listen("t_one", "p", 10, skipped).await.unwrap();
+        database
+            .record_listen("t_one", "p", 10, skipped)
+            .await
+            .unwrap();
         // t_tie: 2 skips vs 2 plays → not strictly more skips.
         for t in [10, 20] {
-            database.record_listen("t_tie", "p", t, skipped).await.unwrap();
+            database
+                .record_listen("t_tie", "p", t, skipped)
+                .await
+                .unwrap();
         }
         for t in [30, 40] {
-            database.record_listen("t_tie", "p", t, played).await.unwrap();
+            database
+                .record_listen("t_tie", "p", t, played)
+                .await
+                .unwrap();
         }
 
         let penalized = database.frequently_skipped_track_ids().await.unwrap();
@@ -7451,7 +7867,11 @@ mod tests {
         let db_path = temp_db_path("users-sessions");
         let database = Database::connect(&db_path).await.expect("connect database");
 
-        assert_eq!(database.count_users().await.unwrap(), 0, "starts in setup mode");
+        assert_eq!(
+            database.count_users().await.unwrap(),
+            0,
+            "starts in setup mode"
+        );
 
         let admin = UserRecord {
             id: "u1".into(),
@@ -7463,29 +7883,99 @@ mod tests {
         };
         database.create_user(&admin).await.unwrap();
         assert_eq!(database.count_users().await.unwrap(), 1);
-        assert_eq!(database.user_by_username("alice").await.unwrap().unwrap().role, "admin");
-        assert_eq!(database.user_by_api_token("tok-abc").await.unwrap().unwrap().id, "u1");
+        assert_eq!(
+            database
+                .user_by_username("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .role,
+            "admin"
+        );
+        assert_eq!(
+            database
+                .user_by_api_token("tok-abc")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "u1"
+        );
         assert!(database.user_by_api_token("nope").await.unwrap().is_none());
 
         // Session lookup respects expiry.
-        database.create_session("hash1", "u1", 100, 1000, Some("phone")).await.unwrap();
-        assert_eq!(database.session_user("hash1", 500).await.unwrap().unwrap().username, "alice");
-        assert!(database.session_user("hash1", 2000).await.unwrap().is_none(), "expired");
-        assert!(database.session_user("missing", 500).await.unwrap().is_none());
+        database
+            .create_session("hash1", "u1", 100, 1000, Some("phone"))
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .session_user("hash1", 500)
+                .await
+                .unwrap()
+                .unwrap()
+                .username,
+            "alice"
+        );
+        assert!(
+            database
+                .session_user("hash1", 2000)
+                .await
+                .unwrap()
+                .is_none(),
+            "expired"
+        );
+        assert!(
+            database
+                .session_user("missing", 500)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Pruning drops only expired rows.
-        database.create_session("hash2", "u1", 100, 5000, None).await.unwrap();
+        database
+            .create_session("hash2", "u1", 100, 5000, None)
+            .await
+            .unwrap();
         assert_eq!(database.prune_expired_sessions(2000).await.unwrap(), 1);
-        assert!(database.session_user("hash2", 2000).await.unwrap().is_some());
+        assert!(
+            database
+                .session_user("hash2", 2000)
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         // Updates + deletion (which also clears sessions).
         database.set_user_role("u1", "listener").await.unwrap();
         database.set_user_api_token("u1", "tok-xyz").await.unwrap();
-        assert!(database.user_by_api_token("tok-abc").await.unwrap().is_none());
-        assert_eq!(database.user_by_username("alice").await.unwrap().unwrap().role, "listener");
+        assert!(
+            database
+                .user_by_api_token("tok-abc")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            database
+                .user_by_username("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .role,
+            "listener"
+        );
         database.delete_user("u1").await.unwrap();
         assert_eq!(database.count_users().await.unwrap(), 0);
-        assert!(database.session_user("hash2", 1000).await.unwrap().is_none(), "sessions cascade");
+        assert!(
+            database
+                .session_user("hash2", 1000)
+                .await
+                .unwrap()
+                .is_none(),
+            "sessions cascade"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -7672,8 +8162,10 @@ mod tests {
 
         // Facet: most-common tag first; "Music" on both, the genres on one each.
         let tags = database.browse_index().await.unwrap().tags;
-        let counts: std::collections::HashMap<_, _> =
-            tags.iter().map(|t| (t.value.as_str(), t.track_count)).collect();
+        let counts: std::collections::HashMap<_, _> = tags
+            .iter()
+            .map(|t| (t.value.as_str(), t.track_count))
+            .collect();
         assert_eq!(counts.get("Music"), Some(&2));
         assert_eq!(counts.get("Rock music"), Some(&1));
         assert_eq!(counts.get("Jazz"), Some(&1));
@@ -8436,11 +8928,24 @@ mod tests {
         assert_ne!(new_id, "artist_old1");
 
         // Star both stale artists; give one an acquired image.
-        database.set_favorite("artist", "artist_old1", 1).await.unwrap();
-        database.set_favorite("artist", "artist_old2", 2).await.unwrap();
+        database
+            .set_favorite("artist", "artist_old1", 1)
+            .await
+            .unwrap();
+        database
+            .set_favorite("artist", "artist_old2", 2)
+            .await
+            .unwrap();
         database
             .upsert_acquired_artist_artwork(
-                "artist_old1", "deezer", None, Some("k"), Some("jpg"), Some(1000), "acquired", 9,
+                "artist_old1",
+                "deezer",
+                None,
+                Some("k"),
+                Some("jpg"),
+                Some(1000),
+                "acquired",
+                9,
             )
             .await
             .unwrap();
@@ -8476,22 +8981,52 @@ mod tests {
         let database = Database::connect(&db_path).await.expect("connect");
 
         // b -> a, then chain c -> b should flatten to c -> a.
-        database.add_artist_alias("b", "a", "Artist A", 1).await.unwrap();
-        database.add_artist_alias("c", "b", "Artist B", 2).await.unwrap();
+        database
+            .add_artist_alias("b", "a", "Artist A", 1)
+            .await
+            .unwrap();
+        database
+            .add_artist_alias("c", "b", "Artist B", 2)
+            .await
+            .unwrap();
         let map = database.artist_alias_map().await.unwrap();
         assert_eq!(map.get("b").map(String::as_str), Some("Artist A"));
         // c flattened to the ultimate canonical name "Artist A" (not "Artist B").
         assert_eq!(map.get("c").map(String::as_str), Some("Artist A"));
 
         // Self-alias is a no-op; a cycle is rejected.
-        database.add_artist_alias("a", "a", "Artist A", 3).await.unwrap();
-        assert!(database.artist_alias_map().await.unwrap().get("a").is_none());
+        database
+            .add_artist_alias("a", "a", "Artist A", 3)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .artist_alias_map()
+                .await
+                .unwrap()
+                .get("a")
+                .is_none()
+        );
         assert!(database.add_artist_alias("a", "c", "x", 4).await.is_err());
 
         // Unmerge removes one member.
         database.remove_artist_alias("c").await.unwrap();
-        assert!(database.artist_alias_map().await.unwrap().get("c").is_none());
-        assert!(database.artist_alias_map().await.unwrap().get("b").is_some());
+        assert!(
+            database
+                .artist_alias_map()
+                .await
+                .unwrap()
+                .get("c")
+                .is_none()
+        );
+        assert!(
+            database
+                .artist_alias_map()
+                .await
+                .unwrap()
+                .get("b")
+                .is_some()
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -8621,10 +9156,19 @@ mod tests {
         database.save_library(&mut library).await.expect("save");
 
         // A fresh track has no loudness yet — it's a candidate for analysis.
-        let missing = database.tracks_missing_loudness(None, 10).await.expect("missing");
+        let missing = database
+            .tracks_missing_loudness(None, 10)
+            .await
+            .expect("missing");
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].track_id, "track_1");
-        assert!(database.track_loudness("track_1").await.expect("read").is_none());
+        assert!(
+            database
+                .track_loudness("track_1")
+                .await
+                .expect("read")
+                .is_none()
+        );
 
         // Record a measurement; it reads back and the track is no longer queued.
         database
@@ -8635,15 +9179,33 @@ mod tests {
             database.track_loudness("track_1").await.expect("read"),
             Some((-16.5, -1.2))
         );
-        assert!(database.tracks_missing_loudness(None, 10).await.expect("missing").is_empty());
+        assert!(
+            database
+                .tracks_missing_loudness(None, 10)
+                .await
+                .expect("missing")
+                .is_empty()
+        );
 
         // A NULL marker (un-measurable track) still suppresses re-analysis but reads as None.
         database
             .upsert_track_loudness("track_1", None, None, 1_900_000_000)
             .await
             .expect("upsert null");
-        assert!(database.track_loudness("track_1").await.expect("read").is_none());
-        assert!(database.tracks_missing_loudness(None, 10).await.expect("missing").is_empty());
+        assert!(
+            database
+                .track_loudness("track_1")
+                .await
+                .expect("read")
+                .is_none()
+        );
+        assert!(
+            database
+                .tracks_missing_loudness(None, 10)
+                .await
+                .expect("missing")
+                .is_empty()
+        );
 
         // A loaded queue gets its loudness re-attached from the table.
         database
@@ -8654,7 +9216,10 @@ mod tests {
             track_id: Some("track_1".to_string()),
             ..Default::default()
         }];
-        database.fill_queue_loudness(&mut items).await.expect("fill");
+        database
+            .fill_queue_loudness(&mut items)
+            .await
+            .expect("fill");
         assert_eq!(items[0].integrated_loudness_lufs, Some(-12.0));
         assert_eq!(items[0].true_peak_dbtp, Some(-0.5));
 
@@ -8677,21 +9242,39 @@ mod tests {
 
         // Batch size 1: the first page is track_1; resuming after its keyset cursor yields
         // track_2 — never track_1 again — so an unmeasured (stuck) front can't strand the tail.
-        let first = database.tracks_missing_loudness(None, 1).await.expect("first");
+        let first = database
+            .tracks_missing_loudness(None, 1)
+            .await
+            .expect("first");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].track_id, "track_1");
 
         let c1 = &first[0];
-        let after = Some((c1.artist_name.as_str(), c1.title.as_str(), c1.track_id.as_str()));
-        let second = database.tracks_missing_loudness(after, 1).await.expect("second");
+        let after = Some((
+            c1.artist_name.as_str(),
+            c1.title.as_str(),
+            c1.track_id.as_str(),
+        ));
+        let second = database
+            .tracks_missing_loudness(after, 1)
+            .await
+            .expect("second");
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].track_id, "track_2");
 
         // Past the last track the sweep ends, even though neither track was ever measured.
         let c2 = &second[0];
-        let after2 = Some((c2.artist_name.as_str(), c2.title.as_str(), c2.track_id.as_str()));
+        let after2 = Some((
+            c2.artist_name.as_str(),
+            c2.title.as_str(),
+            c2.track_id.as_str(),
+        ));
         assert!(
-            database.tracks_missing_loudness(after2, 1).await.expect("third").is_empty()
+            database
+                .tracks_missing_loudness(after2, 1)
+                .await
+                .expect("third")
+                .is_empty()
         );
 
         let _ = std::fs::remove_file(db_path);
@@ -8796,8 +9379,7 @@ mod tests {
         // Track carries an embedded *title* tag (only title), plus its folder observation.
         let mut library = fixture_library();
         library.tracks[0].title = "Embedded Title".to_string();
-        library
-            .tracks[0]
+        library.tracks[0]
             .observed_metadata
             .push(TrackMetadataObservation {
                 source: "embedded_tag".to_string(),

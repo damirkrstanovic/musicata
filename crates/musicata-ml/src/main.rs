@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// Musicata — a local-first music server + web controller.
+// Copyright (C) 2026 Damir Krstanović
+//
+// This program is free software: you can redistribute it and/or modify it under the terms of
+// the GNU Affero General Public License as published by the Free Software Foundation, either
+// version 3 of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+// See the GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License along with this
+// program. If not, see <https://www.gnu.org/licenses/>.
+
 //! `musicata-ml` — an optional, standalone audio-ML service (M7).
 //!
 //! It runs an ONNX audio model (PANNs CNN14, raw 16 kHz waveform in) and exposes it over HTTP:
@@ -119,7 +135,10 @@ mod tests {
                 panic!("boom while holding the lock");
             })
         };
-        assert!(poisoner.join().is_err(), "the thread panicked, poisoning the lock");
+        assert!(
+            poisoner.join().is_err(),
+            "the thread panicked, poisoning the lock"
+        );
         assert!(mutex.lock().is_err(), "the mutex is now poisoned");
 
         // Recovery still yields the guard and the value.
@@ -145,7 +164,9 @@ async fn info(State(state): State<AppState>) -> Json<serde_json::Value> {
 /// Lock a mutex, recovering the guard even if a previous holder panicked. A single bad
 /// request must not poison the model and brick every later request.
 fn lock_recovered<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// `POST /analyze` — body is the raw audio file; returns the embedding + top tags.

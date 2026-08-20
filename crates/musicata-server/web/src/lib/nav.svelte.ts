@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // In-page navigation: a stack of routes synced to the History API for the Back button,
 // mirroring the old player's nav-stack (the player is one page, not a client router).
 export type Route =

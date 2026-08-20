@@ -55,9 +55,15 @@ Download the binary for your machine from the
 [latest release](https://github.com/damirkrstanovic/musicata/releases/latest), then:
 
 ```sh
-tar -xzf musicata-x86_64-unknown-linux-musl.tar.gz
+tar -xzf musicata-x86_64-linux.tar.gz
+cd musicata-x86_64-linux
 ./musicata-server --library /path/to/music --addr 0.0.0.0:3030
 ```
+
+Three builds are published: `musicata-x86_64-linux` runs on any 64-bit Intel/AMD machine
+including low-power NAS CPUs, `musicata-x86_64-v3-linux` is faster on post-2015 CPUs (AVX2 —
+it will crash on older ones), and `musicata-aarch64-linux` is for ARM (Raspberry Pi 4/5, Apple
+silicon VMs). When in doubt take the first.
 
 Open `http://<host>:3030`, create your admin account, and add your music sources and players
 from the **Settings** page. That's it.
@@ -85,7 +91,6 @@ covered in **[Running & deploying Musicata](docs/deployment.md)**.
 - [Audio ML Service (embeddings & tags)](docs/musicata-ml.md)
 - [Plugins](docs/plugins.md)
 - [Web UI Style Guide](docs/style-guide.md)
-- [Research](docs/research.md)
 - [Initial Requirements](docs/requirements.md)
 
 Contributors: see **[AGENTS.md](AGENTS.md)** for architecture, conventions, and the build/test
@@ -93,4 +98,17 @@ workflow.
 
 ## License
 
-AGPL-3.0.
+Musicata is free software licensed under the **GNU Affero General Public License, version 3
+or later** — see [COPYING](COPYING) for the full text. If you run a modified Musicata as a
+network service, AGPL section 13 requires you to offer its source to your users — and Musicata
+does that for you. A **Source code** link, with the running version beside it, appears on the
+sign-in screen and in the player's account menu. Point it at your fork under **Settings → About
+& source**: it's a setting, so complying with the license never means rebuilding.
+
+Third-party material stored in this repository (the AudioSet class labels) is attributed in
+[NOTICE](NOTICE). The dependencies compiled *into* each release — the Rust crates and the
+Svelte/Workbox code inside the embedded web app — are attributed in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), which ships in the release tarball and in
+both container images.
+
+Security reports: see [SECURITY.md](SECURITY.md) — please don't file them as public issues.

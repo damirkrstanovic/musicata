@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { onDestroy } from "svelte";
   import { api, type Playlist, type SmartPlaylist } from "../lib/api";
   import type { RadioStation } from "../types/RadioStation";
@@ -111,7 +112,10 @@
     <div class="section-head"><h2>Radio</h2></div>
     <div class="playlist-list">
       {#each stations as st (st.id)}
-        <button class="nav-link" type="button" onclick={() => playStream(st.stream_url, st.name)}>{st.name}</button>
+        <!-- Play the station through the server, not its upstream URL directly: the CSP
+             restricts media to this origin, and the relay keeps the user's IP off the
+             station's logs. `st.stream_url` remains the real URL, for editing in /admin. -->
+        <button class="nav-link" type="button" onclick={() => playStream(`/api/radio/${encodeURIComponent(st.id)}/stream`, st.name)}>{st.name}</button>
       {/each}
     </div>
   </section>

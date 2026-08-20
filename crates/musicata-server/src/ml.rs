@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The audio-ML worker (M7). A **scheduled** background task (unlike the always-draining
 //! workers): off by default, it runs at a user-set daily local time (default 02:00) — sending
 //! un-analyzed tracks to the optional `musicata-ml` service over HTTP and storing the returned
@@ -42,9 +43,10 @@ struct ServiceTag {
     score: f32,
 }
 
-/// Whether ML analysis is enabled (default **off** — opt-in).
+/// Whether ML analysis is enabled. The default lives in `BOOL_SETTINGS` (off — opt-in), not
+/// here, so every reader of this key agrees on it.
 pub async fn enabled(database: &Database) -> bool {
-    matches!(database.get_setting(SETTING_ML_ENABLED).await, Ok(Some(v)) if v == "true")
+    crate::bool_setting(database, SETTING_ML_ENABLED).await
 }
 
 /// The default analysis-service URL when the user hasn't set one: `MUSICATA_ML_SERVICE_URL` (the
@@ -144,7 +146,11 @@ async fn ml_pass(
     }
     // The last track in stable order — the cursor to resume from, regardless of how many stored.
     let next_cursor = targets.last().map(|target| {
-        (target.artist_name.clone(), target.title.clone(), target.track_id.clone())
+        (
+            target.artist_name.clone(),
+            target.title.clone(),
+            target.track_id.clone(),
+        )
     });
 
     let total = targets.len();
@@ -170,9 +176,10 @@ async fn ml_pass(
                 let Ok(audio) = crate::read_track_source_file(&providers, &target).await else {
                     return (target.track_id, None);
                 };
-                let analysis = tokio::task::spawn_blocking(move || analyze_via_service(&url, &audio))
-                    .await
-                    .unwrap_or_else(|_| Err("analysis task panicked".to_string()));
+                let analysis =
+                    tokio::task::spawn_blocking(move || analyze_via_service(&url, &audio))
+                        .await
+                        .unwrap_or_else(|_| Err("analysis task panicked".to_string()));
                 match analysis {
                     Ok(analysis) => (target.track_id, Some(analysis)),
                     // Service down / track undecodable → skip (retried next run).
@@ -184,7 +191,9 @@ async fn ml_pass(
             });
         }
         while let Some(joined) = set.join_next().await {
-            let Ok((track_id, analysis)) = joined else { continue };
+            let Ok((track_id, analysis)) = joined else {
+                continue;
+            };
             done += 1;
             if let Some(analysis) = analysis {
                 let tags_json =
@@ -258,8 +267,16 @@ fn seconds_until(now_secs_of_day: i64, target_secs_of_day: i64) -> i64 {
 /// Parse an "HH:MM" daily schedule to seconds-of-day (defaults/clamps to a valid time; 02:00).
 fn parse_schedule(raw: &str) -> i64 {
     let mut parts = raw.split(':');
-    let hour: i64 = parts.next().and_then(|h| h.trim().parse().ok()).unwrap_or(2).clamp(0, 23);
-    let minute: i64 = parts.next().and_then(|m| m.trim().parse().ok()).unwrap_or(0).clamp(0, 59);
+    let hour: i64 = parts
+        .next()
+        .and_then(|h| h.trim().parse().ok())
+        .unwrap_or(2)
+        .clamp(0, 23);
+    let minute: i64 = parts
+        .next()
+        .and_then(|m| m.trim().parse().ok())
+        .unwrap_or(0)
+        .clamp(0, 59);
     hour * 3600 + minute * 60
 }
 

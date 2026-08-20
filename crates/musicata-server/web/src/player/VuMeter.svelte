@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import { getAudio } from "../lib/playback";
   import { meter } from "../lib/meter.svelte";
 

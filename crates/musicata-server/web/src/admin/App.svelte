@@ -1,4 +1,5 @@
 <script lang="ts">
+  // SPDX-License-Identifier: AGPL-3.0-or-later
   import Modal from "../lib/Modal.svelte";
   import StatusDashboard from "./StatusDashboard.svelte";
   import SourcesPanel from "./SourcesPanel.svelte";

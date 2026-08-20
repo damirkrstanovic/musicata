@@ -2,6 +2,10 @@
 
 Date: 2026-06-07
 
+> **Status — shipped.** Autoplay and similar-track radio run in
+> `src/recommendations.rs` + `web/src/lib/autoplay.svelte.ts`, with the toggle in the
+> player. Read the rest as the design behind what shipped; roadmap M7 tracks follow-ups.
+
 ## Context
 
 "I play something and then it keeps going with similar stuff" — Spotify-style **Autoplay** /

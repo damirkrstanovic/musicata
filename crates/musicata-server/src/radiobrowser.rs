@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Client for the Radio Browser public directory (https://www.radio-browser.info),
 //! a free, community-maintained database of internet radio stations (no API key).
 //!

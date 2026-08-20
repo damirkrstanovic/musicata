@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Typed mirror of the server's `PlayerCommand` enum (musicata-core), sent to
 // POST /api/players/{id}/commands. Hand-typed: it's a tagged enum the client only ever
 // *sends*, so a struct-derived type would add no checking the literals don't already give.

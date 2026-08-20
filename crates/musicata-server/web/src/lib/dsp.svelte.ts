@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // EQ state (Svelte 5 runes). The **profile library** (`custom`) is now stored **server-side**
 // (so presets follow the user across devices — see crate::dsp), loaded via `load()`. The
 // per-browser bits — which profile is active, the enabled flag, and volume leveling — stay in

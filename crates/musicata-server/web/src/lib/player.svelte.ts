@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Central player state (Svelte 5 runes). The hot path lives here: `elapsed`/`duration` are
 // their OWN signals, mutated alone on every ~1/s progress tick, so the footer's time/seek
 // re-render WITHOUT touching now-playing, queue, or any track-list highlight (those derive
