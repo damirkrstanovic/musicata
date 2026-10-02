@@ -10,9 +10,9 @@ later version. See COPYING for the full license text.
 Third-party material redistributed in this repository
 --------------------------------------------------------------------------------
 
-This file covers third-party material stored in THIS REPOSITORY. Musicata's Rust
-and npm dependencies are fetched at build time and are not checked in here; their
-licenses are recorded in Cargo.lock / package-lock.json and in the per-dependency
+This file covers third-party material stored in THIS REPOSITORY. Except for the
+vendored SMB crate below, Musicata's Rust and npm dependencies are fetched at build
+time; their licenses are recorded in Cargo.lock / package-lock.json and in the per-dependency
 comments in each crate's Cargo.toml.
 
 They ARE, however, compiled into every Musicata binary — the server links its Rust
@@ -20,6 +20,12 @@ dependency tree statically and embeds the built web app — so the attribution t
 licenses require travels with the release tarball and the container images in
 THIRD-PARTY-NOTICES.md. Regenerate it with `node scripts/gen-third-party-notices.mjs`
 after changing dependencies.
+
+SMB client (vendor/smb)
+  smb 0.11.2, https://github.com/afiffon/smb-rs
+  Copyright 2025 AVIV N. MIT license; see vendor/smb/LICENSE.md.
+  Musicata retains directory-batch wake-ups to prevent a scanner deadlock.
+  Provenance and regression tests are documented in vendor/smb/MUSICATA-PATCH.md.
 
 Two third-party works are downloaded at runtime rather than redistributed, and so
 carry no obligation here:

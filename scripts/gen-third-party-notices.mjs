@@ -79,7 +79,10 @@ function rustPackages(oversized) {
     const version = block.match(/^\s*version = "([^"]+)"/m)?.[1];
     if (!name || !version || own.has(name)) continue;
 
-    const dir = sources.map((s) => `${s}/${name}-${version}`).find((p) => existsSync(p));
+    const vendored = `${ROOT}vendor/${name}`;
+    const dir = !/^source\s*=/m.test(block) && existsSync(`${vendored}/Cargo.toml`)
+      ? vendored
+      : sources.map((s) => `${s}/${name}-${version}`).find((p) => existsSync(p));
     if (!dir) {
       missing.push(`${name} ${version}`);
       continue;

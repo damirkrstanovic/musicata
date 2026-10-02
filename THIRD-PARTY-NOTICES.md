@@ -591,7 +591,7 @@ the exact versions are listed below and are available from
 | workbox-routing | 7.4.1 | MIT |
 | workbox-strategies | 7.4.1 | MIT |
 
-> 57 package(s) ship no license file in their published artifact; their SPDX expression above is the operative grant: audio-core 0.2.1, binrw 0.15.1, binrw_derive 0.15.1, cesu8 1.1.0, crc-catalog 2.4.0, dasp_frame 0.11.0, dasp_sample 0.11.0, jni-sys-macros 0.4.1, kbkdf 0.1.0-pre.0, lofty 0.24.0, lofty_attr 0.12.0, modular-bitfield-impl 0.11.2, ndk 0.8.0, ndk-context 0.1.1, ndk-sys 0.5.0+25.2.9519653, oboe 0.6.1, oboe-sys 0.6.1, ogg_pager 0.7.2, r-efi 5.3.0, r-efi 6.0.0, realfft 3.5.0, rusty-chromaprint 0.3.0, smb 0.11.2, smb-dtyp 0.11.2, smb-dtyp-derive 0.11.2, smb-fscc 0.11.2, smb-msg 0.11.2, smb-msg-derive 0.11.2, smb-rpc 0.11.2, smb-transport 0.11.2, sqlite-vec 0.1.9, symphonia 0.5.5, symphonia-bundle-flac 0.5.5, symphonia-bundle-mp3 0.5.5, symphonia-codec-aac 0.5.5, symphonia-codec-adpcm 0.5.5, symphonia-codec-alac 0.5.5, symphonia-codec-pcm 0.5.5, symphonia-codec-vorbis 0.5.5, symphonia-core 0.5.5, symphonia-format-isomp4 0.5.5, symphonia-format-ogg 0.5.5, symphonia-format-riff 0.5.5, symphonia-metadata 0.5.5, symphonia-utils-xiph 0.5.5, ts-rs 10.1.0, ts-rs-macros 10.1.0, valuable 0.1.1, wasip2 1.0.2+wasi-0.2.9, wasip3 0.4.0+wasi-0.3.0-rc-2026-01-06, wasm-encoder 0.244.0, wasm-metadata 0.244.0, wasmparser 0.244.0, winapi-i686-pc-windows-gnu 0.4.0, winapi-x86_64-pc-windows-gnu 0.4.0, wit-component 0.244.0, wit-parser 0.244.0.
+> 56 package(s) ship no license file in their published artifact; their SPDX expression above is the operative grant: audio-core 0.2.1, binrw 0.15.1, binrw_derive 0.15.1, cesu8 1.1.0, crc-catalog 2.4.0, dasp_frame 0.11.0, dasp_sample 0.11.0, jni-sys-macros 0.4.1, kbkdf 0.1.0-pre.0, lofty 0.24.0, lofty_attr 0.12.0, modular-bitfield-impl 0.11.2, ndk 0.8.0, ndk-context 0.1.1, ndk-sys 0.5.0+25.2.9519653, oboe 0.6.1, oboe-sys 0.6.1, ogg_pager 0.7.2, r-efi 5.3.0, r-efi 6.0.0, realfft 3.5.0, rusty-chromaprint 0.3.0, smb-dtyp 0.11.2, smb-dtyp-derive 0.11.2, smb-fscc 0.11.2, smb-msg 0.11.2, smb-msg-derive 0.11.2, smb-rpc 0.11.2, smb-transport 0.11.2, sqlite-vec 0.1.9, symphonia 0.5.5, symphonia-bundle-flac 0.5.5, symphonia-bundle-mp3 0.5.5, symphonia-codec-aac 0.5.5, symphonia-codec-adpcm 0.5.5, symphonia-codec-alac 0.5.5, symphonia-codec-pcm 0.5.5, symphonia-codec-vorbis 0.5.5, symphonia-core 0.5.5, symphonia-format-isomp4 0.5.5, symphonia-format-ogg 0.5.5, symphonia-format-riff 0.5.5, symphonia-metadata 0.5.5, symphonia-utils-xiph 0.5.5, ts-rs 10.1.0, ts-rs-macros 10.1.0, valuable 0.1.1, wasip2 1.0.2+wasi-0.2.9, wasip3 0.4.0+wasi-0.3.0-rc-2026-01-06, wasm-encoder 0.244.0, wasm-metadata 0.244.0, wasmparser 0.244.0, winapi-i686-pc-windows-gnu 0.4.0, winapi-x86_64-pc-windows-gnu 0.4.0, wit-component 0.244.0, wit-parser 0.244.0.
 
 ## License texts
 
@@ -7055,6 +7055,20 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+```
+
+### smb 0.11.2
+
+```
+<!-- markdownlint-disable -->
+
+Copyright 2025 AVIV N
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 ### atomic-waker 1.1.2

@@ -45,6 +45,11 @@ jobs:
           MUSICATA_SKIP_WEB_BUILD: "1"
         run: cargo test
 
+      # Dependency tests are not run by the workspace suite. These deterministic
+      # iterator tests need no NAS and guard the locally patched SMB wake-up race.
+      - name: SMB directory wake-up regression
+        run: cargo test --manifest-path vendor/smb/Cargo.toml --target-dir target --locked --lib batch_wakeup_tests
+
       # The minimal build drops the SMB dependency and gates out the OpenSubsonic, podcast,
       # Archive and Snapcast code paths. It breaks on a mis-scoped `#[cfg]` long before anyone
       # tries to ship it, so it is worth its own run.

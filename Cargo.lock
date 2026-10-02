@@ -2062,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "lofty",
  "serde",
@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-endpoint"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "rodio",
@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-ml"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-server"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2137,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-storage"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "libsqlite3-sys",
@@ -3588,8 +3588,6 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smb"
 version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c12ddf75029c02180237fa98948bd3dea72647c08bd7d1b5fa4923491764100"
 dependencies = [
  "aead",
  "aes",
