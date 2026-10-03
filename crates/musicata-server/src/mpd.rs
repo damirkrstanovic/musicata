@@ -216,11 +216,21 @@ impl MpdConnection {
         Ok(())
     }
 
+    /// Queue identity and order only; tags can change without the URLs changing.
+    pub async fn queue_uris(&mut self) -> Result<Vec<String>> {
+        Ok(self
+            .command("playlistinfo")
+            .await?
+            .into_iter()
+            .filter_map(|(key, value)| (key == "file").then_some(value))
+            .collect())
+    }
+
     /// Read the playback cursor (status + current song) **without** the queue — the
     /// server owns the queue, so it only reads which index is playing, the elapsed
     /// position, and the options back from MPD. Also returns MPD's queue version,
-    /// which increments only on queue edits (not on seeks or song changes), so an
-    /// unexpected bump signals an external client edited the queue.
+    /// which increments on content edits and stream metadata updates. Compare queue
+    /// URLs before treating a version bump as an external content/order edit.
     pub async fn read_status(&mut self) -> Result<MpdStatus> {
         let status = self.command("status").await?;
         let current = self.command("currentsong").await?;
@@ -239,8 +249,7 @@ impl MpdConnection {
 /// owns the queue and reads only the cursor (position/elapsed/options/now-playing).
 pub struct MpdStatus {
     pub state: PlaybackState,
-    /// Increments only on queue edits (add/delete/move/clear) — used to detect an
-    /// external client changing the queue out from under the server.
+    /// Increments on queue edits and metadata updates; not proof of a content change.
     pub playlist_version: u64,
 }
 
