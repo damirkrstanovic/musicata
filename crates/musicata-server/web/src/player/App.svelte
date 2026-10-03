@@ -1,6 +1,6 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
-  import { onMount, onDestroy } from "svelte";
+  import { onMount, onDestroy, tick, untrack } from "svelte";
   import { api } from "../lib/api";
   import { player } from "../lib/player.svelte";
   import { nav } from "../lib/nav.svelte";
@@ -40,6 +40,42 @@
   let audioEl: HTMLAudioElement;
   let audio: BrowserAudio | null = null;
   let ws: PlayerSocket | null = null;
+  let navOpen = $state(false);
+  let nowPlayingOpen = $state(false);
+  let mobile = $state(false);
+
+  onMount(() => {
+    const query = matchMedia("(max-width: 820px)");
+    const update = () => { mobile = query.matches; };
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  });
+
+  async function setNowPlaying(open: boolean) {
+    nowPlayingOpen = open;
+    await tick();
+    document.querySelector<HTMLButtonElement>(`[aria-label="${open ? "Close" : "Open"} Now Playing"]`)?.focus();
+  }
+
+  async function openNavigation() {
+    navOpen = true;
+    await tick();
+    document.querySelector<HTMLButtonElement>('[aria-label="Close navigation"]')?.focus();
+  }
+
+  async function closeNavigation() {
+    if (!navOpen) return;
+    navOpen = false;
+    await tick();
+    document.querySelector<HTMLButtonElement>('[aria-label="Open navigation"]')?.focus();
+  }
+
+  // Choosing a saved playlist/view should reveal it behind the mobile drawer.
+  $effect(() => {
+    nav.current;
+    untrack(() => { void closeNavigation(); });
+  });
   // Set when the connection drops while this tab was the playing output, so we resume on
   // reconnect: a restarted server restores the session as *paused* (it can't know a tab is still
   // here), which would otherwise leave the footer paused while audio was mid-track.
@@ -237,12 +273,24 @@
   });
 </script>
 
-<svelte:window onpopstate={() => nav.pop()} />
+<svelte:window onpopstate={() => nav.pop()} onkeydown={(event) => {
+  if (event.key === "Escape") {
+    if (player.queueOpen) player.queueOpen = false;
+    else if (nowPlayingOpen) void setNowPlaying(false);
+    else void closeNavigation();
+  }
+}} />
 
-<main class="shell">
-  <Sidebar />
+<main class="shell" class:nav-open={navOpen} class:np-open={nowPlayingOpen}>
+  <header class="mobile-bar" inert={mobile && (navOpen || nowPlayingOpen || player.queueOpen)}>
+    <button class="bar-icon" type="button" aria-label="Open navigation" aria-expanded={navOpen} onclick={openNavigation}>☰</button>
+    <span class="mobile-brand">Musicata</span>
+    <a class="bar-icon" href="/admin" aria-label="Settings">⚙</a>
+  </header>
+  <button class="scrim" type="button" hidden={!navOpen} aria-label="Dismiss navigation" onclick={closeNavigation}></button>
+  <Sidebar onclose={closeNavigation} inert={mobile && !navOpen} />
 
-  <section class="content">
+  <section class="content" inert={mobile && (navOpen || nowPlayingOpen || player.queueOpen)}>
     <header class="content-header">
       {#if nav.canGoBack}
         <button class="back-btn" type="button" onclick={() => nav.pop()}>‹ Back</button>
@@ -296,8 +344,9 @@
     {/if}
   </section>
 
-  <aside class="right-rail">
-    <div class="rail-header">
+  <aside class="right-rail" class:overlay-open={player.queueOpen} inert={mobile && navOpen}>
+    <div class="rail-header" inert={mobile && player.queueOpen}>
+      <button class="np-chevron" type="button" aria-label="Close Now Playing" onclick={() => setNowPlaying(false)}>⌄</button>
       <div class="player-switch">
         <select
           class="player-switch-btn"
@@ -321,10 +370,10 @@
       <VuMeter />
       <StatsPanel />
     </div>
-    <Footer />
+    <Footer onexpand={() => setNowPlaying(true)} inert={mobile && player.queueOpen} />
   </aside>
 </main>
 
 <Modal />
-<InstallPrompt />
+{#if !navOpen && !nowPlayingOpen && !player.queueOpen}<InstallPrompt />{/if}
 <audio bind:this={audioEl} preload="none" hidden></audio>

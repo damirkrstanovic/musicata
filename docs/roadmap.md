@@ -394,6 +394,24 @@ Tasks:
   description/categories/display_override, so the app is installable; the icon is
   served and precached by the service worker. Initial and history loads show a
   shimmer skeleton (respecting `prefers-reduced-motion`).
+- [ ] **Rich mobile web experience, no app installation required.** Make connecting to
+  Musicata's web address on a phone sufficient for everyday use; home-screen/PWA installation
+  remains optional. Refine touch-friendly navigation, a full now-playing view, search and
+  library browsing, queue editing, playlists/mixes, output selection, volume, EQ, and settings
+  for small screens and one-handed use. Preserve navigation and playback state across refresh,
+  reconnect, screen locking, and returning from another app; show connection/recovery status
+  clearly. Support accessible controls, mobile safe areas and keyboards, and fast loading of
+  large libraries. Validate the complete browser-only flow on iOS Safari and Android Chrome,
+  including Media Session controls where supported; distinguish remote-output control from
+  browser playback and account for platform background-audio restrictions.
+  First pass restores the mobile navigation drawer, persistent play/pause/next and Queue
+  controls, and expanded Now Playing with output selection and volume. Touch-driven Chromium
+  regressions cover 320/360px portrait and 800px landscape, saved playlists, queue selection,
+  output presets, and focus restoration. Real Android/iOS and background/reconnect validation
+  remain open. PWA installation also needs trusted HTTPS: a public domain with DNS-01 validation
+  can keep the server LAN-only; `.local` requires a private CA trusted by each device. See
+  [Let's Encrypt DNS-01](https://letsencrypt.org/docs/challenge-types/#dns-01-challenge) and
+  [Caddy local HTTPS](https://caddyserver.com/docs/automatic-https#local-https).
 - [x] Add virtualized lists for large libraries. Two layers: (1) track rows use
   `content-visibility: auto` with `contain-intrinsic-size`, so the browser skips
   layout/paint for off-screen rows; (2) **incremental (infinite-scroll) loading** so
@@ -840,8 +858,8 @@ headphones, one-tap switch, each with its own correction + volume) is the drivin
 Tasks (browser-first; see `docs/dsp.md` for per-phase detail + the files touched):
 
 The **entire browser DSP tier (Phases 0–4) is DONE** — see `crate::dsp`, `web/src/lib/{audio,dsp,
-audioDevices}.ts`, `web/src/player/EqPanel.svelte`. Only the CamillaDSP DAC tier (Phase 5) +
-polish remain.
+audioDevices}.ts`, `web/src/player/EqPanel.svelte`. Remaining work includes the MPD/DAC path,
+EQ across all outputs, and polish.
 
 - [x] **Phase 0–1 — profile model + browser DSP core.** Browser EQ: a Web Audio graph in
   `BrowserAudio` (`source → preamp → biquads → convolver → leveling → destination`) with
@@ -893,6 +911,15 @@ polish remain.
 - [ ] **Phase 6 (cont.) — remaining polish.** A Roon-style signal-path badge over the
   WebSocket; phone-app filter export (GraphicEQ.txt / IR WAV for JamesDSP / Wavelet); server-side
   album-mode apply for Snapcast.
+- [ ] **EQ for every output.** Make the EQ panel control the selected player/output for
+  MPD, native endpoints, and synchronized playback as well as the browser. Reuse the shared
+  `DspProfile` model for parametric EQ, preamp, and AutoEq presets; persist profile selection
+  and bypass per output on the server so every controller sees the same state. Apply EQ in
+  the actual playback path without requiring browser audio, avoid applying it twice, and
+  preserve synchronized playback. Build on existing Snapcast DSP and evaluate the MPD/DAC
+  processing path described above. Verify audible correction, bypass, live profile changes,
+  and output switching on the Mele → Topping DAC path and every supported output kind,
+  including CPU usage on the Celeron.
 - [ ] **VU meter for every output.** Make the meter follow the selected player/zone for
   MPD, native endpoints, and synchronized playback as well as the browser. Obtain real
   per-channel level measurements from the server/output audio path and push lightweight

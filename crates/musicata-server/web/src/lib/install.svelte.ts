@@ -64,6 +64,10 @@ class Install {
     await event.userChoice.catch(() => undefined);
   }
 
+  dismissPrompt(): void {
+    this.deferred = null;
+  }
+
   dismissIosHint(): void {
     this.iosHint = false;
     try {

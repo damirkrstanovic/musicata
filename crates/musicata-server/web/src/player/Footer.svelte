@@ -10,6 +10,8 @@
   import type { RepeatMode } from "../types/RepeatMode";
   import SeekBar from "./SeekBar.svelte";
 
+  let { onexpand, inert = false }: { onexpand: () => void; inert?: boolean } = $props();
+
   const REPEAT_NEXT: Record<RepeatMode, RepeatMode> = { off: "all", all: "one", one: "off" };
 
   function send(command: PlayerCommand) {
@@ -25,7 +27,7 @@
   );
 </script>
 
-<footer class="transport" data-status={player.status}>
+<footer class="transport" data-status={player.status} {inert}>
   <div class="transport-now">
     <div class="now-art">
       {#if player.nowPlaying?.artwork_url}
@@ -52,6 +54,16 @@
         </span>
       {/if}
     </div>
+  </div>
+
+  <div class="mini-controls">
+    <button class="control play" type="button"
+      aria-label={player.status === "playing" && !player.playBlocked ? "Pause" : "Play"}
+      onclick={() => togglePlayback()}>{player.status === "playing" && !player.playBlocked ? "❚❚" : "▶"}</button>
+    <button class="control" type="button" aria-label="Next" onclick={() => next()}>⏭</button>
+    <button class="control" type="button" aria-label="Queue" aria-expanded={player.queueOpen}
+      onclick={() => (player.queueOpen = !player.queueOpen)}>Queue</button>
+    <button class="np-chevron" type="button" aria-label="Open Now Playing" onclick={onexpand}>⌃</button>
   </div>
 
   <SeekBar />
