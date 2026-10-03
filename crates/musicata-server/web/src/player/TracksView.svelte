@@ -1,7 +1,8 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
-  import { untrack } from "svelte";
+  import { untrack, tick, onDestroy } from "svelte";
   import { api, type TrackRow } from "../lib/api";
+  import { nav } from "../lib/nav.svelte";
   import { onVisible } from "../lib/dom";
   import { browse } from "../lib/browse.svelte";
   import { search } from "../lib/search.svelte";
@@ -13,6 +14,7 @@
   let offset = 0;
   let loading = false;
   let token = 0;
+  onDestroy(() => { token++; });
 
   async function loadMore() {
     if (done || loading) return;
@@ -44,6 +46,8 @@
       done = true;
     } finally {
       loading = false;
+      await tick();
+      if (mine === token && nav.current.name === "tracks" && !nav.restoreScroll() && !done) void loadMore();
     }
   }
 

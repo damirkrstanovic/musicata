@@ -3,10 +3,11 @@
   // A slim, dismissable top banner offering PWA install: a one-tap "Install" on Chrome/Android,
   // or "Add to Home Screen" instructions on iOS Safari (which has no install API).
   import { install } from "../lib/install.svelte";
+  let { inline = false }: { inline?: boolean } = $props();
 </script>
 
 {#if install.iosHint}
-  <div class="install-banner" role="dialog" aria-label="Install Musicata">
+  <div class="install-banner" class:inline role="dialog" aria-label="Install Musicata">
     <div class="install-text">
       <strong>Install Musicata</strong>
       <span>Tap <span aria-hidden="true">⎙</span> Share, then “Add to Home Screen”.</span>
@@ -14,7 +15,7 @@
     <button type="button" class="install-x" onclick={() => install.dismissIosHint()} aria-label="Dismiss">×</button>
   </div>
 {:else if install.canPrompt}
-  <div class="install-banner">
+  <div class="install-banner" class:inline>
     <div class="install-text">
       <strong>Install Musicata</strong>
       <span>Add it to your device for a full-screen app.</span>
@@ -41,6 +42,13 @@
     border: 1px solid rgba(255, 255, 255, 0.08);
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
     color: #e9ecf1;
+  }
+  .install-banner.inline {
+    position: static;
+    width: 100%;
+    transform: none;
+    margin-bottom: 16px;
+    animation: none;
   }
   .install-text {
     display: flex;

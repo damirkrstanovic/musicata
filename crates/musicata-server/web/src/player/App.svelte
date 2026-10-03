@@ -1,6 +1,6 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
-  import { onMount, onDestroy, tick, untrack } from "svelte";
+  import { onMount, onDestroy, tick } from "svelte";
   import { api } from "../lib/api";
   import { player } from "../lib/player.svelte";
   import { nav } from "../lib/nav.svelte";
@@ -31,6 +31,7 @@
   import MetadataPanel from "./MetadataPanel.svelte";
   import FavoritesView from "./FavoritesView.svelte";
   import PlaylistView from "./PlaylistView.svelte";
+  import PlaylistsView from "./PlaylistsView.svelte";
   import SmartPlaylistView from "./SmartPlaylistView.svelte";
   import MixView from "./MixView.svelte";
   import InstallPrompt from "./InstallPrompt.svelte";
@@ -40,22 +41,24 @@
   let audioEl: HTMLAudioElement;
   let audio: BrowserAudio | null = null;
   let ws: PlayerSocket | null = null;
-  let navOpen = $state(false);
-  let nowPlayingOpen = $state(false);
+  const navOpen = $derived(nav.overlays.includes("navigation"));
+  const nowPlayingOpen = $derived(nav.overlays.includes("nowPlaying"));
   let mobile = $state(false);
 
   onMount(() => {
     const query = matchMedia("(max-width: 820px)");
     const update = () => { mobile = query.matches; };
     update();
+    nav.start();
     query.addEventListener("change", update);
-    return () => query.removeEventListener("change", update);
+    return () => { query.removeEventListener("change", update); nav.stop(); };
   });
 
   async function setNowPlaying(open: boolean) {
-    nowPlayingOpen = open;
+    if (open) nav.openOverlay("nowPlaying");
+    else nav.closeOverlay();
     await tick();
-    document.querySelector<HTMLButtonElement>(`[aria-label="${open ? "Close" : "Open"} Now Playing"]`)?.focus();
+    if (open) document.querySelector<HTMLButtonElement>('[aria-label="Close Now Playing"]')?.focus();
   }
 
   async function openOutput() {
@@ -64,23 +67,18 @@
   }
 
   async function openNavigation() {
-    navOpen = true;
+    nav.openOverlay("navigation");
     await tick();
     document.querySelector<HTMLButtonElement>('[aria-label="Close navigation"]')?.focus();
   }
 
   async function closeNavigation() {
     if (!navOpen) return;
-    navOpen = false;
+    nav.closeOverlay();
     await tick();
     document.querySelector<HTMLButtonElement>('[aria-label="Open navigation"]')?.focus();
   }
 
-  // Choosing a saved playlist/view should reveal it behind the mobile drawer.
-  $effect(() => {
-    nav.current;
-    untrack(() => { void closeNavigation(); });
-  });
   // Set when the connection drops while this tab was the playing output, so we resume on
   // reconnect: a restarted server restores the session as *paused* (it can't know a tab is still
   // here), which would otherwise leave the footer paused while audio was mid-track.
@@ -104,6 +102,8 @@
             ? "Artists"
             : route.name === "favorites"
               ? "Favorites"
+              : route.name === "playlists"
+                ? "Playlists"
               : route.name === "album"
                 ? route.title
                 : route.name === "artist" || route.name === "playlist" || route.name === "smart"
@@ -296,7 +296,14 @@
   });
 </script>
 
-<svelte:window onpopstate={() => nav.pop()} onkeydown={(event) => {
+<svelte:window onpopstate={async (event) => {
+  const wasNowPlaying = nowPlayingOpen;
+  const wasNavigation = navOpen;
+  nav.restore(event.state);
+  await tick();
+  if (wasNowPlaying && !nowPlayingOpen) document.querySelector<HTMLButtonElement>('.now-title-button')?.focus({preventScroll: true});
+  else if (wasNavigation && !navOpen) document.querySelector<HTMLButtonElement>('[aria-label="Open navigation"]')?.focus({preventScroll: true});
+}} onkeydown={(event) => {
   if (event.key === "Escape") {
     if (player.queueOpen) player.queueOpen = false;
     else if (nowPlayingOpen) void setNowPlaying(false);
@@ -306,6 +313,7 @@
 
 <main class="shell" class:nav-open={navOpen} class:np-open={nowPlayingOpen}>
   <header class="mobile-bar" inert={mobile && (navOpen || nowPlayingOpen || player.queueOpen)}>
+    {#if nav.canGoBack}<button class="bar-icon mobile-back" type="button" aria-label="Back" onclick={() => nav.pop()}>‹</button>{/if}
     <button class="bar-icon" type="button" aria-label="Open navigation" aria-expanded={navOpen} onclick={openNavigation}>☰</button>
     <button class="mobile-output" type="button" onclick={openOutput} aria-expanded={nowPlayingOpen}>
       <span>Output:</span>
@@ -315,9 +323,10 @@
     <a class="bar-icon" href="/admin" aria-label="Settings">⚙</a>
   </header>
   <button class="scrim" type="button" hidden={!navOpen} aria-label="Dismiss navigation" onclick={closeNavigation}></button>
-  <Sidebar onclose={closeNavigation} inert={mobile && !navOpen} />
+  <Sidebar onnowplaying={() => setNowPlaying(true)} onclose={closeNavigation} inert={mobile && !navOpen} />
 
   <section class="content" inert={mobile && (navOpen || nowPlayingOpen || player.queueOpen)}>
+    <InstallPrompt inline />
     <header class="content-header">
       {#if nav.canGoBack}
         <button class="back-btn" type="button" onclick={() => nav.pop()}>‹ Back</button>
@@ -362,6 +371,8 @@
       <AlbumDetail id={route.id} />
     {:else if route.name === "artist"}
       <ArtistDetail id={route.id} />
+    {:else if route.name === "playlists"}
+      <PlaylistsView />
     {:else if route.name === "playlist"}
       <PlaylistView id={route.id} />
     {:else if route.name === "smart"}
@@ -373,6 +384,7 @@
 
   <aside class="right-rail" class:overlay-open={player.queueOpen} inert={mobile && navOpen}>
     <div class="rail-header" inert={mobile && player.queueOpen}>
+      {#if nowPlayingOpen}<span class="desktop-now-heading">Now Playing</span>{/if}
       <button class="np-chevron" type="button" aria-label="Close Now Playing" onclick={() => setNowPlaying(false)}>⌄</button>
       <div class="player-switch">
         <select
@@ -392,15 +404,21 @@
     </div>
     <div class="rail-top">
       <MetadataPanel />
-      <QueueDrawer />
+      {#if !mobile && nowPlayingOpen && !player.queueOpen}<QueueDrawer embedded />
+      {:else if !(mobile && nowPlayingOpen) || player.queueOpen}<QueueDrawer />{/if}
       <EqPanel />
       <VuMeter />
       <StatsPanel />
     </div>
     <Footer onexpand={() => setNowPlaying(true)} inert={mobile && player.queueOpen} />
+    {#if mobile && nowPlayingOpen && !player.queueOpen}<QueueDrawer embedded />{/if}
   </aside>
+  <nav class="mobile-tabs" aria-label="Main navigation" inert={navOpen || player.queueOpen}>
+    <button type="button" data-tab="library" aria-current={!nowPlayingOpen && !["playlists", "playlist", "smart"].includes(route.name) ? "page" : undefined} class:active={!nowPlayingOpen && !["playlists", "playlist", "smart"].includes(route.name)} onclick={() => nav.root({name: nav.browseView})}>Library</button>
+    <button type="button" data-tab="playlists" aria-current={!nowPlayingOpen && ["playlists", "playlist", "smart"].includes(route.name) ? "page" : undefined} class:active={!nowPlayingOpen && ["playlists", "playlist", "smart"].includes(route.name)} onclick={() => nav.root({name: "playlists"})}>Playlists</button>
+    <button type="button" data-tab="now-playing" aria-current={nowPlayingOpen ? "page" : undefined} class:active={nowPlayingOpen} onclick={() => setNowPlaying(true)}>Now Playing</button>
+  </nav>
 </main>
 
 <Modal />
-{#if !navOpen && !nowPlayingOpen && !player.queueOpen}<InstallPrompt />{/if}
 <audio bind:this={audioEl} preload="none" hidden></audio>

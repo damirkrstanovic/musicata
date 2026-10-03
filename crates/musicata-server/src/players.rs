@@ -32,6 +32,7 @@ use tokio::task::JoinHandle;
 use crate::auth::MpdStreamAuth;
 use crate::mpd::{MpdConnection, MpdStatus};
 use crate::providers::ProviderRegistry;
+use crate::queue_persistence::{QueueOwner, QueuePersist, QueuePersistence};
 #[cfg(feature = "snapcast")]
 use crate::snapcast::{DecodedTrack, SnapcastManager, StereoEq, WriterEvent, WriterMsg};
 
@@ -108,16 +109,12 @@ impl PlayerHandle {
         }
     }
 
-    /// The per-second position tick stream, if the backend emits one. Only the browser
-    /// player does (MPD's elapsed rides its periodic state broadcast instead); the
-    /// listen recorder uses this to see elapsed advance without the hot-path cost of
-    /// re-broadcasting the full state every second.
-    pub fn subscribe_progress(&self) -> Option<broadcast::Receiver<ProgressTick>> {
+    fn subscribe_history(&self) -> broadcast::Receiver<ListenSample> {
         match self {
-            PlayerHandle::Mpd(_) => None,
-            PlayerHandle::Browser(player) => Some(player.subscribe_progress()),
+            Self::Mpd(player) => player.history_tx.subscribe(),
+            Self::Browser(player) => player.history_tx.subscribe(),
             #[cfg(feature = "snapcast")]
-            PlayerHandle::Snapcast(player) => Some(player.subscribe_progress()),
+            Self::Snapcast(player) => player.history_tx.subscribe(),
         }
     }
 
@@ -327,70 +324,38 @@ async fn record_action(database: &Database, player_id: &str, action: ListenActio
     }
 }
 
-/// Await the next progress tick, or never resolve when there is no progress channel
-/// (MPD/zone) — so the recorder's `select!` simply falls through to state frames.
-async fn next_progress(progress: &mut Option<broadcast::Receiver<ProgressTick>>) -> ProgressTick {
-    loop {
-        match progress {
-            Some(rx) => match rx.recv().await {
-                Ok(tick) => return tick,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => *progress = None,
-            },
-            None => std::future::pending::<()>().await,
-        }
-    }
+/// Internal, ordered history events. Keep these separate from UI progress frames:
+/// merging two independent channels can assign a tick to the wrong track when
+/// controls no longer yield to SQLite between commands.
+#[derive(Clone)]
+struct ListenSample {
+    status: PlaybackStatus,
+    track_id: Option<String>,
+    elapsed: Option<f64>,
+    duration: Option<f64>,
 }
 
-/// Spawns the per-player task that records listening history under the ListenBrainz
-/// completion rule. It folds two sources into the tracker: full `PlaybackState` frames
-/// (track changes, status, and — for MPD — elapsed) and, when present, the browser's
-/// lightweight per-second `ProgressTick`s (which carry the advancing elapsed the full
-/// state deliberately doesn't re-broadcast every second).
 fn spawn_listen_recorder(
     player_id: String,
-    mut states: broadcast::Receiver<PlaybackState>,
-    mut progress: Option<broadcast::Receiver<ProgressTick>>,
+    mut events: broadcast::Receiver<ListenSample>,
     database: Database,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tracker = ListenTracker::default();
-        // The last library track id / status seen on a full state frame, used to give a
-        // bare progress tick its context.
-        let mut last_track: Option<String> = None;
-        let mut last_status = PlaybackStatus::Stopped;
         loop {
-            let action = tokio::select! {
-                state = states.recv() => match state {
-                    Ok(state) => {
-                        let track_id = state.now_playing.and_then(|n| n.track_id);
-                        last_track = track_id.clone();
-                        last_status = state.status;
-                        tracker.observe(
-                            state.status,
-                            track_id.as_deref(),
-                            state.elapsed_seconds,
-                            state.duration_seconds,
-                        )
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
-                tick = next_progress(&mut progress) => {
-                    // Progress only flows while the output is rendering audio, so treat it
-                    // as Playing on the last-known track.
-                    if last_status != PlaybackStatus::Playing {
-                        continue;
-                    }
-                    tracker.observe(
-                        PlaybackStatus::Playing,
-                        last_track.as_deref(),
-                        Some(tick.elapsed_seconds),
-                        tick.duration_seconds,
-                    )
+            match events.recv().await {
+                Ok(event) => {
+                    let action = tracker.observe(
+                        event.status,
+                        event.track_id.as_deref(),
+                        event.elapsed,
+                        event.duration,
+                    );
+                    record_action(&database, &player_id, action).await;
                 }
-            };
-            record_action(&database, &player_id, action).await;
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
         }
     })
 }
@@ -479,8 +444,7 @@ impl PlayerManager {
         player.restore().await;
         let recorder = spawn_listen_recorder(
             zone.id.clone(),
-            player.subscribe(),
-            None,
+            player.history_tx.subscribe(),
             self.database.clone(),
         );
         self.zones
@@ -596,8 +560,7 @@ impl PlayerManager {
         };
         let recorder = spawn_listen_recorder(
             record.id.clone(),
-            handle.subscribe(),
-            handle.subscribe_progress(),
+            handle.subscribe_history(),
             self.database.clone(),
         );
         self.players.write().await.insert(
@@ -653,7 +616,17 @@ impl PlayerManager {
 
     pub async fn remove(&self, id: &str) -> Result<()> {
         self.require_record(id).await?;
-        self.players.write().await.remove(id); // Drop aborts the task.
+        let entry = self.players.write().await.remove(id);
+        if let Some(entry) = entry {
+            let handle = entry.handle.clone();
+            drop(entry); // Abort polling/recording before stopping the writer.
+            match handle {
+                PlayerHandle::Mpd(player) => player.persistence.stop().await,
+                PlayerHandle::Browser(player) => player.persistence.stop().await,
+                #[cfg(feature = "snapcast")]
+                PlayerHandle::Snapcast(player) => player.persistence.stop().await,
+            }
+        }
         self.database.delete_player(id).await?;
         Ok(())
     }
@@ -722,7 +695,12 @@ impl PlayerManager {
     }
 
     pub async fn delete_zone(&self, id: &str) -> Result<()> {
-        self.zones.write().await.remove(id); // Drop aborts the recorder.
+        let entry = self.zones.write().await.remove(id);
+        if let Some(entry) = entry {
+            let player = entry.player.clone();
+            drop(entry);
+            player.persistence.stop().await;
+        }
         self.database.delete_zone(id).await
     }
 
@@ -793,6 +771,7 @@ pub struct MpdPlayer {
     id: String,
     addr: String,
     database: Database,
+    persistence: QueuePersistence,
     public_base_url: String,
     stream_auth: MpdStreamAuth,
     /// Serialize queue mutations, MPD commands, cursor application and persistence.
@@ -806,6 +785,7 @@ pub struct MpdPlayer {
     /// refreshed from MPD.
     state: Mutex<QueueState>,
     state_tx: broadcast::Sender<PlaybackState>,
+    history_tx: broadcast::Sender<ListenSample>,
     /// Last validated MPD queue version. Metadata updates also bump it, so a changed
     /// version triggers a URI comparison, never an unconditional queue reload.
     expected_playlist_version: AtomicU64,
@@ -823,7 +803,9 @@ impl MpdPlayer {
         stream_auth: MpdStreamAuth,
     ) -> Self {
         let (state_tx, _) = broadcast::channel(16);
+        let (history_tx, _) = broadcast::channel(128);
         Self {
+            persistence: QueuePersistence::new(database.clone(), QueueOwner::Player(id.clone())),
             id,
             addr,
             database,
@@ -834,6 +816,7 @@ impl MpdPlayer {
             online: AtomicBool::new(false),
             state: Mutex::new(QueueState::default()),
             state_tx,
+            history_tx,
             expected_playlist_version: AtomicU64::new(0),
             restored: AtomicBool::new(false),
         }
@@ -850,42 +833,18 @@ impl MpdPlayer {
     /// Build the controller-facing state: the server-owned queue plus the
     /// MPD-derived cursor (now-playing is the queue item at the cursor position).
     async fn snapshot(&self) -> PlaybackState {
-        let state = self.state.lock().await;
-        PlaybackState {
-            status: state.status,
-            now_playing: state
-                .position
-                .and_then(|index| state.queue.get(index).cloned()),
-            elapsed_seconds: state.elapsed_seconds,
-            duration_seconds: state.duration_seconds,
-            volume: state.volume,
-            repeat: state.repeat,
-            shuffle: state.shuffle,
-            queue: state.queue.clone(),
-            queue_position: state.position,
-            next_up: peek_next_index(&state).and_then(|index| state.queue.get(index).cloned()),
-        }
+        self.state.lock().await.snapshot()
     }
 
     async fn broadcast(&self) {
-        let _ = self.state_tx.send(self.snapshot().await);
+        let state = self.state.lock().await;
+        let _ = self.history_tx.send(state.listen_sample());
+        let _ = self.state_tx.send(state.snapshot());
     }
 
     /// Persist the server-owned queue (failures logged, never propagated).
-    async fn persist(&self, persist: QueuePersist) {
-        let result = match &persist {
-            QueuePersist::Playback(playback) => {
-                self.database.save_player_playback(&self.id, playback).await
-            }
-            QueuePersist::Queue(playback, items) => {
-                self.database
-                    .save_player_queue(&self.id, playback, items)
-                    .await
-            }
-        };
-        if let Err(error) = result {
-            tracing::warn!(player = %self.id, %error, "failed to persist mpd queue");
-        }
+    fn persist(&self, persist: QueuePersist) {
+        self.persistence.submit(persist);
     }
 
     /// Fold MPD's reported cursor (status + current song) into the server queue state:
@@ -1091,15 +1050,15 @@ impl MpdPlayer {
         if let Some(status) = status {
             self.apply_cursor(status).await;
         }
-        let persist = {
+        {
             let state = self.state.lock().await;
-            if mutates_queue {
+            let persist = if mutates_queue {
                 QueuePersist::Queue(state.playback(), state.queue.clone())
             } else {
                 QueuePersist::Playback(state.playback())
-            }
-        };
-        self.persist(persist).await;
+            };
+            self.persist(persist);
+        }
         self.broadcast().await;
         Ok(())
     }
@@ -1213,8 +1172,8 @@ impl MpdPlayer {
                 }
             }
         }
-        if let Ok(state) = self.state(database).await {
-            let _ = self.state_tx.send(state);
+        if self.state(database).await.is_ok() {
+            self.broadcast().await;
         }
         loop {
             idle.idle().await?;
@@ -1229,7 +1188,7 @@ impl MpdPlayer {
             self.broadcast().await;
             // Persist the cursor (cheap row); the queue itself is unchanged here.
             let playback = { self.state.lock().await.playback() };
-            self.persist(QueuePersist::Playback(playback)).await;
+            self.persist(QueuePersist::Playback(playback));
         }
     }
 }
@@ -1372,8 +1331,10 @@ pub struct BrowserPlayer {
     player_id: String,
     /// Where the server-owned queue is persisted, so it survives a restart.
     database: Database,
+    persistence: QueuePersistence,
     state: Mutex<QueueState>,
     state_tx: broadcast::Sender<PlaybackState>,
+    history_tx: broadcast::Sender<ListenSample>,
     /// Lightweight position ticks. The output tab reports progress ~1×/second; rather
     /// than re-broadcast the whole `PlaybackState` (queue and all) on every tick, those
     /// go out on this channel as a tiny frame. Full state is reserved for real changes
@@ -1393,14 +1354,6 @@ const PROGRESS_PERSIST_SECS: i64 = 10;
 /// the listen recorder's completion rule (and a live-ish seek bar), infrequent enough to
 /// avoid spamming the state broadcast.
 const MPD_POLL_SECS: u64 = 5;
-
-/// Which slice of the persisted queue a change needs written back.
-enum QueuePersist {
-    /// Only the lightweight playback row changed (play/pause/seek/volume/…).
-    Playback(PlayerPlayback),
-    /// The queue items changed too (enqueue/clear/remove/move/play-tracks).
-    Queue(PlayerPlayback, Vec<QueueItem>),
-}
 
 /// A position-only update for controllers: the current elapsed time and (once known)
 /// the track duration. Serialized as `{ "type": "progress", … }` on the WebSocket.
@@ -1427,6 +1380,35 @@ struct QueueState {
 }
 
 impl QueueState {
+    fn snapshot(&self) -> PlaybackState {
+        PlaybackState {
+            status: self.status,
+            now_playing: self
+                .position
+                .and_then(|index| self.queue.get(index).cloned()),
+            elapsed_seconds: self.elapsed_seconds,
+            duration_seconds: self.duration_seconds,
+            volume: self.volume,
+            repeat: self.repeat,
+            shuffle: self.shuffle,
+            queue: self.queue.clone(),
+            queue_position: self.position,
+            next_up: peek_next_index(self).and_then(|index| self.queue.get(index).cloned()),
+        }
+    }
+
+    fn listen_sample(&self) -> ListenSample {
+        ListenSample {
+            status: self.status,
+            track_id: self
+                .position
+                .and_then(|i| self.queue.get(i))
+                .and_then(|item| item.track_id.clone()),
+            elapsed: self.elapsed_seconds,
+            duration: self.duration_seconds,
+        }
+    }
+
     /// The lightweight, persistable playback row (everything but the queue items).
     fn playback(&self) -> PlayerPlayback {
         PlayerPlayback {
@@ -1444,12 +1426,18 @@ impl QueueState {
 impl BrowserPlayer {
     fn new(database: Database, player_id: String) -> Self {
         let (state_tx, _) = broadcast::channel(32);
+        let (history_tx, _) = broadcast::channel(128);
         let (progress_tx, _) = broadcast::channel(32);
         Self {
+            persistence: QueuePersistence::new(
+                database.clone(),
+                QueueOwner::Player(player_id.clone()),
+            ),
             player_id,
             database,
             state: Mutex::new(QueueState::default()),
             state_tx,
+            history_tx,
             progress_tx,
             last_progress_persist: AtomicI64::new(0),
         }
@@ -1474,22 +1462,8 @@ impl BrowserPlayer {
 
     /// Write a queue change back to the database. Failures are logged, never
     /// propagated — persistence must not break live playback control.
-    async fn persist(&self, persist: QueuePersist) {
-        let result = match &persist {
-            QueuePersist::Playback(playback) => {
-                self.database
-                    .save_player_playback(&self.player_id, playback)
-                    .await
-            }
-            QueuePersist::Queue(playback, items) => {
-                self.database
-                    .save_player_queue(&self.player_id, playback, items)
-                    .await
-            }
-        };
-        if let Err(error) = result {
-            tracing::warn!(player = %self.player_id, %error, "failed to persist player queue");
-        }
+    fn persist(&self, persist: QueuePersist) {
+        self.persistence.submit(persist);
     }
 
     /// Always available — it is the local browser.
@@ -1507,50 +1481,38 @@ impl BrowserPlayer {
     }
 
     pub async fn snapshot(&self) -> PlaybackState {
-        let state = self.state.lock().await;
-        PlaybackState {
-            status: state.status,
-            now_playing: state
-                .position
-                .and_then(|index| state.queue.get(index).cloned()),
-            elapsed_seconds: state.elapsed_seconds,
-            duration_seconds: state.duration_seconds,
-            volume: state.volume,
-            repeat: state.repeat,
-            shuffle: state.shuffle,
-            queue: state.queue.clone(),
-            queue_position: state.position,
-            next_up: peek_next_index(&state).and_then(|index| state.queue.get(index).cloned()),
-        }
+        self.state.lock().await.snapshot()
     }
 
     async fn broadcast(&self) {
-        let _ = self.state_tx.send(self.snapshot().await);
+        let state = self.state.lock().await;
+        let _ = self.history_tx.send(state.listen_sample());
+        let _ = self.state_tx.send(state.snapshot());
     }
 
     pub async fn execute(&self, command: PlayerCommand, database: &Database) -> Result<()> {
         // Commands that change the queue itself need the item list rewritten;
         // the rest only touch the lightweight playback row.
         let mutates_queue = command_mutates_queue(&command);
-        let persist = {
+        {
             let mut state = self.state.lock().await;
             apply_to_queue_state(&mut state, command, database).await?;
             let playback = state.playback();
-            if mutates_queue {
+            let persist = if mutates_queue {
                 QueuePersist::Queue(playback, state.queue.clone())
             } else {
                 QueuePersist::Playback(playback)
-            }
-        };
+            };
+            self.persist(persist);
+        }
         self.broadcast().await;
-        self.persist(persist).await;
         Ok(())
     }
 
     /// The output tab finished the current track: advance (honoring repeat).
     pub async fn track_ended(&self) {
+        let mut state = self.state.lock().await;
         let playback = {
-            let mut state = self.state.lock().await;
             if state.repeat == RepeatMode::One {
                 state.elapsed_seconds = Some(0.0);
             } else {
@@ -1558,10 +1520,10 @@ impl BrowserPlayer {
             }
             state.playback()
         };
+        // Advancing only moves the position within the same queue.
+        self.persist(QueuePersist::Playback(playback));
+        drop(state);
         self.broadcast().await;
-        // Advancing only moves the position within the same queue, so the item
-        // list is unchanged — persist just the playback row.
-        self.persist(QueuePersist::Playback(playback)).await;
     }
 
     /// The output tab reports its real playback position and track duration. This
@@ -1569,14 +1531,15 @@ impl BrowserPlayer {
     /// `PlaybackState` (which would re-send the whole queue every second). The stored
     /// state is still updated so the next full snapshot/refresh reflects the position.
     pub async fn report_progress(&self, elapsed_seconds: f64, duration_seconds: Option<f64>) {
+        let mut state = self.state.lock().await;
         let (duration, playback) = {
-            let mut state = self.state.lock().await;
             state.elapsed_seconds = Some(elapsed_seconds);
             if let Some(duration) = duration_seconds {
                 state.duration_seconds = Some(duration);
             }
             (state.duration_seconds, state.playback())
         };
+        let _ = self.history_tx.send(state.listen_sample());
         let _ = self.progress_tx.send(ProgressTick {
             elapsed_seconds,
             duration_seconds: duration,
@@ -1591,7 +1554,7 @@ impl BrowserPlayer {
                 .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
-            self.persist(QueuePersist::Playback(playback)).await;
+            self.persist(QueuePersist::Playback(playback));
         }
     }
 }
@@ -1612,8 +1575,10 @@ pub struct ZonePlayer {
     zone_id: String,
     /// Where the canonical zone queue is persisted, so it survives a restart.
     database: Database,
+    persistence: QueuePersistence,
     state: Mutex<QueueState>,
     state_tx: broadcast::Sender<PlaybackState>,
+    history_tx: broadcast::Sender<ListenSample>,
     progress_tx: broadcast::Sender<ProgressTick>,
     last_progress_persist: AtomicI64,
 }
@@ -1621,12 +1586,15 @@ pub struct ZonePlayer {
 impl ZonePlayer {
     fn new(database: Database, zone_id: String) -> Self {
         let (state_tx, _) = broadcast::channel(32);
+        let (history_tx, _) = broadcast::channel(128);
         let (progress_tx, _) = broadcast::channel(32);
         Self {
+            persistence: QueuePersistence::new(database.clone(), QueueOwner::Zone(zone_id.clone())),
             zone_id,
             database,
             state: Mutex::new(QueueState::default()),
             state_tx,
+            history_tx,
             progress_tx,
             last_progress_persist: AtomicI64::new(0),
         }
@@ -1648,22 +1616,8 @@ impl ZonePlayer {
         apply_restored_snapshot(&mut state, snapshot);
     }
 
-    async fn persist(&self, persist: QueuePersist) {
-        let result = match &persist {
-            QueuePersist::Playback(playback) => {
-                self.database
-                    .save_zone_playback(&self.zone_id, playback)
-                    .await
-            }
-            QueuePersist::Queue(playback, items) => {
-                self.database
-                    .save_zone_queue(&self.zone_id, playback, items)
-                    .await
-            }
-        };
-        if let Err(error) = result {
-            tracing::warn!(zone = %self.zone_id, %error, "failed to persist zone queue");
-        }
+    fn persist(&self, persist: QueuePersist) {
+        self.persistence.submit(persist);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<PlaybackState> {
@@ -1675,25 +1629,13 @@ impl ZonePlayer {
     }
 
     pub async fn snapshot(&self) -> PlaybackState {
-        let state = self.state.lock().await;
-        PlaybackState {
-            status: state.status,
-            now_playing: state
-                .position
-                .and_then(|index| state.queue.get(index).cloned()),
-            elapsed_seconds: state.elapsed_seconds,
-            duration_seconds: state.duration_seconds,
-            volume: state.volume,
-            repeat: state.repeat,
-            shuffle: state.shuffle,
-            queue: state.queue.clone(),
-            queue_position: state.position,
-            next_up: peek_next_index(&state).and_then(|index| state.queue.get(index).cloned()),
-        }
+        self.state.lock().await.snapshot()
     }
 
     async fn broadcast(&self) {
-        let _ = self.state_tx.send(self.snapshot().await);
+        let state = self.state.lock().await;
+        let _ = self.history_tx.send(state.listen_sample());
+        let _ = self.state_tx.send(state.snapshot());
     }
 
     /// Apply a command to the canonical zone queue, broadcast/persist it, then drive
@@ -1708,18 +1650,18 @@ impl ZonePlayer {
     ) -> Result<()> {
         let mutates_queue = command_mutates_queue(&command);
         // Phase 1: update the canonical queue exactly like the browser player.
-        let persist = {
+        {
             let mut state = self.state.lock().await;
             apply_to_queue_state(&mut state, command.clone(), database).await?;
             let playback = state.playback();
-            if mutates_queue {
+            let persist = if mutates_queue {
                 QueuePersist::Queue(playback, state.queue.clone())
             } else {
                 QueuePersist::Playback(playback)
-            }
-        };
+            };
+            self.persist(persist);
+        }
         self.broadcast().await;
-        self.persist(persist).await;
         // Phase 2: drive members. Browser members render the zone's now-playing
         // straight off the broadcast above (no extra work). MPD members are driven
         // by forwarding the command — queue ops map 1:1 to MPD and indices stay
@@ -1762,8 +1704,8 @@ impl ZonePlayer {
     /// The browser output rendering this zone finished the current track: advance
     /// (honoring repeat). MPD members advance on their own — see the type docs.
     pub async fn track_ended(&self) {
+        let mut state = self.state.lock().await;
         let playback = {
-            let mut state = self.state.lock().await;
             if state.repeat == RepeatMode::One {
                 state.elapsed_seconds = Some(0.0);
             } else {
@@ -1771,21 +1713,23 @@ impl ZonePlayer {
             }
             state.playback()
         };
+        self.persist(QueuePersist::Playback(playback));
+        drop(state);
         self.broadcast().await;
-        self.persist(QueuePersist::Playback(playback)).await;
     }
 
     /// The browser output reports its real position/duration for this zone. Emits a
     /// lightweight tick (not full state) and persists the elapsed position, throttled.
     pub async fn report_progress(&self, elapsed_seconds: f64, duration_seconds: Option<f64>) {
+        let mut state = self.state.lock().await;
         let (duration, playback) = {
-            let mut state = self.state.lock().await;
             state.elapsed_seconds = Some(elapsed_seconds);
             if let Some(duration) = duration_seconds {
                 state.duration_seconds = Some(duration);
             }
             (state.duration_seconds, state.playback())
         };
+        let _ = self.history_tx.send(state.listen_sample());
         let _ = self.progress_tx.send(ProgressTick {
             elapsed_seconds,
             duration_seconds: duration,
@@ -1798,7 +1742,7 @@ impl ZonePlayer {
                 .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
-            self.persist(QueuePersist::Playback(playback)).await;
+            self.persist(QueuePersist::Playback(playback));
         }
     }
 }
@@ -2250,6 +2194,7 @@ fn active_shuffle(state: &QueueState) -> &[usize] {
 pub struct SnapcastPlayer {
     id: String,
     database: Database,
+    persistence: QueuePersistence,
     providers: Arc<RwLock<ProviderRegistry>>,
     /// Kept so the snapserver + FIFO outlive the player; also the control handle home.
     #[allow(dead_code)]
@@ -2257,7 +2202,7 @@ pub struct SnapcastPlayer {
     sample_rate: u32,
     state: Mutex<QueueState>,
     state_tx: broadcast::Sender<PlaybackState>,
-    progress_tx: broadcast::Sender<ProgressTick>,
+    history_tx: broadcast::Sender<ListenSample>,
     last_progress_persist: AtomicI64,
     /// Commands to the FIFO writer thread (std channel: the thread blocks on it while idle).
     writer_tx: std::sync::mpsc::Sender<WriterMsg>,
@@ -2288,7 +2233,7 @@ impl SnapcastPlayer {
         manager: Arc<SnapcastManager>,
     ) -> Arc<Self> {
         let (state_tx, _) = broadcast::channel(32);
-        let (progress_tx, _) = broadcast::channel(32);
+        let (history_tx, _) = broadcast::channel(128);
         let (writer_tx, writer_rx) = std::sync::mpsc::channel();
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         let sample_rate = manager.sample_rate();
@@ -2298,6 +2243,7 @@ impl SnapcastPlayer {
             .spawn(move || crate::snapcast::run_writer(fifo, writer_rx, events_tx))
             .expect("spawn snapcast writer thread");
         Arc::new(Self {
+            persistence: QueuePersistence::new(database.clone(), QueueOwner::Player(id.clone())),
             id,
             database,
             providers,
@@ -2305,7 +2251,7 @@ impl SnapcastPlayer {
             sample_rate,
             state: Mutex::new(QueueState::default()),
             state_tx,
-            progress_tx,
+            history_tx,
             last_progress_persist: AtomicI64::new(0),
             writer_tx,
             events_rx: std::sync::Mutex::new(Some(events_rx)),
@@ -2326,30 +2272,14 @@ impl SnapcastPlayer {
         self.state_tx.subscribe()
     }
 
-    pub fn subscribe_progress(&self) -> broadcast::Receiver<ProgressTick> {
-        self.progress_tx.subscribe()
-    }
-
     pub async fn snapshot(&self) -> PlaybackState {
-        let state = self.state.lock().await;
-        PlaybackState {
-            status: state.status,
-            now_playing: state
-                .position
-                .and_then(|index| state.queue.get(index).cloned()),
-            elapsed_seconds: state.elapsed_seconds,
-            duration_seconds: state.duration_seconds,
-            volume: state.volume,
-            repeat: state.repeat,
-            shuffle: state.shuffle,
-            queue: state.queue.clone(),
-            queue_position: state.position,
-            next_up: peek_next_index(&state).and_then(|index| state.queue.get(index).cloned()),
-        }
+        self.state.lock().await.snapshot()
     }
 
     async fn broadcast(&self) {
-        let _ = self.state_tx.send(self.snapshot().await);
+        let state = self.state.lock().await;
+        let _ = self.history_tx.send(state.listen_sample());
+        let _ = self.state_tx.send(state.snapshot());
     }
 
     /// Reload the queue persisted before the last shutdown (restored paused — no audio is
@@ -2367,25 +2297,13 @@ impl SnapcastPlayer {
         apply_restored_snapshot(&mut state, snapshot);
     }
 
-    async fn persist(&self, persist: QueuePersist) {
-        let result = match &persist {
-            QueuePersist::Playback(playback) => {
-                self.database.save_player_playback(&self.id, playback).await
-            }
-            QueuePersist::Queue(playback, items) => {
-                self.database
-                    .save_player_queue(&self.id, playback, items)
-                    .await
-            }
-        };
-        if let Err(error) = result {
-            tracing::warn!(player = %self.id, %error, "snapcast: failed to persist queue");
-        }
+    fn persist(&self, persist: QueuePersist) {
+        self.persistence.submit(persist);
     }
 
     async fn persist_playback(&self) {
         let playback = self.state.lock().await.playback();
-        self.persist(QueuePersist::Playback(playback)).await;
+        self.persist(QueuePersist::Playback(playback));
     }
 
     pub async fn execute(
@@ -2395,18 +2313,18 @@ impl SnapcastPlayer {
         _base_url: &str,
     ) -> Result<()> {
         let mutates_queue = command_mutates_queue(&command);
-        let persist = {
+        {
             let mut state = self.state.lock().await;
             apply_to_queue_state(&mut state, command.clone(), database).await?;
             let playback = state.playback();
-            if mutates_queue {
+            let persist = if mutates_queue {
                 QueuePersist::Queue(playback, state.queue.clone())
             } else {
                 QueuePersist::Playback(playback)
-            }
-        };
+            };
+            self.persist(persist);
+        }
         self.broadcast().await;
-        self.persist(persist).await;
         self.reconcile(&command).await;
         Ok(())
     }
@@ -2625,8 +2543,8 @@ impl SnapcastPlayer {
     /// MPD position poll (the audio truth is snapserver's; this is the seek bar + the
     /// listen recorder's view).
     async fn on_tick(&self) {
-        let (elapsed, duration, playback) = {
-            let mut state = self.state.lock().await;
+        let mut state = self.state.lock().await;
+        let playback = {
             if state.status != PlaybackStatus::Playing {
                 return;
             }
@@ -2637,12 +2555,9 @@ impl SnapcastPlayer {
                 elapsed = duration;
             }
             state.elapsed_seconds = Some(elapsed);
-            (elapsed, state.duration_seconds, state.playback())
+            state.playback()
         };
-        let _ = self.progress_tx.send(ProgressTick {
-            elapsed_seconds: elapsed,
-            duration_seconds: duration,
-        });
+        let _ = self.history_tx.send(state.listen_sample());
         let now = now_unix();
         let last = self.last_progress_persist.load(Ordering::Relaxed);
         if now.saturating_sub(last) >= PROGRESS_PERSIST_SECS
@@ -2651,7 +2566,7 @@ impl SnapcastPlayer {
                 .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
-            self.persist(QueuePersist::Playback(playback)).await;
+            self.persist(QueuePersist::Playback(playback));
         }
     }
 }
@@ -2933,6 +2848,119 @@ mod tests {
             )
             .await
             .expect("play command");
+    }
+
+    // A busy SQLite writer must not stall the output WebSocket's progress handler
+    // or the next Stop command. This uses a real independent write transaction.
+    #[tokio::test]
+    async fn browser_controls_remain_responsive_while_database_is_locked() {
+        use sqlx::Connection;
+        let path = temp_db("busy-playback");
+        let database = Database::connect(&path).await.unwrap();
+        let player = BrowserPlayer::new(database.clone(), "busy-browser".into());
+        player
+            .execute(
+                PlayerCommand::PlayStream {
+                    url: "/radio".into(),
+                    title: "Radio".into(),
+                },
+                &database,
+            )
+            .await
+            .unwrap();
+        let mut lock = sqlx::SqliteConnection::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut lock)
+            .await
+            .unwrap();
+        let mut updates = player.subscribe();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            player
+                .execute(
+                    PlayerCommand::PlayStream {
+                        url: "/new-radio".into(),
+                        title: "New radio".into(),
+                    },
+                    &database,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                updates.recv().await.unwrap().status,
+                PlaybackStatus::Playing
+            );
+            player.report_progress(12.0, Some(60.0)).await;
+            player
+                .execute(PlayerCommand::Stop, &database)
+                .await
+                .unwrap();
+            assert_eq!(
+                updates.recv().await.unwrap().status,
+                PlaybackStatus::Stopped
+            );
+        })
+        .await;
+        sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
+        assert!(result.is_ok(), "database persistence blocked progress/Stop");
+        let saved = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(saved) = database.load_player_queue("busy-browser").await.unwrap()
+                    && saved.playback.status == PlaybackStatus::Stopped
+                {
+                    break saved;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            saved.items.len(),
+            1,
+            "progress/Stop must preserve the queue"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn removed_zone_cannot_checkpoint_from_a_surviving_controller() {
+        let path = temp_db("deleted-zone-checkpoint");
+        let database = Database::connect(&path).await.unwrap();
+        let manager = PlayerManager::load(
+            database.clone(),
+            "http://localhost".into(),
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+        )
+        .await
+        .unwrap();
+        let zone = manager.create_zone("Temporary").await.unwrap();
+        let stale = manager.get_zone(&zone.id).await.unwrap();
+        manager
+            .command_zone(
+                &zone.id,
+                PlayerCommand::PlayStream {
+                    url: "/radio".into(),
+                    title: "Radio".into(),
+                },
+            )
+            .await
+            .unwrap();
+        manager.delete_zone(&zone.id).await.unwrap();
+        // A connected controller may still hold this Arc after removal.
+        stale.report_progress(20.0, Some(60.0)).await;
+        assert!(database.load_zone_queue(&zone.id).await.unwrap().is_none());
+        let recreated = manager.create_zone("Temporary").await.unwrap();
+        assert!(
+            manager
+                .zone_state(&recreated.id)
+                .await
+                .unwrap()
+                .queue
+                .is_empty()
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     /// The recorder runs in a background task, so poll the history until it has at
@@ -3236,6 +3264,20 @@ mod tests {
             );
         }
 
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(saved) = database.load_player_queue(BROWSER_PLAYER_ID).await.unwrap()
+                    && saved.items.len() == 3
+                    && saved.playback.repeat == RepeatMode::All
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queue checkpoint before restart");
+
         // Fresh manager over the same database = a server restart.
         let manager = PlayerManager::load(
             database.clone(),
@@ -3373,6 +3415,20 @@ mod tests {
             );
             zone.id
         };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(saved) = database.load_zone_queue(&zone_id).await.unwrap()
+                    && saved.items.len() == 3
+                    && saved.playback.position == Some(1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("zone checkpoint before restart");
 
         // Fresh manager over the same database = a server restart.
         let manager = PlayerManager::load(

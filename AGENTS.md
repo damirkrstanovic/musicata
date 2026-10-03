@@ -111,6 +111,12 @@ explicitly. See `docs/native-endpoint.md` and `docs/musicata-ml.md`.
 - **Incremental scans**: reuse parsed metadata for files with unchanged size+mtime; read tags
   only for new/changed files; watch the local FS, fall back to a periodic pass for network
   sources. (See prior-art §2.)
+- **User experience and UI latency win over immediate database consistency.** When
+  making tradeoffs, keep user interactions responsive: update live state in memory and
+  persist asynchronously. Playback controls and WebSocket updates must never wait for
+  SQLite writes or database lock contention. Coalesce transient state (such as playback
+  position) and drain it to the database in the background. Restoring a slightly older
+  playback position or state after a crash is preferable to delaying Play, Pause or Stop.
 - **Network is never on a request's hot path**: bind the web port before scanning;
   connect/scan in the background with timeouts; surface progress/errors via the activity log +
   WebSocket, not blocking calls or polling.

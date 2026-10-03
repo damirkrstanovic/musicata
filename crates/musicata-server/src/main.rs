@@ -35,6 +35,7 @@ mod players;
 mod podcast;
 mod providers;
 mod proxy;
+mod queue_persistence;
 mod radiobrowser;
 mod recommendations;
 #[cfg(feature = "provider-smb")]

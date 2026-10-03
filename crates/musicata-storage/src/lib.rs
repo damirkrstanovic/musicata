@@ -34,7 +34,9 @@ use std::{
 
 #[derive(Clone)]
 pub struct Database {
+    // SQLite has one writer. Keep blocked writes off the foreground read pool.
     pool: SqlitePool,
+    reads: SqlitePool,
 }
 
 /// Register the sqlite-vec extension as a global SQLite auto-extension, once per process, so
@@ -77,11 +79,16 @@ impl Database {
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(15));
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
+            .max_connections(1)
+            .connect_with(options.clone())
             .await
             .with_context(|| format!("failed to open {}", path.display()))?;
-        let database = Self { pool };
+        let reads = SqlitePoolOptions::new()
+            .max_connections(5)
+            .min_connections(1)
+            .connect_with(options.read_only(true).create_if_missing(false))
+            .await?;
+        let database = Self { pool, reads };
         database.migrate().await?;
 
         Ok(database)
@@ -604,7 +611,7 @@ impl Database {
     pub async fn load_library(&self) -> Result<Option<Library>> {
         let Some(provider) =
             sqlx::query("SELECT id, source_root FROM providers ORDER BY id LIMIT 1")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.reads)
                 .await?
         else {
             return Ok(None);
@@ -615,17 +622,17 @@ impl Database {
 
         let artist_rows =
             sqlx::query("SELECT id, name, album_count, track_count FROM artists ORDER BY name")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.reads)
                 .await?;
         let album_rows = sqlx::query(
             "SELECT id, title, artist_id, artist_name, year, track_count, artwork_url, artwork_path FROM albums ORDER BY artist_name, year, title",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let track_rows = sqlx::query(
             "SELECT id, provider_id, provider_item_id, title, artist_id, artist_name, album_id, album_title, year, track_number, disc_number, extension, file_size_bytes, modified_at_unix_seconds, content_hash, relative_path, stream_url, path, added_at_unix_seconds, duration_seconds FROM tracks ORDER BY artist_name, year, album_title, disc_number, track_number, title",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let observation_rows = sqlx::query(
             "SELECT id, track_id, source, confidence, observed_at_unix_seconds, approval_state,
@@ -636,17 +643,17 @@ impl Database {
                 isrc, embedded_artwork_count
             FROM track_metadata_observations ORDER BY track_id, id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let field_observation_rows = sqlx::query(
             "SELECT observation_id, source, field_name, value_json, confidence,
                 observed_at_unix_seconds, approval_state
             FROM track_metadata_field_observations ORDER BY observation_id, id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let scan_error_rows = sqlx::query("SELECT path, message FROM scan_errors ORDER BY id")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
 
         let mut artists = Vec::with_capacity(artist_rows.len());
@@ -803,7 +810,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT id, provider_item_id, file_size_bytes, modified_at_unix_seconds, content_hash FROM tracks ORDER BY provider_item_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
 
         if rows.is_empty() && !scanned.tracks.is_empty() {
@@ -823,14 +830,14 @@ impl Database {
                 isrc, embedded_artwork_count
             FROM track_metadata_observations ORDER BY track_id, id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let field_observation_rows = sqlx::query(
             "SELECT observation_id, source, field_name, value_json, confidence,
                 observed_at_unix_seconds, approval_state
             FROM track_metadata_field_observations ORDER BY observation_id, id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let mut field_observations_by_observation: BTreeMap<
             i64,
@@ -971,7 +978,7 @@ impl Database {
         .bind(&match_query)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let mut artists = Vec::with_capacity(artist_rows.len());
         for row in artist_rows {
@@ -992,7 +999,7 @@ impl Database {
         .bind(&match_query)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let mut albums = Vec::with_capacity(album_rows.len());
         for row in album_rows {
@@ -1021,7 +1028,7 @@ impl Database {
         .bind(&match_query)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let mut tracks = Vec::with_capacity(track_rows.len());
         for row in track_rows {
@@ -1067,7 +1074,7 @@ impl Database {
     pub async fn summary(&self) -> Result<Option<LibrarySummary>> {
         let Some(provider) =
             sqlx::query("SELECT id, source_root FROM providers ORDER BY rowid LIMIT 1")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.reads)
                 .await?
         else {
             return Ok(None);
@@ -1078,7 +1085,7 @@ impl Database {
                 (SELECT COUNT(*) FROM albums) AS album_count,
                 (SELECT COUNT(*) FROM tracks) AS track_count",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&self.reads)
         .await?;
         Ok(Some(LibrarySummary {
             provider_id: provider.try_get("id")?,
@@ -1097,7 +1104,7 @@ impl Database {
     ) -> Result<(Vec<Artist>, usize)> {
         let total = i64_to_usize(
             sqlx::query("SELECT COUNT(*) AS n FROM artists")
-                .fetch_one(&self.pool)
+                .fetch_one(&self.reads)
                 .await?
                 .try_get("n")?,
             "total",
@@ -1109,7 +1116,7 @@ impl Database {
         let rows = sqlx::query(&sql)
             .bind(limit)
             .bind(offset)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         let mut artists = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1126,7 +1133,7 @@ impl Database {
     ) -> Result<(Vec<Album>, usize)> {
         let total = i64_to_usize(
             sqlx::query("SELECT COUNT(*) AS n FROM albums")
-                .fetch_one(&self.pool)
+                .fetch_one(&self.reads)
                 .await?
                 .try_get("n")?,
             "total",
@@ -1138,7 +1145,7 @@ impl Database {
         let rows = sqlx::query(&sql)
             .bind(limit)
             .bind(offset)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         let mut albums = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1157,7 +1164,7 @@ impl Database {
     ) -> Result<(Vec<Album>, usize)> {
         let total = i64_to_usize(
             sqlx::query("SELECT COUNT(*) AS n FROM albums")
-                .fetch_one(&self.pool)
+                .fetch_one(&self.reads)
                 .await?
                 .try_get("n")?,
             "total",
@@ -1171,7 +1178,7 @@ impl Database {
         let rows = sqlx::query(&sql)
             .bind(limit)
             .bind(offset)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         let albums = rows.iter().map(album_from_row).collect::<Result<_>>()?;
         Ok((albums, total))
@@ -1194,7 +1201,7 @@ impl Database {
             sqlx::query("SELECT COUNT(*) AS n FROM albums WHERE year BETWEEN ?1 AND ?2")
                 .bind(lo)
                 .bind(hi)
-                .fetch_one(&self.pool)
+                .fetch_one(&self.reads)
                 .await?
                 .try_get("n")?,
             "total",
@@ -1208,7 +1215,7 @@ impl Database {
             .bind(hi)
             .bind(limit)
             .bind(offset)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         let albums = rows.iter().map(album_from_row).collect::<Result<_>>()?;
         Ok((albums, total))
@@ -1268,7 +1275,7 @@ impl Database {
                 .bind(composer)
                 .bind(&folder_prefix)
                 .bind(tag)
-                .fetch_one(&self.pool)
+                .fetch_one(&self.reads)
                 .await?
                 .try_get("n")?,
             "total",
@@ -1286,7 +1293,7 @@ impl Database {
             .bind(tag)
             .bind(limit)
             .bind(offset)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         let mut albums = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1346,7 +1353,7 @@ impl Database {
                 .bind(composer)
                 .bind(&folder_prefix)
                 .bind(tag)
-                .fetch_one(&self.pool)
+                .fetch_one(&self.reads)
                 .await?
                 .try_get("n")?,
             "total",
@@ -1365,7 +1372,7 @@ impl Database {
             .bind(tag)
             .bind(limit)
             .bind(offset)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         let mut tracks = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1379,7 +1386,7 @@ impl Database {
             "SELECT id, name, album_count, track_count, artwork_url FROM artists WHERE id = ?1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         row.map(|row| artist_from_row(&row)).transpose()
     }
@@ -1388,7 +1395,7 @@ impl Database {
         let sql = format!("SELECT {ALBUM_COLUMNS} FROM albums WHERE id = ?1");
         let row = sqlx::query(&sql)
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.reads)
             .await?;
         row.map(|row| album_from_row(&row)).transpose()
     }
@@ -1397,7 +1404,7 @@ impl Database {
     pub async fn album_artwork_url(&self, album_id: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT artwork_url FROM albums WHERE id = ?1")
             .bind(album_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.reads)
             .await?;
         match row {
             Some(row) => Ok(row.try_get("artwork_url")?),
@@ -1410,7 +1417,7 @@ impl Database {
     pub async fn random_tracks(&self, limit: i64) -> Result<Vec<Track>> {
         let columns = track_columns("t");
         let sql = format!("SELECT {columns} FROM tracks t ORDER BY RANDOM() LIMIT ?1");
-        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.reads).await?;
         rows.iter().map(track_from_row).collect()
     }
 
@@ -1423,7 +1430,7 @@ impl Database {
              ORDER BY confidence DESC LIMIT 1",
         )
         .bind(track_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         match row {
             Some(row) => Ok(row.try_get("lyrics")?),
@@ -1438,7 +1445,7 @@ impl Database {
         );
         let row = sqlx::query(&sql)
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.reads)
             .await?;
         row.map(|row| track_from_row(&row)).transpose()
     }
@@ -1461,7 +1468,7 @@ impl Database {
         for id in ids {
             query = query.bind(id);
         }
-        let rows = query.fetch_all(&self.pool).await?;
+        let rows = query.fetch_all(&self.reads).await?;
         let mut by_id: std::collections::HashMap<String, Track> =
             std::collections::HashMap::with_capacity(rows.len());
         for row in &rows {
@@ -1476,7 +1483,7 @@ impl Database {
             format!("SELECT {ALBUM_COLUMNS} FROM albums WHERE artist_id = ?1 ORDER BY year, title");
         let rows = sqlx::query(&sql)
             .bind(artist_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         rows.iter().map(album_from_row).collect()
     }
@@ -1489,7 +1496,7 @@ impl Database {
         );
         let rows = sqlx::query(&sql)
             .bind(artist_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         rows.iter().map(track_from_row).collect()
     }
@@ -1502,7 +1509,7 @@ impl Database {
         );
         let rows = sqlx::query(&sql)
             .bind(album_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         rows.iter().map(track_from_row).collect()
     }
@@ -1513,7 +1520,7 @@ impl Database {
     pub async fn album_provider_id(&self, album_id: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT provider_id FROM tracks WHERE album_id = ?1 LIMIT 1")
             .bind(album_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.reads)
             .await?;
         match row {
             Some(row) => Ok(Some(row.try_get("provider_id")?)),
@@ -1529,7 +1536,7 @@ impl Database {
         let year_rows = sqlx::query(
             "SELECT year, COUNT(*) AS n FROM tracks WHERE year IS NOT NULL GROUP BY year ORDER BY year DESC",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let mut years = Vec::with_capacity(year_rows.len());
         for row in year_rows {
@@ -1543,7 +1550,7 @@ impl Database {
         // Folders are derived from each track's relative path; computed in Rust to
         // match the scanner's parent-directory semantics exactly.
         let path_rows = sqlx::query("SELECT relative_path FROM tracks")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         let mut folder_counts: BTreeMap<String, usize> = BTreeMap::new();
         for row in path_rows {
@@ -1581,7 +1588,7 @@ impl Database {
                AND trim(json_extract(je.value, '$.label')) <> ''
              GROUP BY label ORDER BY n DESC, label",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let mut facets = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1601,7 +1608,7 @@ impl Database {
              WHERE trim(json_each.value) <> ''
              GROUP BY json_each.value ORDER BY json_each.value"
         );
-        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(&sql).fetch_all(&self.reads).await?;
         let mut facets = Vec::with_capacity(rows.len());
         for row in rows {
             facets.push(BrowseTextFacet {
@@ -1660,7 +1667,7 @@ impl Database {
              ORDER BY a.artist_name, a.title",
         )
         .bind(retry_before_unix_seconds)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter()
             .map(|row| {
@@ -1715,7 +1722,7 @@ impl Database {
              FROM acquired_album_artwork WHERE album_id = ?1",
         )
         .bind(album_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?
         else {
             return Ok(None);
@@ -1767,7 +1774,7 @@ impl Database {
              ORDER BY a.track_count DESC, a.name",
         )
         .bind(retry_before_unix_seconds)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter()
             .map(|row| {
@@ -1824,7 +1831,7 @@ impl Database {
              FROM acquired_artist_artwork WHERE artist_id = ?1",
         )
         .bind(artist_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?
         else {
             return Ok(None);
@@ -1875,7 +1882,7 @@ impl Database {
         };
         // old artist id -> new artist id (only where it actually changes).
         let artist_rows = sqlx::query("SELECT id, name FROM artists")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         let mut artist_map: Vec<(String, String)> = Vec::new();
         for row in &artist_rows {
@@ -1887,7 +1894,7 @@ impl Database {
             }
         }
         let album_rows = sqlx::query("SELECT id, artist_name, title FROM albums")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         let mut album_map: Vec<(String, String)> = Vec::new();
         for row in &album_rows {
@@ -1975,7 +1982,7 @@ impl Database {
             "SELECT canonical_key, canonical_name FROM artist_aliases WHERE alias_key = ?1",
         )
         .bind(&canon_key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?
         {
             if !seen.insert(canon_key.clone()) {
@@ -2028,7 +2035,7 @@ impl Database {
             "SELECT alias_key, canonical_key, canonical_name FROM artist_aliases
              ORDER BY canonical_name, alias_key",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter()
             .map(|row| {
@@ -2044,7 +2051,7 @@ impl Database {
     /// The resolver the regroup applies: normalized alias key → canonical display name.
     pub async fn artist_alias_map(&self) -> Result<BTreeMap<String, String>> {
         let rows = sqlx::query("SELECT alias_key, canonical_name FROM artist_aliases")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         let mut map = BTreeMap::new();
         for row in &rows {
@@ -2076,7 +2083,7 @@ impl Database {
              LIMIT 1",
         )
         .bind(album_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         Ok(match row {
             Some(row) => (row.try_get("rel")?, row.try_get("rg")?),
@@ -2115,7 +2122,7 @@ impl Database {
         )
         .bind(retry_before_unix_seconds)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter()
             .map(|row| {
@@ -2196,7 +2203,7 @@ impl Database {
         .bind(after_artist)
         .bind(after_title)
         .bind(after_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter()
             .map(|row| {
@@ -2245,7 +2252,7 @@ impl Database {
         .bind(after_artist)
         .bind(after_title)
         .bind(after_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter()
             .map(|row| {
@@ -2307,7 +2314,7 @@ impl Database {
     /// How many tracks have an embedding (for `/admin` status).
     pub async fn embedding_count(&self) -> Result<i64> {
         Ok(sqlx::query_scalar("SELECT COUNT(*) FROM track_features")
-            .fetch_one(&self.pool)
+            .fetch_one(&self.reads)
             .await?)
     }
 
@@ -2321,7 +2328,7 @@ impl Database {
         let seed: Option<Vec<u8>> =
             sqlx::query_scalar("SELECT embedding FROM track_embedding WHERE track_id = ?1")
                 .bind(seed_track_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.reads)
                 .await?;
         let Some(seed) = seed else {
             return Ok(Vec::new());
@@ -2333,7 +2340,7 @@ impl Database {
         )
         .bind(&seed[..])
         .bind((k + 1) as i64)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         // Propagate decode errors rather than silently dropping a neighbor.
         let mut neighbors = Vec::new();
@@ -2392,7 +2399,7 @@ impl Database {
         for id in ids {
             query = query.bind(id);
         }
-        let rows = query.fetch_all(&self.pool).await?;
+        let rows = query.fetch_all(&self.reads).await?;
         rows.iter()
             .map(|row| Ok((row.try_get("id")?, row.try_get("artist_name")?)))
             .collect()
@@ -2431,7 +2438,7 @@ impl Database {
              WHERE track_id = ?1 AND integrated_lufs IS NOT NULL",
         )
         .bind(track_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         match row {
             Some(row) => {
@@ -2451,7 +2458,7 @@ impl Database {
              WHERE album_id = ?1 AND integrated_lufs IS NOT NULL",
         )
         .bind(album_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         match row {
             Some(row) => {
@@ -2477,7 +2484,7 @@ impl Database {
              WHERE l.integrated_lufs IS NOT NULL
              ORDER BY t.album_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
 
         // Fold consecutive rows per album (ordered by album_id).
@@ -2546,7 +2553,7 @@ impl Database {
             let album_id: Option<String> =
                 sqlx::query_scalar("SELECT album_id FROM tracks WHERE id = ?1")
                     .bind(&id)
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(&self.reads)
                     .await?;
             if let Some(album_id) = album_id
                 && let Some((lufs, peak)) = self.album_loudness(&album_id).await?
@@ -2573,7 +2580,7 @@ impl Database {
         )
         .bind(entity_kind)
         .bind(seed_mbid)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         match row {
             Some(row) => Ok(Some((
@@ -2618,7 +2625,7 @@ impl Database {
              ) AS mbid",
         )
         .bind(track_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         // Propagate a decode error instead of masking it as "no MBID".
         match row {
@@ -2665,7 +2672,7 @@ impl Database {
         for mbid in mbids {
             q = q.bind(mbid);
         }
-        let rows = q.fetch_all(&self.pool).await?;
+        let rows = q.fetch_all(&self.reads).await?;
         // Propagate decode errors rather than silently dropping a row.
         let mut track_ids = Vec::new();
         for row in &rows {
@@ -2690,7 +2697,7 @@ impl Database {
              ) AS mbid",
         )
         .bind(track_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         // Propagate a decode error instead of masking it as "no MBID".
         match row {
@@ -2721,7 +2728,7 @@ impl Database {
         for name in &lowered {
             q = q.bind(name);
         }
-        let rows = q.fetch_all(&self.pool).await?;
+        let rows = q.fetch_all(&self.reads).await?;
         rows.iter()
             .map(|row| Ok((row.try_get("aname")?, row.try_get("id")?)))
             .collect()
@@ -2735,7 +2742,7 @@ impl Database {
              WHERE listened_at_unix_seconds >= ?1 AND event_kind = 'played'",
         )
         .bind(since_unix_seconds)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter()
             .map(|row| Ok(row.try_get("track_id")?))
@@ -2755,7 +2762,7 @@ impl Database {
                   > SUM(CASE WHEN event_kind = 'played' THEN 1 ELSE 0 END)
                 AND SUM(CASE WHEN event_kind = 'skipped' THEN 1 ELSE 0 END) >= 2",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter()
             .map(|row| Ok(row.try_get("track_id")?))
@@ -2792,7 +2799,7 @@ impl Database {
         )
         .bind(seed_track_id)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter().map(|row| Ok(row.try_get("id")?)).collect()
     }
@@ -2830,7 +2837,7 @@ impl Database {
              LIMIT ?1",
         )
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter()
             .map(|row| {
@@ -2848,7 +2855,7 @@ impl Database {
     // ---- Identification stats (MusicBrainz coverage) -------------------------
 
     async fn scalar_i64(&self, sql: &str) -> Result<i64> {
-        Ok(sqlx::query(sql).fetch_one(&self.pool).await?.try_get(0)?)
+        Ok(sqlx::query(sql).fetch_one(&self.reads).await?.try_get(0)?)
     }
 
     /// How much of the library has been identified (resolved a MusicBrainz recording id,
@@ -2923,7 +2930,7 @@ impl Database {
              WHERE NOT EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND {identified})
              ORDER BY track_count DESC, title LIMIT ?1"
         );
-        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.reads).await?;
         rows.iter().map(album_from_row).collect()
     }
 
@@ -2935,7 +2942,7 @@ impl Database {
              WHERE NOT EXISTS (SELECT 1 FROM tracks t WHERE t.artist_id = ar.id AND {identified})
              ORDER BY track_count DESC, name LIMIT ?1"
         );
-        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.reads).await?;
         rows.iter().map(artist_from_row).collect()
     }
 
@@ -2964,7 +2971,7 @@ impl Database {
         )
         .bind(retry_before_unix_seconds)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter()
             .map(|row| {
@@ -3041,7 +3048,7 @@ impl Database {
                     track_number, disc_number, year
              FROM track_musicbrainz_metadata WHERE status = 'resolved'",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let aliases = self.artist_alias_map().await?;
         if resolved.is_empty() && aliases.is_empty() {
@@ -3053,7 +3060,7 @@ impl Database {
             "SELECT track_id, field_name FROM track_metadata_field_observations
              WHERE source = 'embedded_tag'",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let mut embedded: BTreeSet<(String, String)> = BTreeSet::new();
         for row in &embedded_rows {
@@ -3147,7 +3154,7 @@ impl Database {
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM settings WHERE key = ?1")
             .bind(key)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.reads)
             .await?;
         Ok(match row {
             Some(row) => Some(row.try_get("value")?),
@@ -3162,7 +3169,7 @@ impl Database {
     pub async fn get_bool_setting(&self, key: &str) -> Result<Option<bool>> {
         let row = sqlx::query("SELECT value FROM bool_settings WHERE key = ?1")
             .bind(key)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.reads)
             .await?;
         Ok(match row {
             Some(row) => Some(row.try_get::<i64, _>("value")? != 0),
@@ -3201,7 +3208,7 @@ impl Database {
     /// How many accounts exist — zero means the app is in first-run "setup" mode.
     pub async fn count_users(&self) -> Result<i64> {
         let row = sqlx::query("SELECT COUNT(*) AS n FROM users")
-            .fetch_one(&self.pool)
+            .fetch_one(&self.reads)
             .await?;
         Ok(row.try_get("n")?)
     }
@@ -3241,7 +3248,7 @@ impl Database {
              FROM users WHERE {predicate}"
         ))
         .bind(value)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         row.map(|row| user_from_row(&row)).transpose()
     }
@@ -3251,7 +3258,7 @@ impl Database {
             "SELECT id, username, password_hash, role, api_token, created_at_unix_seconds
              FROM users ORDER BY username",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter().map(user_from_row).collect()
     }
@@ -3327,7 +3334,7 @@ impl Database {
         )
         .bind(token_hash)
         .bind(now)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         row.map(|row| user_from_row(&row)).transpose()
     }
@@ -3354,7 +3361,7 @@ impl Database {
     pub async fn list_players(&self) -> Result<Vec<PlayerRecord>> {
         let rows =
             sqlx::query("SELECT id, kind, address, name, zone_id FROM players ORDER BY name, id")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.reads)
                 .await?;
         rows.iter().map(player_record_from_row).collect()
     }
@@ -3362,7 +3369,7 @@ impl Database {
     pub async fn player_record(&self, id: &str) -> Result<Option<PlayerRecord>> {
         let row = sqlx::query("SELECT id, kind, address, name, zone_id FROM players WHERE id = ?1")
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.reads)
             .await?;
         row.as_ref().map(player_record_from_row).transpose()
     }
@@ -3371,7 +3378,7 @@ impl Database {
         let rows =
             sqlx::query("SELECT id, kind, address, name, zone_id FROM players WHERE zone_id = ?1")
                 .bind(zone_id)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.reads)
                 .await?;
         rows.iter().map(player_record_from_row).collect()
     }
@@ -3416,7 +3423,7 @@ impl Database {
         let found: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM players WHERE auth_token_hash = ?1 LIMIT 1")
                 .bind(token_hash)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.reads)
                 .await?;
         Ok(found.is_some())
     }
@@ -3428,7 +3435,7 @@ impl Database {
             "SELECT auth_token_hash FROM players WHERE id = ?1",
         )
         .bind(player_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?
         .flatten();
         Ok(hash)
@@ -3568,7 +3575,7 @@ impl Database {
              FROM player_queue WHERE player_id = ?1",
         )
         .bind(player_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?
         else {
             return Ok(None);
@@ -3593,7 +3600,7 @@ impl Database {
              FROM player_queue_items WHERE player_id = ?1 ORDER BY seq",
         )
         .bind(player_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let mut items = item_rows
             .iter()
@@ -3709,7 +3716,7 @@ impl Database {
              FROM zone_queue WHERE zone_id = ?1",
         )
         .bind(zone_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?
         else {
             return Ok(None);
@@ -3734,7 +3741,7 @@ impl Database {
              FROM zone_queue_items WHERE zone_id = ?1 ORDER BY seq",
         )
         .bind(zone_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         let mut items = item_rows
             .iter()
@@ -3756,7 +3763,7 @@ impl Database {
 
     pub async fn list_zones(&self) -> Result<Vec<Zone>> {
         let rows = sqlx::query("SELECT id, name FROM zones ORDER BY name, id")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         rows.iter()
             .map(|row| {
@@ -3845,7 +3852,7 @@ impl Database {
         );
         let rows = sqlx::query(&sql)
             .bind(limit as i64)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         rows.iter()
             .map(|row| Ok((track_from_row(row)?, row.try_get("last_listen")?)))
@@ -3891,7 +3898,7 @@ impl Database {
              ORDER BY id ASC LIMIT ?1",
         )
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter()
             .map(|row| {
@@ -3938,7 +3945,7 @@ impl Database {
         let rows = sqlx::query(&sql)
             .bind(limit as i64)
             .bind(since_unix)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         rows.iter()
             .map(|row| Ok((track_from_row(row)?, row.try_get("plays")?)))
@@ -3959,7 +3966,7 @@ impl Database {
         );
         let rows = sqlx::query(&sql)
             .bind(limit as i64)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         rows.iter()
             .map(|row| Ok((track_from_row(row)?, row.try_get("skips")?)))
@@ -3985,7 +3992,7 @@ impl Database {
         );
         let rows = sqlx::query(&sql)
             .bind(limit as i64)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         rows.iter().map(track_from_row).collect()
     }
@@ -4010,7 +4017,7 @@ impl Database {
         let rows = sqlx::query(&sql)
             .bind(limit as i64)
             .bind(since_unix)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         rows.iter().map(track_from_row).collect()
     }
@@ -4026,30 +4033,30 @@ impl Database {
 
         let total_plays: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM listens WHERE event_kind = 'played'")
-                .fetch_one(&self.pool)
+                .fetch_one(&self.reads)
                 .await?;
         let total_skips: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM listens WHERE event_kind = 'skipped'")
-                .fetch_one(&self.pool)
+                .fetch_one(&self.reads)
                 .await?;
         let distinct_tracks_played: i64 = sqlx::query_scalar(
             "SELECT COUNT(DISTINCT track_id) FROM listens WHERE event_kind = 'played'",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&self.reads)
         .await?;
         let plays_last_7_days: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM listens
              WHERE event_kind = 'played' AND listened_at_unix_seconds >= ?1",
         )
         .bind(now_unix - 7 * DAY)
-        .fetch_one(&self.pool)
+        .fetch_one(&self.reads)
         .await?;
         let plays_last_30_days: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM listens
              WHERE event_kind = 'played' AND listened_at_unix_seconds >= ?1",
         )
         .bind(now_unix - 30 * DAY)
-        .fetch_one(&self.pool)
+        .fetch_one(&self.reads)
         .await?;
 
         // Ordered played times feed the streak + session derivations below.
@@ -4057,7 +4064,7 @@ impl Database {
             "SELECT listened_at_unix_seconds FROM listens
              WHERE event_kind = 'played' ORDER BY listened_at_unix_seconds ASC",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
 
         // Unique UTC day indices (times are sorted, so adjacent-dedup yields unique).
@@ -4072,7 +4079,7 @@ impl Database {
         let mut favorite_artists = 0;
         let fav_rows =
             sqlx::query("SELECT item_type, COUNT(*) AS n FROM favorites GROUP BY item_type")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.reads)
                 .await?;
         for row in &fav_rows {
             let item_type: String = row.try_get("item_type")?;
@@ -4133,7 +4140,7 @@ impl Database {
                     (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = playlists.id) AS song_count
              FROM playlists ORDER BY name",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter().map(playlist_from_row).collect()
     }
@@ -4145,7 +4152,7 @@ impl Database {
              FROM playlists WHERE id = ?1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         row.as_ref().map(playlist_from_row).transpose()
     }
@@ -4157,7 +4164,7 @@ impl Database {
             "SELECT {columns} FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
              WHERE pt.playlist_id = ?1 ORDER BY pt.position"
         );
-        let rows = sqlx::query(&sql).bind(id).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(&sql).bind(id).fetch_all(&self.reads).await?;
         rows.iter().map(track_from_row).collect()
     }
 
@@ -4167,7 +4174,7 @@ impl Database {
             "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position",
         )
         .bind(id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter()
             .map(|row| Ok(row.try_get("track_id")?))
@@ -4270,7 +4277,7 @@ impl Database {
     pub async fn favorite_ids(&self, item_type: &str) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT item_id FROM favorites WHERE item_type = ?1")
             .bind(item_type)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reads)
             .await?;
         rows.iter().map(|row| Ok(row.try_get("item_id")?)).collect()
     }
@@ -4281,7 +4288,7 @@ impl Database {
             "SELECT {columns} FROM favorites f JOIN tracks t ON t.id = f.item_id
              WHERE f.item_type = 'track' ORDER BY f.created_at_unix_seconds DESC"
         );
-        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(&sql).fetch_all(&self.reads).await?;
         rows.iter().map(track_from_row).collect()
     }
 
@@ -4290,7 +4297,7 @@ impl Database {
             "SELECT {ALBUM_COLUMNS} FROM favorites f JOIN albums a ON a.id = f.item_id
              WHERE f.item_type = 'album' ORDER BY f.created_at_unix_seconds DESC"
         );
-        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(&sql).fetch_all(&self.reads).await?;
         rows.iter().map(album_from_row).collect()
     }
 
@@ -4300,7 +4307,7 @@ impl Database {
              JOIN artists a ON a.id = f.item_id
              WHERE f.item_type = 'artist' ORDER BY f.created_at_unix_seconds DESC",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter().map(artist_from_row).collect()
     }
@@ -4332,7 +4339,7 @@ impl Database {
             "SELECT id, name, stream_url, homepage_url, created_at_unix_seconds
              FROM radio_stations ORDER BY name",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter().map(radio_station_from_row).collect()
     }
@@ -4343,7 +4350,7 @@ impl Database {
              FROM radio_stations WHERE id = ?1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         row.as_ref().map(radio_station_from_row).transpose()
     }
@@ -4406,7 +4413,7 @@ impl Database {
             "SELECT id, kind, display_name, enabled, host, share, base_path, username, password, domain, created_at_unix_seconds
              FROM sources ORDER BY display_name",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter().map(source_from_row).collect()
     }
@@ -4417,7 +4424,7 @@ impl Database {
              FROM sources WHERE id = ?1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.reads)
         .await?;
         row.as_ref().map(source_from_row).transpose()
     }
@@ -4445,7 +4452,7 @@ impl Database {
             "SELECT id, kind, label, status, started_at_unix_seconds, finished_at_unix_seconds, message
              FROM activities ORDER BY id DESC",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reads)
         .await?;
         rows.iter().map(activity_from_row).collect()
     }
@@ -6243,6 +6250,42 @@ mod tests {
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[tokio::test]
+    async fn queued_writes_do_not_starve_foreground_reads() {
+        use sqlx::Connection;
+        use std::time::Duration;
+        let path = temp_db_path("writer-reader-isolation");
+        let database = Database::connect(&path).await.unwrap();
+        let mut blocker = sqlx::SqliteConnection::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut blocker)
+            .await
+            .unwrap();
+        let mut writers = Vec::new();
+        for i in 0..8 {
+            let db = database.clone();
+            writers.push(tokio::spawn(async move {
+                db.set_setting(&format!("blocked-{i}"), "value").await
+            }));
+        }
+        // Give all writers a chance to reach the held lock. In the old shared pool
+        // these consume every connection, including those needed to authenticate Stop.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let read = tokio::time::timeout(Duration::from_millis(500), database.count_users()).await;
+        sqlx::query("ROLLBACK").execute(&mut blocker).await.unwrap();
+        for writer in writers {
+            writer.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            read.expect("queued writes blocked an authentication read")
+                .unwrap(),
+            0
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn saves_and_loads_library() {
@@ -8812,11 +8855,8 @@ mod tests {
 
         // A concurrent read on another pool connection must return promptly — well
         // under the 15s busy-timeout — rather than blocking on the open writer.
-        let read = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tracks").fetch_one(&database.pool),
-        )
-        .await;
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(3), database.count_users()).await;
         assert!(
             matches!(read, Ok(Ok(_))),
             "a read must not block on a held write transaction (got {read:?})"

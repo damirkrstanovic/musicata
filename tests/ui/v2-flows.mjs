@@ -155,6 +155,49 @@ await sleep(2500);
 
 console.log(`Svelte UI smoke (${PATH}, ${MODE}):`);
 
+// Desktop shares the listening destinations, while keeping the library visible.
+if (MODE === "behavior") {
+  await js(`localStorage.removeItem('musicata.browse-view'); history.replaceState(null, '')`);
+  await send('Page.reload');
+  await sleep(1200);
+  check('desktop starts with album browsing', await js(`document.querySelectorAll('.album-card').length > 0`));
+  await mobileScreenshot('desktop-album-home');
+  check('desktop install prompt leaves browsing tabs clickable', await js(`(() => {
+    const b = [...document.querySelectorAll('.seg')].find(b => b.textContent.trim() === 'Artists');
+    const r = b.getBoundingClientRect();
+    return b.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
+  })()`));
+  await clickText('.seg', 'Artists');
+  await js(`history.replaceState(null, '')`);
+  await send('Page.reload');
+  await sleep(1200);
+  check('desktop remembers browsing choice on a new visit', await js(`document.querySelectorAll('.artist-card').length > 0`));
+  await clickText('.library-nav button', 'Playlists');
+  await sleep(400);
+  check('desktop exposes saved playlists destination', await js(`document.querySelectorAll('.saved-playlist').length > 0`));
+  await clickText('.library-nav button', 'Library');
+  await sleep(400);
+  check('Library returns to preferred browsing view', await js(`document.querySelectorAll('.artist-card').length > 0`));
+  await js(`document.querySelector('.now-title-button')?.click()`);
+  await sleep(300);
+  check('desktop title opens Now Playing beside the library', await js(`document.querySelector('.shell').classList.contains('np-open') && !!document.querySelector('.right-rail .queue-drawer') && document.querySelector('.content').getBoundingClientRect().right <= document.querySelector('.right-rail').getBoundingClientRect().left + 1`));
+  check('desktop Now Playing does not offer a duplicate queue overlay', await js(`!document.querySelector('.queue-btn')?.getClientRects().length`));
+  await mobileScreenshot('desktop-now-playing');
+  await js('history.back()');
+  await sleep(300);
+  check('desktop Back closes Now Playing and preserves browsing', await js(`!document.querySelector('.shell').classList.contains('np-open') && document.querySelectorAll('.artist-card').length > 0`));
+  await js('history.forward()');
+  await sleep(300);
+  check('desktop Forward restores Now Playing', await js(`document.querySelector('.shell').classList.contains('np-open') && !!document.querySelector('.right-rail .queue-drawer')`));
+  await js(`localStorage.setItem('musicata.browse-view', 'removed-view'); history.replaceState(null, '')`);
+  await send('Page.reload');
+  await sleep(1200);
+  check('invalid browsing preference falls back to Albums', await js(`document.querySelectorAll('.album-card').length > 0`));
+}
+// The remaining playback and scale checks explicitly exercise the track table.
+await clickText('.seg', 'Tracks');
+await sleep(600);
+
 if (MODE === "scale") {
   const total = (await api("/api/library/summary"))?.track_count ?? 0;
   const initial = await js(`document.querySelectorAll('.track-list .track').length`);
@@ -189,6 +232,18 @@ if (MODE === "scale") {
     }
   }
   check("album artwork renders (img bytes loaded)", coverLoaded > 0, `loaded=${coverLoaded}`);
+  // Returning deep into a paged grid must rebuild enough pages to restore scroll.
+  await js(`document.querySelector('.scroll-sentinel')?.scrollIntoView()`);
+  await sleep(800);
+  await js(`document.querySelector('.album-card:last-child')?.scrollIntoView()`);
+  await sleep(500);
+  const deepScroll = await js(`document.querySelector('.content').scrollTop`);
+  const deepCount = await js(`document.querySelectorAll('.album-card').length`);
+  await js(`document.querySelector('.album-card:last-child .card-text')?.click()`);
+  await sleep(500);
+  await js(`document.querySelector('.back-btn')?.click()`);
+  check("Back restores a paged album grid", await waitUntil(`document.querySelectorAll('.album-card').length > 60 && Math.abs(document.querySelector('.content').scrollTop - ${deepScroll}) < 4`, 5000) < Infinity, `cards=${deepCount}, scroll=${deepScroll}`);
+
   check("no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
   check("no CSP violations", cspViolations.length === 0, cspViolations.slice(0, 3).join(" | "));
   console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);
@@ -212,6 +267,47 @@ await sleep(4200);
 check("playback started", (await js(`document.querySelector('.transport')?.dataset.status`)) === "playing");
 check("hot path: elapsed text updates on ticks", (await js(`window.__t`)) >= 2);
 check("hot path: now-title NOT swept on ticks", (await js(`window.__n`)) === 0);
+
+// A real SQLite writer must not delay Pause or prevent the output WebSocket
+// from carrying it. Hold the write lock through a periodic progress checkpoint.
+if (process.env.MUSICATA_SMOKE_DB) {
+  const {spawn} = await import('node:child_process');
+  const locker = spawn('python3', ['-u', '-c', `
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1], timeout=20)
+c.execute('BEGIN IMMEDIATE')
+print('locked', flush=True)
+sys.stdin.readline()
+c.rollback()
+`, process.env.MUSICATA_SMOKE_DB]);
+  try {
+    await new Promise((resolve, reject) => {
+      locker.stdout.once('data', resolve);
+      locker.once('error', reject);
+      locker.once('exit', code => { if (code) reject(new Error('lock helper failed')); });
+    });
+    await sleep(11000);
+    await js(`(() => {
+      window.__pauseRequest = 'not sent';
+      const original = window.fetch;
+      window.fetch = async (...args) => {
+        const start = performance.now();
+        const response = await original(...args);
+        if (String(args[0]).includes('/commands')) window.__pauseRequest = {status: response.status, ms: performance.now() - start};
+        return response;
+      };
+    })()`);
+    await js(`document.querySelector('.transport-buttons .control.play')?.click()`);
+    const pauseMs = await waitUntil(`document.querySelector('.transport')?.dataset.status === 'paused' && document.querySelector('audio')?.paused`, 2000);
+    check('busy database: Pause stops actual browser audio promptly', pauseMs < 1000,
+      `${pauseMs}ms; ` + JSON.stringify(await js(`({status:document.querySelector('.transport')?.dataset.status, paused:document.querySelector('audio')?.paused, request:window.__pauseRequest})`)));
+  } finally {
+    locker.stdin.end('release\n');
+    await new Promise(resolve => locker.once('exit', resolve));
+  }
+  await js(`document.querySelector('.transport-buttons .control.play')?.click()`);
+  await waitUntil(`document.querySelector('.transport')?.dataset.status === 'playing'`, 3000);
+}
 
 // ---- Transport: the core music-playing controls (pause/resume, skip, seek) ----
 // Clicking a track queued the whole list (playTracks), so next/previous have somewhere to go.
@@ -637,7 +733,7 @@ for (const [width, height] of [[360, 800], [800, 360], [320, 568]]) {
   check(`${label}: queue selection plays`, !!queueTitle && await waitUntil(`document.querySelector('#now-title')?.textContent === ${JSON.stringify(queueTitle)}`, 2000) < Infinity);
   check(`${label}: queue closes`, await tapMobile('.queue-head-actions button:last-child'));
   check(`${label}: queue returns focus`, await js(`document.activeElement?.getAttribute('aria-label') === 'Queue'`));
-  check(`${label}: now playing expands`, await tapMobile('[aria-label="Open Now Playing"]'));
+  check(`${label}: now playing expands`, await tapMobile('.now-title-button'));
   await mobileScreenshot(`${width}x${height}-now-playing`);
   check(`${label}: full playback controls work`, await tapMobile('.transport-buttons .play'));
   check(`${label}: output selector is visible`, await js(`(() => {const el=document.querySelector('.player-switch-btn'); const r=el.getBoundingClientRect(); return r.width > 0 && r.top >= 0 && r.bottom <= innerHeight && el.contains(document.elementFromPoint(r.x+r.width/2, r.y+r.height/2));})()`));
@@ -670,6 +766,46 @@ check("mobile: main screen names the chosen output", await js(`document.querySel
 await js(`localStorage.setItem('musicata.output', 'player:removed-output')`);
 await send("Page.reload");
 check("mobile: removed output falls back to browser", await waitUntil(`document.querySelector('.mobile-output strong')?.textContent === 'This Browser'`, 5000) < Infinity);
+
+// Fresh phone entry and one coherent browser/visible Back history.
+await send("Emulation.setDeviceMetricsOverride", {width: 360, height: 800, deviceScaleFactor: 1, mobile: true});
+await js(`localStorage.removeItem('musicata.browse-view'); history.replaceState(null, '')`);
+await send("Page.reload");
+await sleep(1800);
+await mobileScreenshot('phone-album-home');
+check("phone home opens Albums", await js(`document.querySelector('.seg.is-active')?.textContent.trim() === 'Albums'`));
+check("phone has Library, Playlists and Now Playing destinations", await js(`['Library','Playlists','Now Playing'].every(label => [...document.querySelectorAll('.mobile-tabs button')].some(b => b.textContent.trim() === label))`));
+await clickText('.seg', 'Albums');
+await sleep(500);
+await js('window.scrollTo(0, 240)');
+const gridScroll = await js('window.scrollY');
+await js("document.querySelector('.album-card .card-cover')?.click()");
+await sleep(700);
+const historyAlbum = await js("document.querySelector('.hero-title')?.textContent");
+check("phone title opens Now Playing", await tapMobile('.now-title-button'));
+await mobileScreenshot('phone-now-playing-queue');
+check("Now Playing includes current queue", await js(`document.querySelector('.shell').classList.contains('np-open') && !!document.querySelector('.queue-drawer.embedded')`));
+const embeddedTitle = await js(`document.querySelector('.queue-drawer.embedded .q-title')?.textContent`);
+check("Now Playing queue track can be tapped", await tapMobile('.queue-drawer.embedded .q-main', true));
+check("Now Playing queue selection plays", !!embeddedTitle && await waitUntil(`document.querySelector('#now-title')?.textContent === ${JSON.stringify(embeddedTitle)}`, 1500) < Infinity);
+await js('document.querySelector(".right-rail").scrollTop = 0');
+await js('history.back()');
+await sleep(500);
+check("phone Back closes Now Playing before leaving album", await js(`!document.querySelector('.shell').classList.contains('np-open') && document.querySelector('.hero-title')?.textContent === ${JSON.stringify(historyAlbum)}`));
+await js('history.forward()');
+await sleep(500);
+check("phone Forward restores Now Playing", await js(`document.querySelector('.shell').classList.contains('np-open')`));
+await tapMobile('[aria-label="Close Now Playing"]');
+await sleep(300);
+await tapMobile('.mobile-back');
+await sleep(700);
+check("visible Back returns to album grid", await js(`document.querySelector('.seg.is-active')?.textContent.trim() === 'Albums' && !document.querySelector('.hero-title')`));
+check("Back restores grid scroll", await js(`Math.abs(window.scrollY - ${gridScroll}) < 4`));
+await js('history.forward()');
+await sleep(600);
+check("Forward after visible Back restores album", await js(`document.querySelector('.hero-title')?.textContent === ${JSON.stringify(historyAlbum)}`));
+check("phone Playlists destination is reachable", await tapMobile('.mobile-tabs [data-tab="playlists"]'));
+check("phone Playlists lists saved playlist", await waitUntil(`document.querySelector('.saved-playlists')?.textContent.includes('Phone playlist')`, 1500) < Infinity);
 
 check("mobile: no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
 

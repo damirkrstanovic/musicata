@@ -29,22 +29,21 @@
 
 <footer class="transport" data-status={player.status} {inert}>
   <div class="transport-now">
-    <div class="now-art">
+    <button class="now-art" type="button" aria-label="Show Now Playing" onclick={onexpand}>
       {#if player.nowPlaying?.artwork_url}
         <img src={player.nowPlaying.artwork_url} alt="" />
       {:else}
         <span class="now-art-fallback">♪</span>
       {/if}
-    </div>
+    </button>
     <div class="now-text">
-      <strong id="now-title"
+      <button class="now-title-button" type="button" onclick={onexpand} aria-label="Show Now Playing and queue"><strong id="now-title"
         >{player.nowPlaying?.title ??
           (player.connection === "online"
             ? "Nothing playing"
             : player.connection === "connecting"
               ? "Connecting…"
-              : "Reconnecting…")}</strong
-      >
+              : "Reconnecting…")}</strong></button>
       {#if player.connection === "online"}
         <span>{subtitle}</span>
       {:else}
@@ -63,7 +62,6 @@
     <button class="control" type="button" aria-label="Next" onclick={() => next()}>⏭</button>
     <button class="control" type="button" aria-label="Queue" aria-expanded={player.queueOpen}
       onclick={() => (player.queueOpen = !player.queueOpen)}>Queue</button>
-    <button class="np-chevron" type="button" aria-label="Open Now Playing" onclick={onexpand}>⌃</button>
   </div>
 
   <SeekBar />

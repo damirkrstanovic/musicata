@@ -25,9 +25,29 @@ cards** in a full-width grid (`.browse-grid` → `.card`/`.album-card`/`.artist-
 by infinite scroll and a contextual **sort** select. Browsing is **master→detail**: a card
 opens a **hero header** (`.detail-hero` — large cover, serif title, a clickable artist link,
 year · tracks · duration, and **Play** / **Shuffle**) above the tracklist (album) or an
-albums grid (artist). Drill-downs push onto the nav store's stack, synced to the History API;
-the **‹ Back** button and the browser Back button both pop it. Album covers in grids request
+albums grid (artist). Drill-downs create browser history entries through the nav store;
+the visible **Back** control and browser Back/Forward use the same history entries,
+including the navigation drawer, Now Playing, and queue. Entries store the route and
+scroll position; paged grids load enough content to restore a deep browsing position. Album covers in grids request
 the `?size=300` thumbnail; hero covers `?size=600`.
+
+## Listening flow across screens
+
+A fresh visit on any screen starts with album covers. The last Albums, Artists or Tracks
+choice is remembered in this browser; Library returns to that choice. Detail routes
+and temporary playback panels are restored by history, not saved as the browsing preference. Persistent bottom destinations are
+**Library · Playlists · Now Playing**, with the compact player above them. Artists and
+Tracks remain available in the browsing switcher. The top bar keeps the current output
+visible and exposes Back whenever there is an in-app history entry.
+
+The compact player's title and artwork open Now Playing: controls followed directly by
+the active queue, with its current track highlighted. Saved playlists have a separate
+browse screen. Back closes the current playback/drawer view before returning through
+library navigation, and Forward restores that view. Desktop retains its three-column
+layout and exposes the same Library, Playlists and Now Playing destinations in the sidebar.
+Clicking its current song or Now Playing opens the queue alongside the transport, leaving
+the library available. Output selection and playback controls stay visible. The optional
+install prompt sits in the page flow on all screen sizes so it cannot cover browsing controls.
 
 ## Aesthetic
 

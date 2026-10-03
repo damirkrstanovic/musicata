@@ -6,8 +6,10 @@
   import { initial } from "../lib/dom";
   import { tick } from "svelte";
 
+  let { embedded = false }: { embedded?: boolean } = $props();
   let wasOpen = false;
   $effect(() => {
+    if (embedded) return;
     const open = player.queueOpen;
     if (!open && !wasOpen) return;
     wasOpen = open;
@@ -27,8 +29,8 @@
   }
 </script>
 
-{#if player.queueOpen}
-  <section class="queue-drawer" aria-label="Play queue">
+{#if embedded || player.queueOpen}
+  <section class="queue-drawer" class:embedded aria-label="Play queue">
     <header class="queue-head">
       <strong>Queue</strong>
       <div class="queue-head-actions">
@@ -43,7 +45,7 @@
         <button class="ghost-button" type="button" onclick={() => sendCommand(player.target, { command: "clear" })}>
           Clear
         </button>
-        <button class="ghost-button" type="button" aria-label="Close queue" onclick={close}>Close</button>
+        {#if !embedded}<button class="ghost-button" type="button" aria-label="Close queue" onclick={close}>Close</button>{/if}
       </div>
     </header>
 

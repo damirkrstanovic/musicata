@@ -12,6 +12,23 @@ How Musicata is tested today, and what's planned. Two layers:
   (~11k tracks) when present, for realistic scale; falls back to the testdata fixture.
   Also runs on every commit (skips cleanly if no Chromium).
 
+## Testing a remotely built server
+
+The smoke suite builds locally by default. To test an executable already compiled in
+another machine or a Kubernetes build pod, use an absolute path:
+
+```sh
+MUSICATA_SERVER_BIN=/tmp/musicata-server MUSICATA_UI_LOGS=/tmp/musicata-ui-logs scripts/ui-smoke.sh
+```
+
+The executable must include the matching web build. Release builds embed it normally;
+for a transferable debug build use `cargo build -p musicata-server --features rust-embed/debug-embed`.
+When supplying prebuilt `web/dist/`, set `MUSICATA_SKIP_WEB_BUILD=1` in the builder.
+Do not copy the local music database, credentials, or real library into a build pod.
+The suite runs against disposable databases and holds a real SQLite write lock to
+verify that Pause stops browser audio promptly even during background persistence.
+Python 3 is used only for this temporary lock-holder process.
+
 ## Current coverage
 
 | Area | Rust | UI smoke |
