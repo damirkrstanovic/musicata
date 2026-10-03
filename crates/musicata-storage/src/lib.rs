@@ -20,7 +20,7 @@ use musicata_core::{
     LibrarySummary, MetadataApprovalState, MetadataFieldValue, PlaybackStatus, Playlist,
     ProviderMapping, QueueItem, RadioStation, RepeatMode, ScanIssue, SearchResults, Track,
     TrackCanonicalOverride, TrackMetadataFieldObservation, TrackMetadataObservation, Zone,
-    album_identity, artist_identity, regroup_library_with_overrides,
+    album_identity, artist_identity, normalize_artist_key, regroup_library_with_overrides,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -401,10 +401,18 @@ impl Database {
     }
 
     pub async fn save_library(&self, library: &mut Library) -> Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        // SQLx must own the transaction so cancellation rolls it back before the
+        // connection returns to the pool. Raw BEGIN/COMMIT leaks locks on drop.
+        let mut conn = self.pool.begin().await?;
 
         let result = async {
+            // Acquire the write reservation before reading timestamps, avoiding a
+            // deferred read-to-write upgrade racing another SQLite writer. Use a
+            // normal managed BEGIN: SQLx 0.8's custom BEGIN checks the handle after
+            // acknowledgement, leaving a cancellation gap before its guard exists.
+            sqlx::query("DELETE FROM track_metadata_field_observations")
+                .execute(&mut *conn)
+                .await?;
             // Preserve each track's original "added at" timestamp across the full
             // delete/re-insert by keying on (provider id, provider item id) — the
             // item id alone can collide once more than one source is merged in.
@@ -432,9 +440,6 @@ impl Database {
                 track.added_at_unix_seconds = Some(added_at);
             }
 
-            sqlx::query("DELETE FROM track_metadata_field_observations")
-                .execute(&mut *conn)
-                .await?;
             sqlx::query("DELETE FROM track_metadata_observations")
                 .execute(&mut *conn)
                 .await?;
@@ -591,20 +596,9 @@ impl Database {
         }
         .await;
 
-        match result {
-            Ok(()) => match sqlx::query("COMMIT").execute(&mut *conn).await {
-                Ok(_) => Ok(()),
-                Err(error) => {
-                    // Roll back so the connection isn't returned to the pool mid-transaction.
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    Err(error.into())
-                }
-            },
-            Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(error)
-            }
-        }
+        result?;
+        conn.commit().await?;
+        Ok(())
     }
 
     pub async fn load_library(&self) -> Result<Option<Library>> {
@@ -3098,6 +3092,49 @@ impl Database {
         let Some(library) = self.load_library().await? else {
             return Ok(0);
         };
+        // The worker revisits resolved metadata while idle. Only regroup when a
+        // canonical value changes; otherwise a full-library rewrite repeatedly
+        // takes SQLite's sole writer away from login and playback persistence.
+        let album_artists: BTreeMap<_, _> = library
+            .albums
+            .iter()
+            .map(|album| (album.id.as_str(), album.artist_name.as_str()))
+            .collect();
+        let canonical_artist = |name: &str| {
+            aliases
+                .get(&normalize_artist_key(name))
+                .cloned()
+                .unwrap_or_else(|| name.to_owned())
+        };
+        let unchanged = library.tracks.iter().all(|track| {
+            let empty = TrackCanonicalOverride::default();
+            let over = overrides.get(&track.id).unwrap_or(&empty);
+            let album_artist = album_artists
+                .get(track.album_id.as_str())
+                .copied()
+                .unwrap_or(&track.artist_name);
+            over.title
+                .as_ref()
+                .is_none_or(|value| value == &track.title)
+                && over
+                    .album_title
+                    .as_ref()
+                    .is_none_or(|value| value == &track.album_title)
+                && over.year.is_none_or(|value| Some(value) == track.year)
+                && over
+                    .track_number
+                    .is_none_or(|value| Some(value) == track.track_number)
+                && over
+                    .disc_number
+                    .is_none_or(|value| Some(value) == track.disc_number)
+                && canonical_artist(over.artist_name.as_deref().unwrap_or(&track.artist_name))
+                    == track.artist_name
+                && canonical_artist(over.album_artist_name.as_deref().unwrap_or(album_artist))
+                    == album_artist
+        });
+        if unchanged {
+            return Ok(0);
+        }
         let mut regrouped = regroup_library_with_overrides(library, &overrides, &aliases);
         let applied = overrides.len() as u64;
         self.save_library(&mut regrouped).await?;
@@ -3472,8 +3509,9 @@ impl Database {
         playback: &PlayerPlayback,
         items: &[QueueItem],
     ) -> Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        // SQLx must own the transaction so cancellation rolls it back before the
+        // connection returns to the pool. Raw BEGIN/COMMIT leaks locks on drop.
+        let mut conn = self.pool.begin().await?;
         let result = async {
             sqlx::query("DELETE FROM player_queue_items WHERE player_id = ?1")
                 .bind(player_id)
@@ -3518,20 +3556,9 @@ impl Database {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-        match result {
-            Ok(()) => match sqlx::query("COMMIT").execute(&mut *conn).await {
-                Ok(_) => Ok(()),
-                Err(error) => {
-                    // Roll back so the connection isn't returned to the pool mid-transaction.
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    Err(error.into())
-                }
-            },
-            Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(error)
-            }
-        }
+        result?;
+        conn.commit().await?;
+        Ok(())
     }
 
     /// Load a player's persisted queue, or `None` if it has never had one saved.
@@ -3623,8 +3650,9 @@ impl Database {
         playback: &PlayerPlayback,
         items: &[QueueItem],
     ) -> Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        // SQLx must own the transaction so cancellation rolls it back before the
+        // connection returns to the pool. Raw BEGIN/COMMIT leaks locks on drop.
+        let mut conn = self.pool.begin().await?;
         let result = async {
             sqlx::query("DELETE FROM zone_queue_items WHERE zone_id = ?1")
                 .bind(zone_id)
@@ -3669,20 +3697,9 @@ impl Database {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-        match result {
-            Ok(()) => match sqlx::query("COMMIT").execute(&mut *conn).await {
-                Ok(_) => Ok(()),
-                Err(error) => {
-                    // Roll back so the connection isn't returned to the pool mid-transaction.
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    Err(error.into())
-                }
-            },
-            Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(error)
-            }
-        }
+        result?;
+        conn.commit().await?;
+        Ok(())
     }
 
     /// Load a zone's persisted queue, or `None` if it has never had one saved.
@@ -4458,8 +4475,9 @@ impl Database {
         &self,
         activities: &[ActivityRecord],
     ) -> Result<(), sqlx::Error> {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        // SQLx must own the transaction so cancellation rolls it back before the
+        // connection returns to the pool. Raw BEGIN/COMMIT leaks locks on drop.
+        let mut conn = self.pool.begin().await?;
         let result = async {
             sqlx::query("DELETE FROM activities")
                 .execute(&mut *conn)
@@ -4483,20 +4501,9 @@ impl Database {
             Ok::<(), sqlx::Error>(())
         }
         .await;
-        match result {
-            Ok(()) => match sqlx::query("COMMIT").execute(&mut *conn).await {
-                Ok(_) => Ok(()),
-                Err(error) => {
-                    // Roll back so the connection isn't returned to the pool mid-transaction.
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    Err(error.into())
-                }
-            },
-            Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(error)
-            }
-        }
+        result?;
+        conn.commit().await?;
+        Ok(())
     }
 }
 
@@ -8692,6 +8699,91 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
     }
 
+    // Cancelling any multi-statement write must release SQLite's writer lock, even
+    // if cancellation happens while BEGIN is being acknowledged by the worker.
+    #[tokio::test]
+    async fn cancelled_writes_release_the_database_lock() {
+        use super::{PlayerPlayback, is_locked};
+        use musicata_core::{PlaybackStatus, RepeatMode};
+        use sqlx::{Connection, sqlite::SqliteConnectOptions};
+        use std::{future::Future, pin::Pin, task::Poll, time::Duration};
+
+        for operation in ["library", "player", "zone", "activities"] {
+            let db_path = temp_db_path(&format!("cancelled-{operation}"));
+            let database = Database::connect(&db_path).await.unwrap();
+            let mut library = fixture_library();
+            database.save_library(&mut library).await.unwrap();
+            let mut probe = sqlx::SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .busy_timeout(Duration::from_millis(100)),
+            )
+            .await
+            .unwrap();
+            let playback = PlayerPlayback {
+                status: PlaybackStatus::Stopped,
+                position: None,
+                elapsed_seconds: None,
+                volume: Some(50),
+                repeat: RepeatMode::Off,
+                shuffle: false,
+                shuffle_order: vec![],
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            // Advance one poll at a time and probe while the operation is parked.
+            // A short operation can finish within one poll if the SQLite worker
+            // keeps up; retry those attempts, but require an actual cancellation.
+            'attempt: loop {
+                let mut write: Pin<Box<dyn Future<Output = anyhow::Result<()>>>> = match operation {
+                    "library" => Box::pin(database.save_library(&mut library)),
+                    "player" => Box::pin(database.save_player_queue("p", &playback, &[])),
+                    "zone" => Box::pin(database.save_zone_queue("z", &playback, &[])),
+                    _ => Box::pin(database.replace_activities(&[])),
+                };
+                loop {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{operation} never exposed an active write to cancel"
+                    );
+                    let progress =
+                        std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await;
+                    if let Poll::Ready(result) = progress {
+                        result.unwrap();
+                        continue 'attempt;
+                    }
+                    match sqlx::query("BEGIN IMMEDIATE").execute(&mut probe).await {
+                        Ok(_) => {
+                            sqlx::query("ROLLBACK").execute(&mut probe).await.unwrap();
+                        }
+                        Err(error) if is_locked(&error) => break,
+                        Err(error) => panic!("lock probe failed: {error}"),
+                    }
+                }
+                drop(write);
+                break;
+            }
+
+            // A completely separate connection must be able to write again. A raw
+            // BEGIN without a transaction guard leaves the pooled connection locked.
+            // Transaction drop queues rollback on the SQLite worker. Allow it to
+            // be scheduled even when the full suite is running in parallel.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match sqlx::query("BEGIN IMMEDIATE").execute(&mut probe).await {
+                    Ok(_) => break,
+                    Err(error) if is_locked(&error) && std::time::Instant::now() < deadline => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("{operation} leaked its write lock: {error}"),
+                }
+            }
+            sqlx::query("ROLLBACK").execute(&mut probe).await.unwrap();
+            drop(probe);
+            database.pool.close().await;
+            let _ = std::fs::remove_file(db_path);
+        }
+    }
+
     // A long-held write transaction (like the scan's full-library `save_library`
     // rewrite) must not block concurrent reads. Under the old rollback journal this
     // SELECT would wait on the writer and hit the busy-timeout; WAL lets it through.
@@ -9354,6 +9446,22 @@ mod tests {
         assert_eq!(track.album_id, album.id);
         assert!(lib.artists.iter().all(|a| a.name != "Artist"));
 
+        // An idle enrichment pass must not rewrite the entire library. Even with
+        // another writer active, an already-applied pass should finish using reads.
+        let writer = database.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let reapplied = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            database.reapply_canonical_grouping(),
+        )
+        .await;
+        writer.rollback().await.unwrap();
+        assert_eq!(
+            reapplied
+                .expect("unchanged grouping waited for a write lock")
+                .unwrap(),
+            0
+        );
+
         // A later rescan rewrites the track back to folder-derived grouping...
         let mut rescanned = fixture_library();
         database.save_library(&mut rescanned).await.expect("resave");
@@ -9368,6 +9476,41 @@ mod tests {
         let lib = database.load_library().await.expect("load").expect("lib");
         assert_eq!(lib.tracks[0].title, "Real Title");
 
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn canonical_alias_reapply_is_read_only_when_unchanged() {
+        let db_path = temp_db_path("alias-reapply");
+        let database = Database::connect(&db_path).await.unwrap();
+        database.save_library(&mut fixture_library()).await.unwrap();
+        database
+            .add_artist_alias("artist", "canonical", "Canonical", 1)
+            .await
+            .unwrap();
+        database.reapply_canonical_grouping().await.unwrap();
+        let library = database.load_library().await.unwrap().unwrap();
+        assert_eq!(library.tracks[0].artist_name, "Canonical");
+        assert_eq!(library.albums[0].artist_name, "Canonical");
+        let writer = database.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            database.reapply_canonical_grouping(),
+        )
+        .await;
+        writer.rollback().await.unwrap();
+        assert_eq!(
+            result
+                .expect("unchanged aliases waited for a writer")
+                .unwrap(),
+            0
+        );
+        database.save_library(&mut fixture_library()).await.unwrap();
+        database.reapply_canonical_grouping().await.unwrap();
+        let rescanned = database.load_library().await.unwrap().unwrap();
+        assert_eq!(rescanned.tracks[0].artist_name, "Canonical");
+        assert_eq!(rescanned.albums[0].artist_name, "Canonical");
+        database.pool.close().await;
         let _ = std::fs::remove_file(db_path);
     }
 

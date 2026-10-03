@@ -34,6 +34,7 @@ export function connectPlayer(
     const scheme = location.protocol === "https:" ? "wss" : "ws";
     socket = new WebSocket(`${scheme}://${location.host}/api/${kind}s/${encodeURIComponent(id)}/ws`);
     socket.onmessage = (event) => {
+      if (closed) return; // Ignore queued snapshots from a previously selected output.
       let msg: { type?: string };
       try {
         msg = JSON.parse(event.data);

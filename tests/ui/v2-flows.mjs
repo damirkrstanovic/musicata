@@ -60,6 +60,10 @@ if (MODE === "behavior") {
       body: JSON.stringify({ zone_id: zone.id }),
     });
   }
+  await api("/api/zones", {
+    method: "POST", headers: {"content-type": "application/json"},
+    body: JSON.stringify({name: "Z Remote output"}),
+  });
   await api("/api/radio", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -561,6 +565,25 @@ check("restart resume goes to playing", (await js(`document.querySelector('.tran
 const r2 = await js(`document.querySelector('.seek-row .time')?.textContent`);
 check("restart resume actually plays on this tab (elapsed advances)", !!r1 && r1 !== r2, `${r1} -> ${r2}`);
 
+// Switching away from a playing browser must stop its stream and must never
+// forward its old audio events into the newly selected remote output's socket.
+check("output handoff starts with local audio playing", await js(`!document.querySelector('audio').paused`));
+await js(`(() => {
+  window.__outputReports = [];
+  const send = WebSocket.prototype.send;
+  WebSocket.prototype.send = function(data) { window.__outputReports.push(data); return send.call(this, data); };
+  const select = document.querySelector('.player-switch-btn');
+  select.value = [...select.options].find(o => o.textContent.includes('Z Remote output')).value;
+  select.dispatchEvent(new Event('change', {bubbles: true}));
+})()`);
+await sleep(1300);
+check("switching output pauses local audio", await js(`document.querySelector('audio').paused`));
+await js(`document.querySelector('audio').dispatchEvent(new Event('ended'))`);
+await sleep(200);
+check("old browser progress and ended do not reach remote output", await js(`window.__outputReports.every(data => !['progress', 'ended'].includes(JSON.parse(data).type))`));
+await js(`(() => { const s = document.querySelector('.player-switch-btn'); s.value = [...s.options].find(o => o.textContent === 'This Browser').value; s.dispatchEvent(new Event('change', {bubbles: true})); })()`);
+await sleep(600);
+
 check("no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
 // Mobile regression: CSS used to hide the desktop controls without rendering their
 // mobile replacements. Hit-test and tap real controls, rather than DOM .click()
@@ -595,6 +618,10 @@ for (const [width, height] of [[360, 800], [800, 360], [320, 568]]) {
   await send("Emulation.setDeviceMetricsOverride", {width, height, deviceScaleFactor: 1, mobile: true});
   await sleep(350);
   await mobileScreenshot(`${width}x${height}-browse`);
+  check(`${label}: output is labelled on the main screen`, await js(`document.querySelector('.mobile-output')?.textContent.includes('Output:')`));
+  check(`${label}: output button opens selection`, await tapMobile('.mobile-output'));
+  check(`${label}: output selector receives focus`, await js(`document.activeElement?.classList.contains('player-switch-btn')`));
+  await tapMobile('[aria-label="Close Now Playing"]');
   const priorStatus = await js('document.querySelector(".transport")?.dataset.status');
   check(`${label}: playback control is reachable`, await tapMobile('.mini-controls .play'));
   check(`${label}: playback toggles`, await waitUntil(`document.querySelector('.transport')?.dataset.status !== ${JSON.stringify(priorStatus)}`, 2000) < Infinity);
@@ -627,6 +654,22 @@ for (const [width, height] of [[360, 800], [800, 360], [320, 568]]) {
   check(`${label}: navigation closes`, await tapMobile('[aria-label="Close navigation"]'));
   check(`${label}: no horizontal overflow`, await js('document.documentElement.scrollWidth <= innerWidth'));
 }
+
+// A remote output choice survives reopening the controller; a removed output
+// falls back safely instead of attempting a WebSocket to a nonexistent target.
+await tapMobile('.mobile-output');
+const chosenOutput = await js(`(() => {
+  const select = document.querySelector('.player-switch-btn');
+  select.value = [...select.options].find(o => o.value.startsWith('zone:')).value;
+  select.dispatchEvent(new Event('change', {bubbles: true}));
+  return select.value;
+})()`);
+await send("Page.reload");
+check("mobile: chosen output survives reload", await waitUntil(`document.querySelector('.player-switch-btn')?.value === ${JSON.stringify(chosenOutput)}`, 5000) < Infinity);
+check("mobile: main screen names the chosen output", await js(`document.querySelector('.mobile-output strong')?.textContent === document.querySelector('.player-switch-btn option:checked')?.textContent.replace('Zone · ', '')`));
+await js(`localStorage.setItem('musicata.output', 'player:removed-output')`);
+await send("Page.reload");
+check("mobile: removed output falls back to browser", await waitUntil(`document.querySelector('.mobile-output strong')?.textContent === 'This Browser'`, 5000) < Infinity);
 
 check("mobile: no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
 

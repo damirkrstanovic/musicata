@@ -1572,7 +1572,7 @@ h1 {
 }
 
 @media (max-width: 820px) {
-  /* ---- Mobile top bar (hamburger · brand · settings) ---- */
+  /* ---- Mobile top bar (navigation · current output · settings) ---- */
   .mobile-bar {
     position: fixed;
     inset: 0 0 auto 0;
@@ -1604,11 +1604,28 @@ h1 {
     border-color: var(--accent);
   }
 
-  .mobile-brand {
+  .mobile-output {
     flex: 1;
-    font-family: var(--font-display);
-    font-size: 1.15rem;
-    letter-spacing: 0.3px;
+    min-width: 0;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 8px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .mobile-output strong {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: left;
   }
 
   /* ---- Shell: single scrolling column beneath the fixed bar ---- */
