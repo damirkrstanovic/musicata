@@ -122,6 +122,15 @@ one round-trip each); streaming fetches only the requested byte range; guest/
 anonymous needs `allow_unsigned_guest_access` + a non-empty (`guest`) username, and
 connects have a timeout so an unreachable host can't hang the request.
 
+**Directory iteration race (1.0.2):** `smb` 0.11.2's async directory stream used
+`notify_waiters()` when the consumer drained a batch. If the producer had not yet
+started waiting, the notification was lost and discovery stalled indefinitely.
+The vendored fix uses `notify_one()` to retain that wake-up; deterministic tests
+exercise both thread orderings. A parallel listing probe on a Celeron N4500 went
+from stalling after 150 directories to enumerating all 1,189 in about five seconds.
+This is a scheduling race, not a missing system SMB library. See
+`vendor/smb/MUSICATA-PATCH.md`; remove the patch when upstream ships the fix.
+
 ---
 
 ## 5. Background work: progress, errors, real-time UI

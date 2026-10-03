@@ -16,6 +16,12 @@ default-members = [
     "crates/musicata-storage",
 ]
 resolver = "2"
+exclude = ["vendor/smb"]
+
+[patch.crates-io]
+# smb 0.11.2 loses a directory-batch wake-up on some thread schedules.
+# Keep the verified fix local until an upstream release includes it.
+smb = { path = "vendor/smb" }
 
 # Release builds get cross-crate inlining + maximal vectorization. The fingerprint
 # path (symphonia decode + chromaprint FFT) is the main beneficiary.
