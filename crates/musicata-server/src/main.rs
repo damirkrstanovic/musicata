@@ -1076,7 +1076,7 @@ const AUTOPLAY_BATCH: usize = 10;
 /// **Continuous play** — when autoplay is on and a playing queue nears its end, append similar
 /// tracks so the music keeps going. Its own decoupled loop (polls, never on a request path);
 /// the seed slides with playback (current track), so it walks the similarity graph rather than
-/// looping. Covers the browser player and every zone.
+/// looping. Covers every standalone player backend and every zone.
 async fn autoplay_loop(
     players: Arc<players::PlayerManager>,
     database: Database,
@@ -1087,34 +1087,55 @@ async fn autoplay_loop(
     let _ = ready.wait_for(|&r| r).await;
     loop {
         tokio::time::sleep(AUTOPLAY_POLL).await;
-        // Default on: continue unless the user explicitly turned it off.
-        let on = bool_setting(&database, SETTING_AUTOPLAY).await;
-        if !on {
-            continue;
-        }
-        if let Some(handle) = players.get(players::BROWSER_PLAYER_ID).await
-            && let Ok(state) = handle.state(&database).await
-            && let Some(ids) =
-                autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await
-        {
-            let _ = handle
-                .execute(
-                    PlayerCommand::Enqueue { track_ids: ids },
-                    &database,
-                    players.public_base_url(),
-                )
-                .await;
-        }
-        if let Ok(zones) = players.zones().await {
-            for zone in zones {
-                if let Ok(state) = players.zone_state(&zone.id).await
-                    && let Some(ids) =
-                        autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state).await
+        autoplay_pass(&players, &database, &listenbrainz, &musicbrainz).await;
+    }
+}
+
+async fn autoplay_pass(
+    players: &players::PlayerManager,
+    database: &Database,
+    listenbrainz: &Arc<recommendations::ListenBrainzClient>,
+    musicbrainz: &MusicBrainzClient,
+) {
+    // Default on: continue unless the user explicitly turned it off.
+    let on = bool_setting(database, SETTING_AUTOPLAY).await;
+    if !on {
+        return;
+    }
+    if let Ok(outputs) = players.descriptors().await {
+        for output in outputs {
+            // A zone owns its canonical queue and forwards refills to its members.
+            // Refilling a member independently would duplicate or diverge its queue.
+            if output.zone_id.is_some() || !output.capabilities.queue {
+                continue;
+            }
+            if let Some(handle) = players.get(&output.id).await
+                && let Ok(state) = handle.state(database).await
+                && let Some(ids) =
+                    autoplay_candidates(database, listenbrainz, musicbrainz, &state).await
+            {
+                if let Err(error) = handle
+                    .execute(
+                        PlayerCommand::Enqueue { track_ids: ids },
+                        database,
+                        players.public_base_url(),
+                    )
+                    .await
                 {
-                    let _ = players
-                        .command_zone(&zone.id, PlayerCommand::Enqueue { track_ids: ids })
-                        .await;
+                    tracing::debug!(player = %output.id, %error, "autoplay refill failed");
                 }
+            }
+        }
+    }
+    if let Ok(zones) = players.zones().await {
+        for zone in zones {
+            if let Ok(state) = players.zone_state(&zone.id).await
+                && let Some(ids) =
+                    autoplay_candidates(database, listenbrainz, musicbrainz, &state).await
+            {
+                let _ = players
+                    .command_zone(&zone.id, PlayerCommand::Enqueue { track_ids: ids })
+                    .await;
             }
         }
     }

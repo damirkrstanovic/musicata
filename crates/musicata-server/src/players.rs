@@ -4046,4 +4046,180 @@ mod tests {
         let near_clip = leveling_gain(&item(Some(-30.0), Some(-0.5)));
         assert!((near_clip - 10f32.powf(0.5 / 20.0)).abs() < 1e-3);
     }
+    // Drive real backend queues without requiring audio hardware or external services.
+    // The old browser-only pass leaves both of these playing queues at one track.
+    async fn assert_autoplay_refills(kind: &str) {
+        let path = temp_db("autoplay-output");
+        let database = Database::connect(&path).await.unwrap();
+        let mut library = library_with_tracks(12);
+        database.save_library(&mut library).await.unwrap();
+        let manager = PlayerManager::load(
+            database.clone(),
+            "http://localhost".into(),
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+        )
+        .await
+        .unwrap();
+        let mut fifo_reader: Option<std::fs::File> = None;
+        let id = match kind {
+            "mpd" => {
+                manager
+                    .register("mpd", "127.0.0.1:1", "Test MPD")
+                    .await
+                    .unwrap()
+                    .id
+            }
+            #[cfg(feature = "snapcast")]
+            "snapcast" => {
+                let settings = crate::snapcast::SnapcastSettings {
+                    manage_server: false,
+                    fifo_path: path.with_extension("fifo"),
+                    ..Default::default()
+                };
+                let snap = Arc::new(SnapcastManager::start(settings).await.unwrap());
+                fifo_reader = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(snap.fifo_path())
+                        .unwrap(),
+                );
+                manager.enable_snapcast(snap).await.unwrap();
+                SNAPCAST_PLAYER_ID.to_string()
+            }
+            _ => BROWSER_PLAYER_ID.to_string(),
+        };
+        let handle = manager.get(&id).await.unwrap();
+        let seed = resolve_queue_items(&database, &["track_1".into()])
+            .await
+            .unwrap();
+        let state = match &handle {
+            PlayerHandle::Mpd(p) => &p.state,
+            PlayerHandle::Browser(p) => &p.state,
+            #[cfg(feature = "snapcast")]
+            PlayerHandle::Snapcast(p) => &p.state,
+        };
+        {
+            let mut state = state.lock().await;
+            state.queue = seed;
+            state.position = Some(0);
+            state.status = PlaybackStatus::Playing;
+            state.elapsed_seconds = Some(12.0);
+        }
+        let lb = Arc::new(crate::recommendations::ListenBrainzClient::with_base_url(
+            "http://127.0.0.1:1",
+        ));
+        let mb = crate::musicbrainz::MusicBrainzClient::default();
+        database
+            .set_bool_setting(crate::SETTING_AUTOPLAY, false)
+            .await
+            .unwrap();
+        crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+        assert_eq!(
+            state.lock().await.queue.len(),
+            1,
+            "disabled autoplay must not append"
+        );
+        database
+            .set_bool_setting(crate::SETTING_AUTOPLAY, true)
+            .await
+            .unwrap();
+        crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+        {
+            let state = state.lock().await;
+            assert!(
+                state.queue.len() > 1,
+                "{kind}: autoplay must append similar tracks"
+            );
+            assert_eq!(state.position, Some(0), "refill must not restart playback");
+            assert_eq!(state.elapsed_seconds, Some(12.0));
+            assert_eq!(state.queue[0].track_id.as_deref(), Some("track_1"));
+            let ids: std::collections::HashSet<_> =
+                state.queue.iter().map(|i| &i.track_id).collect();
+            assert_eq!(
+                ids.len(),
+                state.queue.len(),
+                "refill must exclude queued tracks"
+            );
+        }
+        let filled = state.lock().await.queue.len();
+        crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+        assert_eq!(
+            state.lock().await.queue.len(),
+            filled,
+            "a full queue needs no refill"
+        );
+        // A zone owns its members' queue: never refill a member independently.
+        let zone = manager.create_zone("Autoplay test zone").await.unwrap();
+        manager.set_zone(&id, Some(&zone.id)).await.unwrap();
+        state.lock().await.queue.truncate(1);
+        crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+        assert_eq!(
+            state.lock().await.queue.len(),
+            1,
+            "zone members must not refill independently"
+        );
+        manager
+            .command_zone(
+                &zone.id,
+                PlayerCommand::PlayTracks {
+                    track_ids: vec!["track_1".into()],
+                    start_index: 0,
+                },
+            )
+            .await
+            .unwrap();
+        crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+        let zone_state = manager.zone_state(&zone.id).await.unwrap();
+        assert!(zone_state.queue.len() > 1, "zones must still refill");
+        if kind == "browser" {
+            // Browser clients consume the zone broadcast, not a mirrored standalone queue.
+            assert_eq!(state.lock().await.queue.len(), 1);
+        } else {
+            assert_eq!(
+                state.lock().await.queue.len(),
+                zone_state.queue.len(),
+                "zone refill reaches its member once"
+            );
+        }
+        manager.set_zone(&id, None).await.unwrap();
+        state.lock().await.queue.truncate(1);
+        for status in [PlaybackStatus::Paused, PlaybackStatus::Stopped] {
+            state.lock().await.status = status;
+            crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+            assert_eq!(state.lock().await.queue.len(), 1);
+        }
+        {
+            let mut state = state.lock().await;
+            state.status = PlaybackStatus::Playing;
+            state.repeat = RepeatMode::All;
+        }
+        crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+        assert_eq!(
+            state.lock().await.queue.len(),
+            1,
+            "repeat must not grow the queue"
+        );
+        drop(handle);
+        drop(manager);
+        drop(fifo_reader.take());
+        let _ = std::fs::remove_file(path.with_extension("fifo"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn autoplay_refills_mpd() {
+        assert_autoplay_refills("mpd").await;
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
+    async fn autoplay_refills_snapcast() {
+        assert_autoplay_refills("snapcast").await;
+    }
+
+    #[tokio::test]
+    async fn autoplay_refills_browser() {
+        assert_autoplay_refills("browser").await;
+    }
 }

@@ -6,6 +6,19 @@ Date: 2026-06-07
 > `src/recommendations.rs` + `web/src/lib/autoplay.svelte.ts`, with the toggle in the
 > player. Read the rest as the design behind what shipped; roadmap M7 tracks follow-ups.
 
+## Current behavior (1.0.8)
+
+The global **Autoplay** switch in Queue applies to browser, standalone MPD, Snapcast,
+native endpoints, and zones. Every six seconds a background pass checks playing queues
+with repeat off. With fewer than five upcoming tracks, it appends up to ten similar
+library tracks, using the current song as the seed. Zone members are skipped individually;
+the zone refills its canonical queue and forwards the addition once to its members.
+Paused/stopped queues and repeat modes do not refill. Queued tracks and completed listens
+from the last seven days are excluded, so a small library can exhaust eligible candidates.
+The Mix view remains the initial radio selection; the live Queue shows appended tracks.
+
+The design sections below include aspirations beyond this implementation.
+
 ## Context
 
 "I play something and then it keeps going with similar stuff" — Spotify-style **Autoplay** /
@@ -117,7 +130,7 @@ Coverage: **browser ✓, zone ✓** (both via `track_ended`); **MPD ✓** with t
    `((•))` button; `playTrackIds`/`startRadio` in the web player.
 3. **[DONE] Autoplay + `< 5` refill** — a decoupled `autoplay_loop` (global `autoplay` setting,
    `GET/PUT /api/autoplay`, an "Autoplay" toggle in the queue drawer) that tops up a playing
-   queue (browser + zones) with similar tracks when fewer than 5 remain, sliding the seed to the
+   queue (browser, MPD, Snapcast, native endpoints, and zones) with similar tracks when fewer than 5 remain, sliding the seed to the
    current track and excluding what's queued + recently played.
 4. **[DONE] Per-artist cap** (≤2 per batch, round-robin so no artist dominates). **Next:** a
    skip-penalty cooldown (`event_kind='skipped'`).
