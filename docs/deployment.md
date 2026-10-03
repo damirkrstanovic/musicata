@@ -6,6 +6,30 @@ of this — music sources, players, API keys, and artwork settings all live in t
 the **/admin** Settings page (live, no restart, no config files). Flags and environment
 variables exist only for *bootstrap* (where the library and database live, the bind address).
 
+## Homelab development workspace
+
+For this repository's development environment, run previews, compilation and tests in
+Kubernetes context `homelab-k3s`, namespace `musicata-build`, pod `dev-work`. Its 40 GiB
+`dev-work` PVC holds the checkout at `/home/damirk/src/musicata` and the preview data.
+Keep desktop access lightweight:
+
+```sh
+kubectl --context homelab-k3s -n musicata-build port-forward pod/dev-work 3030:3030
+```
+
+The preview then opens at `http://localhost:3030`. Run builds/tests inside that workspace;
+keep test databases separate from `.musicata/musicata.db`. For example:
+
+```sh
+kubectl --context homelab-k3s -n musicata-build exec dev-work -- bash -lc \
+  'cd /home/damirk/src/musicata && CARGO_HOME="$PWD/.cluster/cargo" cargo build'
+```
+
+This is a development pod, not the production deployment template. The workspace persists
+across pod replacement; the preview process and port-forward must be restarted when their
+processes/pod stop. The previous local preview's library/database remain on the desktop
+as an inactive copy. Do not run both copies as independent writable previews.
+
 ## Running from source
 
 The server scans `testdata` by default and serves the web controller plus JSON APIs:
@@ -91,6 +115,9 @@ cargo test -p musicata-server -- --ignored live_mpd
 ```
 
 ## Deploying a release
+
+For distribution detection, dependency checks, Docker (default) or native systemd installation,
+and upgrades with state backups, use the [Linux installer](install-linux.md).
 
 Musicata ships as a single static binary with the web app embedded — no runtime dependencies.
 Tagged releases attach Linux binaries for x86_64 and aarch64.

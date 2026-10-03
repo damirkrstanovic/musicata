@@ -1642,7 +1642,11 @@ impl QueueState {
             shuffle: self.shuffle,
             queue: self.queue.clone(),
             queue_position: self.position,
-            queue_activity: self.queue_activity.clone(),
+            // Prefetch is internal work while music is playing. Only announce generation
+            // when Next or a drained queue is waiting for the newly appended tracks.
+            queue_activity: self.queue_activity.clone().filter(|activity| {
+                activity != "Finding more tracks…" || self.resume_refill_at.is_some()
+            }),
             next_up: peek_next_index(self).and_then(|index| self.queue.get(index).cloned()),
         }
     }
@@ -3309,6 +3313,42 @@ mod tests {
     use super::*;
     use musicata_core::{Album, Artist, Library, ProviderMapping, Track};
     use std::path::PathBuf;
+
+    #[test]
+    fn autoplay_prefetch_is_quiet_until_playback_waits_for_tracks() {
+        let mut state = QueueState {
+            status: PlaybackStatus::Playing,
+            queue: vec![QueueItem {
+                track_id: Some("seed".into()),
+                ..Default::default()
+            }],
+            position: Some(0),
+            ..Default::default()
+        };
+        let (_, seed) = state.begin_refill(5).expect("prefetch starts");
+        assert!(seed.queue_activity.is_none(), "prefetch is not a user wait");
+        assert!(state.snapshot().queue_activity.is_none());
+        assert!(
+            state.begin_refill(5).is_none(),
+            "quiet work stays deduplicated"
+        );
+
+        state.preserve_refill_resume();
+        assert_eq!(
+            state.snapshot().queue_activity.as_deref(),
+            Some("Finding more tracks…")
+        );
+        state.cancel_refill();
+        assert!(state.snapshot().queue_activity.is_none());
+
+        state.request_refill_resume();
+        assert_eq!(
+            state.snapshot().queue_activity.as_deref(),
+            Some("Finding more tracks…")
+        );
+        state.cancel_refill();
+        assert!(state.snapshot().queue_activity.is_none());
+    }
 
     // ---- ListenTracker (the completion-rule state machine) ----
 

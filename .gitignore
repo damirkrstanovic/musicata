@@ -7,3 +7,6 @@
 
 # Docker Compose runtime library bind mount
 /music/
+
+# Persistent development cache/launchers in the Kubernetes workspace
+/.cluster/

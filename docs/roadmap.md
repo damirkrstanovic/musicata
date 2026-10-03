@@ -984,6 +984,10 @@ Tasks:
   audio permissions/device selection, and local discovery/name resolution where needed.
   Make reruns/upgrades preserve settings and the library, provide backups/recovery and clear
   diagnostics, and test fresh installs and upgrades on each supported distribution family.
+  Initial implementation: [Linux installer](install-linux.md), Docker by default or native
+  systemd, preflight diagnostics, CPU-gated Docker ML, saved upgrade settings and state
+  recovery. Optional audio availability remains constrained by official distro repositories;
+  full boot/device/cast-in validation remains part of this milestone.
 - [x] **Add systemd service examples.** `packaging/musicata.service` (shipped in the release
   archive) runs the server as a locked-down system user with state in `/var/lib/musicata`.
 - [x] **Add Docker or container image.** A `Dockerfile` builds a slim image (snapserver is not

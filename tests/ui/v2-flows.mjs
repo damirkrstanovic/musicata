@@ -607,11 +607,19 @@ if (appendTrack) {
   );
   const liveCount = await js(`document.querySelectorAll('.mix-queue .queue-row').length`);
   check("mix follows tracks appended after generation", liveCount > queuedBeforeAppend, `${queuedBeforeAppend} -> ${liveCount}`);
-  await js(`document.querySelector('.mix-queue .queue-row:last-child .q-main')?.click()`);
+  const beforeSelection = await api("/api/players/browser-local/state");
+  const selectedIndex = liveCount - 1;
+  await js(`document.querySelector('.mix-queue .queue-row[data-index="${selectedIndex}"] .q-main')?.click()`);
   await sleep(400);
+  const afterSelection = await api("/api/players/browser-local/state");
+  const originalIds = beforeSelection.queue.map((item) => item.track_id);
+  // Selecting the tail can legitimately trigger autoplay to append more tracks.
+  // Preserve the original queue prefix and select the requested item, not a fixed length.
   check(
     "mix row plays by queue index without replacing the live queue",
-    (await js(`document.querySelectorAll('.mix-queue .queue-row').length`)) === liveCount,
+    afterSelection?.queue_position === selectedIndex &&
+      JSON.stringify(afterSelection?.queue?.slice(0, originalIds.length).map((item) => item.track_id)) === JSON.stringify(originalIds),
+    `position ${afterSelection?.queue_position}, queue ${originalIds.length} -> ${afterSelection?.queue?.length}`,
   );
 }
 

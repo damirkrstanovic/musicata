@@ -17,7 +17,8 @@
 # /data must be writable by uid 10001 (the image's `musicata` user).
 
 # 1. Build the service. Override the repo's dev-default x86-64-v3 (.cargo/config.toml) with a
-#    portable baseline so the image runs on low-end CPUs.
+#    baseline for Rust. The bundled prebuilt ONNX Runtime still requires x86-64-v3;
+#    this image does NOT run on non-AVX Celerons. The Linux installer checks ML separately.
 #    NOTE: trixie (glibc 2.41), not bookworm — the prebuilt ONNX Runtime that ort downloads is
 #    linked against glibc >= 2.38 (`__isoc23_*` symbols), so it won't link on bookworm (2.36).
 FROM rust:1-trixie AS build

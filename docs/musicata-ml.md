@@ -47,6 +47,13 @@ MUSICATA_ML_DATA_URL=https://huggingface.co/pranjal-pravesh/PANNs_CNN14_ONNX/res
 
 ## Performance
 
+**Linux CPU requirement:** the currently bundled ONNX Runtime requires x86-64-v3, even
+though the Dockerfile builds Rust with an x86-64-v2 baseline. The exact 1.0.9 ML executable
+fails at startup with an illegal instruction on the Mele Celeron N4500 (no AVX/AVX2).
+The Linux installer checks this separately from the server's lower CPU requirement and
+offers ML only for Docker deployments. A compatible remote ML host works with a Celeron
+Musicata server. See [Linux installation](install-linux.md#cpu-eligibility-and-ml).
+
 **CPU only — no GPU.** A **release** build does **~1 s per track** (the whole `testdata` library,
 123 tracks, in ~110 s); inference is sub-second and the cost is mostly the audio decode. GPU
 acceleration was investigated (CUDA/ROCm/MIGraphX/WebGPU execution providers) and **dropped** — on

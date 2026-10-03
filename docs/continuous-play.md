@@ -15,9 +15,10 @@ appends up to ten similar library tracks, using the current song as the seed. Lo
 independently, so a slow output cannot delay another. Zone members are skipped individually;
 the zone refills its canonical queue and forwards the addition once to its members.
 
-The player shows **Finding more tracks…** while a refill is pending. Pressing Next at the
-end remembers the request and starts the first appended track when results arrive; a
-natural end during a lookup does the same. Stop, Pause, replacing/editing the queue, and
+Background prefetch stays quiet while playback can continue. The player shows
+**Finding more tracks…** only when Next or a drained queue is waiting for a refill.
+Pressing Next at the end remembers the request and starts the first appended track when
+results arrive; a natural end during a lookup does the same. Stop, Pause, replacing/editing the queue, and
 turning Autoplay off invalidate pending work. An empty result shows **No more tracks found**.
 Queued tracks and completed listens from the last seven days are excluded, so a small
 library can exhaust eligible candidates.
