@@ -6,16 +6,32 @@ Date: 2026-06-07
 > `src/recommendations.rs` + `web/src/lib/autoplay.svelte.ts`, with the toggle in the
 > player. Read the rest as the design behind what shipped; roadmap M7 tracks follow-ups.
 
-## Current behavior (1.0.8)
+## Current behavior
 
 The global **Autoplay** switch in Queue applies to browser, standalone MPD, Snapcast,
-native endpoints, and zones. Every six seconds a background pass checks playing queues
-with repeat off. With fewer than five upcoming tracks, it appends up to ten similar
-library tracks, using the current song as the seed. Zone members are skipped individually;
+native endpoints, and zones. A background scheduler checks each output every second.
+With repeat off and fewer than five upcoming tracks, it starts one lookup per output and
+appends up to ten similar library tracks, using the current song as the seed. Lookups run
+independently, so a slow output cannot delay another. Zone members are skipped individually;
 the zone refills its canonical queue and forwards the addition once to its members.
-Paused/stopped queues and repeat modes do not refill. Queued tracks and completed listens
-from the last seven days are excluded, so a small library can exhaust eligible candidates.
-The Mix view remains the initial radio selection; the live Queue shows appended tracks.
+
+The player shows **Finding more tracks…** while a refill is pending. Pressing Next at the
+end remembers the request and starts the first appended track when results arrive; a
+natural end during a lookup does the same. Stop, Pause, replacing/editing the queue, and
+turning Autoplay off invalidate pending work. An empty result shows **No more tracks found**.
+Queued tracks and completed listens from the last seven days are excluded, so a small
+library can exhaust eligible candidates.
+
+Starting a radio mix opens the Mix view immediately with loading/error feedback. The Mix
+view follows the selected output's live queue, including appended tracks, and clicking a
+row changes its position without replacing that queue. A late radio response cannot
+replace a newer request or follow the listener to a different output.
+
+All recommendation sources share artist interleaving: allow pairs, then choose another
+artist when one remains available. Local candidate selection distributes its pool across
+matching artists so a large discography cannot hide the alternatives. Autoplay also checks
+the existing queue's last two artists. Sparse libraries can still repeat one artist after
+all suitable alternatives have been used.
 
 The design sections below include aspirations beyond this implementation.
 

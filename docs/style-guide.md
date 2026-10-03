@@ -12,8 +12,9 @@ binary via `rust-embed` from `web/dist/`. Components are `PascalCase.svelte`.
   players & zones, and the activity/error log. Anything administrative or
   long-running lives here, never crowding the player.
 
-Keep the split clean: if a control manages configuration or shows background
-progress/errors, it belongs on `/admin`.
+Keep the split clean: configuration and maintenance progress belong on `/admin`.
+Playback work initiated by the listener (creating a mix or finding the next song) shows
+its loading, empty, and error states in the player, where the action was taken.
 
 ## Browsing (player)
 

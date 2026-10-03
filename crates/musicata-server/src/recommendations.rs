@@ -364,6 +364,61 @@ fn weighted_artist_track_order(
     out
 }
 
+/// Select a varied mix from relevance-ranked candidates. Two adjacent tracks by one artist are
+/// allowed when they are the closest matches, but a third is deferred while another artist is
+/// available anywhere in the candidate pool. `preceding_artists` is the existing queue tail in
+/// playback order, so an autoplay refill cannot extend an already-long run.
+pub fn diversify_track_ids(
+    candidates: &[(String, String)],
+    limit: usize,
+    preceding_artists: &[String],
+) -> Vec<String> {
+    fn key(id: &str, artist: &str) -> String {
+        if artist.trim().is_empty() {
+            format!("\0{id}")
+        } else {
+            artist.to_lowercase()
+        }
+    }
+
+    let mut pending = candidates.to_vec();
+    let mut out = Vec::with_capacity(limit.min(pending.len()));
+    let mut previous = preceding_artists
+        .last()
+        .filter(|artist| !artist.trim().is_empty())
+        .map(|artist| artist.to_lowercase());
+    let mut run = previous.as_ref().map_or(0, |artist| {
+        preceding_artists
+            .iter()
+            .rev()
+            .take_while(|tail| tail.eq_ignore_ascii_case(artist))
+            .count()
+    });
+
+    while out.len() < limit && !pending.is_empty() {
+        let alternative_exists = previous
+            .as_ref()
+            .is_some_and(|last| pending.iter().any(|(id, artist)| key(id, artist) != *last));
+        let pick = pending
+            .iter()
+            .position(|(id, artist)| {
+                let candidate = key(id, artist);
+                !(alternative_exists && previous.as_ref() == Some(&candidate) && run >= 2)
+            })
+            .expect("a candidate is eligible when no alternative exists");
+        let (id, artist) = pending.remove(pick);
+        let candidate = key(&id, &artist);
+        if previous.as_ref() == Some(&candidate) {
+            run += 1;
+        } else {
+            previous = Some(candidate);
+            run = 1;
+        }
+        out.push(id);
+    }
+    out
+}
+
 /// Up to `limit` local track ids to play after `seed_track_id`, highest-relevance first:
 /// **(1)** ListenBrainz **similar-artists** of the seed's artist → those artists' local tracks
 /// (the radio workhorse, **weighted-by-score sampling** so closer artists lead but the tail
@@ -396,10 +451,14 @@ pub async fn similar_track_ids(
         .await
         .unwrap_or_default();
 
-    let mut out: Vec<String> = Vec::new();
+    // Keep a wider pool than the requested mix. Selection happens only after all sources have
+    // contributed, otherwise a seed artist's high local score can fill the batch before a
+    // neighboring artist is ever considered.
+    let candidate_limit = limit.saturating_mul(4).max(limit);
+    let mut candidates: Vec<String> = Vec::new();
     let mut deferred: Vec<String> = Vec::new();
     // Route a candidate to `out` (or `deferred` if it's a frequent skip), de-duplicating via
-    // `seen`. Returns true once `out` has reached `limit`.
+    // `seen`.
     macro_rules! consider {
         ($id:expr) => {{
             let id = $id;
@@ -407,10 +466,9 @@ pub async fn similar_track_ids(
                 if penalized.contains(&id) {
                     deferred.push(id);
                 } else {
-                    out.push(id);
+                    candidates.push(id);
                 }
             }
-            out.len() >= limit
         }};
     }
 
@@ -433,16 +491,14 @@ pub async fn similar_track_ids(
                 }
                 let seed = (now_unix as u64) ^ fnv1a(seed_track_id);
                 for id in weighted_artist_track_order(&artists, &by_artist, seed, PER_ARTIST) {
-                    if consider!(id) {
-                        break;
-                    }
+                    consider!(id);
                 }
             }
         }
     }
 
     // 2. Similar recordings (bonus — often empty for a given recording MBID).
-    if out.len() < limit
+    if candidates.len() < candidate_limit
         && let Ok(Some(mbid)) = database.track_recording_mbid(seed_track_id).await
     {
         let scored = cached_similar_recordings(database, client, &mbid, now_unix).await;
@@ -450,35 +506,43 @@ pub async fn similar_track_ids(
             let mbids: Vec<String> = scored.into_iter().map(|s| s.mbid).collect();
             if let Ok(local) = database.tracks_for_recording_mbids(&mbids).await {
                 for id in local {
-                    if consider!(id) {
-                        break;
-                    }
+                    consider!(id);
                 }
             }
         }
     }
 
     // 3. Local content fallback (always available, no network).
-    if out.len() < limit {
-        let want = ((limit - out.len()) * 4).max(limit) as i64;
+    if candidates.len() < candidate_limit {
+        let want = candidate_limit as i64;
         if let Ok(local) = database.similar_local_track_ids(seed_track_id, want).await {
             for id in local {
-                if consider!(id) {
-                    break;
-                }
+                consider!(id);
             }
         }
     }
 
-    // Pull in the held-back frequent-skips only if we still owe tracks to reach `limit`.
-    for id in deferred {
-        if out.len() >= limit {
-            break;
-        }
-        out.push(id);
+    // Keep frequent skips behind ordinary candidates; they can still fill a sparse library.
+    candidates.extend(deferred);
+    if candidates.is_empty() {
+        return candidates;
     }
-
-    out
+    let mut artist_ids = candidates.clone();
+    artist_ids.push(seed_track_id.to_string());
+    let artists = database
+        .artist_names_for(&artist_ids)
+        .await
+        .unwrap_or_default();
+    // The initial station prepends its seed: include it in the consecutive-artist limit.
+    let preceding: Vec<String> = artists.get(seed_track_id).cloned().into_iter().collect();
+    let ranked: Vec<(String, String)> = candidates
+        .into_iter()
+        .map(|id| {
+            let artist = artists.get(&id).cloned().unwrap_or_default();
+            (id, artist)
+        })
+        .collect();
+    diversify_track_ids(&ranked, limit, &preceding)
 }
 
 #[cfg(test)]
@@ -655,5 +719,88 @@ mod tests {
             high_first > 320,
             "expected High to lead most draws, got {high_first}/400"
         );
+    }
+
+    #[test]
+    fn diversify_track_ids_breaks_a_skewed_local_fallback_run() {
+        // Local similarity ranks the seed artist first. A radio mix must still reach the
+        // other matching artists before returning to that artist.
+        let candidates = [
+            ("a1", "Seed Artist"),
+            ("a2", "Seed Artist"),
+            ("a3", "Seed Artist"),
+            ("a4", "Seed Artist"),
+            ("b1", "Neighbor"),
+            ("c1", "Another Neighbor"),
+        ]
+        .map(|(id, artist)| (id.to_string(), artist.to_string()));
+
+        let mix = diversify_track_ids(&candidates, 6, &[]);
+        let artists: Vec<_> = mix
+            .iter()
+            .map(|id| {
+                candidates
+                    .iter()
+                    .find(|(candidate, _)| candidate == id)
+                    .unwrap()
+                    .1
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(
+            artists,
+            [
+                "Seed Artist",
+                "Seed Artist",
+                "Neighbor",
+                "Seed Artist",
+                "Seed Artist",
+                "Another Neighbor"
+            ]
+        );
+    }
+
+    #[test]
+    fn diversify_track_ids_breaks_runs_across_recommendation_sources() {
+        // Similar artists, similar recordings, and local fallback can all nominate the same
+        // artist. Selection must diversify their combined pool, not each source in isolation.
+        let candidates = [
+            ("artist-a-1", "A"),
+            ("artist-a-2", "A"),
+            ("artist-a-3", "A"),
+            ("artist-b-1", "B"),
+            ("artist-c-1", "C"),
+            ("artist-a-4", "A"),
+        ]
+        .map(|(id, artist)| (id.to_string(), artist.to_string()));
+
+        let mix = diversify_track_ids(&candidates, 6, &[]);
+        let artists: Vec<_> = mix
+            .iter()
+            .map(|id| {
+                candidates
+                    .iter()
+                    .find(|(candidate, _)| candidate == id)
+                    .unwrap()
+                    .1
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(artists, ["A", "A", "B", "A", "C", "A"]);
+    }
+
+    #[test]
+    fn diversify_track_ids_respects_the_existing_autoplay_tail() {
+        let candidates = [("a3", "A"), ("a4", "A"), ("b1", "B"), ("a5", "A")]
+            .map(|(id, artist)| (id.to_string(), artist.to_string()));
+
+        let mix = diversify_track_ids(&candidates, 4, &["A".to_string(), "A".to_string()]);
+        assert_eq!(mix, ["b1", "a3", "a4", "a5"]);
+    }
+
+    #[test]
+    fn diversify_track_ids_keeps_a_single_artist_library_playable() {
+        let candidates = ["a1", "a2", "a3"].map(|id| (id.to_string(), "A".to_string()));
+        assert_eq!(diversify_track_ids(&candidates, 3, &[]), ["a1", "a2", "a3"]);
     }
 }

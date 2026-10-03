@@ -3,6 +3,7 @@
   import { player } from "../lib/player.svelte";
   import { autoplay } from "../lib/autoplay.svelte";
   import { sendCommand } from "../lib/commands";
+  import { playQueueIndex } from "../lib/playback";
   import { initial } from "../lib/dom";
   import { tick } from "svelte";
 
@@ -48,6 +49,9 @@
         {#if !embedded}<button class="ghost-button" type="button" aria-label="Close queue" onclick={close}>Close</button>{/if}
       </div>
     </header>
+    {#if player.queueActivity}
+      <p class="queue-activity" role="status" aria-live="polite">{player.queueActivity}</p>
+    {/if}
 
     {#if player.queue.length === 0}
       <p class="queue-empty">The queue is empty.</p>
@@ -62,7 +66,7 @@
             <button
               class="q-main"
               type="button"
-              onclick={() => sendCommand(player.target, { command: "play_queue_index", index })}
+              onclick={() => playQueueIndex(index)}
             >
               <span class="q-title">{item.title || "Unknown"}</span>
               <span class="q-sub">{[item.artist, item.album].filter(Boolean).join(" · ")}</span>
@@ -97,3 +101,7 @@
     {/if}
   </section>
 {/if}
+
+<style>
+  .queue-activity { margin: 0.7rem 0; color: var(--muted); }
+</style>

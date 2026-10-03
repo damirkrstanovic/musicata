@@ -46,6 +46,9 @@
               : "Reconnecting…")}</strong></button>
       {#if player.connection === "online"}
         <span>{subtitle}</span>
+        {#if player.queueActivity}
+          <span class="queue-activity" role="status" aria-live="polite">{player.queueActivity}</span>
+        {/if}
       {:else}
         <span class="conn-sub">
           Lost the server connection.

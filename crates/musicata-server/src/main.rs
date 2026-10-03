@@ -1067,7 +1067,7 @@ async fn loudness_loop(
 /// Whether continuous play / autoplay is on. **Default on** — when a playing queue nears its end
 /// it keeps the music going; the user can turn it off. Stored as "true"/"false"; unset = on.
 const SETTING_AUTOPLAY: &str = "autoplay";
-const AUTOPLAY_POLL: Duration = Duration::from_secs(6);
+const AUTOPLAY_POLL: Duration = Duration::from_secs(1);
 /// Refill when fewer than this many tracks remain after the current one (Music Assistant's
 /// "Don't Stop The Music" uses the same threshold).
 const AUTOPLAY_MIN_UPCOMING: usize = 5;
@@ -1083,82 +1083,170 @@ async fn autoplay_loop(
     listenbrainz: Arc<recommendations::ListenBrainzClient>,
     mut ready: tokio::sync::watch::Receiver<bool>,
 ) {
-    let musicbrainz = MusicBrainzClient::default();
     let _ = ready.wait_for(|&r| r).await;
+    let musicbrainz = MusicBrainzClient::default();
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut in_flight = std::collections::HashMap::new();
+    let mut tick = tokio::time::interval(AUTOPLAY_POLL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut was_enabled = true;
     loop {
-        tokio::time::sleep(AUTOPLAY_POLL).await;
-        autoplay_pass(&players, &database, &listenbrainz, &musicbrainz).await;
+        tokio::select! {
+            completed = jobs.join_next_with_id(), if !jobs.is_empty() => {
+                if let Some(result) = completed {
+                    let id = match result {
+                        Ok((id, ())) => id,
+                        Err(error) => error.id(),
+                    };
+                    in_flight.remove(&id);
+                }
+            }
+            _ = tick.tick() => {
+                let enabled = bool_setting(&database, SETTING_AUTOPLAY).await;
+                if enabled {
+                    schedule_autoplay_refills(&players, &database, &listenbrainz, &musicbrainz, &mut jobs, &mut in_flight).await;
+                } else if was_enabled {
+                    cancel_autoplay_refills(&players).await;
+                    jobs.abort_all();
+                    in_flight.clear();
+                }
+                was_enabled = enabled;
+            }
+        }
     }
 }
 
-async fn autoplay_pass(
-    players: &players::PlayerManager,
-    database: &Database,
-    listenbrainz: &Arc<recommendations::ListenBrainzClient>,
-    musicbrainz: &MusicBrainzClient,
-) {
-    // Default on: continue unless the user explicitly turned it off.
-    let on = bool_setting(database, SETTING_AUTOPLAY).await;
-    if !on {
-        return;
-    }
+async fn cancel_autoplay_refills(players: &PlayerManager) {
     if let Ok(outputs) = players.descriptors().await {
         for output in outputs {
-            // A zone owns its canonical queue and forwards refills to its members.
-            // Refilling a member independently would duplicate or diverge its queue.
-            if output.zone_id.is_some() || !output.capabilities.queue {
-                continue;
-            }
-            if let Some(handle) = players.get(&output.id).await
-                && let Ok(state) = handle.state(database).await
-                && let Some(ids) =
-                    autoplay_candidates(database, listenbrainz, musicbrainz, &state).await
-            {
-                if let Err(error) = handle
-                    .execute(
-                        PlayerCommand::Enqueue { track_ids: ids },
-                        database,
-                        players.public_base_url(),
-                    )
-                    .await
-                {
-                    tracing::debug!(player = %output.id, %error, "autoplay refill failed");
-                }
+            if let Some(handle) = players.get(&output.id).await {
+                handle.cancel_autoplay_refill().await;
             }
         }
     }
     if let Ok(zones) = players.zones().await {
         for zone in zones {
-            if let Ok(state) = players.zone_state(&zone.id).await
-                && let Some(ids) =
-                    autoplay_candidates(database, listenbrainz, musicbrainz, &state).await
-            {
-                let _ = players
-                    .command_zone(&zone.id, PlayerCommand::Enqueue { track_ids: ids })
-                    .await;
-            }
+            let _ = players.cancel_zone_autoplay_refill(&zone.id).await;
         }
     }
 }
 
-/// Track ids to append if a playing queue is near its end, else `None`. Seed = the current
-/// track; excludes everything already queued. Skips repeat-all (that loops by design).
+/// At most one lookup per output; a slow lookup never delays another output's next pass.
+async fn schedule_autoplay_refills(
+    players: &Arc<players::PlayerManager>,
+    database: &Database,
+    listenbrainz: &Arc<recommendations::ListenBrainzClient>,
+    musicbrainz: &MusicBrainzClient,
+    jobs: &mut tokio::task::JoinSet<()>,
+    in_flight: &mut std::collections::HashMap<tokio::task::Id, String>,
+) {
+    if let Ok(outputs) = players.descriptors().await {
+        for output in outputs {
+            let key = format!("player:{}", output.id);
+            if output.zone_id.is_some()
+                || !output.capabilities.queue
+                || in_flight.values().any(|target| target == &key)
+            {
+                continue;
+            }
+            if let Some(handle) = players.get(&output.id).await {
+                let player_id = output.id;
+                let database = database.clone();
+                let listenbrainz = listenbrainz.clone();
+                let base_url = players.public_base_url().to_string();
+                let musicbrainz = musicbrainz.clone();
+                let task = jobs.spawn(async move {
+                    // Refresh MPD inside its own job: an unreachable daemon must not delay
+                    // checks or feedback on another output.
+                    if handle.state(&database).await.is_err() { return; }
+                    let Some((revision, state)) = handle.begin_autoplay_refill(AUTOPLAY_MIN_UPCOMING).await else { return; };
+                    let ids = autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state)
+                        .await.unwrap_or_default();
+                    if !bool_setting(&database, SETTING_AUTOPLAY).await
+                        || !matches!(database.player_record(&player_id).await, Ok(Some(record)) if record.zone_id.is_none()) {
+                        handle.cancel_autoplay_refill().await;
+                        return;
+                    }
+                    if let Err(error) = handle.finish_autoplay_refill(revision, ids, &database, &base_url).await {
+                        tracing::debug!(player = %player_id, %error, "autoplay refill failed");
+                        handle.cancel_autoplay_refill().await;
+                    }
+                });
+                in_flight.insert(task.id(), key);
+            }
+        }
+    }
+    if let Ok(zones) = players.zones().await {
+        for zone in zones {
+            let key = format!("zone:{}", zone.id);
+            if in_flight.values().any(|target| target == &key) {
+                continue;
+            }
+            let players = players.clone();
+            let database = database.clone();
+            let listenbrainz = listenbrainz.clone();
+            let zone_id = zone.id;
+            let musicbrainz = musicbrainz.clone();
+            let task = jobs.spawn(async move {
+                let Ok(Some((revision, state))) = players
+                    .begin_zone_autoplay_refill(&zone_id, AUTOPLAY_MIN_UPCOMING)
+                    .await
+                else {
+                    return;
+                };
+                let ids = autoplay_candidates(&database, &listenbrainz, &musicbrainz, &state)
+                    .await
+                    .unwrap_or_default();
+                if !bool_setting(&database, SETTING_AUTOPLAY).await {
+                    let _ = players.cancel_zone_autoplay_refill(&zone_id).await;
+                    return;
+                }
+                if let Err(error) = players
+                    .finish_zone_autoplay_refill(&zone_id, revision, ids)
+                    .await
+                {
+                    tracing::debug!(zone = %zone_id, %error, "autoplay refill failed");
+                    let _ = players.cancel_zone_autoplay_refill(&zone_id).await;
+                }
+            });
+            in_flight.insert(task.id(), key);
+        }
+    }
+}
+
+#[cfg(test)]
+async fn autoplay_pass(
+    players: Arc<players::PlayerManager>,
+    database: Database,
+    listenbrainz: Arc<recommendations::ListenBrainzClient>,
+) {
+    if !bool_setting(&database, SETTING_AUTOPLAY).await {
+        return;
+    }
+    let mut jobs = tokio::task::JoinSet::new();
+    schedule_autoplay_refills(
+        &players,
+        &database,
+        &listenbrainz,
+        &crate::MusicBrainzClient::new("http://127.0.0.1:1"),
+        &mut jobs,
+        &mut Default::default(),
+    )
+    .await;
+    while let Some(result) = jobs.join_next().await {
+        result.expect("autoplay worker panicked");
+    }
+}
+
+/// Candidates for an atomically reserved refill. Seed = the current (or just ended) track;
+/// excludes everything already queued. Eligibility is owned by QueueState::begin_refill.
 async fn autoplay_candidates(
     database: &Database,
     listenbrainz: &Arc<recommendations::ListenBrainzClient>,
     musicbrainz: &MusicBrainzClient,
     state: &musicata_core::PlaybackState,
 ) -> Option<Vec<String>> {
-    use musicata_core::{PlaybackStatus, RepeatMode};
-    if !matches!(state.status, PlaybackStatus::Playing) || !matches!(state.repeat, RepeatMode::Off)
-    {
-        return None;
-    }
     let position = state.queue_position?;
-    let upcoming = state.queue.len().saturating_sub(position + 1);
-    if upcoming >= AUTOPLAY_MIN_UPCOMING {
-        return None;
-    }
     let seed = state.queue.get(position)?.track_id.clone()?;
     let exclude: std::collections::HashSet<String> = state
         .queue
@@ -1176,6 +1264,25 @@ async fn autoplay_candidates(
         Some(recommendations::RECENCY_WINDOW_SECONDS), // autoplay: don't repeat recent plays
     )
     .await;
+    let names = database.artist_names_for(&ids).await.unwrap_or_default();
+    let candidates: Vec<_> = ids
+        .into_iter()
+        .map(|id| {
+            let artist = names.get(&id).cloned().unwrap_or_default();
+            (id, artist)
+        })
+        .collect();
+    let tail: Vec<_> = state
+        .queue
+        .iter()
+        .rev()
+        .take(2)
+        .map(|item| item.artist.clone())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let ids = recommendations::diversify_track_ids(&candidates, AUTOPLAY_BATCH, &tail);
     (!ids.is_empty()).then_some(ids)
 }
 
@@ -3481,6 +3588,9 @@ async fn set_autoplay(
         .set_bool_setting(SETTING_AUTOPLAY, body.enabled)
         .await
         .map_err(db_error)?;
+    if !body.enabled {
+        cancel_autoplay_refills(&state.players).await;
+    }
     Ok(Json(body))
 }
 
@@ -3494,10 +3604,15 @@ async fn player_command(
         .get(&id)
         .await
         .ok_or_else(|| AppError::not_found(format!("unknown player: {id}")))?;
-    player
-        .execute(command, &state.database, state.players.public_base_url())
-        .await
-        .map_err(db_error)?;
+    let pending_next = matches!(command, PlayerCommand::Next)
+        && bool_setting(&state.database, SETTING_AUTOPLAY).await
+        && player.request_autoplay_resume().await;
+    if !pending_next {
+        player
+            .execute(command, &state.database, state.players.public_base_url())
+            .await
+            .map_err(db_error)?;
+    }
     // The command always updates the server queue; an MPD player that couldn't be
     // reached reports itself offline. Surface that so the controller can show a clear
     // message — the track is queued and resumes when the player reconnects — rather
@@ -3558,11 +3673,20 @@ async fn zone_command(
     Path(id): Path<String>,
     Json(command): Json<PlayerCommand>,
 ) -> Result<Json<PlaybackState>, AppError> {
-    state
-        .players
-        .command_zone(&id, command)
-        .await
-        .map_err(db_error)?;
+    let pending_next = matches!(command, PlayerCommand::Next)
+        && bool_setting(&state.database, SETTING_AUTOPLAY).await
+        && state
+            .players
+            .request_zone_autoplay_resume(&id)
+            .await
+            .map_err(db_error)?;
+    if !pending_next {
+        state
+            .players
+            .command_zone(&id, command)
+            .await
+            .map_err(db_error)?;
+    }
     let playback = state.players.zone_state(&id).await.map_err(db_error)?;
     Ok(Json(playback))
 }
@@ -7559,6 +7683,7 @@ mod tests {
         ARTWORK_CACHE_CONTROL, BOOL_SETTINGS, Config, DEFAULT_SOURCE_URL, PlayerManager,
         ProviderHandle, ProviderRegistry, acoustid_lookup_duration, app, artwork_etag,
         bool_setting_default, normalize_size, parse_range, resize_to_jpeg,
+        schedule_autoplay_refills,
     };
 
     /// The registry is the single declaration of every boolean setting's default *and* its
@@ -7620,7 +7745,12 @@ mod tests {
     };
     use musicata_core::{Library, LocalDiskProvider, scan_local_library};
     use musicata_storage::Database;
-    use std::{collections::HashMap, fs, path::PathBuf, time::SystemTime};
+    use std::{
+        collections::HashMap,
+        fs,
+        path::PathBuf,
+        time::{Duration, SystemTime},
+    };
     use tower::ServiceExt;
 
     #[test]
@@ -7726,6 +7856,76 @@ mod tests {
                 "track_count": 0,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn autoplay_scheduler_deduplicates_a_held_output_without_blocking_another() {
+        let fixture = TestFixture::new("autoplay-scheduler-isolation");
+        let mut library = fixture.library();
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .expect("connect database");
+        database
+            .save_library(&mut library)
+            .await
+            .expect("save library");
+        let (_app, players) = fixture.app_with_database(database.clone()).await;
+        let second = players
+            .register("native", "second-output", "Second output")
+            .await
+            .expect("register native output");
+
+        let (release_held, held) = tokio::sync::oneshot::channel::<()>();
+        let mut jobs = tokio::task::JoinSet::new();
+        let held_job = jobs.spawn(async move {
+            let _ = held.await;
+        });
+        let mut in_flight = std::collections::HashMap::from([(
+            held_job.id(),
+            format!("player:{}", crate::players::BROWSER_PLAYER_ID),
+        )]);
+        let listenbrainz = std::sync::Arc::new(crate::recommendations::ListenBrainzClient::new());
+
+        schedule_autoplay_refills(
+            &players,
+            &database,
+            &listenbrainz,
+            &crate::MusicBrainzClient::new("http://127.0.0.1:1"),
+            &mut jobs,
+            &mut in_flight,
+        )
+        .await;
+        assert!(
+            in_flight
+                .values()
+                .any(|key| key == &format!("player:{}", second.id)),
+            "the ready second output must be scheduled while browser work is held"
+        );
+        assert_eq!(in_flight.len(), 2, "one task per output");
+
+        // A second poll while the browser job remains pending must neither duplicate browser nor
+        // hold up the second output's task.
+        schedule_autoplay_refills(
+            &players,
+            &database,
+            &listenbrainz,
+            &crate::MusicBrainzClient::new("http://127.0.0.1:1"),
+            &mut jobs,
+            &mut in_flight,
+        )
+        .await;
+        assert_eq!(in_flight.len(), 2, "in-flight outputs are de-duplicated");
+        tokio::time::timeout(Duration::from_millis(250), jobs.join_next())
+            .await
+            .expect("the second output should finish without waiting for the held output")
+            .expect("second output task exists")
+            .expect("second output task succeeds");
+
+        release_held.send(()).expect("release held output");
+        jobs.join_next()
+            .await
+            .expect("held output task exists")
+            .expect("held output task succeeds");
     }
 
     #[tokio::test]

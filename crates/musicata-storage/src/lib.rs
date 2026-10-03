@@ -2382,8 +2382,9 @@ impl Database {
         Ok(diversify(&ranked, limit))
     }
 
-    /// Map a set of track ids to their artist names (order not preserved).
-    async fn artist_names_for(
+    /// Map a set of track ids to artist names (order not preserved). Recommendation selection
+    /// uses this after gathering candidates from several sources.
+    pub async fn artist_names_for(
         &self,
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, String>> {
@@ -2782,8 +2783,9 @@ impl Database {
                  FROM track_metadata_observations o, json_each(o.genres)
                  WHERE o.track_id = ?1
              ),
-             seed AS (SELECT artist_id FROM tracks WHERE id = ?1)
-             SELECT t.id AS id,
+             seed AS (SELECT artist_id FROM tracks WHERE id = ?1),
+             scored AS (
+             SELECT t.id AS id, t.artist_id AS artist_id,
                  (SELECT COUNT(DISTINCT json_each.value)
                   FROM track_metadata_observations o2, json_each(o2.genres)
                   WHERE o2.track_id = t.id AND json_each.value IN (SELECT g FROM seed_genres)) * 10
@@ -2794,7 +2796,16 @@ impl Database {
                      OR EXISTS (SELECT 1 FROM track_metadata_observations o2, json_each(o2.genres)
                                 WHERE o2.track_id = t.id
                                   AND json_each.value IN (SELECT g FROM seed_genres)) )
-             ORDER BY score DESC, RANDOM()
+             ), ranked AS (
+                 SELECT id, score,
+                        ROW_NUMBER() OVER (PARTITION BY artist_id ORDER BY score DESC, RANDOM()) AS artist_rank
+                 FROM scored
+             )
+             SELECT id FROM ranked
+             -- Pull one round of each matching artist before returning for another. This keeps
+             -- a prolific seed artist from consuming the bounded candidate pool while every
+             -- row remains a same-artist or shared-genre match.
+             ORDER BY artist_rank, score DESC, RANDOM()
              LIMIT ?2",
         )
         .bind(seed_track_id)
@@ -7104,6 +7115,58 @@ mod tests {
             ids,
             vec!["track_2", "track_1"],
             "output follows input order"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn local_similarity_pool_keeps_other_artists_when_seed_artist_is_large() {
+        let db_path = temp_db_path("local-similarity-diversity");
+        let database = Database::connect(&db_path).await.unwrap();
+        let mut library = fixture_library();
+        let template = library.tracks[0].clone();
+        library.tracks = (0..221)
+            .map(|i| {
+                let mut track = template.clone();
+                track.id = format!("track_{i}");
+                track.provider.item_id = format!("album/{i}.mp3");
+                track.relative_path = format!("album/{i}.mp3");
+                if i < 201 {
+                    track.artist_id = "artist_a".to_string();
+                    track.artist_name = "Artist A".to_string();
+                } else if i < 211 {
+                    track.artist_id = "artist_b".to_string();
+                    track.artist_name = "Artist B".to_string();
+                } else {
+                    track.artist_id = "artist_c".to_string();
+                    track.artist_name = "Artist C".to_string();
+                }
+                track
+            })
+            .collect();
+        database.save_library(&mut library).await.unwrap();
+
+        // Artist A's same-artist score outranks the shared-genre neighbors. A plain SQL LIMIT
+        // of 100 would therefore contain only A, making a later diversity pass powerless.
+        let candidates = database
+            .similar_local_track_ids("track_0", 100)
+            .await
+            .unwrap();
+        let artists = database.artist_names_for(&candidates).await.unwrap();
+        assert!(
+            candidates
+                .iter()
+                .filter(|id| artists.get(*id).is_some_and(|artist| artist == "Artist B"))
+                .count()
+                >= 10
+        );
+        assert!(
+            candidates
+                .iter()
+                .filter(|id| artists.get(*id).is_some_and(|artist| artist == "Artist C"))
+                .count()
+                >= 10
         );
 
         let _ = std::fs::remove_file(db_path);

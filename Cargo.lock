@@ -2062,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-core"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "lofty",
  "serde",
@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-endpoint"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "anyhow",
  "rodio",
@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-ml"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-server"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-storage"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "anyhow",
  "libsqlite3-sys",

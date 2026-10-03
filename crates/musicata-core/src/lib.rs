@@ -657,6 +657,9 @@ pub struct PlaybackState {
     pub shuffle: bool,
     pub queue: Vec<QueueItem>,
     pub queue_position: Option<usize>,
+    /// Short-lived explanation for a pending background queue operation. Never persisted.
+    #[serde(default)]
+    pub queue_activity: Option<String>,
     /// The track the server will play next, given the current repeat/shuffle order — a hint
     /// for clients that prefetch (the native endpoint's gapless playback). `None` when the
     /// next item can't be predicted (end of a shuffle cycle, or the queue stops at the end).
