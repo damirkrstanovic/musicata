@@ -4132,7 +4132,11 @@ mod tests {
                 "{kind}: autoplay must append similar tracks"
             );
             assert_eq!(state.position, Some(0), "refill must not restart playback");
-            assert_eq!(state.elapsed_seconds, Some(12.0));
+            // Snapcast's live control task may tick while the refill is in flight.
+            assert!(
+                state.elapsed_seconds.is_some_and(|elapsed| elapsed >= 12.0),
+                "refill must not reset playback progress"
+            );
             assert_eq!(state.queue[0].track_id.as_deref(), Some("track_1"));
             let ids: std::collections::HashSet<_> =
                 state.queue.iter().map(|i| &i.track_id).collect();
