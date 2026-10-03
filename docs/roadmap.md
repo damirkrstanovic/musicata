@@ -513,7 +513,7 @@ Tasks:
   (ListenBrainz Labs `similar-recordings`, cached + parser-tested; a local genre/artist fallback;
   MBID→local matcher; recency dedup); **"Start radio from this"** (`/api/tracks/{id}/radio` + a
   footer button); and a decoupled **`autoplay_loop`** (global `autoplay` setting + queue-drawer
-  toggle) that tops up a playing queue (browser + zones) with similar tracks when < 5 remain,
+  toggle) that tops up a playing queue (browser, MPD, Snapcast, native endpoints, and zones) with similar tracks when < 5 remain,
   sliding the seed to the current track. **Variety filters shipped:** a per-artist cap (2),
   **weighted-by-score sampling** of similar artists (closer artists lead but the tail still
   surfaces — fresh ordering each session, deterministic per press; `weighted_artist_track_order`
