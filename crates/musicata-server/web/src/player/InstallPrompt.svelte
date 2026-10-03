@@ -20,6 +20,7 @@
       <span>Add it to your device for a full-screen app.</span>
     </div>
     <button type="button" class="install-go" onclick={() => install.prompt()}>Install</button>
+    <button type="button" class="install-x" onclick={() => install.dismissPrompt()} aria-label="Dismiss">×</button>
   </div>
 {/if}
 
@@ -33,7 +34,7 @@
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    max-width: min(28rem, calc(100vw - 1rem));
+    width: min(28rem, calc(100vw - 1rem));
     padding: 0.6rem 0.75rem;
     border-radius: 0.75rem;
     background: #20242c;
@@ -70,6 +71,9 @@
     line-height: 1;
     cursor: pointer;
     padding: 0 0.25rem;
+  }
+  @media (max-width: 820px) {
+    .install-banner { top: calc(60px + env(safe-area-inset-top)); }
   }
   @media (prefers-reduced-motion: no-preference) {
     .install-banner {

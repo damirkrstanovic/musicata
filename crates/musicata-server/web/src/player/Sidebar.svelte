@@ -11,6 +11,8 @@
   import BrowseFilters from "./BrowseFilters.svelte";
   import AccountMenu from "./AccountMenu.svelte";
 
+  let { onclose, inert = false }: { onclose: () => void; inert?: boolean } = $props();
+
   let playlists = $state<Playlist[]>([]);
   let smart = $state<SmartPlaylist[]>([]);
   let stations = $state<RadioStation[]>([]);
@@ -45,10 +47,11 @@
   }
 </script>
 
-<aside class="library-panel">
+<aside class="library-panel" {inert}>
   <div class="brand">
     <span class="brand-mark">M</span>
     <div class="brand-text"><h1>Musicata</h1><p>Player</p></div>
+    <button class="np-chevron" type="button" aria-label="Close navigation" onclick={onclose}>×</button>
   </div>
 
   <label class="search">

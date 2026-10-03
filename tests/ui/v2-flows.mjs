@@ -37,6 +37,15 @@ function check(name, ok, detail = "") {
 // Behavior phase: pre-create a zone (holding the browser player) and a radio station via the
 // API, so the page loads with them present.
 if (MODE === "behavior") {
+  const saved = await api('/api/playlists', {
+    method: 'POST', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({name: 'Phone playlist'}),
+  });
+  const tracks = await api('/api/tracks?limit=2');
+  await api(`/api/playlists/${saved.id}`, {
+    method: 'PATCH', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({add_track_ids: tracks.items.map(t => t.id)}),
+  });
   const players = (await api("/api/players")) || [];
   const browser = players.find((p) => p.kind === "browser");
   const zone = await api("/api/zones", {
@@ -553,6 +562,74 @@ const r2 = await js(`document.querySelector('.seek-row .time')?.textContent`);
 check("restart resume actually plays on this tab (elapsed advances)", !!r1 && r1 !== r2, `${r1} -> ${r2}`);
 
 check("no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
+// Mobile regression: CSS used to hide the desktop controls without rendering their
+// mobile replacements. Hit-test and tap real controls, rather than DOM .click()
+// (which would also activate off-screen or covered controls).
+async function tapMobile(selector, scroll = false) {
+  if (scroll) await js(`document.querySelector(${JSON.stringify(selector)})?.scrollIntoView({block: 'center'})`);
+  const point = await js(`(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    const x = r.x + r.width / 2, y = r.y + r.height / 2;
+    if (r.width < 1 || r.height < 1 || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return null;
+    return el.contains(document.elementFromPoint(x, y)) ? {x, y} : null;
+  })()`);
+  if (!point) return false;
+  await send("Input.dispatchTouchEvent", {type: "touchStart", touchPoints: [point]});
+  await send("Input.dispatchTouchEvent", {type: "touchEnd", touchPoints: []});
+  await sleep(350);
+  return true;
+}
+async function mobileScreenshot(name) {
+  if (!process.env.MUSICATA_UI_SCREENSHOTS) return;
+  const { mkdir, writeFile } = await import('node:fs/promises');
+  const dir = process.env.MUSICATA_UI_SCREENSHOTS;
+  await mkdir(dir, {recursive: true});
+  const {data} = await send('Page.captureScreenshot', {format: 'png'});
+  await writeFile(`${dir}/${name}.png`, Buffer.from(data, 'base64'));
+}
+await send("Emulation.setTouchEmulationEnabled", {enabled: true});
+for (const [width, height] of [[360, 800], [800, 360], [320, 568]]) {
+  const label = `mobile ${width}x${height}`;
+  await send("Emulation.setDeviceMetricsOverride", {width, height, deviceScaleFactor: 1, mobile: true});
+  await sleep(350);
+  await mobileScreenshot(`${width}x${height}-browse`);
+  const priorStatus = await js('document.querySelector(".transport")?.dataset.status');
+  check(`${label}: playback control is reachable`, await tapMobile('.mini-controls .play'));
+  check(`${label}: playback toggles`, await waitUntil(`document.querySelector('.transport')?.dataset.status !== ${JSON.stringify(priorStatus)}`, 2000) < Infinity);
+  const priorTitle = await js('document.querySelector("#now-title")?.textContent');
+  check(`${label}: next is reachable`, await tapMobile('.mini-controls [aria-label="Next"]'));
+  check(`${label}: next changes track`, await waitUntil(`document.querySelector('#now-title')?.textContent !== ${JSON.stringify(priorTitle)}`, 2000) < Infinity);
+  check(`${label}: queue button is reachable`, await tapMobile('.mini-controls [aria-label="Queue"]'));
+  check(`${label}: queue opens`, await waitUntil('document.querySelector(".queue-drawer")', 1000) < Infinity);
+  check(`${label}: queue receives focus`, await js(`document.activeElement?.getAttribute('aria-label') === 'Close queue'`));
+  await mobileScreenshot(`${width}x${height}-queue`);
+  const queueTitle = await js('document.querySelector(".queue-row .q-title")?.textContent');
+  check(`${label}: queue track is tappable`, await tapMobile('.queue-row .q-main'));
+  check(`${label}: queue selection plays`, !!queueTitle && await waitUntil(`document.querySelector('#now-title')?.textContent === ${JSON.stringify(queueTitle)}`, 2000) < Infinity);
+  check(`${label}: queue closes`, await tapMobile('.queue-head-actions button:last-child'));
+  check(`${label}: queue returns focus`, await js(`document.activeElement?.getAttribute('aria-label') === 'Queue'`));
+  check(`${label}: now playing expands`, await tapMobile('[aria-label="Open Now Playing"]'));
+  await mobileScreenshot(`${width}x${height}-now-playing`);
+  check(`${label}: full playback controls work`, await tapMobile('.transport-buttons .play'));
+  check(`${label}: output selector is visible`, await js(`(() => {const el=document.querySelector('.player-switch-btn'); const r=el.getBoundingClientRect(); return r.width > 0 && r.top >= 0 && r.bottom <= innerHeight && el.contains(document.elementFromPoint(r.x+r.width/2, r.y+r.height/2));})()`));
+  check(`${label}: output preset is tappable`, await tapMobile('.output-btn:last-child', true));
+  check(`${label}: output preset applies volume`, await waitUntil(`Number(document.querySelector('.transport-aux input[aria-label="Volume"]')?.value) === 20`, 2000) < Infinity);
+  await tapMobile('.output-btn:first-child', true);
+  await js('document.querySelector(".right-rail").scrollTop = 0');
+  check(`${label}: now playing closes`, await tapMobile('[aria-label="Close Now Playing"]'));
+  check(`${label}: navigation opens`, await tapMobile('[aria-label="Open navigation"]'));
+  check(`${label}: covered content cannot take focus`, await js(`document.querySelector('.content').inert && document.querySelector('.right-rail').inert`));
+  check(`${label}: saved playlist is tappable`, await tapMobile('.playlist-list .nav-link', true));
+  check(`${label}: saved playlist opens and closes navigation`, await waitUntil(`document.querySelector('.hero-title')?.textContent === 'Phone playlist' && document.querySelector('.hero-sub')?.textContent === '2 tracks' && !document.querySelector('.shell').classList.contains('nav-open')`, 2000) < Infinity);
+  await tapMobile('[aria-label="Open navigation"]');
+  check(`${label}: navigation closes`, await tapMobile('[aria-label="Close navigation"]'));
+  check(`${label}: no horizontal overflow`, await js('document.documentElement.scrollWidth <= innerWidth'));
+}
+
+check("mobile: no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
+
 check("no CSP violations", cspViolations.length === 0, cspViolations.slice(0, 3).join(" | "));
 console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);
 ws.close();

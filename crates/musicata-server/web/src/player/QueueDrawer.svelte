@@ -4,6 +4,23 @@
   import { autoplay } from "../lib/autoplay.svelte";
   import { sendCommand } from "../lib/commands";
   import { initial } from "../lib/dom";
+  import { tick } from "svelte";
+
+  let wasOpen = false;
+  $effect(() => {
+    const open = player.queueOpen;
+    if (!open && !wasOpen) return;
+    wasOpen = open;
+    void tick().then(() => {
+      if (player.queueOpen !== open) return;
+      if (open) {
+        document.querySelector<HTMLButtonElement>('[aria-label="Close queue"]')?.focus();
+      } else {
+        [...document.querySelectorAll<HTMLButtonElement>('.mini-controls [aria-label="Queue"], .queue-btn')]
+          .find(button => button.getClientRects().length > 0 && !button.closest('[inert]'))?.focus();
+      }
+    });
+  });
 
   function close() {
     player.queueOpen = false;
@@ -26,7 +43,7 @@
         <button class="ghost-button" type="button" onclick={() => sendCommand(player.target, { command: "clear" })}>
           Clear
         </button>
-        <button class="ghost-button" type="button" onclick={close}>Close</button>
+        <button class="ghost-button" type="button" aria-label="Close queue" onclick={close}>Close</button>
       </div>
     </header>
 
