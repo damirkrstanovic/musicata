@@ -8729,38 +8729,39 @@ mod tests {
                 shuffle: false,
                 shuffle_order: vec![],
             };
-            let mut write: Pin<Box<dyn Future<Output = anyhow::Result<()>>>> = match operation {
-                "library" => Box::pin(database.save_library(&mut library)),
-                "player" => Box::pin(database.save_player_queue("p", &playback, &[])),
-                "zone" => Box::pin(database.save_zone_queue("z", &playback, &[])),
-                _ => Box::pin(database.replace_activities(&[])),
-            };
-
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            // Advance exactly one poll at a time. While probing, the operation is
-            // parked, so it cannot race all the way through COMMIT before cancellation.
-            loop {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{operation} never acquired its write lock"
-                );
-                std::future::poll_fn(|cx| {
+            // Advance one poll at a time and probe while the operation is parked.
+            // A short operation can finish within one poll if the SQLite worker
+            // keeps up; retry those attempts, but require an actual cancellation.
+            'attempt: loop {
+                let mut write: Pin<Box<dyn Future<Output = anyhow::Result<()>>>> = match operation {
+                    "library" => Box::pin(database.save_library(&mut library)),
+                    "player" => Box::pin(database.save_player_queue("p", &playback, &[])),
+                    "zone" => Box::pin(database.save_zone_queue("z", &playback, &[])),
+                    _ => Box::pin(database.replace_activities(&[])),
+                };
+                loop {
                     assert!(
-                        write.as_mut().poll(cx).is_pending(),
-                        "{operation} finished before cancellation"
+                        std::time::Instant::now() < deadline,
+                        "{operation} never exposed an active write to cancel"
                     );
-                    Poll::Ready(())
-                })
-                .await;
-                match sqlx::query("BEGIN IMMEDIATE").execute(&mut probe).await {
-                    Ok(_) => {
-                        sqlx::query("ROLLBACK").execute(&mut probe).await.unwrap();
+                    let progress =
+                        std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await;
+                    if let Poll::Ready(result) = progress {
+                        result.unwrap();
+                        continue 'attempt;
                     }
-                    Err(error) if is_locked(&error) => break,
-                    Err(error) => panic!("lock probe failed: {error}"),
+                    match sqlx::query("BEGIN IMMEDIATE").execute(&mut probe).await {
+                        Ok(_) => {
+                            sqlx::query("ROLLBACK").execute(&mut probe).await.unwrap();
+                        }
+                        Err(error) if is_locked(&error) => break,
+                        Err(error) => panic!("lock probe failed: {error}"),
+                    }
                 }
+                drop(write);
+                break;
             }
-            drop(write);
 
             // A completely separate connection must be able to write again. A raw
             // BEGIN without a transaction guard leaves the pooled connection locked.
