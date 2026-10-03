@@ -18,6 +18,8 @@ export interface Target {
 class Player {
   activeId = $state<string | null>(null);
   activeKind = $state<TargetKind>("player");
+  /** Advances whenever the selected output changes, even if it later changes back. */
+  targetEpoch = $state(0);
   /** The browser player's id, and the zone it belongs to (if any) — the targets this tab
    *  outputs audio for. */
   browserId = $state<string | null>(null);
@@ -71,6 +73,9 @@ class Player {
   }
   get queuePosition(): number {
     return this.playback?.queue_position ?? -1;
+  }
+  get queueActivity(): string | null {
+    return this.playback?.queue_activity ?? null;
   }
 }
 

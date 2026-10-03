@@ -354,6 +354,7 @@ fn parse_playback_state(
         shuffle: find(status, "random") == Some("1"),
         queue: queue_items,
         queue_position: find(status, "song").and_then(|value| value.parse().ok()),
+        queue_activity: None,
         next_up,
     }
 }

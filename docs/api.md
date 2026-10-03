@@ -186,6 +186,12 @@ consume the connections needed for authentication and browsing.
 
 ### WebSocket: `/api/players/{id}/ws`
 
+`PlaybackState.queue_activity` is an optional, transient listener-facing message (for
+example, “Finding more tracks…” or “No more tracks found”). It is delivered with normal
+state updates, not persisted as playback history. With Autoplay enabled, a terminal `Next`
+can return while a refill is still pending; playback proceeds to the first appended item
+when it arrives. Stop/Pause or replacing the queue cancels that pending intent.
+
 The server pushes a full `PlaybackState` JSON message on every real change (play/
 pause, track change, queue edit, volume/repeat/shuffle):
 

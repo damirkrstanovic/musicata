@@ -542,8 +542,46 @@ const beforeRadio = await api("/api/players/browser-local/state");
 const seedId = beforeRadio?.now_playing?.track_id;
 const e0 = beforeRadio?.elapsed_seconds ?? 0;
 const q0 = beforeRadio?.queue?.length ?? 0;
+// Recommendation lookup may take a while. The click must immediately move to Mix and describe
+// that work instead of looking like a missed tap.
+await js(`(() => {
+  const originalFetch = window.fetch.bind(window);
+  const pending = [];
+  window.__radioPendingCount = 0;
+  window.__radioReleasedCount = 0;
+  window.__releaseHeldRadio = () => pending.shift()?.();
+  window.__restoreRadioFetch = () => { window.fetch = originalFetch; };
+  window.fetch = (input, init) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (url.includes('/audio-radio?')) {
+      return Promise.resolve(new Response(JSON.stringify({ tracks: [] }), {
+        headers: { 'content-type': 'application/json' },
+      }));
+    }
+    if (url.includes('/radio?')) {
+      if (window.__failNextRadio) {
+        window.__failNextRadio = false;
+        return Promise.reject(new Error('Recommendation service unavailable'));
+      }
+      window.__radioPendingCount++;
+      return new Promise((resolve, reject) => pending.push(() => originalFetch(input, init).then(
+        value => { window.__radioReleasedCount++; resolve(value); },
+        error => { window.__radioReleasedCount++; reject(error); },
+      )));
+    }
+    return originalFetch(input, init);
+  };
+})()`);
 await js(`document.querySelector('.radio-btn')?.click()`);
-await sleep(2000);
+check(
+  "radio click immediately shows loading feedback",
+  await js(`document.querySelector('[data-mix-status="loading"]')?.textContent?.includes("Finding more tracks")`),
+);
+await js(`window.__releaseHeldRadio?.()`);
+check(
+  "released radio request populates the live mix",
+  await waitUntil(`document.querySelectorAll('.mix-queue .queue-row').length > 0`, 3000) < Infinity,
+);
 const afterRadio = await api("/api/players/browser-local/state");
 check(
   "radio continues the seed (no restart)",
@@ -555,6 +593,71 @@ check(
   (afterRadio?.queue?.length ?? 0) >= q0,
   `queue ${q0} -> ${afterRadio?.queue?.length}`,
 );
+const queuedBeforeAppend = afterRadio?.queue?.length ?? 0;
+const appendTrack = (await api("/api/tracks?limit=2"))?.items?.find((track) => track.id !== seedId);
+if (appendTrack) {
+  await api("/api/players/browser-local/commands", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ command: "enqueue", track_ids: [appendTrack.id] }),
+  });
+  check(
+    "appended track reaches the live mix",
+    await waitUntil(`document.querySelectorAll('.mix-queue .queue-row').length > ${queuedBeforeAppend}`, 3000) < Infinity,
+  );
+  const liveCount = await js(`document.querySelectorAll('.mix-queue .queue-row').length`);
+  check("mix follows tracks appended after generation", liveCount > queuedBeforeAppend, `${queuedBeforeAppend} -> ${liveCount}`);
+  await js(`document.querySelector('.mix-queue .queue-row:last-child .q-main')?.click()`);
+  await sleep(400);
+  check(
+    "mix row plays by queue index without replacing the live queue",
+    (await js(`document.querySelectorAll('.mix-queue .queue-row').length`)) === liveCount,
+  );
+}
+
+// A held older response must not replace a newer radio request, or spill onto a newly selected
+// output. Audio-radio has a deterministic empty response; normal radio remains held.
+await js(`document.querySelector('.radio-btn')?.click()`);
+check("older radio request is held", await waitUntil(`window.__radioPendingCount === 2`, 1000) < Infinity);
+await clickText(".seg", "Tracks");
+check("track browser opens for newer request", await waitUntil(`document.querySelector('.track-audio-radio')`, 1000) < Infinity);
+await js(`document.querySelector('.track-audio-radio')?.click()`);
+check(
+  "newer audio-radio request completes",
+  await waitUntil(`document.querySelector('[data-mix-status="empty"]')`, 1000) < Infinity,
+);
+const newerMix = await js(`document.querySelector('[data-mix-status="empty"]')?.textContent`);
+await js(`window.__releaseHeldRadio?.()`);
+check("older held request finishes", await waitUntil(`window.__radioReleasedCount === 2`, 3000) < Infinity);
+check(
+  "older radio response cannot overwrite a newer mix",
+  (await js(`document.querySelector('[data-mix-status="empty"]')?.textContent`)) === newerMix,
+);
+await js(`window.__failNextRadio = true; document.querySelector('.radio-btn')?.click()`);
+await waitUntil(`document.querySelector('[data-mix-status="error"]')`, 1000);
+check(
+  "radio request errors are visible in Mix",
+  /recommendation service unavailable/i.test((await js(`document.querySelector('[data-mix-status="error"]')?.textContent`)) || ""),
+);
+await js(`document.querySelector('.radio-btn')?.click()`);
+check("output-switch radio request is held", await waitUntil(`window.__radioPendingCount === 3`, 1000) < Infinity);
+const oldOutputQueueBeforeSwitch = (await api("/api/players/browser-local/state"))?.queue?.length ?? 0;
+await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>/smoke zone/i.test(o.textContent)); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
+check(
+  "output switch completes before stale response release",
+  await waitUntil(`/smoke zone/i.test(document.querySelector('.player-switch-btn option:checked')?.textContent || '')`, 3000) < Infinity,
+);
+await js(`window.__releaseHeldRadio?.()`);
+check("switched-output held request finishes", await waitUntil(`window.__radioReleasedCount === 3`, 3000) < Infinity);
+check(
+  "stale radio response stays off a newly selected output",
+  /different output/i.test((await js(`document.querySelector('.content')?.textContent`)) || ""),
+);
+check(
+  "stale radio response does not change its original output queue",
+  ((await api("/api/players/browser-local/state"))?.queue?.length ?? 0) === oldOutputQueueBeforeSwitch,
+);
+await js(`window.__restoreRadioFetch?.()`);
 // Continuous-play (autoplay) toggle persists through the API.
 await api("/api/autoplay", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true }) });
 check("autoplay toggle persists", (await api("/api/autoplay"))?.enabled === true);

@@ -1,22 +1,68 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// The current "mix" — a seed-based radio (the seed track plus similar/sounds-like tracks). Held
-// here so the Mix view can show what was generated, instead of the tracks vanishing into the
-// queue. Transient (the latest mix); replaced each time you start a new one.
-import type { TrackRow } from "./api";
+// The current seed-based radio request. The output is part of its identity: a late response must
+// never start playback on whichever output the user selected while it was loading.
+import type { Target } from "./player.svelte";
+
+function sameTarget(a: Target | null, b: Target | null): boolean {
+  return a?.kind === b?.kind && a?.id === b?.id;
+}
 
 class RadioMix {
   /** The seed track's title, e.g. shown as "Sounds like {seed}". */
   seed = $state("");
-  tracks = $state<TrackRow[]>([]);
+  target = $state<Target | null>(null);
+  loading = $state(false);
+  empty = $state(false);
+  error = $state<string | null>(null);
+  private request = 0;
+  private targetEpoch = 0;
 
-  /** Replace the current mix. `tracks` is seed-first, as returned by the radio endpoints. */
-  set(tracks: TrackRow[]): void {
-    this.tracks = tracks;
-    this.seed = tracks[0]?.title ?? "";
+  /** Begin a new request and invalidate every earlier response. */
+  begin(target: Target, targetEpoch: number, seed = ""): number {
+    this.request += 1;
+    this.target = target;
+    this.targetEpoch = targetEpoch;
+    this.seed = seed;
+    this.loading = true;
+    this.empty = false;
+    this.error = null;
+    return this.request;
+  }
+
+  isCurrent(request: number, target: Target | null, targetEpoch: number): boolean {
+    return this.request === request && this.targetEpoch === targetEpoch && sameTarget(this.target, target);
+  }
+
+  finish(request: number, target: Target, targetEpoch: number, seed: string, error: string | null): boolean {
+    if (!this.isCurrent(request, target, targetEpoch)) return false;
+    this.loading = false;
+    this.seed = seed;
+    this.error = error;
+    return true;
+  }
+
+  finishEmpty(request: number, target: Target, targetEpoch: number, seed: string): boolean {
+    if (!this.finish(request, target, targetEpoch, seed, null)) return false;
+    this.empty = true;
+    return true;
+  }
+
+  matches(target: Target | null): boolean {
+    return sameTarget(this.target, target);
+  }
+
+  invalidate(): void {
+    this.request += 1;
+    this.loading = false;
+  }
+
+  cancel(): void {
+    this.invalidate();
+    this.target = null;
   }
 
   get active(): boolean {
-    return this.tracks.length > 0;
+    return this.target !== null;
   }
 }
 

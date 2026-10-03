@@ -4,7 +4,7 @@
 import type { BrowserAudio } from "./audio";
 import { api, type TrackRow } from "./api";
 import { sendCommand } from "./commands";
-import { player } from "./player.svelte";
+import { player, type Target } from "./player.svelte";
 import { radioMix } from "./radioMix.svelte";
 import { nav } from "./nav.svelte";
 
@@ -20,8 +20,14 @@ export function getAudio(): BrowserAudio | null {
 }
 
 /** Play `tracks` on the active player, starting at `startIndex`. Call from a click handler. */
-export async function playTracks(tracks: TrackRow[], startIndex = 0): Promise<void> {
-  if (!player.target || !tracks.length) return;
+export async function playTracks(
+  tracks: TrackRow[],
+  startIndex = 0,
+  target = player.target,
+  preserveRadio = false,
+): Promise<boolean> {
+  if (!target || !tracks.length) return false;
+  if (!preserveRadio) radioMix.cancel();
   // Only prime local audio when this tab is the output (browser target); MPD/zone targets
   // play on their own device.
   if (player.isBrowserOutput) {
@@ -29,11 +35,24 @@ export async function playTracks(tracks: TrackRow[], startIndex = 0): Promise<vo
     audio?.claim();
     audio?.primePlay(start.stream_url);
   }
-  await sendCommand(player.target, {
+  return sendCommand(target, {
     command: "play_tracks",
     track_ids: tracks.map((t) => t.id),
     start_index: startIndex,
   });
+}
+
+/** Select a queue item while preserving the browser-output gesture required for audio playback. */
+export function playQueueIndex(index: number): void {
+  const target = player.target;
+  if (!target) return;
+  if (player.isBrowserOutput) {
+    audio?.claim();
+    const stream = player.queue[index]?.stream_url;
+    if (stream) audio?.primePlay(stream);
+  }
+  radioMix.invalidate();
+  void sendCommand(target, { command: "play_queue_index", index });
 }
 
 // ---- Transport verbs ----
@@ -91,10 +110,21 @@ function step(command: "next" | "previous"): void {
 
 /** Start a "radio" from a seed track: the seed plus similar tracks. Call from a click handler. */
 export async function startRadio(seedTrackId: string): Promise<void> {
+  const target = player.target;
+  if (!target) return;
+  const targetEpoch = player.targetEpoch;
   // Claim output inside the gesture before the await, so autoplay policy lets it play.
   if (player.isBrowserOutput) audio?.claim();
-  const res = await api.trackRadio(seedTrackId, 25);
-  await openMix(res?.tracks ?? [], seedTrackId);
+  const request = radioMix.begin(target, targetEpoch, player.nowPlaying?.title ?? "");
+  nav.push({ name: "mix" });
+  try {
+    const res = await api.trackRadio(seedTrackId, 25);
+    await openMix(res?.tracks ?? [], seedTrackId, target, targetEpoch, request);
+  } catch (error) {
+    if (radioMix.isCurrent(request, player.target, player.targetEpoch)) {
+      radioMix.finish(request, target, targetEpoch, player.nowPlaying?.title ?? "", error instanceof Error ? error.message : "Could not find tracks.");
+    }
+  }
 }
 
 /**
@@ -103,28 +133,49 @@ export async function startRadio(seedTrackId: string): Promise<void> {
  * no-op then, just like {@link startRadio}. Call from a click handler.
  */
 export async function startAudioRadio(seedTrackId: string): Promise<void> {
+  const target = player.target;
+  if (!target) return;
+  const targetEpoch = player.targetEpoch;
   if (player.isBrowserOutput) audio?.claim();
-  const res = await api.trackAudioRadio(seedTrackId, 25);
-  await openMix(res?.tracks ?? [], seedTrackId);
+  const request = radioMix.begin(target, targetEpoch, player.nowPlaying?.title ?? "");
+  nav.push({ name: "mix" });
+  try {
+    const res = await api.trackAudioRadio(seedTrackId, 25);
+    await openMix(res?.tracks ?? [], seedTrackId, target, targetEpoch, request);
+  } catch (error) {
+    if (radioMix.isCurrent(request, player.target, player.targetEpoch)) {
+      radioMix.finish(request, target, targetEpoch, player.nowPlaying?.title ?? "", error instanceof Error ? error.message : "Could not find tracks.");
+    }
+  }
 }
 
 /** Show the generated mix in the Mix view and play it. If the seed is already playing, keep it
  *  going and just queue the rest (no restart); otherwise play the whole mix from the seed. */
-async function openMix(tracks: TrackRow[], seedTrackId: string): Promise<void> {
-  if (!tracks.length) return;
-  radioMix.set(tracks);
-  nav.push({ name: "mix" });
-  if (player.nowPlaying?.track_id === seedTrackId && player.status !== "stopped") {
-    const rest = tracks.map((track) => track.id).filter((id) => id !== seedTrackId);
-    if (rest.length) await sendCommand(player.target, { command: "enqueue", track_ids: rest });
+async function openMix(
+  tracks: TrackRow[], seedTrackId: string, target: Target, targetEpoch: number, request: number,
+): Promise<void> {
+  if (!radioMix.isCurrent(request, player.target, player.targetEpoch)) return;
+  const seed = tracks[0]?.title ?? player.nowPlaying?.title ?? "";
+  if (!tracks.length) {
+    radioMix.finishEmpty(request, target, targetEpoch, seed);
     return;
   }
-  await playTracks(tracks, 0);
+  let succeeded: boolean;
+  if (player.nowPlaying?.track_id === seedTrackId && player.status !== "stopped") {
+    const rest = tracks.map((track) => track.id).filter((id) => id !== seedTrackId);
+    succeeded = !rest.length || await sendCommand(target, { command: "enqueue", track_ids: rest });
+  } else {
+    succeeded = await playTracks(tracks, 0, target, true);
+  }
+  if (radioMix.isCurrent(request, player.target, player.targetEpoch)) {
+    radioMix.finish(request, target, targetEpoch, seed, succeeded ? null : "Could not start this mix.");
+  }
 }
 
 /** Play an internet-radio stream on the active target. Call from a click handler. */
 export async function playStream(url: string, title: string): Promise<void> {
   if (!player.target) return;
+  radioMix.cancel();
   if (player.isBrowserOutput) {
     audio?.claim();
     audio?.primePlay(url);

@@ -140,6 +140,62 @@ impl PlayerHandle {
             PlayerHandle::Snapcast(player) => player.execute(command, database, base_url).await,
         }
     }
+
+    /// Mark a terminal queue as waiting for an autoplay refill. The subsequent Next is
+    /// deliberately suppressed by the backend so MPD does not stop before the refill lands.
+    pub async fn request_autoplay_resume(&self) -> bool {
+        match self {
+            Self::Mpd(player) => player.request_autoplay_resume().await,
+            Self::Browser(player) => player.request_autoplay_resume().await,
+            #[cfg(feature = "snapcast")]
+            Self::Snapcast(player) => player.request_autoplay_resume().await,
+        }
+    }
+
+    pub async fn begin_autoplay_refill(&self, min_upcoming: usize) -> Option<(u64, PlaybackState)> {
+        match self {
+            Self::Mpd(player) => player.begin_autoplay_refill(min_upcoming).await,
+            Self::Browser(player) => player.begin_autoplay_refill(min_upcoming).await,
+            #[cfg(feature = "snapcast")]
+            Self::Snapcast(player) => player.begin_autoplay_refill(min_upcoming).await,
+        }
+    }
+
+    pub async fn finish_autoplay_refill(
+        &self,
+        revision: u64,
+        track_ids: Vec<String>,
+        database: &Database,
+        base_url: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Mpd(player) => {
+                player
+                    .finish_autoplay_refill(revision, track_ids, database, base_url)
+                    .await
+            }
+            Self::Browser(player) => {
+                player
+                    .finish_autoplay_refill(revision, track_ids, database)
+                    .await
+            }
+            #[cfg(feature = "snapcast")]
+            Self::Snapcast(player) => {
+                player
+                    .finish_autoplay_refill(revision, track_ids, database, base_url)
+                    .await
+            }
+        }
+    }
+
+    pub async fn cancel_autoplay_refill(&self) {
+        match self {
+            Self::Mpd(player) => player.cancel_autoplay_refill().await,
+            Self::Browser(player) => player.cancel_autoplay_refill().await,
+            #[cfg(feature = "snapcast")]
+            Self::Snapcast(player) => player.cancel_autoplay_refill().await,
+        }
+    }
 }
 
 /// Wall-clock seconds since the Unix epoch. Saturates to 0 before 1970.
@@ -609,7 +665,22 @@ impl PlayerManager {
     }
 
     pub async fn set_zone(&self, id: &str, zone_id: Option<&str>) -> Result<Player> {
-        self.require_record(id).await?;
+        let previous = self.require_record(id).await?;
+        if previous.zone_id.as_deref() != zone_id {
+            if let Some(handle) = self.get(id).await {
+                handle.cancel_autoplay_refill().await;
+            }
+            if let Some(previous_zone) = previous.zone_id.as_deref()
+                && let Some(zone) = self.get_zone(previous_zone).await
+            {
+                zone.cancel_autoplay_refill().await;
+            }
+            if let Some(next_zone) = zone_id
+                && let Some(zone) = self.get_zone(next_zone).await
+            {
+                zone.cancel_autoplay_refill().await;
+            }
+        }
         self.database.update_player_zone(id, zone_id).await?;
         self.descriptor(&self.require_record(id).await?).await
     }
@@ -620,6 +691,7 @@ impl PlayerManager {
         if let Some(entry) = entry {
             let handle = entry.handle.clone();
             drop(entry); // Abort polling/recording before stopping the writer.
+            handle.cancel_autoplay_refill().await;
             match handle {
                 PlayerHandle::Mpd(player) => player.persistence.stop().await,
                 PlayerHandle::Browser(player) => player.persistence.stop().await,
@@ -699,6 +771,7 @@ impl PlayerManager {
         if let Some(entry) = entry {
             let player = entry.player.clone();
             drop(entry);
+            player.cancel_autoplay_refill().await;
             player.persistence.stop().await;
         }
         self.database.delete_zone(id).await
@@ -718,6 +791,61 @@ impl PlayerManager {
         }
         zone.execute(command, &self.database, &self.public_base_url, &members)
             .await
+    }
+
+    pub async fn request_zone_autoplay_resume(&self, zone_id: &str) -> Result<bool> {
+        let zone = self
+            .get_zone(zone_id)
+            .await
+            .ok_or_else(|| anyhow!("unknown zone: {zone_id}"))?;
+        Ok(zone.request_autoplay_resume().await)
+    }
+
+    pub async fn cancel_zone_autoplay_refill(&self, zone_id: &str) -> Result<()> {
+        let zone = self
+            .get_zone(zone_id)
+            .await
+            .ok_or_else(|| anyhow!("unknown zone: {zone_id}"))?;
+        zone.cancel_autoplay_refill().await;
+        Ok(())
+    }
+
+    pub async fn begin_zone_autoplay_refill(
+        &self,
+        zone_id: &str,
+        min_upcoming: usize,
+    ) -> Result<Option<(u64, PlaybackState)>> {
+        let zone = self
+            .get_zone(zone_id)
+            .await
+            .ok_or_else(|| anyhow!("unknown zone: {zone_id}"))?;
+        Ok(zone.begin_autoplay_refill(min_upcoming).await)
+    }
+
+    pub async fn finish_zone_autoplay_refill(
+        &self,
+        zone_id: &str,
+        revision: u64,
+        track_ids: Vec<String>,
+    ) -> Result<()> {
+        let zone = self
+            .get_zone(zone_id)
+            .await
+            .ok_or_else(|| anyhow!("unknown zone: {zone_id}"))?;
+        let mut members = Vec::new();
+        for record in self.database.players_in_zone(zone_id).await? {
+            if let Some(handle) = self.get(&record.id).await {
+                members.push(handle);
+            }
+        }
+        zone.finish_autoplay_refill(
+            revision,
+            track_ids,
+            &self.database,
+            &self.public_base_url,
+            &members,
+        )
+        .await
     }
 
     /// The current playback state of a zone's canonical queue.
@@ -830,6 +958,35 @@ impl MpdPlayer {
         self.state_tx.subscribe()
     }
 
+    async fn request_autoplay_resume(&self) -> bool {
+        let mut state = self.state.lock().await;
+        let requested = state.can_request_refill_resume();
+        if requested {
+            state.request_refill_resume();
+        }
+        drop(state);
+        if requested {
+            self.broadcast().await;
+        }
+        requested
+    }
+
+    async fn begin_autoplay_refill(&self, min_upcoming: usize) -> Option<(u64, PlaybackState)> {
+        let mut state = self.state.lock().await;
+        let refill = state.begin_refill(min_upcoming);
+        drop(state);
+        if refill.is_some() {
+            self.broadcast().await;
+        }
+        refill
+    }
+
+    async fn cancel_autoplay_refill(&self) {
+        let _sync = self.sync.lock().await;
+        self.state.lock().await.cancel_refill();
+        self.broadcast().await;
+    }
+
     /// Build the controller-facing state: the server-owned queue plus the
     /// MPD-derived cursor (now-playing is the queue item at the cursor position).
     async fn snapshot(&self) -> PlaybackState {
@@ -854,10 +1011,24 @@ impl MpdPlayer {
     async fn apply_cursor(&self, status: MpdStatus) {
         let mut state = self.state.lock().await;
         let cursor = status.state;
+        if cursor.status == PlaybackStatus::Stopped
+            && state.queue_activity.is_some()
+            && state
+                .position
+                .is_some_and(|position| position + 1 == state.queue.len())
+        {
+            // MPD owns native auto-advance. If it naturally drains while the lookup is
+            // running, retain the exact first appended index to start on completion.
+            state.preserve_refill_resume();
+        }
         state.status = cursor.status;
-        state.position = cursor
+        let next = cursor
             .queue_position
             .filter(|&index| index < state.queue.len());
+        if cursor.status != PlaybackStatus::Stopped {
+            state.clear_exhaustion_after_advance(next);
+        }
+        state.position = next;
         state.elapsed_seconds = cursor.elapsed_seconds;
         state.duration_seconds = cursor.duration_seconds;
         if cursor.volume.is_some() {
@@ -969,6 +1140,11 @@ impl MpdPlayer {
         public_base_url: &str,
     ) -> Result<()> {
         let _sync = self.sync.lock().await;
+        let defer_next = matches!(command, PlayerCommand::Next)
+            && self.state.lock().await.resume_refill_at.is_some();
+        if !defer_next && cancels_autoplay_refill(&command) {
+            self.state.lock().await.cancel_refill();
+        }
         let mutates_queue = command_mutates_queue(&command);
         if mutates_queue {
             let mut state = self.state.lock().await;
@@ -996,6 +1172,7 @@ impl MpdPlayer {
                         }
                     }
                     Some((None, _)) => connection.play().await?,
+                    None if defer_next => {}
                     None => {
                         apply_command(
                             connection,
@@ -1059,6 +1236,71 @@ impl MpdPlayer {
             };
             self.persist(persist);
         }
+        self.broadcast().await;
+        Ok(())
+    }
+
+    async fn finish_autoplay_refill(
+        &self,
+        revision: u64,
+        track_ids: Vec<String>,
+        database: &Database,
+        _base_url: &str,
+    ) -> Result<()> {
+        let items = resolve_queue_items(database, &track_ids).await?;
+        let appended_uris = queue_to_mpd_uris(&items, &self.public_base_url, &self.stream_auth);
+        let _sync = self.sync.lock().await;
+        let (resume, appended_at, continue_playback) = {
+            let mut state = self.state.lock().await;
+            if state.refill_revision != revision || state.queue_activity.is_none() {
+                return Ok(());
+            }
+            if items.is_empty() {
+                state.queue_activity = Some("No more tracks found".into());
+                drop(state);
+                self.broadcast().await;
+                return Ok(());
+            }
+            let resume = state.resume_refill_at.take();
+            let appended_at = state.queue.len();
+            let continue_playback = state.status == PlaybackStatus::Playing || resume.is_some();
+            state.queue.extend(items);
+            if let Some(position) = resume {
+                state.position = Some(position);
+                state.status = PlaybackStatus::Playing;
+                state.elapsed_seconds = Some(0.0);
+                state.duration_seconds = None;
+            }
+            state.queue_activity = None;
+            state.refill_started = false;
+            (resume, appended_at, continue_playback)
+        };
+        let status = {
+            let mut guard = self.connection.lock().await;
+            let connection = ensure_connected(&mut guard, &self.addr).await?;
+            // Do not reload the queue: that stops MPD and restarts a still-playing seed.
+            for uri in &appended_uris {
+                connection.add(uri).await?;
+            }
+            if let Some(position) = resume {
+                connection.play_index(position).await?;
+            }
+            let mut status = connection.read_status().await?;
+            // The daemon can drain between its last poll and this append. Commands share
+            // `sync`, so a Stop cannot be mistaken for that natural end here.
+            if resume.is_none()
+                && continue_playback
+                && status.state.status == PlaybackStatus::Stopped
+            {
+                connection.play_index(appended_at).await?;
+                status = connection.read_status().await?;
+            }
+            status
+        };
+        self.apply_cursor(status).await;
+        let state = self.state.lock().await;
+        self.persist(QueuePersist::Queue(state.playback(), state.queue.clone()));
+        drop(state);
         self.broadcast().await;
         Ok(())
     }
@@ -1377,6 +1619,13 @@ struct QueueState {
     /// `advance`/`step_previous` walk so every track plays once before any repeats.
     /// Empty when shuffle is off; rebuilt lazily when the queue changes.
     shuffle_order: Vec<usize>,
+    /// UI feedback for a queued autoplay refill; deliberately excluded from persistence.
+    queue_activity: Option<String>,
+    refill_started: bool,
+    /// Bumps whenever a user action invalidates an in-flight refill result.
+    refill_revision: u64,
+    /// First newly appended index to start after an explicit Next or natural drain.
+    resume_refill_at: Option<usize>,
 }
 
 impl QueueState {
@@ -1393,6 +1642,7 @@ impl QueueState {
             shuffle: self.shuffle,
             queue: self.queue.clone(),
             queue_position: self.position,
+            queue_activity: self.queue_activity.clone(),
             next_up: peek_next_index(self).and_then(|index| self.queue.get(index).cloned()),
         }
     }
@@ -1419,6 +1669,69 @@ impl QueueState {
             repeat: self.repeat,
             shuffle: self.shuffle,
             shuffle_order: self.shuffle_order.clone(),
+        }
+    }
+
+    fn cancel_refill(&mut self) {
+        self.refill_revision = self.refill_revision.wrapping_add(1);
+        self.queue_activity = None;
+        self.refill_started = false;
+        self.resume_refill_at = None;
+    }
+
+    fn begin_refill(&mut self, min_upcoming: usize) -> Option<(u64, PlaybackState)> {
+        let seed_position = self.position.or_else(|| {
+            self.resume_refill_at
+                .filter(|&resume| resume > 0)
+                .map(|resume| resume - 1)
+        });
+        let eligible = self.repeat == RepeatMode::Off
+            && (self.status == PlaybackStatus::Playing
+                || self.queue_activity.as_deref() == Some("Finding more tracks…"))
+            && seed_position.is_some_and(|position| {
+                self.queue
+                    .get(position)
+                    .is_some_and(|item| item.track_id.is_some())
+                    && self.queue.len().saturating_sub(position + 1) < min_upcoming
+            });
+        if !eligible || self.refill_started {
+            return None;
+        }
+        self.refill_started = true;
+        self.queue_activity = Some("Finding more tracks…".into());
+        let mut snapshot = self.snapshot();
+        if snapshot.queue_position.is_none() {
+            snapshot.queue_position = seed_position;
+            snapshot.now_playing =
+                seed_position.and_then(|position| self.queue.get(position).cloned());
+        }
+        Some((self.refill_revision, snapshot))
+    }
+
+    fn request_refill_resume(&mut self) {
+        self.resume_refill_at = Some(self.queue.len());
+        self.refill_started = false;
+        self.queue_activity = Some("Finding more tracks…".into());
+    }
+
+    fn preserve_refill_resume(&mut self) {
+        self.resume_refill_at = Some(self.queue.len());
+    }
+
+    fn can_request_refill_resume(&self) -> bool {
+        let position = self
+            .position
+            .or_else(|| self.resume_refill_at.and_then(|at| at.checked_sub(1)));
+        self.repeat == RepeatMode::Off
+            && position.is_some_and(|position| {
+                position + 1 == self.queue.len() && self.queue[position].track_id.is_some()
+            })
+            && (self.status == PlaybackStatus::Playing || self.resume_refill_at.is_some())
+    }
+
+    fn clear_exhaustion_after_advance(&mut self, next: Option<usize>) {
+        if self.position != next && self.queue_activity.as_deref() == Some("No more tracks found") {
+            self.cancel_refill();
         }
     }
 }
@@ -1484,6 +1797,68 @@ impl BrowserPlayer {
         self.state.lock().await.snapshot()
     }
 
+    async fn request_autoplay_resume(&self) -> bool {
+        let mut state = self.state.lock().await;
+        let requested = state.can_request_refill_resume();
+        if requested {
+            state.request_refill_resume();
+        }
+        drop(state);
+        if requested {
+            self.broadcast().await;
+        }
+        requested
+    }
+
+    async fn begin_autoplay_refill(&self, min_upcoming: usize) -> Option<(u64, PlaybackState)> {
+        let mut state = self.state.lock().await;
+        let refill = state.begin_refill(min_upcoming);
+        drop(state);
+        if refill.is_some() {
+            self.broadcast().await;
+        }
+        refill
+    }
+
+    async fn cancel_autoplay_refill(&self) {
+        self.state.lock().await.cancel_refill();
+        self.broadcast().await;
+    }
+
+    async fn finish_autoplay_refill(
+        &self,
+        revision: u64,
+        track_ids: Vec<String>,
+        database: &Database,
+    ) -> Result<()> {
+        let items = resolve_queue_items(database, &track_ids).await?;
+        let persist = {
+            let mut state = self.state.lock().await;
+            if state.refill_revision != revision || state.queue_activity.is_none() {
+                return Ok(());
+            }
+            if items.is_empty() {
+                state.queue_activity = Some("No more tracks found".into());
+                drop(state);
+                self.broadcast().await;
+                return Ok(());
+            }
+            if let Some(position) = state.resume_refill_at.take() {
+                state.position = Some(position);
+                state.status = PlaybackStatus::Playing;
+                state.elapsed_seconds = Some(0.0);
+                state.duration_seconds = None;
+            }
+            state.queue.extend(items);
+            state.queue_activity = None;
+            state.refill_started = false;
+            QueuePersist::Queue(state.playback(), state.queue.clone())
+        };
+        self.persist(persist);
+        self.broadcast().await;
+        Ok(())
+    }
+
     async fn broadcast(&self) {
         let state = self.state.lock().await;
         let _ = self.history_tx.send(state.listen_sample());
@@ -1496,7 +1871,14 @@ impl BrowserPlayer {
         let mutates_queue = command_mutates_queue(&command);
         {
             let mut state = self.state.lock().await;
-            apply_to_queue_state(&mut state, command, database).await?;
+            let defer_next =
+                matches!(command, PlayerCommand::Next) && state.resume_refill_at.is_some();
+            if !defer_next {
+                if cancels_autoplay_refill(&command) {
+                    state.cancel_refill();
+                }
+                apply_to_queue_state(&mut state, command, database).await?;
+            }
             let playback = state.playback();
             let persist = if mutates_queue {
                 QueuePersist::Queue(playback, state.queue.clone())
@@ -1517,6 +1899,9 @@ impl BrowserPlayer {
                 state.elapsed_seconds = Some(0.0);
             } else {
                 advance(&mut state, true);
+                if state.status == PlaybackStatus::Stopped && state.queue_activity.is_some() {
+                    state.preserve_refill_resume();
+                }
             }
             state.playback()
         };
@@ -1576,6 +1961,8 @@ pub struct ZonePlayer {
     /// Where the canonical zone queue is persisted, so it survives a restart.
     database: Database,
     persistence: QueuePersistence,
+    /// Serializes zone commands, refill completion, natural drain, and member driving.
+    sync: Mutex<()>,
     state: Mutex<QueueState>,
     state_tx: broadcast::Sender<PlaybackState>,
     history_tx: broadcast::Sender<ListenSample>,
@@ -1592,6 +1979,7 @@ impl ZonePlayer {
             persistence: QueuePersistence::new(database.clone(), QueueOwner::Zone(zone_id.clone())),
             zone_id,
             database,
+            sync: Mutex::new(()),
             state: Mutex::new(QueueState::default()),
             state_tx,
             history_tx,
@@ -1632,6 +2020,93 @@ impl ZonePlayer {
         self.state.lock().await.snapshot()
     }
 
+    async fn request_autoplay_resume(&self) -> bool {
+        let _sync = self.sync.lock().await;
+        let mut state = self.state.lock().await;
+        let requested = if state.can_request_refill_resume() {
+            state.request_refill_resume();
+            true
+        } else {
+            false
+        };
+        drop(state);
+        if requested {
+            self.broadcast().await;
+        }
+        requested
+    }
+
+    async fn begin_autoplay_refill(&self, min_upcoming: usize) -> Option<(u64, PlaybackState)> {
+        let _sync = self.sync.lock().await;
+        let mut state = self.state.lock().await;
+        let refill = state.begin_refill(min_upcoming);
+        drop(state);
+        if refill.is_some() {
+            self.broadcast().await;
+        }
+        refill
+    }
+
+    async fn cancel_autoplay_refill(&self) {
+        let _sync = self.sync.lock().await;
+        self.state.lock().await.cancel_refill();
+        self.broadcast().await;
+    }
+
+    async fn finish_autoplay_refill(
+        &self,
+        revision: u64,
+        track_ids: Vec<String>,
+        database: &Database,
+        public_base_url: &str,
+        members: &[PlayerHandle],
+    ) -> Result<()> {
+        let _sync = self.sync.lock().await;
+        let items = resolve_queue_items(database, &track_ids).await?;
+        let resume = {
+            let mut state = self.state.lock().await;
+            if state.refill_revision != revision || state.queue_activity.is_none() {
+                return Ok(());
+            }
+            if items.is_empty() {
+                state.queue_activity = Some("No more tracks found".into());
+                drop(state);
+                self.broadcast().await;
+                return Ok(());
+            }
+            let resume = state.resume_refill_at.take();
+            if let Some(position) = resume {
+                state.position = Some(position);
+                state.status = PlaybackStatus::Playing;
+                state.elapsed_seconds = Some(0.0);
+                state.duration_seconds = None;
+            }
+            state.queue.extend(items);
+            state.queue_activity = None;
+            state.refill_started = false;
+            self.persist(QueuePersist::Queue(state.playback(), state.queue.clone()));
+            resume
+        };
+        self.broadcast().await;
+        self.drive_members(
+            &PlayerCommand::Enqueue { track_ids },
+            members,
+            database,
+            public_base_url,
+        )
+        .await;
+        if let Some(index) = resume {
+            self.drive_members(
+                &PlayerCommand::PlayQueueIndex { index },
+                members,
+                database,
+                public_base_url,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
     async fn broadcast(&self) {
         let state = self.state.lock().await;
         let _ = self.history_tx.send(state.listen_sample());
@@ -1648,11 +2123,19 @@ impl ZonePlayer {
         public_base_url: &str,
         members: &[PlayerHandle],
     ) -> Result<()> {
+        let _sync = self.sync.lock().await;
         let mutates_queue = command_mutates_queue(&command);
         // Phase 1: update the canonical queue exactly like the browser player.
         {
             let mut state = self.state.lock().await;
-            apply_to_queue_state(&mut state, command.clone(), database).await?;
+            let defer_next =
+                matches!(command, PlayerCommand::Next) && state.resume_refill_at.is_some();
+            if !defer_next {
+                if cancels_autoplay_refill(&command) {
+                    state.cancel_refill();
+                }
+                apply_to_queue_state(&mut state, command.clone(), database).await?;
+            }
             let playback = state.playback();
             let persist = if mutates_queue {
                 QueuePersist::Queue(playback, state.queue.clone())
@@ -1666,8 +2149,12 @@ impl ZonePlayer {
         // straight off the broadcast above (no extra work). MPD members are driven
         // by forwarding the command — queue ops map 1:1 to MPD and indices stay
         // aligned because MPD's queue mirrors the zone's.
-        self.drive_members(&command, members, database, public_base_url)
-            .await;
+        if !matches!(command, PlayerCommand::Next)
+            || !self.state.lock().await.resume_refill_at.is_some()
+        {
+            self.drive_members(&command, members, database, public_base_url)
+                .await;
+        }
         Ok(())
     }
 
@@ -1704,12 +2191,16 @@ impl ZonePlayer {
     /// The browser output rendering this zone finished the current track: advance
     /// (honoring repeat). MPD members advance on their own — see the type docs.
     pub async fn track_ended(&self) {
+        let _sync = self.sync.lock().await;
         let mut state = self.state.lock().await;
         let playback = {
             if state.repeat == RepeatMode::One {
                 state.elapsed_seconds = Some(0.0);
             } else {
                 advance(&mut state, true);
+                if state.status == PlaybackStatus::Stopped && state.queue_activity.is_some() {
+                    state.preserve_refill_resume();
+                }
             }
             state.playback()
         };
@@ -1755,6 +2246,24 @@ fn command_mutates_queue(command: &PlayerCommand) -> bool {
         PlayerCommand::PlayTracks { .. }
             | PlayerCommand::Enqueue { .. }
             | PlayerCommand::Clear
+            | PlayerCommand::RemoveQueueItem { .. }
+            | PlayerCommand::MoveQueueItem { .. }
+            | PlayerCommand::PlayStream { .. }
+    )
+}
+
+/// A user-directed queue/transport change makes a prior background recommendation stale.
+fn cancels_autoplay_refill(command: &PlayerCommand) -> bool {
+    matches!(
+        command,
+        PlayerCommand::SetRepeat { .. }
+            | PlayerCommand::SetShuffle { .. }
+            | PlayerCommand::Pause
+            | PlayerCommand::Stop
+            | PlayerCommand::Clear
+            | PlayerCommand::PlayQueueIndex { .. }
+            | PlayerCommand::PlayTracks { .. }
+            | PlayerCommand::Enqueue { .. }
             | PlayerCommand::RemoveQueueItem { .. }
             | PlayerCommand::MoveQueueItem { .. }
             | PlayerCommand::PlayStream { .. }
@@ -1910,6 +2419,7 @@ fn advance(state: &mut QueueState, stop_at_end: bool) {
 
     match next {
         Some(position) => {
+            state.clear_exhaustion_after_advance(Some(position));
             state.position = Some(position);
             state.elapsed_seconds = Some(0.0);
             state.duration_seconds = None;
@@ -2210,15 +2720,18 @@ pub struct SnapcastPlayer {
     events_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<WriterEvent>>>,
     /// What the writer currently has loaded, so reconcile avoids re-decoding.
     loaded: Mutex<LoadedTrack>,
+    /// Identifies each writer load so an event from a replaced track cannot move the queue.
+    writer_generation: AtomicU64,
 }
 
 /// What the writer thread is currently rendering / has preloaded.
 #[cfg(feature = "snapcast")]
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LoadedTrack {
     track_id: Option<String>,
     position: Option<usize>,
     next_track_id: Option<String>,
+    generation: u64,
 }
 
 #[cfg(feature = "snapcast")]
@@ -2256,6 +2769,7 @@ impl SnapcastPlayer {
             writer_tx,
             events_rx: std::sync::Mutex::new(Some(events_rx)),
             loaded: Mutex::new(LoadedTrack::default()),
+            writer_generation: AtomicU64::new(1),
         })
     }
 
@@ -2274,6 +2788,71 @@ impl SnapcastPlayer {
 
     pub async fn snapshot(&self) -> PlaybackState {
         self.state.lock().await.snapshot()
+    }
+
+    async fn request_autoplay_resume(&self) -> bool {
+        let mut state = self.state.lock().await;
+        let requested = state.can_request_refill_resume();
+        if requested {
+            state.request_refill_resume();
+        }
+        drop(state);
+        if requested {
+            self.broadcast().await;
+        }
+        requested
+    }
+
+    async fn begin_autoplay_refill(&self, min_upcoming: usize) -> Option<(u64, PlaybackState)> {
+        let mut state = self.state.lock().await;
+        let refill = state.begin_refill(min_upcoming);
+        drop(state);
+        if refill.is_some() {
+            self.broadcast().await;
+        }
+        refill
+    }
+
+    async fn cancel_autoplay_refill(&self) {
+        self.state.lock().await.cancel_refill();
+        self.broadcast().await;
+    }
+
+    async fn finish_autoplay_refill(
+        &self,
+        revision: u64,
+        track_ids: Vec<String>,
+        database: &Database,
+        _base_url: &str,
+    ) -> Result<()> {
+        let items = resolve_queue_items(database, &track_ids).await?;
+        let resume = {
+            let mut state = self.state.lock().await;
+            if state.refill_revision != revision || state.queue_activity.is_none() {
+                return Ok(());
+            }
+            if items.is_empty() {
+                state.queue_activity = Some("No more tracks found".into());
+                drop(state);
+                self.broadcast().await;
+                return Ok(());
+            }
+            let resume = state.resume_refill_at.take();
+            if let Some(position) = resume {
+                state.position = Some(position);
+                state.status = PlaybackStatus::Playing;
+                state.elapsed_seconds = Some(0.0);
+                state.duration_seconds = None;
+            }
+            state.queue.extend(items);
+            state.queue_activity = None;
+            state.refill_started = false;
+            QueuePersist::Queue(state.playback(), state.queue.clone())
+        };
+        self.persist(resume);
+        self.broadcast().await;
+        self.reconcile(&PlayerCommand::Enqueue { track_ids }).await;
+        Ok(())
     }
 
     async fn broadcast(&self) {
@@ -2315,7 +2894,14 @@ impl SnapcastPlayer {
         let mutates_queue = command_mutates_queue(&command);
         {
             let mut state = self.state.lock().await;
-            apply_to_queue_state(&mut state, command.clone(), database).await?;
+            let defer_next =
+                matches!(command, PlayerCommand::Next) && state.resume_refill_at.is_some();
+            if !defer_next {
+                if cancels_autoplay_refill(&command) {
+                    state.cancel_refill();
+                }
+                apply_to_queue_state(&mut state, command.clone(), database).await?;
+            }
             let playback = state.playback();
             let persist = if mutates_queue {
                 QueuePersist::Queue(playback, state.queue.clone())
@@ -2375,17 +2961,35 @@ impl SnapcastPlayer {
             return;
         };
 
+        let is_seek = matches!(command, PlayerCommand::Seek { .. });
         let same = {
             let loaded = self.loaded.lock().await;
-            loaded.track_id.as_deref() == Some(track_id.as_str()) && loaded.position == position
-        };
-        let is_seek = matches!(command, PlayerCommand::Seek { .. });
-        if same {
-            if is_seek {
-                let frame = (elapsed * self.sample_rate as f64) as usize;
-                let _ = self.writer_tx.send(WriterMsg::Seek { frame });
+            if loaded.track_id.as_deref() != Some(track_id.as_str()) || loaded.position != position
+            {
+                false
+            } else {
+                // `reconcile` releases its initial state snapshot before taking `loaded`.
+                // Recheck before waking the writer so Pause/Stop cannot be overtaken by an
+                // old reconcile that would otherwise send SetPlaying(true).
+                let state = self.state.lock().await;
+                let current_matches = state.status == PlaybackStatus::Playing
+                    && state.position == position
+                    && state
+                        .position
+                        .and_then(|index| state.queue.get(index))
+                        .and_then(|item| item.track_id.as_deref())
+                        == Some(track_id.as_str());
+                if current_matches {
+                    if is_seek {
+                        let frame = (elapsed * self.sample_rate as f64) as usize;
+                        let _ = self.writer_tx.send(WriterMsg::Seek { frame });
+                    }
+                    let _ = self.writer_tx.send(WriterMsg::SetPlaying(true));
+                }
+                current_matches
             }
-            let _ = self.writer_tx.send(WriterMsg::SetPlaying(true));
+        };
+        if same {
             self.preload(next_item).await;
             return;
         }
@@ -2401,20 +3005,31 @@ impl SnapcastPlayer {
         let duration = decoded.frames() as f64 / self.sample_rate as f64;
         let gain = leveling_gain(&item);
         let frame = (elapsed * self.sample_rate as f64) as usize;
-        let _ = self.writer_tx.send(WriterMsg::Load {
-            track: decoded,
-            start_frame: frame,
-            gain,
-        });
-        let _ = self.writer_tx.send(WriterMsg::SetPlaying(true));
         {
             let mut loaded = self.loaded.lock().await;
+            let mut state = self.state.lock().await;
+            if state.status != PlaybackStatus::Playing
+                || state.position != position
+                || state
+                    .position
+                    .and_then(|i| state.queue.get(i))
+                    .and_then(|item| item.track_id.as_deref())
+                    != Some(track_id.as_str())
+            {
+                return; // A user command overtook the decode; it owns the output now.
+            }
+            let generation = self.writer_generation.fetch_add(1, Ordering::Relaxed);
+            let _ = self.writer_tx.send(WriterMsg::Load {
+                track: decoded,
+                start_frame: frame,
+                gain,
+                generation,
+            });
+            let _ = self.writer_tx.send(WriterMsg::SetPlaying(true));
             loaded.track_id = Some(track_id);
             loaded.position = position;
             loaded.next_track_id = None;
-        }
-        {
-            let mut state = self.state.lock().await;
+            loaded.generation = generation;
             state.duration_seconds = Some(duration);
         }
         self.broadcast().await;
@@ -2425,22 +3040,47 @@ impl SnapcastPlayer {
     /// unless it is already preloaded (so this is cheap to call on every command).
     async fn preload(&self, next_item: Option<QueueItem>) {
         let next_track_id = next_item.as_ref().and_then(|item| item.track_id.clone());
-        {
+        let generation = {
             let mut loaded = self.loaded.lock().await;
             if loaded.next_track_id == next_track_id {
                 return;
             }
             loaded.next_track_id = next_track_id.clone();
-        }
+            loaded.generation
+        };
         let (Some(track_id), Some(item)) = (next_track_id, next_item) else {
             return;
         };
         match self.decode(&track_id).await {
             Ok(decoded) => {
-                let _ = self.writer_tx.send(WriterMsg::Preload {
-                    track: decoded,
-                    gain: leveling_gain(&item),
-                });
+                let loaded = self.loaded.lock().await;
+                let state = self.state.lock().await;
+                let current_matches = state.status == PlaybackStatus::Playing
+                    && state.position == loaded.position
+                    && state
+                        .position
+                        .and_then(|index| state.queue.get(index))
+                        .and_then(|item| item.track_id.as_deref())
+                        == loaded.track_id.as_deref();
+                let actual_next = next_index(
+                    state.position,
+                    state.queue.len(),
+                    state.repeat,
+                    active_shuffle(&state),
+                )
+                .and_then(|index| state.queue.get(index))
+                .and_then(|item| item.track_id.as_deref());
+                if loaded.generation == generation
+                    && loaded.next_track_id.as_deref() == Some(track_id.as_str())
+                    && current_matches
+                    && actual_next == Some(track_id.as_str())
+                {
+                    let _ = self.writer_tx.send(WriterMsg::Preload {
+                        track: decoded,
+                        gain: leveling_gain(&item),
+                        generation,
+                    });
+                }
             }
             Err(error) => {
                 tracing::debug!(player = %self.id, track = %track_id, %error, "snapcast: preload decode failed");
@@ -2474,8 +3114,8 @@ impl SnapcastPlayer {
             loop {
                 tokio::select! {
                     event = events.recv() => match event {
-                        Some(WriterEvent::Advanced) => self.on_advanced().await,
-                        Some(WriterEvent::Drained) => self.on_drained().await,
+                        Some(WriterEvent::Advanced { generation }) => self.on_advanced(generation).await,
+                        Some(WriterEvent::Drained { generation }) => self.on_drained(generation).await,
                         None => break,
                     },
                     _ = ticker.tick() => self.on_tick().await,
@@ -2485,15 +3125,33 @@ impl SnapcastPlayer {
     }
 
     /// The writer rolled gaplessly into the preloaded next track — advance our cursor.
-    async fn on_advanced(&self) {
+    async fn on_advanced(&self, generation: u64) {
         let (new_position, new_track_id, next_item) = {
+            // Keep the output generation locked through the cursor transition. A Load that
+            // wins this lock owns the output; a writer event for the superseded Load must
+            // leave both the state and loaded marker untouched.
+            let mut loaded = self.loaded.lock().await;
+            if loaded.generation != generation {
+                return;
+            }
             let mut state = self.state.lock().await;
+            if state.status != PlaybackStatus::Playing
+                || state.position != loaded.position
+                || state
+                    .position
+                    .and_then(|index| state.queue.get(index))
+                    .and_then(|item| item.track_id.as_deref())
+                    != loaded.track_id.as_deref()
+            {
+                return;
+            }
             let new_position = next_index(
                 state.position,
                 state.queue.len(),
                 state.repeat,
                 active_shuffle(&state),
             );
+            state.clear_exhaustion_after_advance(new_position);
             state.position = new_position;
             state.elapsed_seconds = Some(0.0);
             state.duration_seconds = None;
@@ -2507,20 +3165,26 @@ impl SnapcastPlayer {
                 active_shuffle(&state),
             )
             .and_then(|index| state.queue.get(index).cloned());
-            (new_position, new_track_id, next)
-        };
-        {
-            let mut loaded = self.loaded.lock().await;
             loaded.position = new_position;
             loaded.track_id = new_track_id.clone();
             loaded.next_track_id = None;
-        }
+            (new_position, new_track_id, next)
+        };
         // Best-effort: set the seek-bar duration for the new current track.
         if let Some(track_id) = &new_track_id
             && let Ok(Some(track)) = self.database.track(track_id).await
         {
             let mut state = self.state.lock().await;
-            state.duration_seconds = track.duration_seconds;
+            if state.status == PlaybackStatus::Playing
+                && state.position == new_position
+                && state
+                    .position
+                    .and_then(|index| state.queue.get(index))
+                    .and_then(|item| item.track_id.as_deref())
+                    == Some(track_id.as_str())
+            {
+                state.duration_seconds = track.duration_seconds;
+            }
         }
         self.broadcast().await;
         self.persist_playback().await;
@@ -2528,15 +3192,56 @@ impl SnapcastPlayer {
     }
 
     /// The queue drained with nothing preloaded — stop.
-    async fn on_drained(&self) {
-        {
+    async fn on_drained(&self, generation: u64) {
+        let advance = {
+            // See on_advanced: do not release `loaded` between validating an event and
+            // clearing it, or a completed replacement decode can be wiped by this drain.
+            let mut loaded = self.loaded.lock().await;
+            if loaded.generation != generation {
+                return;
+            }
             let mut state = self.state.lock().await;
-            state.status = PlaybackStatus::Stopped;
-            state.elapsed_seconds = Some(0.0);
-        }
-        *self.loaded.lock().await = LoadedTrack::default();
+            if state.status != PlaybackStatus::Playing
+                || state.position != loaded.position
+                || state
+                    .position
+                    .and_then(|index| state.queue.get(index))
+                    .and_then(|item| item.track_id.as_deref())
+                    != loaded.track_id.as_deref()
+            {
+                return;
+            }
+            let next = next_index(
+                state.position,
+                state.queue.len(),
+                state.repeat,
+                active_shuffle(&state),
+            );
+            if let Some(position) = next {
+                state.position = Some(position);
+                state.elapsed_seconds = Some(0.0);
+                state.duration_seconds = None;
+                *loaded = LoadedTrack::default();
+                true
+            } else {
+                if state.queue_activity.is_some()
+                    && state
+                        .position
+                        .is_some_and(|position| position + 1 == state.queue.len())
+                {
+                    state.preserve_refill_resume();
+                }
+                state.status = PlaybackStatus::Stopped;
+                state.elapsed_seconds = Some(0.0);
+                *loaded = LoadedTrack::default();
+                false
+            }
+        };
         self.broadcast().await;
         self.persist_playback().await;
+        if advance {
+            self.reconcile(&PlayerCommand::Next).await;
+        }
     }
 
     /// Advance the displayed elapsed position once per second while playing, mirroring the
@@ -3674,6 +4379,283 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
     }
 
+    #[tokio::test]
+    async fn mpd_terminal_next_waits_for_a_pending_refill_without_sending_next() {
+        let db_path = temp_db("mpd-pending-refill");
+        let database = Database::connect(&db_path).await.unwrap();
+        let player = MpdPlayer::new(
+            "mpd-pending".into(),
+            "unused".into(),
+            database.clone(),
+            "http://host".into(),
+            MpdStreamAuth::new(),
+        );
+        {
+            let mut state = player.state.lock().await;
+            state.queue = vec![QueueItem {
+                track_id: Some("seed".into()),
+                stream_url: "http://radio.example/seed".into(),
+                ..Default::default()
+            }];
+            state.position = Some(0);
+            state.status = PlaybackStatus::Playing;
+        }
+        assert!(player.request_autoplay_resume().await);
+        assert!(player.begin_autoplay_refill(5).await.is_some());
+        let (connection, script) = scripted_mpd(vec![
+            ("status".into(), "playlist: 0\nstate: stop\n".into()),
+            ("currentsong".into(), String::new()),
+        ])
+        .await;
+        *player.connection.lock().await = Some(connection);
+        player
+            .execute(PlayerCommand::Next, &database, "http://host")
+            .await
+            .unwrap();
+        script.await.unwrap(); // Script contains no `next`: terminal intent held locally.
+        assert_eq!(player.state.lock().await.resume_refill_at, Some(1));
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn mpd_refill_restarts_at_appended_track_if_daemon_drains_after_add() {
+        let db_path = temp_db("mpd-refill-drain");
+        let database = Database::connect(&db_path).await.unwrap();
+        let mut library = library_with_tracks(2);
+        database.save_library(&mut library).await.unwrap();
+        let player = MpdPlayer::new(
+            "mpd-refill".into(),
+            "unused".into(),
+            database.clone(),
+            "http://host".into(),
+            MpdStreamAuth::new(),
+        );
+        {
+            let mut state = player.state.lock().await;
+            state.queue = resolve_queue_items(&database, &["track_1".into()])
+                .await
+                .unwrap();
+            state.position = Some(0);
+            state.status = PlaybackStatus::Playing;
+        }
+        let (revision, _) = player.begin_autoplay_refill(5).await.unwrap();
+        let appended = player.stream_auth.track_url("http://host", "track_2");
+        let (connection, script) = scripted_mpd(vec![
+            (format!("add \"{appended}\""), String::new()),
+            ("status".into(), "playlist: 1\nstate: stop\n".into()),
+            ("currentsong".into(), String::new()),
+            ("play 1".into(), String::new()),
+            (
+                "status".into(),
+                "playlist: 1\nstate: play\nsong: 1\n".into(),
+            ),
+            ("currentsong".into(), format!("file: {appended}\n")),
+        ])
+        .await;
+        *player.connection.lock().await = Some(connection);
+        player
+            .finish_autoplay_refill(revision, vec!["track_2".into()], &database, "http://host")
+            .await
+            .unwrap();
+        script.await.unwrap();
+        assert_eq!(player.snapshot().await.queue_position, Some(1));
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn autoplay_pending_next_resumes_at_the_first_appended_track_and_cancels_stale_work() {
+        let db_path = temp_db("autoplay-pending-next");
+        let database = Database::connect(&db_path).await.unwrap();
+        let mut library = library_with_tracks(3);
+        database.save_library(&mut library).await.unwrap();
+        let player = Arc::new(BrowserPlayer::new(database.clone(), "autoplay-test".into()));
+        {
+            let mut state = player.state.lock().await;
+            state.queue = resolve_queue_items(&database, &["track_1".into()])
+                .await
+                .unwrap();
+            state.position = Some(0);
+            state.status = PlaybackStatus::Playing;
+        }
+        let handle = PlayerHandle::Browser(player.clone());
+        assert!(handle.request_autoplay_resume().await);
+        let (revision, _) = handle.begin_autoplay_refill(5).await.unwrap();
+        handle
+            .execute(PlayerCommand::Next, &database, "")
+            .await
+            .unwrap();
+        handle
+            .finish_autoplay_refill(revision, vec!["track_2".into()], &database, "")
+            .await
+            .unwrap();
+        let state = player.snapshot().await;
+        assert_eq!(state.queue_position, Some(1));
+        assert_eq!(
+            state.now_playing.unwrap().track_id.as_deref(),
+            Some("track_2")
+        );
+        assert!(state.queue_activity.is_none());
+
+        let (revision, _) = handle.begin_autoplay_refill(5).await.unwrap();
+        handle
+            .execute(PlayerCommand::Stop, &database, "")
+            .await
+            .unwrap();
+        handle
+            .finish_autoplay_refill(revision, vec!["track_3".into()], &database, "")
+            .await
+            .unwrap();
+        assert_eq!(
+            player.snapshot().await.queue.len(),
+            2,
+            "stop cancels stale refill"
+        );
+
+        for (command, expected_len) in [
+            (PlayerCommand::Pause, 1),
+            (PlayerCommand::Clear, 0),
+            (
+                PlayerCommand::PlayTracks {
+                    track_ids: vec!["track_1".into()],
+                    start_index: 0,
+                },
+                1,
+            ),
+        ] {
+            {
+                let mut state = player.state.lock().await;
+                state.queue = resolve_queue_items(&database, &["track_1".into()])
+                    .await
+                    .unwrap();
+                state.position = Some(0);
+                state.status = PlaybackStatus::Playing;
+            }
+            let (revision, _) = handle.begin_autoplay_refill(5).await.unwrap();
+            handle.execute(command, &database, "").await.unwrap();
+            handle
+                .finish_autoplay_refill(revision, vec!["track_2".into()], &database, "")
+                .await
+                .unwrap();
+            assert_eq!(
+                player.snapshot().await.queue.len(),
+                expected_len,
+                "user command cancels refill"
+            );
+        }
+        {
+            let mut state = player.state.lock().await;
+            state.status = PlaybackStatus::Playing;
+            state.position = Some(0);
+        }
+        let (revision, _) = handle.begin_autoplay_refill(5).await.unwrap();
+        player.track_ended().await;
+        handle
+            .finish_autoplay_refill(revision, vec!["track_2".into()], &database, "")
+            .await
+            .unwrap();
+        assert_eq!(
+            player.snapshot().await.queue_position,
+            Some(1),
+            "natural drain resumes refill"
+        );
+
+        let (revision, _) = handle.begin_autoplay_refill(5).await.unwrap();
+        handle
+            .finish_autoplay_refill(revision, Vec::new(), &database, "")
+            .await
+            .unwrap();
+        assert_eq!(
+            player.snapshot().await.queue_activity.as_deref(),
+            Some("No more tracks found")
+        );
+        assert!(
+            handle.begin_autoplay_refill(5).await.is_none(),
+            "empty results do not retry each poll"
+        );
+        player.track_ended().await;
+        assert!(
+            handle.begin_autoplay_refill(5).await.is_none(),
+            "draining an exhausted mix does not retry"
+        );
+        assert!(
+            handle.request_autoplay_resume().await,
+            "Next explicitly retries an exhausted mix"
+        );
+        let (revision, seed) = handle.begin_autoplay_refill(5).await.unwrap();
+        assert_eq!(seed.queue_position, Some(1));
+        handle
+            .finish_autoplay_refill(revision, vec!["track_3".into()], &database, "")
+            .await
+            .unwrap();
+        assert_eq!(player.snapshot().await.queue_position, Some(2));
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn zone_autoplay_refill_serializes_next_drain_and_stop() {
+        let db_path = temp_db("zone-autoplay-pending");
+        let database = Database::connect(&db_path).await.unwrap();
+        let mut library = library_with_tracks(3);
+        database.save_library(&mut library).await.unwrap();
+        let manager = PlayerManager::load(
+            database.clone(),
+            "http://host".into(),
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+        )
+        .await
+        .unwrap();
+        let zone = manager.create_zone("Pending zone").await.unwrap();
+        manager
+            .command_zone(
+                &zone.id,
+                PlayerCommand::PlayTracks {
+                    track_ids: vec!["track_1".into()],
+                    start_index: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let (revision, _) = manager
+            .begin_zone_autoplay_refill(&zone.id, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            manager
+                .request_zone_autoplay_resume(&zone.id)
+                .await
+                .unwrap()
+        );
+        manager
+            .command_zone(&zone.id, PlayerCommand::Next)
+            .await
+            .unwrap();
+        manager
+            .finish_zone_autoplay_refill(&zone.id, revision, vec!["track_2".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.zone_state(&zone.id).await.unwrap().queue_position,
+            Some(1)
+        );
+
+        let (revision, _) = manager
+            .begin_zone_autoplay_refill(&zone.id, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .command_zone(&zone.id, PlayerCommand::Stop)
+            .await
+            .unwrap();
+        manager
+            .finish_zone_autoplay_refill(&zone.id, revision, vec!["track_3".into()])
+            .await
+            .unwrap();
+        assert_eq!(manager.zone_state(&zone.id).await.unwrap().queue.len(), 2);
+        let _ = std::fs::remove_file(db_path);
+    }
+
     async fn scripted_mpd(
         script: Vec<(String, String)>,
     ) -> (MpdConnection, tokio::task::JoinHandle<()>) {
@@ -4046,6 +5028,76 @@ mod tests {
         let near_clip = leveling_gain(&item(Some(-30.0), Some(-0.5)));
         assert!((near_clip - 10f32.powf(0.5 / 20.0)).abs() < 1e-3);
     }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
+    async fn snapcast_drain_after_refill_advances_appended_track_and_ignores_stale_event() {
+        let path = temp_db("snapcast-drain-refill-race");
+        let database = Database::connect(&path).await.unwrap();
+        let mut library = library_with_tracks(2);
+        database.save_library(&mut library).await.unwrap();
+        let manager = PlayerManager::load(
+            database.clone(),
+            "http://localhost".into(),
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+        )
+        .await
+        .unwrap();
+        let settings = crate::snapcast::SnapcastSettings {
+            manage_server: false,
+            fifo_path: path.with_extension("fifo"),
+            ..Default::default()
+        };
+        let snap = Arc::new(SnapcastManager::start(settings).await.unwrap());
+        let fifo_reader = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(snap.fifo_path())
+            .unwrap();
+        manager.enable_snapcast(snap).await.unwrap();
+        let player = match manager.get(SNAPCAST_PLAYER_ID).await.unwrap() {
+            PlayerHandle::Snapcast(player) => player,
+            _ => unreachable!("Snapcast handle"),
+        };
+        {
+            let mut state = player.state.lock().await;
+            state.queue = resolve_queue_items(&database, &["track_1".into(), "track_2".into()])
+                .await
+                .unwrap();
+            state.position = Some(0);
+            state.status = PlaybackStatus::Playing;
+        }
+        *player.loaded.lock().await = LoadedTrack {
+            track_id: Some("track_1".into()),
+            position: Some(0),
+            next_track_id: None,
+            generation: 41,
+        };
+
+        // The writer drained just after a refill appended track_2 but before it consumed the
+        // preload. The event must advance to that appended item instead of stopping.
+        player.on_drained(41).await;
+        let state = player.snapshot().await;
+        assert_eq!(state.queue_position, Some(1));
+        assert_eq!(state.status, PlaybackStatus::Playing);
+
+        // A queued drain from the replaced output must not move the new output, even when it
+        // happens to be at the same queue index and track as the newly loaded state.
+        *player.loaded.lock().await = LoadedTrack {
+            track_id: Some("track_2".into()),
+            position: Some(1),
+            next_track_id: None,
+            generation: 42,
+        };
+        player.on_drained(41).await;
+        assert_eq!(player.snapshot().await.queue_position, Some(1));
+
+        drop(fifo_reader);
+        drop(manager);
+        let _ = std::fs::remove_file(path.with_extension("fifo"));
+        let _ = std::fs::remove_file(path);
+    }
+
     // Drive real backend queues without requiring audio hardware or external services.
     // The old browser-only pass leaves both of these playing queues at one track.
     async fn assert_autoplay_refills(kind: &str) {
@@ -4109,12 +5161,11 @@ mod tests {
         let lb = Arc::new(crate::recommendations::ListenBrainzClient::with_base_url(
             "http://127.0.0.1:1",
         ));
-        let mb = crate::musicbrainz::MusicBrainzClient::default();
         database
             .set_bool_setting(crate::SETTING_AUTOPLAY, false)
             .await
             .unwrap();
-        crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+        crate::autoplay_pass(manager.clone(), database.clone(), lb.clone()).await;
         assert_eq!(
             state.lock().await.queue.len(),
             1,
@@ -4124,7 +5175,7 @@ mod tests {
             .set_bool_setting(crate::SETTING_AUTOPLAY, true)
             .await
             .unwrap();
-        crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+        crate::autoplay_pass(manager.clone(), database.clone(), lb.clone()).await;
         {
             let state = state.lock().await;
             assert!(
@@ -4147,7 +5198,7 @@ mod tests {
             );
         }
         let filled = state.lock().await.queue.len();
-        crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+        crate::autoplay_pass(manager.clone(), database.clone(), lb.clone()).await;
         assert_eq!(
             state.lock().await.queue.len(),
             filled,
@@ -4157,7 +5208,7 @@ mod tests {
         let zone = manager.create_zone("Autoplay test zone").await.unwrap();
         manager.set_zone(&id, Some(&zone.id)).await.unwrap();
         state.lock().await.queue.truncate(1);
-        crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+        crate::autoplay_pass(manager.clone(), database.clone(), lb.clone()).await;
         assert_eq!(
             state.lock().await.queue.len(),
             1,
@@ -4173,7 +5224,7 @@ mod tests {
             )
             .await
             .unwrap();
-        crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+        crate::autoplay_pass(manager.clone(), database.clone(), lb.clone()).await;
         let zone_state = manager.zone_state(&zone.id).await.unwrap();
         assert!(zone_state.queue.len() > 1, "zones must still refill");
         if kind == "browser" {
@@ -4190,7 +5241,7 @@ mod tests {
         state.lock().await.queue.truncate(1);
         for status in [PlaybackStatus::Paused, PlaybackStatus::Stopped] {
             state.lock().await.status = status;
-            crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+            crate::autoplay_pass(manager.clone(), database.clone(), lb.clone()).await;
             assert_eq!(state.lock().await.queue.len(), 1);
         }
         {
@@ -4198,7 +5249,7 @@ mod tests {
             state.status = PlaybackStatus::Playing;
             state.repeat = RepeatMode::All;
         }
-        crate::autoplay_pass(&manager, &database, &lb, &mb).await;
+        crate::autoplay_pass(manager.clone(), database.clone(), lb.clone()).await;
         assert_eq!(
             state.lock().await.queue.len(),
             1,

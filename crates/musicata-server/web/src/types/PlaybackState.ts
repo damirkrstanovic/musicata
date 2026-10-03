@@ -5,6 +5,10 @@ import type { RepeatMode } from "./RepeatMode";
 
 export type PlaybackState = { status: PlaybackStatus, now_playing: QueueItem | null, elapsed_seconds: number | null, duration_seconds: number | null, volume: number | null, repeat: RepeatMode, shuffle: boolean, queue: Array<QueueItem>, queue_position: number | null, 
 /**
+ * Short-lived explanation for a pending background queue operation. Never persisted.
+ */
+queue_activity: string | null,
+/**
  * The track the server will play next, given the current repeat/shuffle order — a hint
  * for clients that prefetch (the native endpoint's gapless playback). `None` when the
  * next item can't be predicted (end of a shuffle cycle, or the queue stops at the end).

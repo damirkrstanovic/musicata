@@ -500,6 +500,14 @@ Tasks:
   are unit-tested; the endpoint has a route test. A **web view** ships too — a footer
   "Listening stats" panel (`StatsPanel.svelte`) that renders the figures, smoke-tested. See
   [decisions.md](decisions.md).
+- [ ] **Save a radio mix as a playlist — static or dynamic.** Support the listener's
+  “I like this music; I want the same or similar later” flow directly from a radio mix.
+  Offer **Static** to save the currently queued songs in their current order as an ordinary
+  editable playlist, or **Dynamic** to save the radio seed and generation mode/settings.
+  Opening a dynamic playlist starts a fresh radio mix as if the listener had started radio
+  from that same seed, with continuous play; it need not reproduce the exact songs.
+  Give both a name and a place in Playlists, and clearly distinguish a saved track list from
+  a saved station. Cover both similar-artist/track radio and audio-similarity radio.
 - [x] **Add deterministic smart playlists before adding ML.** A fixed, computed catalog
   (`/api/smart-playlists`, no stored rows — each is a live query): **Top: last 30 days**
   (`most_played_since`), **Never played** (`never_played` anti-join), **Forgotten

@@ -259,6 +259,7 @@
     resumeOnReconnect = false;
     player.playBlocked = false;
     ws?.close();
+    player.targetEpoch += 1;
     player.activeKind = kind;
     player.activeId = id;
     player.playback = null;

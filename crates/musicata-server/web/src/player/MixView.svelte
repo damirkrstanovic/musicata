@@ -1,25 +1,47 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
-  // The current "mix": a seed-based radio (sounds-like / similar). Shows what was generated so it
-  // isn't invisible in the queue, and lets you replay it. Populated by startRadio/startAudioRadio.
+  // A mix is an output-bound, live queue. Refill updates arrive through player state, so this
+  // view never falls back to the initial recommendation snapshot.
   import { radioMix } from "../lib/radioMix.svelte";
-  import { playTracks } from "../lib/playback";
-  import TrackList from "./TrackList.svelte";
+  import { player } from "../lib/player.svelte";
+  import { playQueueIndex } from "../lib/playback";
+  import { initial } from "../lib/dom";
 </script>
 
-{#if radioMix.active}
+{#if radioMix.active && radioMix.matches(player.target)}
   <section class="detail-hero">
     <div class="hero-info">
       <h2 class="hero-title">Mix</h2>
-      <p class="hero-sub">Sounds like {radioMix.seed} · {radioMix.tracks.length} tracks</p>
-      <div class="hero-actions">
-        <button class="primary-button" type="button" onclick={() => playTracks(radioMix.tracks, 0)}>
-          Play
-        </button>
-      </div>
+      <p class="hero-sub">{radioMix.seed ? `Sounds like ${radioMix.seed} · ` : ""}{player.queue.length} tracks</p>
+      {#if radioMix.loading}<p class="admin-hint" data-mix-status="loading" role="status" aria-live="polite">Finding more tracks…</p>{/if}
+      {#if player.queueActivity}<p class="admin-hint" data-mix-status="activity" role="status" aria-live="polite">{player.queueActivity}</p>{/if}
+      {#if radioMix.empty}<p class="admin-hint" data-mix-status="empty">No tracks found for this mix.</p>{/if}
+      {#if radioMix.error}<p class="admin-hint mix-error" data-mix-status="error">{radioMix.error}</p>{/if}
     </div>
   </section>
-  <TrackList tracks={radioMix.tracks} />
+  {#if player.queue.length}
+    <div class="queue-list mix-queue" aria-label="Mix queue">
+      {#each player.queue as item, index (index)}
+        <div class="queue-row" class:current={index === player.queuePosition} data-index={index}>
+          <span class="q-index">{index === player.queuePosition ? "▶" : index + 1}</span>
+          <span class="q-art">{#if item.artwork_url}<img src={item.artwork_url} alt="" />{:else}{initial(item.title)}{/if}</span>
+          <button class="q-main" type="button" onclick={() => playQueueIndex(index)}>
+            <span class="q-title">{item.title || "Unknown"}</span>
+            <span class="q-sub">{[item.artist, item.album].filter(Boolean).join(" · ")}</span>
+          </button>
+        </div>
+      {/each}
+    </div>
+  {:else if !radioMix.loading && !radioMix.error && !radioMix.empty}
+    <p class="queue-empty" data-mix-status="empty">This mix has no queued tracks.</p>
+  {/if}
+{:else if radioMix.active}
+  <p class="admin-hint">This mix belongs to a different output.</p>
 {:else}
   <p class="admin-hint">Start a mix from a track — the ≈ button — to see it here.</p>
 {/if}
+
+<style>
+  .mix-error { color: var(--danger); font-family: var(--font-mono); }
+  .mix-queue { margin-top: 1rem; }
+</style>

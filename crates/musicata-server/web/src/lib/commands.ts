@@ -4,6 +4,7 @@
 // *sends*, so a struct-derived type would add no checking the literals don't already give.
 import type { RepeatMode } from "../types/RepeatMode";
 import type { Target } from "./player.svelte";
+import { radioMix } from "./radioMix.svelte";
 
 export type PlayerCommand =
   | { command: "play" }
@@ -23,15 +24,22 @@ export type PlayerCommand =
   | { command: "move_queue_item"; from: number; to: number }
   | { command: "play_stream"; url: string; title: string };
 
-export async function sendCommand(target: Target | null, command: PlayerCommand): Promise<void> {
-  if (!target) return;
+export async function sendCommand(target: Target | null, command: PlayerCommand): Promise<boolean> {
+  if (!target) return false;
+  if (command.command === "pause" || command.command === "stop") radioMix.invalidate();
+  if (command.command === "clear") radioMix.cancel();
   try {
     const response = await fetch(
       `/api/${target.kind}s/${encodeURIComponent(target.id)}/commands`,
       { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(command) },
     );
-    if (!response.ok) throw new Error(`command → ${response.status}`);
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+      throw new Error(body?.error?.message ?? `command → ${response.status}`);
+    }
+    return true;
   } catch (error) {
     console.error("player command failed", command, error);
+    return false;
   }
 }

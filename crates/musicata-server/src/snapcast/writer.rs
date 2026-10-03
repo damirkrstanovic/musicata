@@ -43,6 +43,7 @@ struct Loaded {
     track: Arc<DecodedTrack>,
     cursor_frames: usize,
     gain: f32,
+    generation: u64,
 }
 
 /// Commands from the async control task to the writer thread.
@@ -54,9 +55,14 @@ pub enum WriterMsg {
         track: Arc<DecodedTrack>,
         start_frame: usize,
         gain: f32,
+        generation: u64,
     },
     /// Queue the next track for gapless continuation when the current one drains.
-    Preload { track: Arc<DecodedTrack>, gain: f32 },
+    Preload {
+        track: Arc<DecodedTrack>,
+        gain: f32,
+        generation: u64,
+    },
     /// Begin/stop writing PCM. Paused = snapserver stream goes idle (silence).
     SetPlaying(bool),
     /// Master output volume (0–100%), applied live to every client uniformly. Per-room
@@ -76,9 +82,9 @@ pub enum WriterMsg {
 /// Events from the writer thread back to the async control task.
 pub enum WriterEvent {
     /// The current track drained and we rolled gaplessly into the preloaded next one.
-    Advanced,
+    Advanced { generation: u64 },
     /// The current track drained and nothing was preloaded.
-    Drained,
+    Drained { generation: u64 },
 }
 
 /// Run the writer loop on the calling (dedicated) thread until `Shutdown` or the command
@@ -217,16 +223,21 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
         }
 
         if drained {
+            let generation = current
+                .as_ref()
+                .map(|loaded| loaded.generation)
+                .unwrap_or_default();
             if let Some((track, gain)) = next.take() {
                 current = Some(Loaded {
                     track,
                     cursor_frames: 0,
                     gain,
+                    generation,
                 });
-                let _ = events.send(WriterEvent::Advanced);
+                let _ = events.send(WriterEvent::Advanced { generation });
             } else {
                 current = None;
-                let _ = events.send(WriterEvent::Drained);
+                let _ = events.send(WriterEvent::Drained { generation });
             }
         }
     }
@@ -246,19 +257,34 @@ fn apply(
             track,
             start_frame,
             gain,
+            generation,
         } => {
             let cursor_frames = start_frame.min(track.frames());
             *current = Some(Loaded {
                 track,
                 cursor_frames,
                 gain,
+                generation,
             });
             *next = None;
             if let Some(eq) = eq.as_mut() {
                 eq.reset(); // don't bleed the previous track's filter state into the new one
             }
         }
-        WriterMsg::Preload { track, gain } => *next = Some((track, gain)),
+        WriterMsg::Preload {
+            track,
+            gain,
+            generation,
+        } => {
+            // A decode started for the previous current track can finish after a
+            // replacement Load. Never let it seed that new output's next track.
+            if current
+                .as_ref()
+                .is_some_and(|loaded| loaded.generation == generation)
+            {
+                *next = Some((track, gain));
+            }
+        }
         WriterMsg::SetPlaying(value) => *playing = value,
         WriterMsg::SetVolume(percent) => *volume = (percent.min(100) as f32) / 100.0,
         WriterMsg::Seek { frame } => {
