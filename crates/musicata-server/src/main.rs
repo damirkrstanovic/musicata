@@ -2844,7 +2844,14 @@ async fn library_summary(State(state): State<AppState>) -> Result<Json<LibrarySu
         .summary()
         .await
         .map_err(db_error)?
-        .ok_or_else(|| AppError::internal("library not initialized"))?;
+        // A fresh database has no provider row until its first scan completes.
+        .unwrap_or_else(|| LibrarySummary {
+            provider_id: String::new(),
+            source_root: String::new(),
+            artist_count: 0,
+            album_count: 0,
+            track_count: 0,
+        });
     Ok(Json(summary))
 }
 
@@ -7668,6 +7675,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_empty_library_summary_before_first_scan() {
+        let fixture = TestFixture::new("uninitialized-summary");
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .expect("connect empty database");
+        assert!(database.summary().await.unwrap().is_none());
+        let app = fixture.app_with_database(database).await.0;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/library/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response.into_body()).await;
+        let summary: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            summary,
+            serde_json::json!({
+                "provider_id": "",
+                "source_root": "",
+                "artist_count": 0,
+                "album_count": 0,
+                "track_count": 0,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn serves_library_summary_json() {
         let fixture = TestFixture::new("summary");
         let app = fixture.app().await;
@@ -8882,6 +8921,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mpd_stream_credentials_only_authorize_audio_and_rotate_on_restart() {
+        let fixture = TestFixture::new("mpd-stream-auth");
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .unwrap();
+        let mut library = fixture.library();
+        database.save_library(&mut library).await.unwrap();
+        let track_id = &library.tracks[0].id;
+        let (app, players) = fixture.app_with_database(database.clone()).await;
+        let setup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/setup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"password123"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(setup.status(), StatusCode::OK);
+        let url = players
+            .mpd_stream_auth
+            .track_url("http://127.0.0.1", track_id);
+        let query = url.split_once('?').unwrap().1;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&url)
+                    .header("range", "bytes=0-6")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_text(response.into_body()).await, "fixture");
+        for path in [
+            "/api/settings",
+            "/api/users",
+            "/api/players/browser-local/state",
+            "/api/tracks",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{path}?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+        for suffix in ["", "?token=invalid"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/tracks/{track_id}/stream{suffix}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        // A new runtime rejects the old MPD URLs and accepts freshly generated ones.
+        let (restarted, players) = fixture.app_with_database(database).await;
+        let response = restarted
+            .clone()
+            .oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = restarted
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        players
+                            .mpd_stream_auth
+                            .track_url("http://127.0.0.1", track_id),
+                    )
+                    .header("range", "bytes=0-6")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
     }
 
     /// A native endpoint (M10) registers itself, gets a token, and that token authenticates
@@ -11017,6 +11154,14 @@ mod tests {
                 .save_library(&mut library)
                 .await
                 .expect("save fixture library");
+            let router = self.app_with_database(database.clone()).await.0;
+            (router, database)
+        }
+
+        async fn app_with_database(
+            &self,
+            database: Database,
+        ) -> (axum::Router, std::sync::Arc<PlayerManager>) {
             let mut registry = ProviderRegistry::new();
             registry.push(ProviderHandle::local(LocalDiskProvider::new(&self.root)));
             registry.push(ProviderHandle::radio(crate::providers::RadioProvider::new(
@@ -11033,7 +11178,7 @@ mod tests {
             let router = app(
                 database.clone(),
                 providers,
-                players,
+                players.clone(),
                 std::sync::Arc::new(crate::activity::ActivityLog::default()),
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 crate::subsonic::SubsonicAuth {
@@ -11044,7 +11189,7 @@ mod tests {
                 self.root.join("musicata.db"),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
             );
-            (router, database)
+            (router, players)
         }
 
         fn write(&self, relative_path: &str) {

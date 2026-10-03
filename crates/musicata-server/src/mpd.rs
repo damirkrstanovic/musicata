@@ -261,8 +261,8 @@ fn find<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
 /// `.../api/tracks/{id}/stream`, if present.
 fn track_id_from_uri(uri: &str) -> Option<String> {
     let rest = uri.split("/api/tracks/").nth(1)?;
+    let rest = rest.split('?').next().unwrap_or(rest);
     let id = rest.strip_suffix("/stream").unwrap_or(rest);
-    let id = id.split('?').next().unwrap_or(id);
     if id.is_empty() {
         None
     } else {
@@ -421,6 +421,14 @@ mod tests {
             Some("track_9".to_string())
         );
         assert_eq!(track_id_from_uri("file:///music/song.mp3"), None);
+    }
+
+    #[test]
+    fn extracts_track_id_from_authenticated_stream_url() {
+        assert_eq!(
+            track_id_from_uri("http://host:3030/api/tracks/track_9/stream?token=secret"),
+            Some("track_9".to_string())
+        );
     }
 
     /// A tiny fake MPD server that replays canned responses, used to exercise the

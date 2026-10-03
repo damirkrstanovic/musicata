@@ -247,6 +247,33 @@ pub fn issue_player_token() -> (String, String) {
     (token, hash)
 }
 
+/// In-memory credential for MPD's track fetches. Rotated on server restart; MPD queues
+/// are rebuilt with the new URLs. Never a user credential or a player-control token.
+#[derive(Clone)]
+pub(crate) struct MpdStreamAuth {
+    token: String,
+}
+
+impl MpdStreamAuth {
+    pub fn new() -> Self {
+        Self {
+            token: generate_token(),
+        }
+    }
+
+    pub fn accepts(&self, token: &str) -> bool {
+        constant_time_eq(&self.token, token)
+    }
+
+    pub fn track_url(&self, base_url: &str, track_id: &str) -> String {
+        format!(
+            "{}/api/tracks/{track_id}/stream?token={}",
+            base_url.trim_end_matches('/'),
+            self.token
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Middleware
 // ---------------------------------------------------------------------------------------------
@@ -275,6 +302,14 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
         // audio streams it must fetch to play. Only for players that actually have a token;
         // everything else stays user-gated.
         if let Some(token) = api_token {
+            if matches!(
+                *request.method(),
+                axum::http::Method::GET | axum::http::Method::HEAD
+            ) && is_stream_path(&path)
+                && state.players.mpd_stream_auth.accepts(&token)
+            {
+                return next.run(request).await;
+            }
             let hashed = hash_token(&token);
             if let Some(player_id) = player_channel_id(&path)
                 && let Ok(Some(stored)) = state.database.player_auth_token_hash(player_id).await
