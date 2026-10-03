@@ -3,6 +3,7 @@
 // their OWN signals, mutated alone on every ~1/s progress tick, so the footer's time/seek
 // re-render WITHOUT touching now-playing, queue, or any track-list highlight (those derive
 // from `playback`, which a tick never changes). This replaces the old manual memoization.
+import { nav } from "./nav.svelte";
 import type { PlaybackState } from "../types/PlaybackState";
 import type { QueueItem } from "../types/QueueItem";
 import type { PlaybackStatus } from "../types/PlaybackStatus";
@@ -31,7 +32,11 @@ class Player {
   elapsed = $state(0);
   duration = $state(0);
   seekDragging = $state(false);
-  queueOpen = $state(false);
+  get queueOpen(): boolean { return nav.overlays.includes("queue"); }
+  set queueOpen(open: boolean) {
+    if (open) nav.openOverlay("queue");
+    else if (this.queueOpen) nav.closeOverlay();
+  }
   /** The browser output wants to play but the browser blocked `el.play()` (autoplay policy).
    *  The footer surfaces a tap-to-resume affordance while this is set. */
   playBlocked = $state(false);

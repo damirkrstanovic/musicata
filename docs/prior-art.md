@@ -667,7 +667,12 @@ track→player handoff. Local-track click→audible is ~50–100 ms for comparis
 NORMAL`). Under the old rollback (`delete`) journal, the scan's full-library
 `save_library` rewrite held an exclusive write lock and every concurrent read (e.g.
 `/api/library/summary`) hit the 5 s busy-timeout and 500'd; WAL lets reads run
-alongside the writer.
+alongside the writer. Queue checkpoints also run outside the playback-control path:
+awaiting a progress write inside the output WebSocket loop prevented it from delivering
+Pause/Stop while SQLite was busy. Live state remains in memory; each output has one
+background writer with coalesced pending state. History consumes a separate ordered
+stream of small track/status/position samples, rather than merging independently
+scheduled state and progress channels. See `src/queue_persistence.rs` and `src/players.rs`.
 
 ---
 
@@ -797,6 +802,36 @@ internet.
 
 **Bonus the relay buys for free:** the user's IP never reaches the radio station, the podcast
 host, or GitHub — only the operator's server talks to them.
+
+---
+
+## 13. Mobile browsing, playback, and Back navigation
+
+**Problem:** a phone controller must make the current song/queue easy to reach,
+offer useful library browsing without starting in thousands of tracks, and make
+the phone's Back action behave like the visible Back control.
+
+**moOde reference (reviewed 2026-10-03):**
+- Its [player template](https://github.com/moode-player/moode/blob/8fc57043d7d90206571c2126f61c14fed505dd78/www/templates/indextpl.html)
+  separates a playback panel (queue, transport, cover) from library views, including
+  album browsing. Playback and browsing are distinct user destinations.
+- Its [panel handlers](https://github.com/moode-player/moode/blob/8fc57043d7d90206571c2126f61c14fed505dd78/www/js/scripts-panels.js)
+  restore the active playback/library view and expose a footer while browsing.
+  Mobile playback initially hides the queue and shows controls; this is not evidence
+  that moOde displays both simultaneously on a phone.
+
+**Musicata application:**
+- `web/src/player/Footer.svelte` makes the current title/artwork an entry to Now
+  Playing and the queue. `QueueDrawer.svelte` can render inline below the mobile
+  transport; the user explicitly chose this over navigating to the song's album.
+- `web/src/lib/nav.svelte.ts` starts fresh phone visits at Albums. `App.svelte`
+  exposes Library, Playlists, and Now Playing destinations; Tracks remains available.
+- Previously the store pushed browser history for details, but `pop()` only
+  changed an in-memory stack and `root()` reset it independently of history.
+  The store now saves routes, overlays, and scroll positions in browser entries;
+  visible Back and browser Back/Forward use those same entries. Paged lists restore
+  enough content to reach the saved position. This is a Musicata fix, not a claim
+  about moOde's browser-history implementation.
 
 ---
 

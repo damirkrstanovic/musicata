@@ -1,6 +1,6 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
-  import { untrack } from "svelte";
+  import { untrack, tick, onDestroy } from "svelte";
   import { api } from "../lib/api";
   import type { Album } from "../types/Album";
   import { onVisible } from "../lib/dom";
@@ -15,6 +15,7 @@
   let offset = 0;
   let loading = false;
   let token = 0; // bumped on filter/search change so stale responses are dropped
+  onDestroy(() => { token++; });
 
   async function loadMore() {
     if (done || loading) return;
@@ -45,6 +46,8 @@
       done = true;
     } finally {
       loading = false;
+      await tick();
+      if (mine === token && nav.current.name === "library" && !nav.restoreScroll() && !done) void loadMore();
     }
   }
 

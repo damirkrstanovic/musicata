@@ -161,6 +161,14 @@ The local browser player is always present as id `browser-local`.
 
 ### Player commands
 
+Live playback state is authoritative in server memory. Commands and position updates
+never wait for queue checkpoints to SQLite. A bounded background writer coalesces
+pending changes; elapsed position is checkpointed at most once every ten seconds.
+After an abrupt shutdown, the restored queue/cursor may be slightly older than the
+last accepted command. Responsive controls take priority over immediate durability.
+Foreground SQLite reads use a separate read-only pool; queued background writes cannot
+consume the connections needed for authentication and browsing.
+
 `POST /api/players/{id}/commands` accepts a JSON object with a `command` field:
 
 | `command` | Extra fields |

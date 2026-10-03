@@ -11,7 +11,7 @@
   import BrowseFilters from "./BrowseFilters.svelte";
   import AccountMenu from "./AccountMenu.svelte";
 
-  let { onclose, inert = false }: { onclose: () => void; inert?: boolean } = $props();
+  let { onclose, onnowplaying, inert = false }: { onclose: () => void; onnowplaying: () => void; inert?: boolean } = $props();
 
   let playlists = $state<Playlist[]>([]);
   let smart = $state<SmartPlaylist[]>([]);
@@ -59,6 +59,9 @@
   </label>
 
   <nav class="library-nav" aria-label="Views">
+    <button class="nav-link desktop-destination" class:is-active={!["playlists", "playlist", "smart", "favorites", "mix"].includes(nav.current.name) && !nav.overlays.includes("nowPlaying")} type="button" onclick={() => nav.root({name: nav.browseView})}>Library</button>
+    <button class="nav-link desktop-destination" class:is-active={["playlists", "playlist", "smart"].includes(nav.current.name) && !nav.overlays.includes("nowPlaying")} type="button" onclick={() => nav.root({name: "playlists"})}>Playlists</button>
+    <button class="nav-link desktop-destination" class:is-active={nav.overlays.includes("nowPlaying")} type="button" onclick={onnowplaying}>Now Playing</button>
     <button
       class="nav-link"
       class:is-active={nav.current.name === "favorites"}

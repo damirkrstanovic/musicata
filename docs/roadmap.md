@@ -407,7 +407,12 @@ Tasks:
   First pass restores the mobile navigation drawer, persistent play/pause/next and Queue
   controls, and expanded Now Playing with output selection and volume. Touch-driven Chromium
   regressions cover 320/360px portrait and 800px landscape, saved playlists, queue selection,
-  output presets, and focus restoration. Real Android/iOS and background/reconnect validation
+  output presets, and focus restoration. The next navigation pass adds album-first phone
+  browsing, Library/Playlists/Now Playing destinations, tappable current-song entry to controls
+  plus queue, and shared browser/visible Back history with scroll restoration. Desktop shares
+  those destinations, defaults to Albums, remembers the browsing view, and opens Now Playing
+  beside the library with output selection and controls visible.
+  Real Android/iOS and background/reconnect validation
   remain open. PWA installation also needs trusted HTTPS: a public domain with DNS-01 validation
   can keep the server LAN-only; `.local` requires a private CA trusted by each device. See
   [Let's Encrypt DNS-01](https://letsencrypt.org/docs/challenge-types/#dns-01-challenge) and

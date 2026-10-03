@@ -1,6 +1,6 @@
 [package]
 name = "musicata-server"
-version = "1.0.6"
+version = "1.0.7"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -80,4 +80,5 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 quick-xml = { version = "0.37", features = ["serialize"], optional = true }
 
 [dev-dependencies]
+sqlx.workspace = true
 tower.workspace = true

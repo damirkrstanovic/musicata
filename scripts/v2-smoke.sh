@@ -18,10 +18,18 @@ node tests/ui/transport-guard.mjs
 
 if [ ! -x "$CHROME" ]; then echo "no chromium at $CHROME; skipping"; exit 0; fi
 
-cargo build -p musicata-server
+SERVER_BIN="${MUSICATA_SERVER_BIN:-./target/debug/musicata-server}"
+if [ -z "${MUSICATA_SERVER_BIN:-}" ]; then cargo build -p musicata-server; fi
 TMP="$(mktemp -d)"
 SRV=""
-cleanup() { kill "${SRV:-}" "${CHR:-}" 2>/dev/null || true; rm -rf "$TMP"; }
+cleanup() {
+  kill "${SRV:-}" "${CHR:-}" 2>/dev/null || true
+  if [ -n "${MUSICATA_UI_LOGS:-}" ]; then
+    mkdir -p "$MUSICATA_UI_LOGS"
+    cp "$TMP"/*.log "$MUSICATA_UI_LOGS/" 2>/dev/null || true
+  fi
+  rm -rf "$TMP"
+}
 trap cleanup EXIT
 
 # --mute-audio: the behavior phase actually plays tracks (real Web Audio), so mute the speakers.
@@ -34,14 +42,14 @@ for _ in $(seq 1 20); do curl -sf http://127.0.0.1:9222/json/version >/dev/null 
 # flows, stops the server. Returns the flows' exit code.
 run_phase() {
   local mode="$1" port="$2"; shift 2
-  ./target/debug/musicata-server "$@" --addr "127.0.0.1:$port" >"$TMP/server-$mode.log" 2>&1 &
+  "$SERVER_BIN" "$@" --addr "127.0.0.1:$port" >"$TMP/server-$mode.log" 2>&1 &
   SRV=$!
   for _ in $(seq 1 80); do
     curl -s "http://127.0.0.1:$port/api/albums?limit=1" 2>/dev/null | grep -q '"id"' && break
     sleep 0.5
   done
   local rc=0
-  node tests/ui/v2-flows.mjs "$port" "$BASE_PATH" "$mode" || rc=$?
+  MUSICATA_SMOKE_DB="$TMP/$mode.db" node tests/ui/v2-flows.mjs "$port" "$BASE_PATH" "$mode" || rc=$?
   kill "$SRV" 2>/dev/null || true
   SRV=""
   return $rc
