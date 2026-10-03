@@ -29,6 +29,7 @@ use musicata_storage::{Database, ListenKind, PlayerPlayback, PlayerQueueSnapshot
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
 
+use crate::auth::MpdStreamAuth;
 use crate::mpd::{MpdConnection, MpdStatus};
 use crate::providers::ProviderRegistry;
 #[cfg(feature = "snapcast")]
@@ -416,6 +417,7 @@ pub const SNAPCAST_PLAYER_ID: &str = "snapcast-local";
 pub struct PlayerManager {
     database: Database,
     public_base_url: String,
+    pub(crate) mpd_stream_auth: MpdStreamAuth,
     /// Needed by the Snapcast player to read library audio for server-side decode.
     #[cfg_attr(not(feature = "snapcast"), allow(dead_code))]
     providers: Arc<RwLock<ProviderRegistry>>,
@@ -436,6 +438,7 @@ impl PlayerManager {
         let manager = Arc::new(Self {
             database,
             public_base_url,
+            mpd_stream_auth: MpdStreamAuth::new(),
             providers,
             players: RwLock::new(BTreeMap::new()),
             zones: RwLock::new(BTreeMap::new()),
@@ -581,6 +584,7 @@ impl PlayerManager {
                     record.address.clone(),
                     self.database.clone(),
                     self.public_base_url.clone(),
+                    self.mpd_stream_auth.clone(),
                 ));
                 // Restore the server-owned queue (server wins) and push it to MPD before
                 // the idle loop starts; with no persisted queue, adopt MPD's current one.
@@ -790,6 +794,7 @@ pub struct MpdPlayer {
     addr: String,
     database: Database,
     public_base_url: String,
+    stream_auth: MpdStreamAuth,
     /// Command connection, reconnected on demand. A separate connection is used
     /// for the blocking idle loop.
     connection: Mutex<Option<MpdConnection>>,
@@ -808,13 +813,20 @@ pub struct MpdPlayer {
 }
 
 impl MpdPlayer {
-    fn new(id: String, addr: String, database: Database, public_base_url: String) -> Self {
+    fn new(
+        id: String,
+        addr: String,
+        database: Database,
+        public_base_url: String,
+        stream_auth: MpdStreamAuth,
+    ) -> Self {
         let (state_tx, _) = broadcast::channel(16);
         Self {
             id,
             addr,
             database,
             public_base_url,
+            stream_auth,
             connection: Mutex::new(None),
             online: AtomicBool::new(false),
             state: Mutex::new(QueueState::default()),
@@ -910,7 +922,7 @@ impl MpdPlayer {
                 // Push the restored queue onto MPD without playing (resumed on first Play).
                 let uris = {
                     let state = self.state.lock().await;
-                    queue_to_mpd_uris(&state.queue, &self.public_base_url)
+                    queue_to_mpd_uris(&state.queue, &self.public_base_url, &self.stream_auth)
                 };
                 let mut guard = self.connection.lock().await;
                 if let Ok(connection) = ensure_connected(&mut guard, &self.addr).await
@@ -1020,7 +1032,16 @@ impl MpdPlayer {
                         }
                     }
                     Some((None, _)) => connection.play().await?,
-                    None => apply_command(connection, &command, database, public_base_url).await?,
+                    None => {
+                        apply_command(
+                            connection,
+                            &command,
+                            database,
+                            public_base_url,
+                            &self.stream_auth,
+                        )
+                        .await?
+                    }
                 }
                 connection.read_status().await
             }
@@ -1084,7 +1105,7 @@ impl MpdPlayer {
         let (uris, position, status) = {
             let state = self.state.lock().await;
             (
-                queue_to_mpd_uris(&state.queue, &self.public_base_url),
+                queue_to_mpd_uris(&state.queue, &self.public_base_url, &self.stream_auth),
                 state.position,
                 state.status,
             )
@@ -1205,15 +1226,18 @@ impl MpdPlayer {
     }
 }
 
-/// Turn the server queue into MPD URIs: library tracks get the public base URL
-/// prepended (MPD fetches them over HTTP); external streams (no track id, e.g. a
-/// radio station) are already absolute.
-fn queue_to_mpd_uris(items: &[QueueItem], public_base_url: &str) -> Vec<String> {
+/// Build fresh authenticated MPD URLs from track ids, including restored/adopted queues
+/// whose URLs may contain a stale credential. External streams never receive our token.
+fn queue_to_mpd_uris(
+    items: &[QueueItem],
+    public_base_url: &str,
+    stream_auth: &MpdStreamAuth,
+) -> Vec<String> {
     items
         .iter()
         .map(|item| {
-            if item.track_id.is_some() {
-                format!("{public_base_url}{}", item.stream_url)
+            if let Some(track_id) = &item.track_id {
+                stream_auth.track_url(public_base_url, track_id)
             } else {
                 item.stream_url.clone()
             }
@@ -1236,6 +1260,7 @@ async fn apply_command(
     command: &PlayerCommand,
     database: &Database,
     public_base_url: &str,
+    stream_auth: &MpdStreamAuth,
 ) -> Result<()> {
     match command {
         PlayerCommand::Play => connection.play().await,
@@ -1253,7 +1278,7 @@ async fn apply_command(
             track_ids,
             start_index,
         } => {
-            let urls = resolve_urls(database, public_base_url, track_ids).await?;
+            let urls = resolve_urls(database, public_base_url, track_ids, stream_auth).await?;
             connection.replace_queue(&urls).await?;
             // Start at the requested queue position (default 0) in the same command,
             // so the controller needn't follow up with a separate play_queue_index.
@@ -1263,7 +1288,7 @@ async fn apply_command(
             Ok(())
         }
         PlayerCommand::Enqueue { track_ids } => {
-            let urls = resolve_urls(database, public_base_url, track_ids).await?;
+            let urls = resolve_urls(database, public_base_url, track_ids, stream_auth).await?;
             for url in &urls {
                 connection.add(url).await?;
             }
@@ -1281,11 +1306,12 @@ async fn resolve_urls(
     database: &Database,
     public_base_url: &str,
     track_ids: &[String],
+    stream_auth: &MpdStreamAuth,
 ) -> Result<Vec<String>> {
     let mut urls = Vec::with_capacity(track_ids.len());
     for id in track_ids {
         if let Some(track) = database.track(id).await? {
-            urls.push(format!("{public_base_url}{}", track.stream_url));
+            urls.push(stream_auth.track_url(public_base_url, &track.id));
         }
     }
     Ok(urls)
@@ -1299,6 +1325,9 @@ async fn enrich_state(state: &mut PlaybackState, database: &Database) {
         let Some(track_id) = item.track_id.clone() else {
             continue;
         };
+        // Adopted MPD URLs can carry credentials; controllers and persisted queues use
+        // the ordinary relative URL. Fresh credentials are added only when sending to MPD.
+        item.stream_url = format!("/api/tracks/{track_id}/stream");
         if item.title.is_empty() {
             if let Ok(Some(track)) = database.track(&track_id).await {
                 item.title = track.title;
@@ -3364,6 +3393,45 @@ mod tests {
 
     // ---- MPD server-owned queue ----------------------------------------------
 
+    #[tokio::test]
+    async fn mpd_library_urls_include_stream_credentials() {
+        let db_path = temp_db("mpd-stream-auth");
+        let database = Database::connect(&db_path).await.unwrap();
+        let mut library = library_with_tracks(1);
+        database.save_library(&mut library).await.unwrap();
+        let stream_auth = MpdStreamAuth::new();
+        let urls = resolve_urls(
+            &database,
+            "http://host:3030",
+            &["track_1".into()],
+            &stream_auth,
+        )
+        .await
+        .unwrap();
+        assert!(
+            urls[0].contains("?token="),
+            "MPD needs credentials to fetch audio"
+        );
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn adopted_mpd_queue_does_not_expose_stream_credentials() {
+        let db_path = temp_db("mpd-adopt-auth");
+        let database = Database::connect(&db_path).await.unwrap();
+        let mut library = library_with_tracks(1);
+        database.save_library(&mut library).await.unwrap();
+        let mut state = PlaybackState::default();
+        state.queue = vec![QueueItem {
+            track_id: Some("track_1".into()),
+            stream_url: "http://old-host/api/tracks/track_1/stream?token=old-secret".into(),
+            ..Default::default()
+        }];
+        enrich_state(&mut state, &database).await;
+        assert_eq!(state.queue[0].stream_url, "/api/tracks/track_1/stream");
+        let _ = std::fs::remove_file(db_path);
+    }
+
     #[test]
     fn queue_to_mpd_uris_prefixes_library_tracks_only() {
         let items = vec![
@@ -3379,8 +3447,11 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let uris = queue_to_mpd_uris(&items, "http://host:3030");
-        assert_eq!(uris[0], "http://host:3030/api/tracks/t1/stream");
+        let mut items = items;
+        items[0].stream_url = "http://old-host/api/tracks/t1/stream?token=expired".into();
+        let stream_auth = MpdStreamAuth::new();
+        let uris = queue_to_mpd_uris(&items, "http://host:3030", &stream_auth);
+        assert_eq!(uris[0], stream_auth.track_url("http://host:3030", "t1"));
         assert_eq!(uris[1], "http://radio.example/stream");
     }
 
@@ -3424,6 +3495,7 @@ mod tests {
             "127.0.0.1:1".to_string(),
             database.clone(),
             "http://host".to_string(),
+            MpdStreamAuth::new(),
         );
         player.restore().await;
 
@@ -3457,6 +3529,7 @@ mod tests {
             "127.0.0.1:1".to_string(),
             database.clone(),
             "http://host".to_string(),
+            MpdStreamAuth::new(),
         );
         {
             let mut state = player.state.lock().await;

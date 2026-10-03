@@ -51,6 +51,11 @@ Musicata can control a local [MPD](https://www.musicpd.org/) instance: it drives
 native protocol, hands MPD Musicata stream URLs to play (so MPD needs no access to your
 files), and pushes live playback state to controllers over a WebSocket.
 
+Musicata automatically adds a random, stream-only credential to MPD's library track URLs,
+so playback works after you create a user account. No user password or API token needs to
+be configured in MPD. The credential rotates on server restart, and restored queues receive
+fresh URLs; it grants no access to settings or player controls.
+
 Start MPD with the sample config (it streams from Musicata, so its `music_directory` can be
 empty), then point the server at it:
 

@@ -81,7 +81,7 @@ Authenticate with any of:
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
-| GET | `/api/library/summary` | Track/album/artist counts and provider. |
+| GET | `/api/library/summary` | Track/album/artist counts and provider. Before the first scan completes, returns HTTP 200 with zero counts and empty `provider_id` / `source_root` strings. |
 | POST | `/api/library/rescan` | Force a filesystem rescan (the server also rescans on a timer). |
 | GET/POST | `/api/library/export` | Export status / start a background library export. |
 | GET | `/api/library/export/download` | Download the completed export archive. |
