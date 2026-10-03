@@ -250,9 +250,11 @@ Tasks:
   auto-advance, read back via `read_status`). On startup the **server queue wins**: it's
   restored (paused) and pushed onto MPD via `load_queue` (no autoplay; the saved
   position resumes on the first Play); with no persisted queue the server adopts MPD's
-  current one. If an external MPD client edits the queue, the idle loop detects the
-  unexpected queue-version bump and **re-asserts** the server queue. The queue thus
-  lives in Musicata's DB for every player kind.
+  current one. MPD queue-version bumps trigger a comparison of the actual queue URLs;
+  **content/order edits** by external clients are repaired, while stream metadata updates
+  preserve playback and auto-advance. Commands and cursor updates are serialized so stale
+  observations cannot undo a replacement queue. The queue lives in Musicata's DB for every
+  player kind.
   **Per-*zone* queues** are now implemented: a zone owns its own canonical
   server-side queue, modeled exactly like the browser player (`ZonePlayer` in
   `players.rs`, persisted to migration v18 tables `zone_queue` + `zone_queue_items`,
@@ -891,6 +893,13 @@ polish remain.
 - [ ] **Phase 6 (cont.) — remaining polish.** A Roon-style signal-path badge over the
   WebSocket; phone-app filter export (GraphicEQ.txt / IR WAV for JamesDSP / Wavelet); server-side
   album-mode apply for Snapcast.
+- [ ] **VU meter for every output.** Make the meter follow the selected player/zone for
+  MPD, native endpoints, and synchronized playback as well as the browser. Obtain real
+  per-channel level measurements from the server/output audio path and push lightweight
+  updates to controllers; do not require browser audio playback. Identify the measurement
+  point, handle pause/stop and output switching correctly, and keep metering off the UI's
+  full-state update path. Verify behavior on the Mele's MPD → Topping DAC path and all other
+  supported output kinds.
 
 Explicitly out of scope: a measurement suite (no sweep/RTA/mic capture), and any Dirac
 ingestion (its filters are locked to its own processor — non-exportable).
@@ -917,6 +926,24 @@ Tasks:
 - [x] **Add release builds for Linux first.** A tagged-release GitHub Actions workflow
   (`.github/workflows/release.yml`) builds static musl binaries for x86_64 and aarch64 and
   attaches them to the release. See [deployment.md](deployment.md).
+- [ ] **One Linux x86-64 build with runtime CPU detection.** Replace the separate portable
+  and x86-64-v3 downloads with one binary that runs on supported low-end CPUs and dispatches
+  to optimized implementations only when their required instructions are available. Audit
+  native dependencies as well as Rust code so unsupported instructions cannot run at startup.
+  Validate both baseline and accelerated paths. Use the Mele Celeron N4500 (no AVX/AVX2) to
+  test `musicata-ml` startup and real model inference, including ONNX Runtime compatibility,
+  memory use, analysis throughput, and impact on concurrent music playback; record measured
+  results and supported dependency versions before claiming ML support on this hardware.
+- [ ] **Distribution-aware Linux installer and upgrader.** Build on the Mele installation
+  script: detect Arch Linux and derivatives, Debian, Ubuntu, and Fedora via `/etc/os-release`,
+  use their package managers, and install required dependencies plus selected optional
+  components for Spotify, Apple music support, MPD/USB-DAC playback, and synchronized
+  playback (Snapcast server/clients). Respect provider availability and account requirements;
+  keep feature configuration in the web UI. Include optional `musicata-ml`, verified release
+  downloads and CPU checks, non-root systemd services that start without an interactive login,
+  audio permissions/device selection, and local discovery/name resolution where needed.
+  Make reruns/upgrades preserve settings and the library, provide backups/recovery and clear
+  diagnostics, and test fresh installs and upgrades on each supported distribution family.
 - [x] **Add systemd service examples.** `packaging/musicata.service` (shipped in the release
   archive) runs the server as a locked-down system user with state in `/var/lib/musicata`.
 - [x] **Add Docker or container image.** A `Dockerfile` builds a slim image (snapserver is not
@@ -980,3 +1007,6 @@ providers, and a metadata review-override UI (podcasts + the Internet Archive it
 both with **/admin source forms** — and the plugin-isolation decision are done); **M11** — the
 CamillaDSP/DAC tier, the signal-path badge, and Snapcast album-mode apply (album/Auto leveling
 **and the explicit Off/Track/Album selector** now ship).
+
+**M12 follow-ups:** a single runtime-dispatched Linux x86-64 build (with Celeron validation
+of `musicata-ml`) and a distribution-aware installer/upgrader, as scoped above.
