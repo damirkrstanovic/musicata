@@ -7890,7 +7890,7 @@ mod tests {
             &players,
             &database,
             &listenbrainz,
-        &crate::MusicBrainzClient::new("http://127.0.0.1:1"),
+            &crate::MusicBrainzClient::new("http://127.0.0.1:1"),
             &mut jobs,
             &mut in_flight,
         )
@@ -7909,7 +7909,7 @@ mod tests {
             &players,
             &database,
             &listenbrainz,
-        &crate::MusicBrainzClient::new("http://127.0.0.1:1"),
+            &crate::MusicBrainzClient::new("http://127.0.0.1:1"),
             &mut jobs,
             &mut in_flight,
         )
