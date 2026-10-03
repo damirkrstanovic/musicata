@@ -45,6 +45,12 @@ Avoid adding source files at the repository root unless they are standard projec
 
 ## Build, Test, and Development Commands
 
+**Use the homelab Kubernetes cluster for development previews, builds and automated tests.**
+Keep only a `kubectl port-forward` on the desktop for browser access; do not copy a
+cluster-built binary back here and leave it running. Use isolated test databases and
+fixtures, preserve the preview data, and record the pod/context used for verification.
+
+
 ```
 cargo build                         # default members; runs the Vite web build
 cargo build --no-default-features   # minimal: drop the SMB `smb` dep
