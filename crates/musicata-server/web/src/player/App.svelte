@@ -58,6 +58,11 @@
     document.querySelector<HTMLButtonElement>(`[aria-label="${open ? "Close" : "Open"} Now Playing"]`)?.focus();
   }
 
+  async function openOutput() {
+    await setNowPlaying(true);
+    document.querySelector<HTMLSelectElement>('.player-switch-btn')?.focus();
+  }
+
   async function openNavigation() {
     navOpen = true;
     await tick();
@@ -173,8 +178,8 @@
     (window as unknown as { __audio?: unknown }).__audio = audio; // debug hook
     audio.setEq(dsp.enabled ? dsp.active : null); // apply persisted profile on load
     audio.setLevelingMode(dsp.levelingMode);
-    audio.onProgress((msg) => ws?.send(msg));
-    audio.onEnded(() => ws?.send({ type: "ended" }));
+    audio.onProgress((msg) => { if (player.isBrowserOutput) ws?.send(msg); });
+    audio.onEnded(() => { if (player.isBrowserOutput) ws?.send({ type: "ended" }); });
     audio.onBlocked((b) => (player.playBlocked = b));
     audio.start();
 
@@ -226,6 +231,17 @@
   async function initConnection() {
     clearTimeout(connectRetry);
     if (await loadTargets()) {
+      // Keep the explicitly chosen output on this device across page reloads.
+      try {
+        const saved = localStorage.getItem("musicata.output");
+        const target = [...players.map(p => ({kind: "player" as const, id: p.id})),
+          ...zones.map(z => ({kind: "zone" as const, id: z.id}))]
+          .find(t => `${t.kind}:${t.id}` === saved);
+        if (target) {
+          connect(target.kind, target.id);
+          return;
+        }
+      } catch { /* Storage may be unavailable; use the normal default. */ }
       const browser = players.find((p) => p.kind === "browser") ?? players[0];
       if (browser) {
         connect("player", browser.id); // the WS owns reconnection from here
@@ -238,6 +254,10 @@
   }
 
   function connect(kind: "player" | "zone", id: string) {
+    // Stop the previous local stream before binding its events to another target.
+    audio?.pause();
+    resumeOnReconnect = false;
+    player.playBlocked = false;
     ws?.close();
     player.activeKind = kind;
     player.activeId = id;
@@ -262,8 +282,11 @@
   }
 
   function onTargetChange(value: string) {
-    const [kind, id] = value.split(":") as ["player" | "zone", string];
+    const separator = value.indexOf(":");
+    const kind = value.slice(0, separator) as "player" | "zone";
+    const id = value.slice(separator + 1);
     connect(kind, id);
+    try { localStorage.setItem("musicata.output", value); } catch { /* Optional preference. */ }
   }
 
   onDestroy(() => {
@@ -284,7 +307,11 @@
 <main class="shell" class:nav-open={navOpen} class:np-open={nowPlayingOpen}>
   <header class="mobile-bar" inert={mobile && (navOpen || nowPlayingOpen || player.queueOpen)}>
     <button class="bar-icon" type="button" aria-label="Open navigation" aria-expanded={navOpen} onclick={openNavigation}>☰</button>
-    <span class="mobile-brand">Musicata</span>
+    <button class="mobile-output" type="button" onclick={openOutput} aria-expanded={nowPlayingOpen}>
+      <span>Output:</span>
+      <strong>{(player.activeKind === "zone" ? zones : players).find(p => p.id === player.activeId)?.name ?? "Connecting…"}</strong>
+      <span aria-hidden="true">⌄</span>
+    </button>
     <a class="bar-icon" href="/admin" aria-label="Settings">⚙</a>
   </header>
   <button class="scrim" type="button" hidden={!navOpen} aria-label="Dismiss navigation" onclick={closeNavigation}></button>
