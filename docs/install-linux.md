@@ -52,11 +52,92 @@ such as SMB are added in the UI and need no host mount. `--port` changes the HTT
 For ALSA names, use `aplay -L` after installing `alsa-utils`; `--alsa-device` defaults to
 ALSA's `default` device. MPD uses software volume and listens on loopback port 6600.
 
+## HTTPS with Caddy
+
+Add `caddy` to `--with` for either native or Docker installation. Musicata then listens on
+`127.0.0.1:<port>` and Caddy serves HTTPS on port 443, redirects HTTP on port 80, and proxies
+media and WebSockets. Browser session cookies receive `Secure`. Plain HTTP remains the
+default when Caddy is omitted.
+
+For a **private LAN installation with a Cloudflare-hosted domain**, use a hostname under a
+registered domain you control, such as `music.example.org`. Configure your router's DNS to
+resolve it to the server's private IP. The certificate challenge uses public Cloudflare DNS;
+no public A/AAAA record or router port forwarding is required. `.local` names cannot receive
+a Let's Encrypt certificate. Allow outbound HTTPS and DNS from the server and LAN access
+to ports 80/443.
+
+Create a Cloudflare API token scoped to the relevant zone with **Zone / DNS / Edit** and
+**Zone / Zone / Read**. Save only the token in a file on the installation host, with mode
+`0600`. Keep it out of shell arguments and command history. Then select either mode:
+
+```sh
+sudo ./scripts/install.sh --mode native --with caddy \
+  --tls-domain music.example.org --tls-dns cloudflare \
+  --tls-dns-token-file /root/cloudflare-token --dry-run
+
+sudo ./scripts/install.sh --mode docker --with caddy \
+  --tls-domain music.example.org --tls-dns cloudflare \
+  --tls-dns-token-file /root/cloudflare-token
+```
+
+Remove `--dry-run` to apply the native example. Add other desired components to the same
+comma-separated `--with` list. `--tls-email admin@example.org` is optional.
+
+The installer builds a pinned Caddy with the Cloudflare plugin: native mode uses Go and
+xcaddy; Docker uses the official Caddy builder and runtime images. Builds require internet
+access and may take several minutes. Native distributions with an older Go package receive
+a checksum-verified temporary toolchain. Go's checksum database verifies downloaded modules.
+The DNS challenge uses public resolvers to avoid a private router's DNS view hiding the
+challenge record. See the [Cloudflare module](https://github.com/caddy-dns/cloudflare) and
+[Caddy DNS validation](https://caddyserver.com/docs/automatic-https#dns-challenge).
+
+For a server reachable from the internet, omit `--tls-dns` and `--tls-dns-token-file`:
+
+```sh
+sudo ./scripts/install.sh --mode docker --with caddy --tls-domain music.example.org
+```
+
+That default uses HTTP/TLS validation and requires public DNS pointing to the server and
+inbound public ports 80/443. The installer leaves firewall and router configuration to you.
+
+Native Caddy runs under the separate distribution `caddy` account in
+`musicata-caddy.service`; Docker runs it as the service UID inside the separate
+`musicata-caddy` container.
+Configuration is in `/etc/musicata/caddy/Caddyfile`; certificates and ACME state persist in
+`/var/lib/musicata-caddy`. The Cloudflare token is copied to root-only
+`/etc/musicata/caddy/cloudflare.env`, supplied at runtime, and excluded from the installation
+manifest and build context. Ordinary upgrades reuse it without needing the original token
+file. Supply a new `--tls-dns-token-file` to rotate the token. Root-only installer backups
+intentionally include the token so rollback can restore it. Never publish the credential
+file or installer backups.
+
+An upgrade can add Caddy while preserving the other components: use `--upgrade --with`
+with the existing component list plus `caddy`, and the TLS options above. Subsequent upgrades
+preserve the hostname, validation method, custom Caddy configuration and certificate state.
+Enabling HTTPS invalidates old browser sessions; sign in again at the HTTPS URL. Custom
+native units that pass `--addr` must remove that argument first so the loopback environment
+setting takes effect. Unmanaged Caddy resources and occupied ports stop installation.
+Activation failures restore the old proxy, credentials, binary/container and Musicata state.
+HTTPS activation succeeds only after a trusted certificate and the proxied health endpoint
+are available.
+
+The native **audio endpoint** currently supports only HTTP/WebSocket connections; it cannot
+connect remotely to an HTTPS-only installation until HTTPS/WSS support is added. Native
+server installation and local MPD playback work with Caddy. With discovery selected, host
+mDNS and cast-in discovery remain enabled, but the loopback HTTP backend is no longer
+advertised; access the web app using its configured TLS hostname.
+
+```sh
+sudo journalctl -u musicata-caddy -n 100 --no-pager  # native proxy
+sudo docker logs --tail 100 musicata-caddy          # Docker proxy
+```
+
 ## Components and distribution dependencies
 
 | Component | Installed/configured |
 |---|---|
 | Server, always | Native static release + systemd, or the released Docker image |
+| `caddy` | HTTPS proxy; optional Cloudflare DNS-01 for private LAN access; persistent certificates |
 | `ml` | Separate CPU-only Docker container; persistent model cache; localhost port 3091 |
 | `mpd` | Host MPD + ALSA utilities; dedicated non-root `musicata-mpd.service` with audio-device access |
 | `discovery` | Host Avahi, NSS mDNS resolution, `_http._tcp` advertisement with the Musicata port |
@@ -182,8 +263,17 @@ preservation and failure recovery. Run them with:
 
 ```sh
 python3 -m unittest discover -s tests/installer
+python3 tests/installer/caddy-smoke.py --caddy /path/to/caddy --cloudflare
+bash tests/installer/caddy-container-smoke.sh --cloudflare
 bash tests/installer/native-smoke.sh
 ```
+
+The Caddy smoke tests validate the real Cloudflare module with a dummy token, then use
+an isolated local CA to check HTTPS trust, HTTP redirects, session cookies, media streams,
+WebSocket tunnels and certificate persistence after restart. The container harness runs
+the generated build command in the official builder image and uses the resulting binary
+in the official runtime image. Production Cloudflare DNS changes and public ACME issuance
+require a separate check with the deployment's actual domain and token.
 
 The native integration harness uses disposable Kubernetes pods for Debian 13, Ubuntu
 26.04, Fedora 44 and Arch. It installs the real released server, runs it under the service
