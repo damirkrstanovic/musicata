@@ -110,3 +110,19 @@ channel (`/api/players/{id}/state` → 200) while a wrong/absent token is reject
   auth), plus the existing player-token channel tests.
 - Client: `cargo test -p musicata-endpoint` — the `decide()` state machine and the URL/slug/arg
   helpers (no audio device needed to compile the tests on a machine with audio dev libs).
+
+## EQ and output levels
+
+The endpoint connects a separate scoped `/api/players/{id}/audio/ws` worker, so transport-thread
+track downloads do not block live correction or meter reporting. Mono sources map to stereo;
+stereo channels stay separate, and other layouts are rejected. The shared core PEQ/preamp runs
+before the endpoint's software volume and final clipping. Filter coefficients are built on the
+worker for each source's actual sample rate; bounded updates are consumed at frame-block
+boundaries. Desired corrections follow prefetched sources without restarting the queue.
+Applied acknowledgements come from sample processing; idle/preloaded sources do not imply that
+an audible output has applied a revision. Room impulse profiles are rejected by this tier.
+
+Open the player's EQ and VU controls from any controller. The meter shows final software samples,
+including server volume; device/mixer gain and DAC latency are outside that measurement.
+Synthetic-source tests cover mono/stereo, channel isolation, live updates, final gain and meters.
+Physical endpoint playback remains a separate device check.

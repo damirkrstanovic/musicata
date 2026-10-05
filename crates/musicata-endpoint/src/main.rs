@@ -33,6 +33,8 @@
 //! Only `ws://` (LAN) is supported; put it behind a TLS reverse proxy for `wss://`.
 
 mod audio;
+mod dsp;
+mod output_audio;
 mod protocol;
 
 use std::io::ErrorKind;
@@ -71,7 +73,9 @@ fn main() -> Result<()> {
     // The audio player and our view of what's playing outlive individual sessions, so a
     // reconnect (server restart, network blip) keeps the current track playing rather than
     // tearing down the output and reloading from the start.
-    let mut audio = AudioPlayer::new(creds.server.clone(), creds.token.clone())?;
+    let (control, registrations) = dsp::Control::new();
+    output_audio::start(&creds, control.clone(), registrations);
+    let mut audio = AudioPlayer::new(creds.server.clone(), creds.token.clone(), control)?;
     let mut view = EndpointView::default();
     // Reconnect forever; a dropped connection just reconnects.
     loop {
@@ -235,6 +239,7 @@ fn run_session(creds: &Creds, audio: &mut AudioPlayer, view: &mut EndpointView) 
 
 /// Apply the decided action to the audio player and update our view of what we're doing.
 fn apply(audio: &mut AudioPlayer, view: &mut EndpointView, next: &PlaybackState) {
+    audio.set_volume(next.volume);
     match decide(view, next) {
         Action::Load {
             stream_url,

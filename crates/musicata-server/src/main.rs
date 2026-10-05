@@ -27,9 +27,11 @@ mod fingerprint;
 mod loudness;
 mod ml;
 mod mpd;
+mod mpd_dsp;
 mod musicbrainz;
 #[cfg(feature = "provider-opensubsonic")]
 mod opensubsonic;
+mod output_audio;
 mod players;
 #[cfg(feature = "provider-podcast")]
 mod podcast;
@@ -106,6 +108,7 @@ const TAG_WRITE_BACK_DISABLED_REASON: &str =
 #[derive(Clone)]
 struct AppState {
     database: Database,
+    output_audio: Arc<output_audio::OutputAudio>,
     providers: Arc<RwLock<ProviderRegistry>>,
     players: Arc<PlayerManager>,
     musicbrainz: MusicBrainzClient,
@@ -2179,9 +2182,11 @@ async fn apply_snapcast_dsp(database: &musicata_storage::Database, players: &Arc
         .flatten()
         .filter(|value| !value.is_empty());
     let eq = match id {
-        Some(id) => dsp::profile_by_id(database, &id)
-            .await
-            .and_then(|profile| snapcast::StereoEq::from_profile(&profile, rate)),
+        Some(id) => dsp::profile_by_id(database, &id).await.and_then(|profile| {
+            snapcast::StereoEq::from_profile(&profile, rate)
+                .ok()
+                .flatten()
+        }),
         None => None,
     };
     players.set_snapcast_dsp(eq).await;
@@ -2564,6 +2569,7 @@ fn app(
         .map(|parent| parent.join("artwork"))
         .unwrap_or_else(|| PathBuf::from("artwork"));
     let state = AppState {
+        output_audio: Arc::new(output_audio::OutputAudio::default()),
         database,
         providers,
         players,
@@ -2582,6 +2588,19 @@ fn app(
         export_status: Arc::new(std::sync::Mutex::new(backup::ExportStatus::default())),
         ml_trigger,
     };
+    let bootstrap = state.clone();
+    tokio::spawn(async move {
+        if let Ok(players) = bootstrap.database.list_players().await {
+            for player in players {
+                if matches!(player.kind.as_str(), "mpd" | "snapcast") {
+                    let _ = bootstrap
+                        .output_audio
+                        .entry(&bootstrap.database, &bootstrap.players, &player.id)
+                        .await;
+                }
+            }
+        }
+    });
     Router::new()
         .merge(subsonic::routes())
         // The embedded Svelte app (built from web/ by build.rs). Hashed bundles under
@@ -2726,6 +2745,15 @@ fn app(
         .route("/api/autoplay", get(get_autoplay).put(set_autoplay))
         // DSP profile library (EQ + room correction). Authenticated, not admin-only — EQ is a
         // playback preference; see crate::dsp + docs/dsp.md.
+        .route(
+            "/api/players/{id}/dsp",
+            get(output_audio::get_selection).put(output_audio::set_selection),
+        )
+        .route("/api/players/{id}/audio/ws", get(output_audio::audio_ws))
+        .route(
+            "/api/players/{id}/dsp/processor",
+            get(output_audio::get_processor).put(output_audio::set_processor),
+        )
         .route("/api/dsp/profiles", get(dsp::list_profiles))
         .route(
             "/api/dsp/profiles/{id}",
@@ -3428,6 +3456,7 @@ async fn delete_player(
         .remove(&id)
         .await
         .map_err(|error| AppError::not_found(error.to_string()))?;
+    state.output_audio.remove(&id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5151,12 +5180,43 @@ async fn snapcast_update(
     }
     // Server-side EQ correction for the Snapcast stream — persisted + applied live to the writer.
     if let Some(profile_id) = update.dsp_profile_id {
+        let profile_id = profile_id.trim();
+        if !profile_id.is_empty() {
+            let profile = dsp::profile_by_id(&state.database, profile_id)
+                .await
+                .ok_or_else(|| AppError::bad_request("unknown correction profile"))?;
+            profile.validate().map_err(AppError::bad_request)?;
+            if profile.room_ir.is_some() {
+                return Err(AppError::bad_request(
+                    "Snapcast does not support room convolution",
+                ));
+            }
+        }
+        if state
+            .database
+            .player_record(players::SNAPCAST_PLAYER_ID)
+            .await
+            .map_err(db_error)?
+            .is_some()
+        {
+            let selection = musicata_core::dsp::OutputDspSelection {
+                profile_id: (!profile_id.is_empty()).then(|| profile_id.to_owned()),
+                enabled: !profile_id.is_empty(),
+            };
+            let _ = output_audio::set_selection(
+                State(state.clone()),
+                Path(players::SNAPCAST_PLAYER_ID.into()),
+                axum::extract::Query(output_audio::SelectionQuery::default()),
+                Json(selection),
+            )
+            .await?;
+        }
+        // Before the optional output exists, this is its one-time bootstrap preference.
         state
             .database
-            .set_setting("snapcast.dsp_profile_id", profile_id.trim())
+            .set_setting("snapcast.dsp_profile_id", profile_id)
             .await
             .map_err(db_error)?;
-        apply_snapcast_dsp(&state.database, &state.players).await;
     }
     // Start the subsystem immediately when newly enabled; auth/host/input-enable changes persist
     // and take effect on the next restart (the snapserver config is regenerated at startup).
@@ -9349,6 +9409,215 @@ mod tests {
                 .unwrap()
                 .status(),
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn output_restore_disables_a_deleted_profile_binding() {
+        let fixture = TestFixture::new("dsp-missing-restored-profile");
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .unwrap();
+        // Persist the player first, then simulate a checkpoint surviving a profile deletion.
+        let (_, _) = fixture.app_with_database(database.clone()).await;
+        database
+            .set_player_dsp(
+                "browser-local",
+                &musicata_core::dsp::OutputDspSelection {
+                    profile_id: Some("deleted-profile".into()),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        let (router, _) = fixture.app_with_database(database.clone()).await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/players/browser-local/dsp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(value["selection"]["enabled"], false);
+        assert!(value["selection"]["profile_id"].is_null());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while database
+                .player_dsp("browser-local")
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn output_selection_coalesces_without_waiting_for_sqlite_checkpoint() {
+        use sqlx::Connection;
+        let fixture = TestFixture::new("dsp-busy-checkpoint");
+        let (router, database) = fixture.app_with_library_db(fixture.library()).await;
+        let put = |body: &'static str| {
+            router.clone().oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/players/browser-local/dsp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        // Warm the output entry before blocking its asynchronous checkpoint writer.
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/players/browser-local/dsp")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let mut lock = sqlx::SqliteConnection::connect(&format!(
+            "sqlite:{}",
+            fixture.root.join("musicata.db").display()
+        ))
+        .await
+        .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut lock)
+            .await
+            .unwrap();
+        assert_eq!(
+            put(r#"{"profile_id":null,"enabled":false}"#)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            put(r#"{"profile_id":null,"enabled":false}"#),
+        )
+        .await;
+        sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
+        assert_eq!(
+            result
+                .expect("live selection waited for a SQLite checkpoint")
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while database
+                .player_dsp("browser-local")
+                .await
+                .unwrap()
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_dsp_profile_writes_and_delete_select_remain_consistent() {
+        let fixture = TestFixture::new("dsp-concurrent");
+        let (router, database) = fixture.app_with_library_db(fixture.library()).await;
+        async fn request(
+            router: axum::Router,
+            method: &str,
+            path: &str,
+            body: String,
+        ) -> StatusCode {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+        let mut tasks = Vec::new();
+        for n in 0..20 {
+            let router = router.clone();
+            tasks.push(tokio::spawn(async move {
+                request(
+                    router,
+                    "PUT",
+                    &format!("/api/dsp/profiles/profile-{n}"),
+                    format!(
+                        r#"{{"id":"profile-{n}","name":"Profile {n}","preampDb":0,"bands":[]}}"#
+                    ),
+                )
+                .await
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::OK);
+        }
+        let json = database.get_setting("dsp_profiles").await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<crate::dsp::DspProfile>>(&json)
+                .unwrap()
+                .len(),
+            20
+        );
+        for n in 0..20 {
+            let path = format!("/api/dsp/profiles/profile-{n}");
+            let selection = format!(r#"{{"profile_id":"profile-{n}","enabled":true}}"#);
+            let (deleted, selected) = tokio::join!(
+                request(router.clone(), "DELETE", &path, String::new()),
+                request(
+                    router.clone(),
+                    "PUT",
+                    "/api/players/browser-local/dsp",
+                    selection
+                )
+            );
+            assert_eq!(deleted, StatusCode::NO_CONTENT);
+            assert!(selected == StatusCode::OK || selected == StatusCode::BAD_REQUEST);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/players/browser-local/dsp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(value["selection"]["profile_id"], serde_json::Value::Null);
+        assert_eq!(
+            database
+                .player_dsp("browser-local")
+                .await
+                .unwrap()
+                .unwrap()
+                .profile_id,
+            None
         );
     }
 

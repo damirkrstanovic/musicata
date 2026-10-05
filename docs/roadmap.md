@@ -871,15 +871,17 @@ headphones, one-tap switch, each with its own correction + volume) is the drivin
 Tasks (browser-first; see `docs/dsp.md` for per-phase detail + the files touched):
 
 The **entire browser DSP tier (Phases 0–4) is DONE** — see `crate::dsp`, `web/src/lib/{audio,dsp,
-audioDevices}.ts`, `web/src/player/EqPanel.svelte`. Remaining work includes the MPD/DAC path,
-EQ across all outputs, and polish.
+audioDevices}.ts`, `web/src/player/EqPanel.svelte`. Per-output EQ and metering are implemented
+in the feature work for [issue #12](https://github.com/damirkrstanovic/musicata/issues/12).
+Physical verification remains open; see the capability matrix and measured limits in `docs/dsp.md`.
 
 - [x] **Phase 0–1 — profile model + browser DSP core.** Browser EQ: a Web Audio graph in
   `BrowserAudio` (`source → preamp → biquads → convolver → leveling → destination`) with
   `setEq`/`setBypass`/`setSink`, hot-path-safe. Profiles are **server-stored** (`crate::dsp`,
   `DspProfile` JSON in the `dsp_profiles` setting; `GET /api/dsp/profiles` + `PUT/DELETE
   /api/dsp/profiles/{id}`, authenticated, not admin-gated) so they sync across devices; per-browser
-  bits (active/enabled/leveling) stay local. Edited in the player `EqPanel` (not a separate /admin
+  sink bindings and leveling stay local; active profile/bypass now belong to each server output.
+  Edited in the player `EqPanel` (not a separate /admin
   panel — that's where EQ already lives). The `ParametricEQ.txt` parser + paste-import predate this.
 - [x] **Phase 2 — output presets + speakers/headphones switcher (the home-office MVP).** A
   client `audioDevices` store (`OutputPreset[]` in `localStorage`, `enumerateDevices`); a footer
@@ -938,7 +940,7 @@ EQ across all outputs, and polish.
   per-channel level measurements from the server/output audio path and push lightweight
   updates to controllers; do not require browser audio playback. Identify the measurement
   point, handle pause/stop and output switching correctly, and keep metering off the UI's
-  full-state update path. Verify behavior on the Mele's MPD → Topping DAC path and all other
+  full-state update path. Verify behavior on the MPD → USB DAC path and all other
   supported output kinds.
 
 Explicitly out of scope: a measurement suite (no sweep/RTA/mic capture), and any Dirac

@@ -2726,6 +2726,8 @@ pub struct SnapcastPlayer {
     loaded: Mutex<LoadedTrack>,
     /// Identifies each writer load so an event from a replaced track cannot move the queue.
     writer_generation: AtomicU64,
+    audio_tap: Arc<musicata_core::pcm_dsp::AudioTap>,
+    writer_alive: Arc<AtomicBool>,
 }
 
 /// What the writer thread is currently rendering / has preloaded.
@@ -2755,9 +2757,22 @@ impl SnapcastPlayer {
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         let sample_rate = manager.sample_rate();
         let fifo = manager.fifo_path();
+        let audio_tap = Arc::new(musicata_core::pcm_dsp::AudioTap::default());
+        let writer_tap = audio_tap.clone();
+        let writer_alive = Arc::new(AtomicBool::new(true));
+        let alive = writer_alive.clone();
         std::thread::Builder::new()
             .name(format!("snapcast-writer-{id}"))
-            .spawn(move || crate::snapcast::run_writer(fifo, writer_rx, events_tx))
+            .spawn(move || {
+                struct Liveness(Arc<AtomicBool>);
+                impl Drop for Liveness {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let _liveness = Liveness(alive);
+                crate::snapcast::run_writer(fifo, writer_rx, events_tx, writer_tap);
+            })
             .expect("spawn snapcast writer thread");
         Arc::new(Self {
             persistence: QueuePersistence::new(database.clone(), QueueOwner::Player(id.clone())),
@@ -2774,12 +2789,33 @@ impl SnapcastPlayer {
             events_rx: std::sync::Mutex::new(Some(events_rx)),
             loaded: Mutex::new(LoadedTrack::default()),
             writer_generation: AtomicU64::new(1),
+            audio_tap,
+            writer_alive,
         })
     }
 
     /// Set (or clear) the server-side EQ correction applied to the outgoing PCM (before the FIFO).
     pub fn set_dsp(&self, eq: Option<StereoEq>) {
-        let _ = self.writer_tx.send(WriterMsg::SetDsp(Box::new(eq)));
+        self.set_output_dsp(eq, 0);
+    }
+
+    pub fn set_output_dsp(&self, eq: Option<StereoEq>, revision: u64) {
+        let _ = self.writer_tx.send(WriterMsg::SetDsp {
+            chain: Box::new(eq),
+            revision,
+        });
+    }
+
+    pub fn writer_alive(&self) -> bool {
+        self.writer_alive.load(Ordering::Acquire)
+    }
+
+    pub fn audio_tap(&self) -> Arc<musicata_core::pcm_dsp::AudioTap> {
+        self.audio_tap.clone()
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     pub fn is_online(&self) -> bool {

@@ -16,7 +16,6 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
-use serde::{Deserialize, Serialize};
 
 use musicata_storage::Database;
 
@@ -24,40 +23,9 @@ use crate::{AppError, AppState, db_error};
 
 const DSP_PROFILES_KEY: &str = "dsp_profiles";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DspBand {
-    /// "peaking" | "lowshelf" | "highshelf".
-    #[serde(rename = "type")]
-    pub band_type: String,
-    pub freq: f64,
-    pub gain: f64,
-    pub q: f64,
-}
-
-/// `sampleRate` of a stored room impulse response (the WAV bytes live in a file served by
-/// `/api/dsp/profiles/{id}/impulse`; see Phase 4).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RoomIr {
-    pub sample_rate: u32,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DspProfile {
-    pub id: String,
-    pub name: String,
-    /// Preamp / headroom in dB (applied as a front gain so band boosts don't clip).
-    pub preamp_db: f64,
-    #[serde(default)]
-    pub bands: Vec<DspBand>,
-    /// "headphones" | "speakers" — drives the output switcher + which profiles can carry a room IR.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub room_ir: Option<RoomIr>,
-}
+#[cfg(test)]
+pub use musicata_core::dsp::DspBand;
+pub use musicata_core::dsp::{DspProfile, RoomIr};
 
 async fn load_profiles(db: &Database) -> Vec<DspProfile> {
     db.get_setting(DSP_PROFILES_KEY)
@@ -92,14 +60,20 @@ pub async fn upsert_profile(
     Path(id): Path<String>,
     Json(mut profile): Json<DspProfile>,
 ) -> Result<Json<DspProfile>, AppError> {
+    let _profiles = state.output_audio.profile_changes.lock().await;
     profile.id = id;
     if profile.name.trim().is_empty() {
         return Err(AppError::bad_request("profile name is required"));
     }
+    profile.validate().map_err(AppError::bad_request)?;
     let mut profiles = load_profiles(&state.database).await;
     profiles.retain(|p| p.id != profile.id);
     profiles.push(profile.clone());
     store_profiles(&state.database, &profiles).await?;
+    state
+        .output_audio
+        .refresh_profile(&profile.id, Some(profile.clone()))
+        .await;
     Ok(Json(profile))
 }
 
@@ -107,11 +81,18 @@ pub async fn delete_profile(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
+    let _profiles = state.output_audio.profile_changes.lock().await;
     let mut profiles = load_profiles(&state.database).await;
     let before = profiles.len();
     profiles.retain(|p| p.id != id);
     if profiles.len() != before {
         store_profiles(&state.database, &profiles).await?;
+        state.output_audio.refresh_profile(&id, None).await;
+        state
+            .database
+            .clear_dsp_profile_bindings(&id)
+            .await
+            .map_err(crate::db_error)?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -180,6 +161,7 @@ pub async fn upload_impulse(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode, AppError> {
+    let _profiles = state.output_audio.profile_changes.lock().await;
     let mut profiles = load_profiles(&state.database).await;
     let profile = profiles
         .iter_mut()
@@ -199,6 +181,10 @@ pub async fn upload_impulse(
         sample_rate: wav_sample_rate(&body),
     });
     store_profiles(&state.database, &profiles).await?;
+    state
+        .output_audio
+        .refresh_profile(&id, profiles.iter().find(|p| p.id == id).cloned())
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -218,11 +204,16 @@ pub async fn delete_impulse(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
+    let _profiles = state.output_audio.profile_changes.lock().await;
     let _ = tokio::fs::remove_file(impulse_path(&state, &id)).await;
     let mut profiles = load_profiles(&state.database).await;
     if let Some(profile) = profiles.iter_mut().find(|p| p.id == id) {
         profile.room_ir = None;
         store_profiles(&state.database, &profiles).await?;
+        state
+            .output_audio
+            .refresh_profile(&id, profiles.iter().find(|p| p.id == id).cloned())
+            .await;
     }
     Ok(StatusCode::NO_CONTENT)
 }

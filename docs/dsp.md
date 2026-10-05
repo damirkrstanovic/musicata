@@ -440,3 +440,51 @@ CamillaDSP source `../camilladsp` (Cargo.toml, src/filters/*, src/config/mod.rs,
 src/socketserver.rs, backend_alsa.md, websocket.md, translate_rew_xml.py),
 JamesDSP/RootlessJamesDSP (GPLv2), Wavelet, EasyEffects; MDN Web Audio
 (BiquadFilterNode, ConvolverNode).
+
+## Per-output EQ and measured levels
+
+The selected output owns its desired profile and bypass state in SQLite (`player_dsp`).
+Controllers use `/api/players/{id}/dsp` and the separate `/audio/ws` channel; ordinary playback
+state carries no meter frames. A revision is applied only after the renderer consumes it.
+Pending/unavailable/error states retain the desired selection and expose the discrepancy.
+Profiles remain shared; physical browser sink bindings and browser loudness mode stay local.
+
+| Output | Processing | Meter tap | Room convolution |
+|---|---|---|---|
+| Browser | Web Audio | After EQ, leveling and software volume | Supported |
+| Native endpoint | Shared Rust PEQ/preamp, rodio adapter | Final clipped software output | Unsupported |
+| Snapcast | Shared Rust PEQ/preamp in PCM writer | Shared stream, before network/DAC buffering | Unsupported |
+| MPD | Optional CamillaDSP 4.1.x on the playback host | Processor playback RMS/sample peak | Unsupported by this binding |
+| Zone | Choose a member | That member's tap | Member capability |
+
+Snapcast correction affects all clients receiving its stream. A stream meter cannot establish
+room-specific DAC levels or independent room correction. Downstream hardware volume is outside
+all software taps. RMS and sample peak are linear full-scale amplitude, not true peak or sound
+pressure. Meter subscriptions publish bounded snapshots; stale, paused and disconnected readings
+clear. The first browser renderer holds a connection-scoped lease; scoped native endpoint tokens
+can render only their own output. Controllers cannot impersonate native or MPD renderers.
+
+![A controller displaying measured stereo levels for a remote output](images/output-vu.png)
+
+MPD keeps its existing stream URLs, queue and transport. In Settings → Players & zones, connect
+an already routed CamillaDSP processor by hostname/IP and port. Musicata validates a candidate,
+patches only its marked pipeline stage/filter names, preserves device configuration and unrelated
+stages, and confirms the active configuration before acknowledging. A missing processor leaves
+playback running and exposes unavailable correction. Shelf Q is ignored consistently with Web
+Audio's fixed slope; CamillaDSP shelves use Q = 1/√2 for the same response.
+
+Optional new-host preparation: `packaging/install.py --mode native --with mpd,dsp --check` or
+`--dry-run`. Install CamillaDSP 4.1.x first. Applying prepares ALSA loopback, a localhost processor
+service and fixed 48 kHz stereo MPD routing; the selected physical DAC remains in the processor
+configuration. Existing unmanaged routing is refused. Installer backups include MPD and processor
+configuration; normal activation-failure rollback restores them. Existing installations require a
+separate backed-up migration rather than silently changing their routing during upgrade.
+
+Hardware probe (2026-10-05): CamillaDSP 4.1.3, 48 kHz stereo, Celeron N4500 and USB DAC,
+using an isolated user-owned MPD FIFO while the existing server load continued. Known unequal
+stereo tones verified −6 dB preamp, live +6 dB peaking and bypass. Pause/resume/seek/stop/play
+worked; original playback was restored. A nine-band stack used about 2% of one CPU core and
+6.7 MiB RSS over an eight-second steady span. Processor requests peaked at 1.3 ms; MPD seek
+peaked at 130 ms. Four playback-buffer recoveries occurred during transport discontinuities.
+This short probe does not establish long-term underrun-free operation, permanent ALSA-loopback
+routing, native-device playback or physical multi-room synchronization.

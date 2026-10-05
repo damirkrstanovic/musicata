@@ -54,6 +54,7 @@ export class BrowserAudio {
   // Room correction (Phase 4): a ConvolverNode after the EQ bands loaded from a profile's WAV
   // impulse response. `convBuffer` is the decoded IR; `convProfileId` tracks which profile's IR
   // is loaded so we don't refetch on every rebuild.
+  private eqGeneration = 0;
   private convBuffer: AudioBuffer | null = null;
   private convProfileId: string | null = null;
   private conv?: ConvolverNode;
@@ -111,6 +112,28 @@ export class BrowserAudio {
     this.ensureGraph(); // build the graph in this gesture so the context starts running
     this.ctx?.resume().catch(() => {});
   }
+  private rendererAllowed = false;
+  private desiredPlayback: PlaybackState | null = null;
+  setRendererAllowed(allowed: boolean): void {
+    this.rendererAllowed = allowed;
+    if (!allowed) this.pause();
+    else if (this.desiredPlayback) this.drive(this.desiredPlayback);
+  }
+
+  async applyOutputEq(profile: EqProfile | null): Promise<void> {
+    this.ensureGraph();
+    if (!this.ctx || this.graphFailed) throw new Error("Audio processing is unavailable");
+    if (profile?.bands.some(b => b.freq >= this.ctx!.sampleRate / 2)) throw new Error("EQ frequency exceeds this output's sample rate");
+    const generation = ++this.eqGeneration;
+    this.profile = profile;
+    this.convBuffer = null;
+    this.convProfileId = null;
+    this.rebuildChain();
+    await this.loadRoomIr(profile, generation);
+    if (generation !== this.eqGeneration) return;
+    if (profile?.roomIr && !this.convBuffer) throw new Error("Impulse response could not be loaded");
+  }
+
   get isClaimed(): boolean {
     return this.claimed;
   }
@@ -140,7 +163,10 @@ export class BrowserAudio {
    *  create a suspended context (which browsers warn about: "AudioContext was prevented from
    *  starting"). `ensureGraph()` applies the stored profile + IR when it builds. */
   setEq(profile: EqProfile | null): void {
+    ++this.eqGeneration;
     this.profile = profile;
+    this.convBuffer = null;
+    this.convProfileId = null;
     if (this.ctx) {
       this.rebuildChain();
       this.ctx.resume().catch(() => {});
@@ -150,7 +176,7 @@ export class BrowserAudio {
 
   /** Fetch + decode a profile's room-correction impulse response (or clear it), then rebuild so
    *  the ConvolverNode is inserted. No-ops if the same profile's IR is already loaded. */
-  private async loadRoomIr(profile: EqProfile | null): Promise<void> {
+  private async loadRoomIr(profile: EqProfile | null, generation = this.eqGeneration): Promise<void> {
     const id = profile?.roomIr ? profile.id : null;
     if (id === this.convProfileId) return;
     // Without a context there's nothing to load into yet; don't record `convProfileId` so the
@@ -172,7 +198,7 @@ export class BrowserAudio {
     }
     // Only commit if this is still the active request — a newer profile switch (a later
     // loadRoomIr) must not be clobbered by this one's late-resolving fetch.
-    if (this.convProfileId !== id) return;
+    if (generation !== this.eqGeneration || this.convProfileId !== id) return;
     this.convBuffer = decoded;
     this.rebuildChain();
   }
@@ -205,11 +231,11 @@ export class BrowserAudio {
   }
 
   /** Instantaneous RMS level (0..~1, linear) per channel, or null if metering is unavailable. */
-  levels(): { l: number; r: number } | null {
+  levels(): { l: number; r: number; peakL: number; peakR: number } | null {
     if (!this.analyserL || !this.analyserR || !this.bufL || !this.bufR) return null;
     this.analyserL.getFloatTimeDomainData(this.bufL);
     this.analyserR.getFloatTimeDomainData(this.bufR);
-    return { l: rms(this.bufL), r: rms(this.bufR) };
+    return { l: rms(this.bufL), r: rms(this.bufR), peakL: this.bufL.reduce((peak, value) => Math.max(peak, Math.abs(value)), 0), peakR: this.bufR.reduce((peak, value) => Math.max(peak, Math.abs(value)), 0) };
   }
 
   private ensureGraph(): void {
@@ -394,6 +420,7 @@ export class BrowserAudio {
   /** Start a stream right now. Call inside a user gesture so the browser's autoplay policy
    *  lets it play; `drive()` then keeps it in sync once the server's state arrives. */
   primePlay(streamUrl: string): void {
+    if (!this.rendererAllowed) return;
     this.ctx?.resume().catch(() => {});
     if (!this.el.src.endsWith(streamUrl)) this.el.src = streamUrl;
     this.el
@@ -415,6 +442,8 @@ export class BrowserAudio {
 
   /** Reconcile the <audio> element with the desired playback state. */
   drive(playback: PlaybackState): void {
+    this.desiredPlayback = playback;
+    if (!this.rendererAllowed) return;
     if (!this.claimed) return;
     if (playback.volume != null) this.setVolume(playback.volume);
     const now = playback.now_playing;

@@ -19,6 +19,8 @@ import type { TrackMetadataReviewResponse } from "../types/TrackMetadataReviewRe
 import type { TrackMetadataFieldObservation } from "../types/TrackMetadataFieldObservation";
 import type { MetadataFieldReviewUpdate } from "../types/MetadataFieldReviewUpdate";
 import type { EqProfile } from "./dsp";
+import type { OutputDspState } from "../types/OutputDspState";
+import type { OutputDspSelection } from "../types/OutputDspSelection";
 
 // Re-export the generated metadata-review types under the names the editor components use.
 export type { MetadataApprovalState } from "../types/MetadataApprovalState";
@@ -402,6 +404,11 @@ export const api = {
     getJson<UnidentifiedArtist[]>("/api/identification/unidentified", { kind: "artist", limit }),
 
   // DSP profile library (server-synced EQ / room correction)
+  dspProcessor: (id: string) => getJson<{host: string; port: number} | null>(`/api/players/${encodeURIComponent(id)}/dsp/processor`),
+  saveDspProcessor: (id: string, binding: {host: string; port: number} | null) => sendJson<{host: string; port: number} | null>(`/api/players/${encodeURIComponent(id)}/dsp/processor`, "PUT", binding),
+  outputDsp: (id: string) => getJson<OutputDspState>(`/api/players/${encodeURIComponent(id)}/dsp`),
+  saveOutputDsp: (id: string, selection: OutputDspSelection, migrate = false) =>
+    sendJson<OutputDspState>(`/api/players/${encodeURIComponent(id)}/dsp${migrate ? "?migrate=true" : ""}`, "PUT", selection),
   dspProfiles: () => getJson<EqProfile[]>("/api/dsp/profiles"),
   saveDspProfile: (p: EqProfile) =>
     sendJson<EqProfile>(`/api/dsp/profiles/${encodeURIComponent(p.id)}`, "PUT", p),

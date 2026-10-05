@@ -40,6 +40,16 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(new['user'],'damirk')
         with self.assertRaises(m.InstallError): m.options(['--upgrade','--mode','docker'],old)
 
+    def test_dsp_preparation_is_explicit_and_preserves_dac_target(self):
+        with self.assertRaises(m.InstallError): m.options(['--mode','native','--with','dsp'])
+        with self.assertRaises(m.InstallError): m.options(['--mode','docker','--with','mpd,dsp'])
+        cfg = m.options(['--mode','native','--with','mpd,dsp','--alsa-device','hw:CARD=USB,DEV=0'])
+        processor = m.processor_config(cfg)
+        self.assertEqual(processor['devices']['capture']['device'],'hw:Loopback,1,0')
+        self.assertEqual(processor['devices']['playback']['device'],'hw:CARD=USB,DEV=0')
+        self.assertEqual(processor['devices']['samplerate'],48000)
+        self.assertEqual(processor['pipeline'],[])
+
     def test_package_selection(self):
         for family, engine in [('debian','docker.io'),('arch','docker'),('fedora','moby-engine')]:
             self.assertIn(engine,m.packages(family,m.options([])))
@@ -66,11 +76,10 @@ class DeploymentTests(unittest.TestCase):
     def setUp(self):
         from contextlib import ExitStack
         from unittest.mock import patch
-        from types import SimpleNamespace
         import os
         self.stack=ExitStack();self.addCleanup(self.stack.close)
         self.root=Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
-        for name,leaf in [('CONFIG','etc/install.json'),('DATA','state'),('ML_DATA','ml'),('UNIT','etc/musicata.service'),('MPD_UNIT','etc/mpd.service'),('MPD_CONFIG','etc/mpd.conf'),('CURRENT','opt/current'),('BACKUPS','backups'),('NSS','etc/nsswitch.conf'),('AVAHI','etc/avahi.service')]:
+        for name,leaf in [('CONFIG','etc/install.json'),('DATA','state'),('ML_DATA','ml'),('UNIT','etc/musicata.service'),('MPD_UNIT','etc/mpd.service'),('MPD_CONFIG','etc/mpd.conf'),('CURRENT','opt/current'),('BACKUPS','backups'),('NSS','etc/nsswitch.conf'),('AVAHI','etc/avahi.service'),('DSP_CONFIG','etc/camilladsp.json'),('DSP_UNIT','etc/camilladsp.service'),('DSP_MODULE','etc/modules-load.conf')]:
             self.stack.enter_context(patch.object(m,name,self.root/leaf))
         self.artifact=self.root/'artifact';self.artifact.mkdir();(self.artifact/'musicata-server').write_text('fixture binary')
         self.stack.enter_context(patch.object(m,'native_artifact',return_value=self.artifact))
@@ -79,7 +88,7 @@ class DeploymentTests(unittest.TestCase):
         self.stack.enter_context(patch.object(m,'succeeds',side_effect=lambda a:a[0]=='runuser'))
         self.commands=[]
         self.stack.enter_context(patch.object(m,'run',side_effect=lambda a,**kw:self.commands.append(list(map(str,a))) or ''))
-        self.stack.enter_context(patch.object(m.pwd,'getpwnam',return_value=SimpleNamespace(pw_uid=os.getuid(),pw_gid=os.getgid())))
+        self.stack.enter_context(patch.object(m.pwd,'getpwnam',return_value=m.pwd.struct_passwd(("musicata","x",os.getuid(),os.getgid(),"","/nonexistent","/usr/sbin/nologin"))))
         self.health=self.stack.enter_context(patch.object(m,'healthy'))
         self.cfg=m.options(['--mode','native','--library',str(self.root/'music')])
 
@@ -90,6 +99,53 @@ class DeploymentTests(unittest.TestCase):
         m.CURRENT.parent.mkdir();old=m.CURRENT.parent/'old';old.mkdir();m.CURRENT.symlink_to(old)
         saved={k:v for k,v in self.cfg.items() if k not in ('upgrade','yes','check','dry_run')}
         m.CONFIG.write_text(json.dumps(saved));return saved,old
+
+    def test_dsp_configuration_targets_dac_and_failure_restores_files(self):
+        from unittest.mock import patch
+        cfg=m.options(['--mode','native','--with','mpd,dsp','--alsa-device','hw:CARD=USB,DEV=0','--library',str(self.root/'music')])
+        saved,old=self.existing()
+        m.DSP_CONFIG.write_text('original processor routing')
+        m.DSP_UNIT.write_text('original processor unit')
+        m.MPD_CONFIG.write_text('original MPD routing')
+        self.health.side_effect=m.InstallError('health failed')
+        with patch.object(m.shutil,'which',return_value='/usr/bin/camilladsp'),patch.object(m,'configure_mpd'),patch.object(m,'succeeds',side_effect=lambda a:a[0]=='runuser' or a==['systemctl','is-active','--quiet','musicata-camilladsp.service']):
+            with self.assertRaises(m.InstallError): m.deploy(cfg,saved,'debian',[])
+        self.assertEqual(m.DSP_CONFIG.read_text(),'original processor routing')
+        self.assertEqual(m.DSP_UNIT.read_text(),'original processor unit')
+        self.assertEqual(m.MPD_CONFIG.read_text(),'original MPD routing')
+        self.assertFalse(m.DSP_MODULE.exists())
+        self.assertEqual(m.CURRENT.resolve(),old)
+        self.assertIn(['systemctl','start','musicata.service'],self.commands)
+        self.assertIn(['modprobe','snd-aloop'],self.commands)
+        self.assertIn(['systemctl','start','musicata-camilladsp.service'],self.commands)
+
+    def test_failed_fresh_dsp_install_unloads_only_a_new_loopback_module(self):
+        from unittest.mock import patch
+        cfg=m.options(['--mode','native','--with','mpd,dsp','--alsa-device','hw:CARD=USB,DEV=0','--library',str(self.root/'music')])
+        self.health.side_effect=m.InstallError('health failed')
+        exists = Path.exists
+        with patch.object(m.shutil,'which',return_value='/usr/bin/camilladsp'),patch.object(m,'configure_mpd'),patch.object(m.Path,'exists',autospec=True,side_effect=lambda p: False if str(p)=='/sys/module/snd_aloop' else exists(p)):
+            with self.assertRaises(m.InstallError): m.deploy(cfg,None,'debian',[])
+        self.assertIn(['modprobe','-r','snd-aloop'],self.commands)
+
+    def test_failed_dsp_install_preserves_an_existing_loopback_module(self):
+        from unittest.mock import patch
+        cfg=m.options(['--mode','native','--with','mpd,dsp','--alsa-device','hw:CARD=USB,DEV=0','--library',str(self.root/'music')])
+        self.health.side_effect=m.InstallError('health failed')
+        exists = Path.exists
+        with patch.object(m.shutil,'which',return_value='/usr/bin/camilladsp'),patch.object(m,'configure_mpd'),patch.object(m.Path,'exists',autospec=True,side_effect=lambda p: True if str(p)=='/sys/module/snd_aloop' else exists(p)):
+            with self.assertRaises(m.InstallError): m.deploy(cfg,None,'debian',[])
+        self.assertNotIn(['modprobe','-r','snd-aloop'],self.commands)
+
+    def test_dsp_service_and_config_are_prepared_without_device_access(self):
+        from unittest.mock import patch
+        cfg=m.options(['--mode','native','--with','mpd,dsp','--alsa-device','hw:CARD=USB,DEV=0'])
+        with patch.object(m.shutil,'which',return_value='/usr/bin/camilladsp'):
+            m.configure_dsp(cfg,1000,1000)
+        import json
+        self.assertEqual(json.loads(m.DSP_CONFIG.read_text())['devices']['playback']['device'],'hw:CARD=USB,DEV=0')
+        self.assertIn('127.0.0.1 -p 1234',m.DSP_UNIT.read_text())
+        self.assertEqual(m.DSP_MODULE.read_text(),'snd-aloop\n')
 
     def test_fresh_install_creates_non_root_service_and_saved_settings(self):
         import json

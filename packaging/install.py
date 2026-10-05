@@ -28,11 +28,14 @@ ML_DATA = Path('/var/lib/musicata-ml')
 UNIT = Path('/etc/systemd/system/musicata.service')
 MPD_UNIT = Path('/etc/systemd/system/musicata-mpd.service')
 MPD_CONFIG = Path('/etc/musicata-mpd.conf')
+DSP_CONFIG = Path('/etc/musicata-camilladsp.json')
+DSP_UNIT = Path('/etc/systemd/system/musicata-camilladsp.service')
+DSP_MODULE = Path('/etc/modules-load.d/musicata-dsp.conf')
 CURRENT = Path('/opt/musicata/current')
 BACKUPS = Path('/var/backups/musicata')
 NSS = Path('/etc/nsswitch.conf')
 AVAHI = Path('/etc/avahi/services/musicata.service')
-COMPONENTS = {'mpd', 'snapcast', 'airplay', 'spotify', 'discovery', 'ml'}
+COMPONENTS = {'dsp', 'mpd', 'snapcast', 'airplay', 'spotify', 'discovery', 'ml'}
 
 class InstallError(Exception):
     pass
@@ -79,6 +82,10 @@ def options(argv, saved=None):
         args['components'] = sorted(set(filter(None, args['components'].split(','))))
     result.update({k: v for k, v in args.items() if v is not None})
     if set(result['components']) - COMPONENTS: raise InstallError('Unknown component; use --help.')
+    if 'dsp' in result['components'] and (result['mode'] != 'native' or 'mpd' not in result['components']):
+        raise InstallError('DSP preparation requires --mode native --with mpd,dsp and an installed CamillaDSP 4.1 executable.')
+    if 'dsp' in result['components'] and result['alsa_device'] == 'default':
+        raise InstallError('DSP preparation needs an explicit physical DAC --alsa-device, for example plughw:CARD=USB,DEV=0.')
     if result['mode'] == 'native' and 'ml' in result['components']:
         raise InstallError('musicata-ml is available only with --mode docker. A remote ML service can be configured in the web UI.')
     if any(c in result['components'] for c in ('airplay','spotify')):
@@ -267,6 +274,39 @@ WantedBy=multi-user.target
 '''
 
 
+def processor_config(cfg):
+    return {'devices': {'samplerate':48000, 'chunksize':1024, 'queuelimit':4,
+        'silence_threshold':-100, 'silence_timeout':0,
+        'capture':{'type':'Alsa','channels':2,'device':'hw:Loopback,1,0','format':'S32_LE'},
+        'playback':{'type':'Alsa','channels':2,'device':cfg['alsa_device'],'format':'S32_LE'}},
+        'filters':{}, 'pipeline':[]}
+
+
+def configure_dsp(cfg, uid, gid, runtime_changes=None):
+    executable = shutil.which('camilladsp')
+    if not executable: raise InstallError('Install CamillaDSP 4.1 first; no unverified executable is downloaded.')
+    if not DSP_CONFIG.exists(): atomic_write(DSP_CONFIG,json.dumps(processor_config(cfg),indent=2)+'\n')
+    run([executable,'--check',str(DSP_CONFIG)])
+    was_loaded = Path('/sys/module/snd_aloop').exists()
+    run(['modprobe','snd-aloop'])
+    if runtime_changes is not None and not was_loaded: runtime_changes['loopback_loaded'] = True
+    atomic_write(DSP_MODULE,'snd-aloop\n')
+    atomic_write(DSP_UNIT,f'''[Unit]
+Description=Musicata output correction
+After=sound.target
+Before=musicata-mpd.service
+[Service]
+User={uid}
+Group={gid}
+SupplementaryGroups=audio
+ExecStart={executable} -w -a 127.0.0.1 -p 1234 {DSP_CONFIG}
+Restart=on-failure
+NoNewPrivileges=true
+[Install]
+WantedBy=multi-user.target
+''')
+
+
 def configure_mpd(cfg, uid, gid):
     root = Path('/var/lib/musicata-mpd')
     for directory in (root,root/'music',root/'playlists'):
@@ -283,7 +323,8 @@ restore_paused "yes"
 audio_output {{
  type "alsa"
  name "Musicata ALSA"
- device "{cfg['alsa_device']}"
+ device "{'hw:Loopback,0,0' if 'dsp' in cfg['components'] else cfg['alsa_device']}"
+{(' format "48000:32:2"' if 'dsp' in cfg['components'] else '')}
  mixer_type "software"
 }}
 ''')
@@ -390,6 +431,12 @@ def preflight(cfg, saved, family):
         if component in cfg['components']:
             for service in services:
                 if succeeds(['systemctl','is-active','--quiet',service]): issues.append(f'{service} already runs outside Musicata. Resolve the service/port conflict before installing this component.')
+    if 'dsp' in cfg['components']:
+        if not shutil.which('camilladsp'): issues.append('Install CamillaDSP 4.1 before selecting dsp; no third-party packages are downloaded.')
+        elif not re.search(r'\b4\.1\.',run(['camilladsp','--version'])): issues.append('DSP preparation supports CamillaDSP 4.1.x.')
+        if not succeeds(['modprobe','--dry-run','snd-aloop']): issues.append('Kernel ALSA loopback module snd-aloop is unavailable.')
+        if not saved and (DSP_UNIT.exists() or DSP_CONFIG.exists()): issues.append('Existing processor configuration is unmanaged; refusing to overwrite it.')
+        if MPD_CONFIG.exists() and not saved: issues.append('DSP preparation only configures new installer-managed MPD routing; existing routing requires manual backed-up migration.')
     return issues
 
 
@@ -442,7 +489,8 @@ def deploy(cfg, saved, family, missing):
         backup = BACKUPS/stamp
         backup.mkdir(parents=True,mode=0o700)
         backup.chmod(0o700)
-        managed_files = [CONFIG,UNIT,MPD_UNIT,MPD_CONFIG,NSS,AVAHI]
+        managed_files = [CONFIG,UNIT,MPD_UNIT,MPD_CONFIG,NSS,AVAHI] + ([DSP_CONFIG,DSP_UNIT,DSP_MODULE] if "dsp" in cfg["components"] else [])
+        dsp_was_active = bool(saved and "dsp" in cfg["components"] and succeeds(["systemctl","is-active","--quiet","musicata-camilladsp.service"]))
         existing_files = {path for path in managed_files if path.exists()}
         for path in managed_files:
             if path.exists():
@@ -453,6 +501,7 @@ def deploy(cfg, saved, family, missing):
         new_containers = []
         stopped = False
         backup_complete = False
+        runtime_changes = {}
         try:
             # A consistent SQLite backup requires the server to be stopped (including WAL).
             if saved:
@@ -466,6 +515,7 @@ def deploy(cfg, saved, family, missing):
                 raise InstallError('Insufficient free space for a state backup.')
             with tarfile.open(backup/'state.tar.gz','w:gz') as tf: tf.add(DATA,arcname=DATA.name)
             backup_complete = True
+            if 'dsp' in cfg['components']: configure_dsp(cfg,uid,gid,runtime_changes)
             if 'mpd' in cfg['components']: configure_mpd(cfg,uid,gid)
             if cfg['mode'] == 'native':
                 destination = CURRENT.parent/(version+'-'+stamp)
@@ -475,6 +525,8 @@ def deploy(cfg, saved, family, missing):
                 if not saved: atomic_write(UNIT,unit_text(cfg,uid,gid))
             if 'discovery' in cfg['components']: configure_discovery(cfg)
             run(['systemctl','daemon-reload'])
+            if 'dsp' in cfg['components']:
+                run(['systemd-analyze','verify',DSP_UNIT]);run(['systemctl','enable','--now','musicata-camilladsp.service'])
             if 'mpd' in cfg['components']:
                 run(['systemd-analyze','verify',MPD_UNIT]);run(['systemctl','enable','--now','musicata-mpd.service'])
             if cfg['mode'] == 'native':
@@ -498,9 +550,15 @@ def deploy(cfg, saved, family, missing):
             for name in new_containers:
                 succeeds(['docker','rm','-f',name])
             if cfg['mode'] == 'native': succeeds(['systemctl','stop','musicata.service'])
+            if 'dsp' in cfg['components']:
+                succeeds(['systemctl','stop','musicata-camilladsp.service'])
+                if not saved: succeeds(['systemctl','disable','musicata-camilladsp.service'])
             if not saved:
                 succeeds(['systemctl','disable','musicata.service'])
                 if 'mpd' in cfg['components']: succeeds(['systemctl','disable','--now','musicata-mpd.service'])
+            if runtime_changes.get('loopback_loaded'):
+                # The kernel refuses removal if another process still uses this module.
+                recover('unload new ALSA loopback module',lambda:run(['modprobe','-r','snd-aloop']))
             def restore_link():
                 if old_link or not saved:
                     CURRENT.unlink(missing_ok=True)
@@ -525,6 +583,7 @@ def deploy(cfg, saved, family, missing):
                 recover('container '+name,lambda name=name:run(['docker','rename',name+'-previous-'+stamp,name]))
             # Never launch an old binary against partially restored or migrated state.
             if not recovery_errors:
+                if dsp_was_active: recover("start output processor",lambda:run(["systemctl","start","musicata-camilladsp.service"]))
                 for name in stopped_containers:
                     recover('start '+name,lambda name=name:run(['docker','start',name]))
                 if saved and stopped and cfg['mode']=='native':

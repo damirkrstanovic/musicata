@@ -835,6 +835,25 @@ the phone's Back action behave like the visible Back control.
 
 ---
 
+## Output correction with CamillaDSP (2026-10-05)
+
+CamillaDSP's [control protocol](https://github.com/HEnquist/camilladsp/blob/v4.1.3/websocket.md)
+supports validating a candidate configuration and patching a running processor. Musicata uses
+`ValidateConfigJson`, `PatchConfig` and `GetConfigJson`: patches own a marked pipeline stage and
+its filter names, while leaving capture/playback devices and other applications' stages intact.
+Removed filters must be explicitly set to `null`; leaving them out does not remove them.
+Active configurations include serialization defaults, so confirmation compares requested values
+and the exact owned filter set rather than raw JSON equality. Playback RMS/peak responses use
+dBFS and may lack valid stereo channels; unavailable measurements are not zero levels.
+
+The [biquad implementation](https://github.com/HEnquist/camilladsp/blob/v4.1.3/src/filters/biquad.rs)
+uses Q for shelf shape. Web Audio uses a fixed shelf slope and ignores shelf Q. Matching that
+response requires Q = 1/√2 in CamillaDSP and slope = 1 in Musicata's Rust shelves. The real PCM
+integration in `src/mpd_dsp.rs` covers live patching, old-filter removal and shelf response parity.
+`docs/dsp.md` records the short hardware probe and its limits.
+
+---
+
 ## Conventions these led to
 
 - **Enum dispatch over `dyn`** for provider/player handles (async methods, object

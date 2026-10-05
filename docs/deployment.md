@@ -6,29 +6,12 @@ of this — music sources, players, API keys, and artwork settings all live in t
 the **/admin** Settings page (live, no restart, no config files). Flags and environment
 variables exist only for *bootstrap* (where the library and database live, the bind address).
 
-## Homelab development workspace
+## Development workspace
 
-For this repository's development environment, run previews, compilation and tests in
-Kubernetes context `homelab-k3s`, namespace `musicata-build`, pod `dev-work`. Its 40 GiB
-`dev-work` PVC holds the checkout at `/home/damirk/src/musicata` and the preview data.
-Keep desktop access lightweight:
-
-```sh
-kubectl --context homelab-k3s -n musicata-build port-forward pod/dev-work 3030:3030
-```
-
-The preview then opens at `http://localhost:3030`. Run builds/tests inside that workspace;
-keep test databases separate from `.musicata/musicata.db`. For example:
-
-```sh
-kubectl --context homelab-k3s -n musicata-build exec dev-work -- bash -lc \
-  'cd /home/damirk/src/musicata && CARGO_HOME="$PWD/.cluster/cargo" cargo build'
-```
-
-This is a development pod, not the production deployment template. The workspace persists
-across pod replacement; the preview process and port-forward must be restarted when their
-processes/pod stop. The previous local preview's library/database remain on the desktop
-as an inactive copy. Do not run both copies as independent writable previews.
+Contributors run previews, compilation and automated tests in the development Kubernetes
+workspace described in `AGENTS.md`. Use an isolated checkout and test databases, preserve
+preview data, and record the context/pod used for verification. Keep a desktop port-forward
+for browser access; the server remains in the cluster.
 
 ## Running from source
 
@@ -241,3 +224,26 @@ cargo test --offline
 
 If a sandbox or CI image has a read-only global Cargo registry, set `CARGO_HOME` to a writable
 directory before building. See [AGENTS.md](../AGENTS.md) for the full build/test guide.
+
+## EQ and VU for MPD outputs
+
+An MPD player can use a CamillaDSP 4.1.x processor on its playback host. Route MPD through
+the processor to the physical DAC first, then connect its hostname/IP and port in Settings →
+Players & zones. EQ selections and bypass are live product settings; the processor binding
+requires an administrator. The VU meter reports processor playback levels, before hardware
+volume. If the processor is unavailable, the controller shows that correction is unavailable
+and clears its meter; MPD transport remains independent.
+
+For a new supported Linux playback host, optional installer preparation uses:
+
+```sh
+packaging/install.py --mode native --with mpd,dsp --alsa-device hw:CARD=USB,DEV=0 --check
+packaging/install.py --mode native --with mpd,dsp --alsa-device hw:CARD=USB,DEV=0 --dry-run
+```
+
+Install CamillaDSP 4.1.x beforehand and replace the example ALSA device with the physical DAC.
+Preparation configures a fixed 48 kHz stereo loopback path and localhost processor service.
+Applying saves MPD and processor configuration for activation-failure rollback, restores an
+existing running processor, and removes a newly loaded loopback module if the kernel permits
+it. Existing unmanaged routing is refused. Existing playback hosts need a separately backed-up
+migration. See `docs/dsp.md` for capabilities, measurement points and hardware verification limits.

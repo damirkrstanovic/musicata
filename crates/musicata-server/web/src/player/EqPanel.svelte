@@ -1,6 +1,8 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
   import { dsp, type LevelingMode } from "../lib/dsp.svelte";
+  import { player } from "../lib/player.svelte";
+  import { outputAudio } from "../lib/outputAudio.svelte";
   import { audioDevices } from "../lib/audioDevices.svelte";
   import { api } from "../lib/api";
   import { parseParametricEq } from "../lib/dsp";
@@ -135,6 +137,7 @@
       <button class="ghost-button" type="button" onclick={() => (dsp.panelOpen = false)}>Close</button>
     </header>
 
+    {#if player.isBrowserOutput}
     <label class="eq-field">
       <span>Volume leveling</span>
       <select
@@ -153,6 +156,7 @@
       album's own quiet and loud moments, falling back to per-track until the album is analyzed.
     </p>
 
+    {/if}
     <div class="eq-divider"></div>
 
     <label class="eq-toggle">
@@ -163,7 +167,9 @@
       />
       <span>Enable equalizer</span>
     </label>
-    <p class="eq-note">Applies to this browser's audio output only.</p>
+    {#if dsp.error || outputAudio.state?.error}<p role="alert">{dsp.error || outputAudio.state?.error}</p>{/if}
+    {#if outputAudio.state?.measurement_point === "snapcast_stream"}<p class="eq-note">EQ affects every client receiving this shared stream.</p>{/if}
+    <p class="eq-note">{outputAudio.name || "Selected output"} · {outputAudio.state?.status ?? "Unavailable"}</p>
 
     <label class="eq-field">
       <span>Preset</span>
@@ -214,6 +220,7 @@
       </div>
     {/if}
 
+    {#if player.isBrowserOutput}
     <details class="eq-import">
       <summary>Outputs (speakers / headphones)</summary>
       <p class="eq-note">
@@ -260,6 +267,8 @@
       <button class="ghost-button" type="button" onclick={addOutput}>+ Add output</button>
     </details>
 
+    {/if}
+    {#if outputAudio.state?.capabilities.room_ir}
     <details class="eq-import">
       <summary>Room correction (speakers)</summary>
       <p class="eq-note">
@@ -284,6 +293,7 @@
         </button>
       {/if}
     </details>
+    {/if}
 
     <details class="eq-import" ontoggle={(e) => e.currentTarget.open && ensureIndex()}>
       <summary>Pick your headphone (AutoEq)</summary>

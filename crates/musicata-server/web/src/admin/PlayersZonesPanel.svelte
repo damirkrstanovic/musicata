@@ -9,10 +9,12 @@
   let status = $state("");
   let error = $state(false);
   let busy = $state(false);
+  let processors = $state<Record<string, {host:string; port:number} | null>>({});
 
   async function load() {
     try {
       [players, zones] = await Promise.all([api.players(), api.zones()]);
+      for (const player of players.filter(p => p.kind === "mpd")) processors[player.id] = await api.dspProcessor(player.id);
     } catch {
       // leave previous state
     }
@@ -49,6 +51,16 @@
     } finally {
       busy = false;
     }
+  }
+
+  async function configureProcessor(player: Player) {
+    const current = processors[player.id];
+    const host = await promptText({title: "Output processor", label: "CamillaDSP hostname or IP (empty to disconnect)", value: current?.host ?? ""});
+    if (host == null) return;
+    const port = host ? await promptText({title: "Output processor", label: "WebSocket port", value: String(current?.port ?? 1234)}) : "1234";
+    if (port == null) return;
+    try { processors[player.id] = await api.saveDspProcessor(player.id, host ? {host, port:Number(port)} : null); }
+    catch (error) {fail(error);}
   }
 
   async function rename(player: Player) {
@@ -138,6 +150,7 @@
             <option value={zone.id}>{zone.name}</option>
           {/each}
         </select>
+        {#if player.kind === "mpd"}<button type="button" class="ghost-button" onclick={() => configureProcessor(player)}>{processors[player.id] ? "Edit processor" : "Connect processor"}</button>{/if}
         <button type="button" class="ghost-button" onclick={() => rename(player)}>Rename</button>
         {#if player.kind !== "browser"}
           <button type="button" class="ghost-button danger" onclick={() => removePlayer(player)}>Remove</button>

@@ -423,3 +423,20 @@ opaque. `coverArt` on albums and songs is the album id.
 - No transcoding: `stream` returns the original file.
 - Numeric ratings (`setRating`) and play-queue sync (`savePlayQueue`) aren't stored yet;
   shares and the jukebox are not implemented.
+
+### Per-output audio
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET/PUT | `/api/players/{id}/dsp` | Desired `{profile_id, enabled}` selection; response includes capabilities, desired/applied revisions, status/error and measurement point. `?migrate=true` writes only if no explicit selection exists. |
+| GET | `/api/players/{id}/audio/ws` | Dedicated audio config/telemetry channel. User session or that native endpoint's scoped token. |
+| GET/PUT | `/api/players/{id}/dsp/processor` | Admin-only MPD processor `{host, port}` binding; `null` disconnects it. |
+
+Audio sockets begin with `dsp_state`. A renderer sends `{type:"renderer"}` and receives
+`renderer_granted` or `renderer_denied`. The granted/config frames include `config.state`,
+`config.profile` and `config.meter_subscribed`. Apply confirmations use `dsp_applied` with
+`session_id`, `revision`, and optional `error`. Renderer `levels` adds a monotonic `sequence`
+and `{rms_l,rms_r,peak_l,peak_r}`. Stale/unowned/unapplied generations are rejected.
+Controllers send `{type:"meter_subscription",enabled:true}` and receive at most 20 snapshots/s;
+`levels:null` means unavailable/stale/paused. Native rendering requires its own endpoint token.
+Endpoint tokens cannot edit desired settings, processor bindings, or another output's channel.

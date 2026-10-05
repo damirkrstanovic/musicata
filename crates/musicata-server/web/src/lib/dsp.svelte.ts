@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // EQ state (Svelte 5 runes). The **profile library** (`custom`) is now stored **server-side**
 // (so presets follow the user across devices — see crate::dsp), loaded via `load()`. The
-// per-browser bits — which profile is active, the enabled flag, and volume leveling — stay in
-// localStorage (they're output/device preferences). The active profile is pushed into the Web
-// Audio graph by an $effect in player/App.svelte.
+// Selection and bypass belong to each server output. Volume leveling and physical browser
+// sink bindings remain local. The owning renderer applies the audio-channel configuration.
 import { parseParametricEq, BUILT_IN_PROFILES, type EqProfile } from "./dsp";
 import { api } from "./api";
+import { outputAudio, type AudioConfig } from "./outputAudio.svelte";
+import type { OutputDspSelection } from "../types/OutputDspSelection";
 
 const LS_KEY = "musicata-dsp"; // client prefs (+ legacy `custom`, migrated to the server once)
 
@@ -27,7 +28,56 @@ class Dsp {
   /** Volume leveling (EBU R128 normalization across tracks / albums). */
   levelingMode = $state<LevelingMode>("off");
   loaded = $state(false);
+  outputId = $state<string | null>(null);
+  error = $state<string | null>(null);
+  private writes = Promise.resolve();
+  private legacySelection: OutputDspSelection | null = null;
+  private migrating = false;
 
+  bindOutput(id: string, name: string): void {
+    this.outputId = id;
+    this.enabled = false;
+    this.activeId = null;
+    this.error = null;
+    outputAudio.select(id, name, config => this.adopt(config));
+  }
+
+  private adopt(config: AudioConfig): void {
+    if (config.state.output_id !== this.outputId) return;
+    if (!config.state.configured && config.state.measurement_point === "browser_output") void this.migrateLegacy();
+    this.enabled = config.state.selection.enabled;
+    this.activeId = config.state.selection.profile_id;
+    if (config.profile) this.custom = [...this.custom.filter(p => p.id !== config.profile!.id), config.profile];
+  }
+
+  private async migrateLegacy(): Promise<void> {
+    if (!this.loaded || this.migrating || !this.legacySelection || !this.outputId) return;
+    const id = this.outputId;
+    const selection = this.legacySelection;
+    const profile = this.profiles.find(p => p.id === selection.profile_id);
+    if (!profile) return;
+    this.migrating = true;
+    try {
+      if (!this.isCustom(profile.id)) await api.saveDspProfile(profile);
+      await api.saveOutputDsp(id, selection, true);
+      this.legacySelection = null;
+      this.saveLocal();
+    } catch { /* Preserve legacy preference for the next load. */ }
+    finally {this.migrating = false;}
+  }
+
+  private write(id = this.outputId, selection: OutputDspSelection = {profile_id: this.activeId, enabled: this.enabled}): void {
+    if (!id) return;
+    const profile = this.profiles.find(p => p.id === selection.profile_id);
+    this.writes = this.writes.then(async () => {
+      if (profile && !this.isCustom(profile.id)) {
+        const existing = (await api.dspProfiles()).find(p => p.id === profile.id);
+        if (!existing) await api.saveDspProfile(profile);
+        this.custom = [...this.custom.filter(p => p.id !== profile.id), existing ?? profile];
+      }
+      await api.saveOutputDsp(id, selection);
+    }).catch(error => { if (id === this.outputId) this.error = String(error); });
+  }
   constructor() {
     // Client preferences only — the profile library comes from the server in load().
     try {
@@ -41,6 +91,7 @@ class Dsp {
         };
         this.enabled = !!p.enabled;
         this.activeId = p.activeId ?? null;
+        if (this.activeId) this.legacySelection = {profile_id:this.activeId, enabled:this.enabled};
         // Prefer the new mode; fall back to the legacy boolean (on → album, the Auto behavior).
         this.levelingMode = isLevelingMode(p.levelingMode)
           ? p.levelingMode
@@ -76,10 +127,11 @@ class Dsp {
       this.custom = [];
     }
     this.loaded = true;
+    if (outputAudio.state?.measurement_point === "browser_output" && !outputAudio.state.configured) void this.migrateLegacy();
   }
 
   get profiles(): EqProfile[] {
-    return [...BUILT_IN_PROFILES, ...this.custom];
+    return [...BUILT_IN_PROFILES.filter(p => !this.isCustom(p.id)), ...this.custom];
   }
   get active(): EqProfile | null {
     return this.profiles.find((p) => p.id === this.activeId) ?? null;
@@ -89,8 +141,9 @@ class Dsp {
   }
 
   setEnabled(v: boolean): void {
-    this.enabled = v;
-    this.saveLocal();
+    if (v && !this.activeId) this.activeId = this.profiles[0]?.id ?? null;
+    this.enabled = v && this.activeId !== null;
+    this.write();
   }
   setLevelingMode(mode: LevelingMode): void {
     this.levelingMode = mode;
@@ -98,17 +151,17 @@ class Dsp {
   }
   setActive(id: string | null): void {
     this.activeId = id;
-    if (id && !this.enabled) this.enabled = true;
-    this.saveLocal();
+    this.enabled = id !== null;
+    this.write();
   }
 
   /** Persist a profile to the server library, select it, and enable. */
   async saveProfile(prof: EqProfile): Promise<void> {
+    const output = this.outputId;
     await api.saveDspProfile(prof);
     this.custom = [...this.custom.filter((p) => p.id !== prof.id), prof];
-    this.activeId = prof.id;
-    this.enabled = true;
-    this.saveLocal();
+    if (output === this.outputId) { this.activeId = prof.id; this.enabled = true; }
+    this.write(output, {profile_id: prof.id, enabled: true});
   }
 
   /** Parse + save a ParametricEQ.txt preset. Returns null if nothing parsed. */
@@ -131,8 +184,8 @@ class Dsp {
       localStorage.setItem(
         LS_KEY,
         JSON.stringify({
-          enabled: this.enabled,
-          activeId: this.activeId,
+          enabled: this.legacySelection?.enabled ?? false,
+          activeId: this.legacySelection?.profile_id ?? null,
           levelingMode: this.levelingMode,
         }),
       );
