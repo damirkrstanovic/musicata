@@ -173,12 +173,12 @@ async function openMix(
 }
 
 /** Play an internet-radio stream on the active target. Call from a click handler. */
-export async function playStream(url: string, title: string): Promise<void> {
-  if (!player.target) return;
+export async function playStream(url: string, title: string): Promise<boolean> {
+  if (!player.target) return false;
   radioMix.cancel();
   if (player.isBrowserOutput) {
     audio?.claim();
     audio?.primePlay(url);
   }
-  await sendCommand(player.target, { command: "play_stream", url, title });
+  return sendCommand(player.target, { command: "play_stream", url, title });
 }

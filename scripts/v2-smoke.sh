@@ -20,7 +20,7 @@ if [ ! -x "$CHROME" ]; then echo "no chromium at $CHROME; skipping"; exit 0; fi
 
 SERVER_BIN="${MUSICATA_SERVER_BIN:-./target/debug/musicata-server}"
 if [ -z "${MUSICATA_SERVER_BIN:-}" ]; then cargo build -p musicata-server; fi
-node --test tests/ui/browser-audio.mjs
+node --test tests/ui/browser-audio.mjs tests/ui/radio-state.mjs
 TMP="$(mktemp -d)"
 SRV=""
 cleanup() {

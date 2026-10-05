@@ -35,6 +35,7 @@
   import PlaylistsView from "./PlaylistsView.svelte";
   import SmartPlaylistView from "./SmartPlaylistView.svelte";
   import MixView from "./MixView.svelte";
+  import RadioView from "./RadioView.svelte";
   import InstallPrompt from "./InstallPrompt.svelte";
   import { install } from "../lib/install.svelte";
   import { audioDevices } from "../lib/audioDevices.svelte";
@@ -101,6 +102,8 @@
           ? "Albums"
           : route.name === "artists"
             ? "Artists"
+            : route.name === "radio"
+              ? "Radio"
             : route.name === "favorites"
               ? "Favorites"
               : route.name === "playlists"
@@ -381,6 +384,8 @@
       <PlaylistView id={route.id} />
     {:else if route.name === "smart"}
       <SmartPlaylistView id={route.id} />
+    {:else if route.name === "radio"}
+      <RadioView />
     {:else if route.name === "mix"}
       <MixView />
     {/if}

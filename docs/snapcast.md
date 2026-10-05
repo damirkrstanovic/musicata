@@ -58,6 +58,13 @@ server-side per-zone DSP is applied (see [dsp.md](dsp.md)).
 3. Pick which input the rooms play, and set per-room volume live. To stream from a phone
    instead, enable the AirPlay/Spotify inputs and cast to "Musicata".
 
+**Internet radio:** choose the Snapcast output, open **Browse radio**, and play a discovered
+or saved station. Musicata decodes direct HTTP(S) audio streams incrementally and sends them
+through the same volume, EQ and VU processing as library tracks. Pausing disconnects the
+broadcast; Play reconnects at the live point. A connection or decoding failure stops playback
+and shows an error in the player; press Play to retry. HLS playlists and segments are not
+supported by this radio decoder.
+
 **Security:** snapserver 0.35 does **not** enforce the per-room passwords yet (auth is stubbed
 upstream), so multi-room is **LAN-only** — keep the server on a trusted network. Musicata writes
 forward-compatible auth config that starts enforcing the moment a future snapserver enables it.

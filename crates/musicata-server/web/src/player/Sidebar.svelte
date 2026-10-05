@@ -2,7 +2,7 @@
   // SPDX-License-Identifier: AGPL-3.0-or-later
   import { onDestroy } from "svelte";
   import { api, type Playlist, type SmartPlaylist } from "../lib/api";
-  import type { RadioStation } from "../types/RadioStation";
+  import { radio } from "../lib/radio.svelte";
   import { nav } from "../lib/nav.svelte";
   import { search } from "../lib/search.svelte";
   import { promptText } from "../lib/modal";
@@ -15,14 +15,13 @@
 
   let playlists = $state<Playlist[]>([]);
   let smart = $state<SmartPlaylist[]>([]);
-  let stations = $state<RadioStation[]>([]);
 
   async function load() {
     try {
-      [playlists, smart, stations] = await Promise.all([
+      [playlists, smart] = await Promise.all([
         api.playlists(),
         api.smartPlaylists(),
-        api.radio(),
+        radio.load(),
       ]);
     } catch {
       // keep previous
@@ -59,7 +58,7 @@
   </label>
 
   <nav class="library-nav" aria-label="Views">
-    <button class="nav-link desktop-destination" class:is-active={!["playlists", "playlist", "smart", "favorites", "mix"].includes(nav.current.name) && !nav.overlays.includes("nowPlaying")} type="button" onclick={() => nav.root({name: nav.browseView})}>Library</button>
+    <button class="nav-link desktop-destination" class:is-active={!["playlists", "playlist", "smart", "favorites", "mix", "radio"].includes(nav.current.name) && !nav.overlays.includes("nowPlaying")} type="button" onclick={() => nav.root({name: nav.browseView})}>Library</button>
     <button class="nav-link desktop-destination" class:is-active={["playlists", "playlist", "smart"].includes(nav.current.name) && !nav.overlays.includes("nowPlaying")} type="button" onclick={() => nav.root({name: "playlists"})}>Playlists</button>
     <button class="nav-link desktop-destination" class:is-active={nav.overlays.includes("nowPlaying")} type="button" onclick={onnowplaying}>Now Playing</button>
     <button
@@ -116,11 +115,12 @@
 
   <section class="section">
     <div class="section-head"><h2>Radio</h2></div>
+    <button class="nav-link" class:is-active={nav.current.name === "radio"} type="button" onclick={() => nav.root({name: "radio"})}>Browse radio</button>
     <div class="playlist-list">
-      {#each stations as st (st.id)}
+      {#each radio.stations as st (st.id)}
         <!-- Play the station through the server, not its upstream URL directly: the CSP
              restricts media to this origin, and the relay keeps the user's IP off the
-             station's logs. `st.stream_url` remains the real URL, for editing in /admin. -->
+             station's logs. `st.stream_url` remains the real URL stored for the station. -->
         <button class="nav-link" type="button" onclick={() => playStream(`/api/radio/${encodeURIComponent(st.id)}/stream`, st.name)}>{st.name}</button>
       {/each}
     </div>

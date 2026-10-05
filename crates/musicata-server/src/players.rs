@@ -1448,7 +1448,7 @@ fn queue_to_mpd_uris(
             if let Some(track_id) = &item.track_id {
                 stream_auth.track_url(public_base_url, track_id)
             } else {
-                item.stream_url.clone()
+                stream_auth.stream_url(public_base_url, &item.stream_url)
             }
         })
         .collect()
@@ -1505,8 +1505,12 @@ async fn apply_command(
         }
         PlayerCommand::RemoveQueueItem { index } => connection.delete_index(*index).await,
         PlayerCommand::MoveQueueItem { from, to } => connection.move_item(*from, *to).await,
-        // Radio/external streams: MPD plays the URL directly and reads its own metadata.
-        PlayerCommand::PlayStream { url, .. } => connection.replace_queue(&[url.clone()]).await,
+        // Local radio relays need an absolute audio-only credential; external URLs stay unchanged.
+        PlayerCommand::PlayStream { url, .. } => {
+            connection
+                .replace_queue(&[stream_auth.stream_url(public_base_url, url)])
+                .await
+        }
     }
 }
 
@@ -2735,6 +2739,7 @@ pub struct SnapcastPlayer {
 #[derive(Clone, Default)]
 struct LoadedTrack {
     track_id: Option<String>,
+    stream_url: Option<String>,
     position: Option<usize>,
     next_track_id: Option<String>,
     generation: u64,
@@ -2983,7 +2988,14 @@ impl SnapcastPlayer {
                 return;
             }
             PlaybackStatus::Paused => {
-                let _ = self.writer_tx.send(WriterMsg::SetPlaying(false));
+                let mut loaded = self.loaded.lock().await;
+                if loaded.stream_url.is_some() {
+                    let _ = self.writer_tx.send(WriterMsg::Stop);
+                    *loaded = LoadedTrack::default();
+                    self.state.lock().await.queue_activity = None;
+                } else {
+                    let _ = self.writer_tx.send(WriterMsg::SetPlaying(false));
+                }
                 return;
             }
             PlaybackStatus::Playing => {}
@@ -2995,9 +3007,7 @@ impl SnapcastPlayer {
             return;
         };
         let Some(track_id) = item.track_id.clone() else {
-            // Snapcast decodes library files; it can't play a bare remote stream URL.
-            tracing::warn!(player = %self.id, "snapcast: skipping non-library stream item");
-            let _ = self.writer_tx.send(WriterMsg::SetPlaying(false));
+            self.reconcile_radio(&item, position).await;
             return;
         };
 
@@ -3034,6 +3044,27 @@ impl SnapcastPlayer {
             return;
         }
 
+        // Disconnect live radio before waiting on a potentially slow library source.
+        {
+            let mut loaded = self.loaded.lock().await;
+            let mut state = self.state.lock().await;
+            if state.status != PlaybackStatus::Playing
+                || state.position != position
+                || state
+                    .position
+                    .and_then(|i| state.queue.get(i))
+                    .and_then(|item| item.track_id.as_deref())
+                    != Some(track_id.as_str())
+            {
+                return;
+            }
+            if loaded.stream_url.is_some() {
+                let _ = self.writer_tx.send(WriterMsg::Stop);
+                *loaded = LoadedTrack::default();
+                state.queue_activity = None;
+            }
+        }
+
         // A different track is now current — decode and load it.
         let decoded = match self.decode(&track_id).await {
             Ok(decoded) => decoded,
@@ -3067,6 +3098,7 @@ impl SnapcastPlayer {
             });
             let _ = self.writer_tx.send(WriterMsg::SetPlaying(true));
             loaded.track_id = Some(track_id);
+            loaded.stream_url = None;
             loaded.position = position;
             loaded.next_track_id = None;
             loaded.generation = generation;
@@ -3128,6 +3160,137 @@ impl SnapcastPlayer {
         }
     }
 
+    /// Live streams are decoded in the background; never wait for their network on Play.
+    async fn reconcile_radio(&self, item: &QueueItem, position: Option<usize>) {
+        let generation = {
+            let mut loaded = self.loaded.lock().await;
+            let mut state = self.state.lock().await;
+            if state.status != PlaybackStatus::Playing
+                || state.position != position
+                || state
+                    .position
+                    .and_then(|i| state.queue.get(i))
+                    .map(|i| i.stream_url.as_str())
+                    != Some(item.stream_url.as_str())
+            {
+                return;
+            }
+            if loaded.stream_url.as_deref() == Some(item.stream_url.as_str())
+                && loaded.position == position
+            {
+                let _ = self.writer_tx.send(WriterMsg::SetPlaying(true));
+                return;
+            }
+            let generation = self.writer_generation.fetch_add(1, Ordering::Relaxed);
+            let _ = self.writer_tx.send(WriterMsg::Stop);
+            *loaded = LoadedTrack {
+                stream_url: Some(item.stream_url.clone()),
+                position,
+                generation,
+                ..Default::default()
+            };
+            state.elapsed_seconds = Some(0.0);
+            state.duration_seconds = None;
+            state.queue_activity = Some("Connecting to radio…".into());
+            generation
+        };
+        self.broadcast().await;
+        let url = if let Some(id) = item
+            .stream_url
+            .strip_prefix("/api/radio/")
+            .and_then(|p| p.strip_suffix("/stream"))
+            .filter(|id| !id.is_empty() && !id.contains('/'))
+        {
+            match self.database.radio_station(id).await {
+                Ok(Some(station)) => Ok(station.stream_url),
+                Ok(None) => Err("This radio station was removed.".to_string()),
+                Err(error) => Err(error.to_string()),
+            }
+        } else {
+            Err("Save this station in Browse radio before playing it on Snapcast.".to_string())
+        };
+        let url = match url {
+            Ok(url) => url,
+            Err(error) => {
+                self.on_stream_failed(generation, error).await;
+                return;
+            }
+        };
+        let sent = {
+            let loaded = self.loaded.lock().await;
+            let state = self.state.lock().await;
+            if loaded.generation != generation
+                || state.status != PlaybackStatus::Playing
+                || state.position != position
+                || state
+                    .position
+                    .and_then(|i| state.queue.get(i))
+                    .map(|i| i.stream_url.as_str())
+                    != Some(item.stream_url.as_str())
+            {
+                return;
+            }
+            let stream = crate::snapcast::stream_radio(url, self.sample_rate);
+            self.writer_tx
+                .send(WriterMsg::LoadStream { stream, generation })
+                .is_ok()
+                && self.writer_tx.send(WriterMsg::SetPlaying(true)).is_ok()
+        };
+        if !sent {
+            self.on_stream_failed(
+                generation,
+                "The Snapcast audio writer is unavailable.".into(),
+            )
+            .await;
+        }
+    }
+
+    async fn on_stream_started(&self, generation: u64) {
+        {
+            let loaded = self.loaded.lock().await;
+            let mut state = self.state.lock().await;
+            if loaded.generation != generation
+                || loaded.stream_url.is_none()
+                || state.status != PlaybackStatus::Playing
+                || state.position != loaded.position
+                || state
+                    .position
+                    .and_then(|i| state.queue.get(i))
+                    .map(|i| &i.stream_url)
+                    != loaded.stream_url.as_ref()
+            {
+                return;
+            }
+            state.queue_activity = None;
+        }
+        self.broadcast().await;
+    }
+
+    async fn on_stream_failed(&self, generation: u64, error: String) {
+        {
+            let mut loaded = self.loaded.lock().await;
+            let mut state = self.state.lock().await;
+            if loaded.generation != generation
+                || loaded.stream_url.is_none()
+                || state.status != PlaybackStatus::Playing
+                || state.position != loaded.position
+                || state
+                    .position
+                    .and_then(|i| state.queue.get(i))
+                    .map(|i| &i.stream_url)
+                    != loaded.stream_url.as_ref()
+            {
+                return;
+            }
+            let _ = self.writer_tx.send(WriterMsg::Stop);
+            state.status = PlaybackStatus::Stopped;
+            state.queue_activity = Some(format!("Radio playback failed: {error}"));
+            *loaded = LoadedTrack::default();
+        }
+        self.broadcast().await;
+        self.persist_playback().await;
+    }
+
     async fn decode(&self, track_id: &str) -> Result<Arc<DecodedTrack>, String> {
         crate::snapcast::decode_queue_item(
             &self.database,
@@ -3156,6 +3319,8 @@ impl SnapcastPlayer {
                     event = events.recv() => match event {
                         Some(WriterEvent::Advanced { generation }) => self.on_advanced(generation).await,
                         Some(WriterEvent::Drained { generation }) => self.on_drained(generation).await,
+                        Some(WriterEvent::StreamStarted { generation }) => self.on_stream_started(generation).await,
+                        Some(WriterEvent::StreamFailed { generation, error }) => self.on_stream_failed(generation, error).await,
                         None => break,
                     },
                     _ = ticker.tick() => self.on_tick().await,
@@ -3207,6 +3372,7 @@ impl SnapcastPlayer {
             .and_then(|index| state.queue.get(index).cloned());
             loaded.position = new_position;
             loaded.track_id = new_track_id.clone();
+            loaded.stream_url = None;
             loaded.next_track_id = None;
             (new_position, new_track_id, next)
         };
@@ -4293,11 +4459,18 @@ mod tests {
             },
         ];
         let mut items = items;
+        items.push(QueueItem {
+            stream_url: "/api/radio/station-1/stream".into(),
+            ..Default::default()
+        });
         items[0].stream_url = "http://old-host/api/tracks/t1/stream?token=expired".into();
         let stream_auth = MpdStreamAuth::new();
         let uris = queue_to_mpd_uris(&items, "http://host:3030", &stream_auth);
         assert_eq!(uris[0], stream_auth.track_url("http://host:3030", "t1"));
         assert_eq!(uris[1], "http://radio.example/stream");
+        assert!(uris[2].starts_with("http://host:3030/api/radio/station-1/stream?token="));
+        let token = uris[2].split_once("?token=").unwrap().1;
+        assert!(stream_auth.accepts(token));
     }
 
     // The MPD player's queue is server-owned and persisted like the browser's: a queue
@@ -5148,6 +5321,7 @@ mod tests {
             position: Some(0),
             next_track_id: None,
             generation: 41,
+            ..Default::default()
         };
 
         // The writer drained just after a refill appended track_2 but before it consumed the
@@ -5164,11 +5338,338 @@ mod tests {
             position: Some(1),
             next_track_id: None,
             generation: 42,
+            ..Default::default()
         };
         player.on_drained(41).await;
         assert_eq!(player.snapshot().await.queue_position, Some(1));
 
         drop(fifo_reader);
+        drop(manager);
+        let _ = std::fs::remove_file(path.with_extension("fifo"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
+    async fn snapcast_saved_radio_reaches_fifo_with_volume_meter_and_live_controls() {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/live.wav", listener.local_addr().unwrap());
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opened = connections.clone();
+        let server = tokio::spawn(async move {
+            let mut clients = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut socket, _) = accepted.unwrap();
+                        opened.fetch_add(1, Ordering::Relaxed);
+                        clients.spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            let mut wave = Vec::new();
+                            wave.extend_from_slice(b"RIFF"); wave.extend_from_slice(&0x7fff0024u32.to_le_bytes());
+                            wave.extend_from_slice(b"WAVEfmt "); wave.extend_from_slice(&16u32.to_le_bytes());
+                            wave.extend_from_slice(&1u16.to_le_bytes()); wave.extend_from_slice(&1u16.to_le_bytes());
+                            wave.extend_from_slice(&44100u32.to_le_bytes()); wave.extend_from_slice(&88200u32.to_le_bytes());
+                            wave.extend_from_slice(&2u16.to_le_bytes()); wave.extend_from_slice(&16u16.to_le_bytes());
+                            wave.extend_from_slice(b"data"); wave.extend_from_slice(&0x7fff0000u32.to_le_bytes());
+                            if socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n").await.is_err() { return; }
+                            if socket.write_all(&wave).await.is_err() { return; }
+                            let pcm: Vec<u8> = (0..2048).flat_map(|_| 16000i16.to_le_bytes()).collect();
+                            loop {
+                                if socket.write_all(&pcm).await.is_err() { break; }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        });
+                    }
+                    _ = clients.join_next(), if !clients.is_empty() => {}
+                }
+            }
+        });
+        let path = temp_db("snapcast-radio");
+        let database = Database::connect(&path).await.unwrap();
+        let station = database
+            .create_radio_station("Test Radio", &url, None, 1)
+            .await
+            .unwrap();
+        let manager = PlayerManager::load(
+            database.clone(),
+            "http://localhost".into(),
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+        )
+        .await
+        .unwrap();
+        let snap = Arc::new(
+            SnapcastManager::start(crate::snapcast::SnapcastSettings {
+                manage_server: false,
+                fifo_path: path.with_extension("fifo"),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(snap.fifo_path())
+            .unwrap();
+        manager.enable_snapcast(snap).await.unwrap();
+        let player = match manager.get(SNAPCAST_PLAYER_ID).await.unwrap() {
+            PlayerHandle::Snapcast(p) => p,
+            _ => unreachable!(),
+        };
+        player
+            .execute(
+                PlayerCommand::SetVolume { volume: 50 },
+                &database,
+                "http://localhost",
+            )
+            .await
+            .unwrap();
+        let profile = musicata_core::dsp::DspProfile {
+            id: "radio".into(),
+            name: "Radio".into(),
+            preamp_db: -6.,
+            bands: vec![],
+            kind: None,
+            room_ir: None,
+        };
+        player.set_output_dsp(StereoEq::from_profile(&profile, 48000).unwrap(), 7);
+        let begin = std::time::Instant::now();
+        player
+            .execute(
+                PlayerCommand::PlayStream {
+                    url: format!("/api/radio/{station}/stream"),
+                    title: "Test Radio".into(),
+                },
+                &database,
+                "http://localhost",
+            )
+            .await
+            .unwrap();
+        assert!(
+            begin.elapsed() < Duration::from_millis(150),
+            "radio connection blocked Play"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut received = Vec::new();
+        while tokio::time::Instant::now() < deadline && received.len() < 16000 {
+            let mut chunk = [0u8; 8192];
+            match reader.read(&mut chunk) {
+                Ok(n) => received.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("{e}"),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            received.len() >= 16000,
+            "saved radio never reached the Snapcast FIFO"
+        );
+        let peak = received
+            .chunks_exact(2)
+            .map(|v| i16::from_le_bytes([v[0], v[1]]).unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(
+            peak > 3000 && peak < 5000,
+            "radio bypassed shared EQ/volume processing: {peak}"
+        );
+        assert!(
+            player.audio_tap().read().is_some(),
+            "radio did not publish the output meter"
+        );
+        let draining = Arc::new(AtomicBool::new(true));
+        let drain_active = draining.clone();
+        let drain = std::thread::spawn(move || {
+            let mut bytes = [0u8; 8192];
+            while drain_active.load(Ordering::Relaxed) {
+                let _ = reader.read(&mut bytes);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let generation = player.loaded.lock().await.generation;
+        player
+            .execute(PlayerCommand::Pause, &database, "http://localhost")
+            .await
+            .unwrap();
+        assert_eq!(player.snapshot().await.status, PlaybackStatus::Paused);
+        assert!(player.loaded.lock().await.stream_url.is_none());
+        player
+            .execute(PlayerCommand::Play, &database, "http://localhost")
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while connections.load(Ordering::Relaxed) < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            connections.load(Ordering::Relaxed) >= 2,
+            "resuming radio must reconnect the live broadcast"
+        );
+        assert_ne!(player.loaded.lock().await.generation, generation);
+        // Events from the cancelled connection must not stop the resumed broadcast.
+        player
+            .on_stream_failed(generation, "stale connection".into())
+            .await;
+        assert_eq!(player.snapshot().await.status, PlaybackStatus::Playing);
+        let second = database
+            .create_radio_station("Second Radio", &url, None, 2)
+            .await
+            .unwrap();
+        let resumed_generation = player.loaded.lock().await.generation;
+        player
+            .execute(
+                PlayerCommand::PlayStream {
+                    url: format!("/api/radio/{second}/stream"),
+                    title: "Second Radio".into(),
+                },
+                &database,
+                "http://localhost",
+            )
+            .await
+            .unwrap();
+        assert_ne!(player.loaded.lock().await.generation, resumed_generation);
+        player
+            .on_stream_failed(resumed_generation, "replaced station".into())
+            .await;
+        assert_eq!(player.snapshot().await.status, PlaybackStatus::Playing);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while connections.load(Ordering::Relaxed) < 3 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            connections.load(Ordering::Relaxed) >= 3,
+            "station replacement did not connect"
+        );
+        // Hold provider access to model a slow library source during the handoff.
+        let mut library = library_with_tracks(1);
+        library.tracks[0].path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata-fixture/The Meridian/Neon Hours/01 Track.mp3");
+        database.save_library(&mut library).await.unwrap();
+        let providers = player.providers.clone();
+        let provider_guard = providers.write().await;
+        let changing = player.clone();
+        let db = database.clone();
+        let change = tokio::spawn(async move {
+            changing
+                .execute(
+                    PlayerCommand::PlayTracks {
+                        track_ids: vec!["track_1".into()],
+                        start_index: 0,
+                    },
+                    &db,
+                    "http://localhost",
+                )
+                .await
+                .unwrap();
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while player
+            .state
+            .lock()
+            .await
+            .queue
+            .first()
+            .and_then(|item| item.track_id.as_deref())
+            != Some("track_1")
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        #[cfg(feature = "provider-smb")]
+        {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert!(
+                player.loaded.lock().await.stream_url.is_none(),
+                "radio remained loaded during a delayed library decode"
+            );
+            assert!(
+                player.audio_tap().read().is_none(),
+                "old radio audio continued while the library source was blocked"
+            );
+        }
+        drop(provider_guard);
+        change.await.unwrap();
+        assert_eq!(
+            player.loaded.lock().await.track_id.as_deref(),
+            Some("track_1")
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while player.audio_tap().read().is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            player.audio_tap().read().is_some(),
+            "library playback did not resume after radio"
+        );
+        player
+            .execute(
+                PlayerCommand::PlayStream {
+                    url: format!("/api/radio/{station}/stream"),
+                    title: "Test Radio".into(),
+                },
+                &database,
+                "http://localhost",
+            )
+            .await
+            .unwrap();
+        server.abort();
+        // An interrupted broadcast must leave an actionable playback failure.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while player.snapshot().await.status == PlaybackStatus::Playing
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(player.snapshot().await.status, PlaybackStatus::Stopped);
+        assert!(player.snapshot().await.queue_activity.is_some());
+        player
+            .execute(
+                PlayerCommand::PlayTracks {
+                    track_ids: vec!["track_1".into()],
+                    start_index: 0,
+                },
+                &database,
+                "http://localhost",
+            )
+            .await
+            .unwrap();
+        assert!(
+            player.snapshot().await.queue_activity.is_none(),
+            "radio failure remained visible during library playback"
+        );
+        let previous_connections = connections.load(Ordering::Relaxed);
+        player
+            .execute(
+                PlayerCommand::PlayStream {
+                    url: url.clone(),
+                    title: "Unsaved URL".into(),
+                },
+                &database,
+                "http://localhost",
+            )
+            .await
+            .unwrap();
+        assert_eq!(player.snapshot().await.status, PlaybackStatus::Stopped);
+        assert!(
+            player
+                .snapshot()
+                .await
+                .queue_activity
+                .unwrap()
+                .contains("Save this station")
+        );
+        assert_eq!(connections.load(Ordering::Relaxed), previous_connections);
+        player
+            .execute(PlayerCommand::Stop, &database, "http://localhost")
+            .await
+            .unwrap();
+        draining.store(false, Ordering::Relaxed);
+        drain.join().unwrap();
         drop(manager);
         let _ = std::fs::remove_file(path.with_extension("fifo"));
         let _ = std::fs::remove_file(path);
