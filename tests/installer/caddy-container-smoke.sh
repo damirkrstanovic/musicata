@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Real official Caddy container, isolated pod network/storage, local test CA only.
+# Real prebuilt Caddy container, isolated pod network/storage, local test CA only.
 set -euo pipefail
 kubectl() { command kubectl --context "${MUSICATA_KUBE_CONTEXT:-homelab-k3s}" "$@"; }
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -14,7 +14,7 @@ cleanup() {
 trap cleanup EXIT
 kubectl create namespace "$namespace" >/dev/null
 PYTHONDONTWRITEBYTECODE=1 python3 - "$root" "$namespace" "${1:-}" >"$scratch/resources.json" <<'PY'
-import importlib.util,json,sys
+import importlib.util,json,os,sys
 from pathlib import Path
 root=Path(sys.argv[1]);namespace=sys.argv[2]
 spec=importlib.util.spec_from_file_location('installer',root/'packaging/install.py')
@@ -34,30 +34,18 @@ pod={'apiVersion':'v1','kind':'Pod','metadata':{'name':'proxy','namespace':names
    'securityContext':{'capabilities':{'drop':['ALL'],'add':['NET_BIND_SERVICE']}},
    'resources':{'requests':{'cpu':'100m','memory':'64Mi'},'limits':{'cpu':'1','memory':'256Mi'}},
    'volumeMounts':[{'name':'fixture','mountPath':'/etc/caddy','readOnly':True},{'name':'data','mountPath':'/data'},{'name':'config','mountPath':'/config'}],
-   'readinessProbe':{'exec':{'command':['sh','-c','curl -fsS --cacert /data/caddy/pki/authorities/local/root.crt --resolve music.example.org:443:127.0.0.1 https://music.example.org/ >/dev/null']},'periodSeconds':2,'timeoutSeconds':3}}
+   'readinessProbe':{'tcpSocket':{'port':443},'periodSeconds':2,'timeoutSeconds':3}}
  ]}}
 if cloudflare:
     cfg.update(tls_dns='cloudflare')
     configmap['data']['DNS-Caddyfile']=m.caddy_text(cfg)
-    pod['spec']['volumes'].append({'name':'binary','emptyDir':{}})
-    build=m.cloudflare_dockerfile().split('RUN ',1)[1].split('\nFROM ',1)[0]
     pod['spec']['initContainers']=[
-      {'name':'build','image':'caddy:2-builder',
-       'securityContext':{'runAsUser':0,'runAsNonRoot':False},
-       'command':['sh','-ec',build+' --output /binary/caddy'],
-       'resources':{'limits':{'cpu':'2','memory':'2Gi'}},
-       'env':[{'name':'GOMAXPROCS','value':'2'}],
-       'volumeMounts':[{'name':'binary','mountPath':'/binary'}]},
-      {'name':'validate','image':'caddy:2-alpine',
-       'securityContext':{'runAsUser':0,'runAsNonRoot':False,'capabilities':{'drop':['ALL'],'add':['SETFCAP','NET_BIND_SERVICE']}},
+      {'name':'validate','image':os.environ.get('MUSICATA_CADDY_IMAGE',m.CLOUDFLARE_IMAGE),
        'env':[{'name':'CLOUDFLARE_API_TOKEN','value':'a'*40}],
-       'command':['sh','-ec','setcap cap_net_bind_service=+ep /binary/caddy; /binary/caddy list-modules | grep -qx dns.providers.cloudflare; /binary/caddy validate --config /etc/caddy/DNS-Caddyfile --adapter caddyfile'],
-       'volumeMounts':[{'name':'binary','mountPath':'/binary'},{'name':'fixture','mountPath':'/etc/caddy','readOnly':True}]}
+       'command':['sh','-ec','caddy version | grep -q "^'+m.CADDY_VERSION+' "; caddy list-modules | grep -qx dns.providers.cloudflare; caddy validate --config /etc/caddy/DNS-Caddyfile --adapter caddyfile'],
+       'volumeMounts':[{'name':'fixture','mountPath':'/etc/caddy','readOnly':True}]}
     ]
-    caddy=pod['spec']['containers'][1]
-    caddy['image']='caddy:2-alpine'
-    caddy['command'][0]='/binary/caddy'
-    caddy['volumeMounts'].append({'name':'binary','mountPath':'/binary','readOnly':True})
+    pod['spec']['containers'][1]['image']=os.environ.get('MUSICATA_CADDY_IMAGE',m.CLOUDFLARE_IMAGE)
 print(json.dumps({'apiVersion':'v1','kind':'List','items':[configmap,pod]}))
 PY
 kubectl apply -f "$scratch/resources.json" >/dev/null

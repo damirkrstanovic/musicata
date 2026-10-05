@@ -83,9 +83,10 @@ sudo ./scripts/install.sh --mode docker --with caddy \
 Remove `--dry-run` to apply the native example. Add other desired components to the same
 comma-separated `--with` list. `--tls-email admin@example.org` is optional.
 
-The installer builds a pinned Caddy with the Cloudflare plugin: native mode uses Go and
-xcaddy; Docker uses the official Caddy builder and runtime images. Builds require internet
-access and may take several minutes. Native distributions with an older Go package receive
+Docker installations pull the prebuilt `ghcr.io/damirkrstanovic/musicata-caddy:1.3.1` image,
+built in release CI with Caddy 2.11.7 and Cloudflare 0.2.4. No compilation runs on the host.
+Native mode builds a pinned Caddy using Go and xcaddy; this requires internet access and
+may take several minutes. Native distributions with an older Go package receive
 a checksum-verified temporary toolchain. Go's checksum database verifies downloaded modules.
 The DNS challenge uses public resolvers to avoid a private router's DNS view hiding the
 challenge record. See the [Cloudflare module](https://github.com/caddy-dns/cloudflare) and
@@ -271,8 +272,8 @@ bash tests/installer/native-smoke.sh
 The Caddy smoke tests validate the real Cloudflare module with a dummy token, then use
 an isolated local CA to check HTTPS trust, HTTP redirects, session cookies, media streams,
 WebSocket tunnels and certificate persistence after restart. The container harness runs
-the generated build command in the official builder image and uses the resulting binary
-in the official runtime image. Production Cloudflare DNS changes and public ACME issuance
+the same release-pinned prebuilt Cloudflare image as the installer, without a build step.
+Production Cloudflare DNS changes and public ACME issuance
 require a separate check with the deployment's actual domain and token.
 
 The native integration harness uses disposable Kubernetes pods for Debian 13, Ubuntu
