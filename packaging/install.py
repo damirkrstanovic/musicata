@@ -48,6 +48,7 @@ CADDY_BINARY = Path('/opt/musicata/caddy')
 CADDY_VERSION = 'v2.11.7'
 CLOUDFLARE_VERSION = 'v0.2.4'
 XCADDY_VERSION = 'v0.4.7'
+CLOUDFLARE_IMAGE = f'ghcr.io/{REPO}-caddy:1.3.1'
 COMPONENTS = {'caddy', 'dsp', 'mpd', 'snapcast', 'airplay', 'spotify', 'discovery', 'ml'}
 
 class InstallError(Exception):
@@ -393,15 +394,6 @@ def build_caddy(scratch):
     return binary
 
 
-def cloudflare_dockerfile():
-    return f'''FROM caddy:2-builder AS builder
-RUN GOSUMDB=sum.golang.org GOPROXY=https://proxy.golang.org xcaddy build {CADDY_VERSION} --with github.com/caddy-dns/cloudflare@{CLOUDFLARE_VERSION}
-FROM caddy:2-alpine
-COPY --from=builder /usr/bin/caddy /usr/bin/caddy
-RUN setcap cap_net_bind_service=+ep /usr/bin/caddy
-'''
-
-
 def prepare_caddy(cfg, scratch):
     candidate = CADDY_CONFIG
     if not candidate.exists():
@@ -565,14 +557,7 @@ def docker_images(cfg, scratch):
             raise InstallError('Optional audio packages could not be installed in the Debian server image. No running Musicata service was replaced. In particular librespot may be absent from configured repositories.\n'+str(error)) from error
         images['server'] = run(['docker','image','inspect','--format','{{.Id}}','musicata-installer:'+cfg['version']])
     if 'caddy' in cfg['components']:
-        image = 'caddy:2-alpine'
-        if cfg['tls_dns']=='cloudflare':
-            build_dir=scratch/'caddy-image';build_dir.mkdir()
-            (build_dir/'Dockerfile').write_text(cloudflare_dockerfile())
-            image='musicata-caddy-cloudflare:'+CADDY_VERSION[1:]+'-'+CLOUDFLARE_VERSION[1:]
-            run(['docker','build','--pull','-t',image,build_dir])
-            images['caddy']=run(['docker','image','inspect','--format','{{.Id}}',image])
-            return images
+        image = CLOUDFLARE_IMAGE if cfg['tls_dns']=='cloudflare' else 'caddy:2-alpine'
         print('Pulling',image,flush=True)
         run(['docker','pull',image])
         images['caddy'] = run(['docker','image','inspect','--format','{{.Id}}',image])
@@ -930,7 +915,8 @@ def main(argv=None):
     if 'caddy' in cfg['components']:
         print(f'HTTPS: https://{cfg["tls_domain"]}/ ; Caddy manages Let\'s Encrypt certificates. Backend: 127.0.0.1:{cfg["port"]}')
         if cfg['tls_dns']=='cloudflare':
-            print('Cloudflare DNS-01: hostname resolves privately through your router; no public inbound ports required. Token needs Zone DNS Edit and Zone Read for this zone. Caddy is built with the Cloudflare module.')
+            print('Cloudflare DNS-01: hostname resolves privately through your router; no public inbound ports required. Token needs Zone DNS Edit and Zone Read for this zone.')
+            print('Docker pulls a prebuilt Caddy image with the Cloudflare module; no compilation.' if cfg['mode']=='docker' else 'Native installation builds Caddy with the Cloudflare module.')
         else:
             print('Public validation requires public DNS pointing to this host and internet access to ports 80/443.')
         if saved and 'caddy' not in saved['components']: print('Enabling HTTPS signs out existing browser sessions; sign in again at the HTTPS address.')

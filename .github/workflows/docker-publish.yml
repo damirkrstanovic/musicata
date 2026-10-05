@@ -1,6 +1,6 @@
 name: docker-publish
 
-# Build + push the container images (server + optional audio-ML) to GHCR. A `v*` tag publishes
+# Build + push the container images (server, optional audio-ML and Cloudflare Caddy) to GHCR. A `v*` tag publishes
 # semver-tagged images plus `latest` — the same tag that cuts the binary release (release.yml).
 # A manual run (workflow_dispatch) publishes an `edge` image from the chosen ref for testing.
 on:
@@ -25,6 +25,9 @@ jobs:
           # The optional audio-ML service (trixie; ONNX Runtime needs glibc >= 2.38).
           - image: ml
             dockerfile: Dockerfile.ml
+          # Prebuilt DNS-01 proxy; installations never compile Caddy on the host.
+          - image: caddy
+            dockerfile: packaging/Dockerfile.caddy
     steps:
       - uses: actions/checkout@v5
 

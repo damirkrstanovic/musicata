@@ -11,6 +11,35 @@ sys.modules[spec.name] = m
 spec.loader.exec_module(m)
 
 class PlanningTests(unittest.TestCase):
+    def test_cloudflare_docker_pulls_prebuilt_image_without_building(self):
+        from unittest.mock import patch
+        cfg=m.options(['--with','caddy','--tls-domain','music.example.org','--tls-dns','cloudflare','--tls-dns-token-file','/root/cloudflare-token'])
+        cfg['version']='1.3.0'
+        commands=[]
+        def docker(argv):
+            commands.append(list(map(str,argv)))
+            if argv[:3]==['docker','image','inspect']: return 'sha256:fixture'
+            return ''
+        with tempfile.TemporaryDirectory() as scratch, patch.object(m,'run',side_effect=docker):
+            images=m.docker_images(cfg,Path(scratch))
+            self.assertFalse(list(Path(scratch).iterdir()))
+        self.assertFalse(any(c[:2]==['docker','build'] for c in commands))
+        pulls=[c[2] for c in commands if c[:2]==['docker','pull']]
+        self.assertTrue(f'ghcr.io/{m.REPO}-caddy:1.3.1' in pulls)
+        self.assertEqual(images['caddy'],'sha256:fixture')
+
+    def test_cloudflare_image_pull_failure_precedes_service_changes(self):
+        from unittest.mock import patch
+        cfg=m.options(['--with','caddy','--tls-domain','music.example.org','--tls-dns','cloudflare','--tls-dns-token-file','/root/cloudflare-token'])
+        cfg['version']='1.3.0'
+        def docker(argv):
+            if argv[:2]==['docker','pull'] and '-caddy:' in argv[2]:
+                raise m.InstallError('registry unavailable')
+            return 'sha256:fixture'
+        with tempfile.TemporaryDirectory() as scratch, patch.object(m,'run',side_effect=docker):
+            with self.assertRaisesRegex(m.InstallError,'registry unavailable'):
+                m.docker_images(cfg,Path(scratch))
+
     def test_distribution_families_and_derivatives(self):
         for distro, like, expected in [('ubuntu','','debian'),('debian','','debian'),('cachyos','arch','arch'),('endeavouros','arch','arch'),('linuxmint','ubuntu debian','debian'),('fedora','','fedora')]:
             self.assertEqual(m.distro_family({'ID':distro,'ID_LIKE':like}), expected)
