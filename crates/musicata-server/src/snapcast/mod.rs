@@ -21,6 +21,7 @@ mod control;
 mod decode;
 mod dsp;
 mod server;
+mod stream;
 mod writer;
 
 use std::sync::Arc;
@@ -38,6 +39,7 @@ pub use server::{
     AIRPLAY_STREAM_NAME, SPOTIFY_STREAM_NAME, STREAM_NAME, SnapRoom, SnapcastManager,
     SnapcastSettings, binary_present, install_command,
 };
+pub(crate) use stream::stream_radio;
 pub use writer::{WriterEvent, WriterMsg, run as run_writer};
 
 /// Resolve a library track id to fully decoded stereo `i16` PCM at `target_rate`: look up

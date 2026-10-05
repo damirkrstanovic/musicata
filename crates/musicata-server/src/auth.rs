@@ -232,12 +232,12 @@ fn player_channel_id(path: &str) -> Option<&str> {
     matches!(tail, "state" | "commands" | "ws" | "audio/ws").then_some(id)
 }
 
-/// Whether `path` is a track audio stream — `/api/tracks/{id}/stream`. A native endpoint
-/// must fetch these to play, so a valid endpoint token authorizes them (M10).
+/// Track and radio audio relays that a playback endpoint may fetch with its token.
 fn is_stream_path(path: &str) -> bool {
     path.strip_prefix("/api/tracks/")
+        .or_else(|| path.strip_prefix("/api/radio/"))
         .and_then(|rest| rest.split_once('/'))
-        .is_some_and(|(_, tail)| tail == "stream")
+        .is_some_and(|(id, tail)| !id.is_empty() && tail == "stream")
 }
 
 /// Mint a per-player endpoint auth token (M10): returns `(cleartext, sha256_hash)`. The
@@ -248,7 +248,7 @@ pub fn issue_player_token() -> (String, String) {
     (token, hash)
 }
 
-/// In-memory credential for MPD's track fetches. Rotated on server restart; MPD queues
+/// In-memory credential for MPD's audio fetches. Rotated on server restart; MPD queues
 /// are rebuilt with the new URLs. Never a user credential or a player-control token.
 #[derive(Clone)]
 pub(crate) struct MpdStreamAuth {
@@ -264,6 +264,20 @@ impl MpdStreamAuth {
 
     pub fn accepts(&self, token: &str) -> bool {
         constant_time_eq(&self.token, token)
+    }
+
+    /// Only attach the credential to a local audio relay, never to an external URL.
+    pub fn stream_url(&self, base_url: &str, url: &str) -> String {
+        if is_stream_path(url) {
+            format!(
+                "{}{}?token={}",
+                base_url.trim_end_matches('/'),
+                url,
+                self.token
+            )
+        } else {
+            url.to_owned()
+        }
     }
 
     pub fn track_url(&self, base_url: &str, track_id: &str) -> String {
@@ -910,6 +924,9 @@ mod tests {
     #[test]
     fn stream_path_classification() {
         assert!(is_stream_path("/api/tracks/abc-1/stream"));
+        assert!(is_stream_path("/api/radio/station-1/stream"));
+        assert!(!is_stream_path("/api/radio/station-1"));
+        assert!(!is_stream_path("/api/radio/station-1/stream/extra"));
         assert!(!is_stream_path("/api/tracks/abc-1"));
         assert!(!is_stream_path("/api/tracks"));
         assert!(!is_stream_path("/api/players/mpd/stream"));

@@ -13,6 +13,7 @@ const DEFAULT_BASE: &str = "https://all.api.radio-browser.info";
 
 /// A normalized directory station for the UI (distinct from a saved `RadioStation`).
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct DirectoryStation {
     pub name: String,
     pub stream_url: String,

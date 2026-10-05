@@ -9247,6 +9247,25 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(body_text(response.into_body()).await, "fixture");
+        // A radio relay uses the same audio-only credential. The missing station reaches
+        // its handler (404), while no/invalid credentials remain unauthorized.
+        for (suffix, expected) in [
+            (format!("?{query}"), StatusCode::NOT_FOUND),
+            (String::new(), StatusCode::UNAUTHORIZED),
+            ("?token=invalid".to_string(), StatusCode::UNAUTHORIZED),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/radio/missing/stream{suffix}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
         for path in [
             "/api/settings",
             "/api/users",

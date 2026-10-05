@@ -5,6 +5,8 @@
 //              the app must window its rendering, not pull the whole library up front.
 // Args: <port> <basePath> <mode=behavior|scale>. Assumes Chrome CDP on :9222. Exits
 // non-zero on any failed assertion.
+import { radioFlows } from "./radio-flows.mjs";
+
 const PORT = process.argv[2];
 const PATH = process.argv[3] || "/v2";
 const MODE = process.argv[4] || "behavior";
@@ -159,6 +161,11 @@ await send("Page.reload");
 await sleep(2500);
 
 console.log(`Svelte UI smoke (${PATH}, ${MODE}):`);
+if (process.env.MUSICATA_RADIO_ONLY) {
+  await radioFlows({js, api, check, waitUntil, clickText, screenshot: mobileScreenshot});
+  ws.close();
+  process.exit(failures ? 1 : 0);
+}
 
 // Desktop shares the listening destinations, while keeping the library visible.
 if (MODE === "behavior") {
@@ -738,6 +745,8 @@ await js(`[...document.querySelectorAll('.library-panel .nav-link')].find(b=>/sm
 await sleep(900);
 check("radio play sets now-playing", /smoke fm/i.test((await js(`document.querySelector('#now-title')?.textContent`)) || ""));
 
+await radioFlows({js, api, check, waitUntil, clickText, screenshot: mobileScreenshot});
+
 // Zone: switch the output to the zone (which holds the browser player) and play.
 await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>/zone/i.test(o.textContent)); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
 await sleep(1200);
@@ -978,6 +987,12 @@ await sleep(600);
 check("Forward after visible Back restores album", await js(`document.querySelector('.hero-title')?.textContent === ${JSON.stringify(historyAlbum)}`));
 check("phone Playlists destination is reachable", await tapMobile('.mobile-tabs [data-tab="playlists"]'));
 check("phone Playlists lists saved playlist", await waitUntil(`document.querySelector('.saved-playlists')?.textContent.includes('Phone playlist')`, 1500) < Infinity);
+
+check("phone navigation opens for Radio", await tapMobile('[aria-label="Open navigation"]'));
+await clickText('.library-panel button', 'Browse radio');
+check("phone Radio is reachable", await waitUntil(`document.querySelector('.radio-view') && !document.querySelector('.content').inert && document.querySelector('.library-panel').getBoundingClientRect().right <= 0`, 2000) < Infinity);
+check("phone radio form fits viewport", await js(`document.querySelector('.radio-add input').getBoundingClientRect().right <= innerWidth && document.documentElement.scrollWidth <= innerWidth`));
+await mobileScreenshot('phone-radio');
 
 check("mobile: no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
 
