@@ -12,6 +12,7 @@
   import { favorites } from "../lib/favorites.svelte";
   import { search } from "../lib/search.svelte";
   import { dsp } from "../lib/dsp.svelte";
+  import { outputAudio, connectBrowserRenderer } from "../lib/outputAudio.svelte";
   import { autoplay } from "../lib/autoplay.svelte";
   import type { PlaybackState } from "../types/PlaybackState";
   import type { Player } from "../types/Player";
@@ -150,15 +151,6 @@
     setMediaPosition(player.elapsed, player.duration);
   }
 
-  // Push the active EQ profile into the Web Audio graph whenever it changes. IMPORTANT: read
-  // the reactive dsp state into `profile` FIRST. If we inlined it as `audio?.setEq(dsp...)`,
-  // the optional chain would short-circuit argument evaluation while `audio` is still null on
-  // the first run, so the effect would track no dependencies and never re-run.
-  $effect(() => {
-    const profile = dsp.enabled ? dsp.active : null;
-    audio?.setEq(profile);
-  });
-
   // Volume leveling toggle → graph (read the reactive dep first; see the note above).
   $effect(() => {
     const mode = dsp.levelingMode;
@@ -176,7 +168,6 @@
     audio = new BrowserAudio(audioEl);
     setAudio(audio);
     (window as unknown as { __audio?: unknown }).__audio = audio; // debug hook
-    audio.setEq(dsp.enabled ? dsp.active : null); // apply persisted profile on load
     audio.setLevelingMode(dsp.levelingMode);
     audio.onProgress((msg) => { if (player.isBrowserOutput) ws?.send(msg); });
     audio.onEnded(() => { if (player.isBrowserOutput) ws?.send({ type: "ended" }); });
@@ -202,12 +193,13 @@
     // Restore the active output's EQ profile + sink (not its volume — don't override the
     // restored playback level just from booting). Wait for profiles to load first.
     await dsp.load();
-    audioDevices.applyActive(false);
+
   });
 
   // Players + zones for the output switcher.
   let players = $state<Player[]>([]);
   let zones = $state<Zone[]>([]);
+  let zoneMemberId = $state<string | null>(null);
 
   // Connection resilience. Once `connect()` runs, connectPlayer reconnects the WS forever, so
   // the only gap is the *initial* target fetch failing (server not up yet, a transient 401);
@@ -253,7 +245,11 @@
     connectRetry = setTimeout(initConnection, 2000);
   }
 
+  let renderer: ReturnType<typeof connectBrowserRenderer> | null = null;
+
   function connect(kind: "player" | "zone", id: string) {
+    renderer?.close();
+    renderer = null;
     // Stop the previous local stream before binding its events to another target.
     audio?.pause();
     resumeOnReconnect = false;
@@ -266,6 +262,11 @@
     player.elapsed = 0;
     player.duration = 0;
     player.connection = "connecting";
+    const output = kind === "player" ? players.find(p => p.id === id) : players.find(p => p.zone_id === id);
+    zoneMemberId = kind === "zone" ? output?.id ?? null : null;
+    if (output) dsp.bindOutput(output.id, output.name);
+    else outputAudio.close();
+    if (audio && player.isBrowserOutput && player.browserId) renderer = connectBrowserRenderer(player.browserId, audio);
     ws = connectPlayer(kind, id, {
       onState: applyState,
       onProgress: applyTick,
@@ -293,6 +294,8 @@
   onDestroy(() => {
     clearTimeout(connectRetry);
     ws?.close();
+    renderer?.close();
+    outputAudio.close();
     audio?.stop();
   });
 </script>
@@ -402,6 +405,16 @@
           {/each}
         </select>
       </div>
+      {#if player.activeKind === "zone"}
+        <label>EQ and meter member
+          <select aria-label="EQ and meter member" value={zoneMemberId ?? ""} onchange={event => {
+            const output = players.find(p => p.id === event.currentTarget.value);
+            if (output) {zoneMemberId = output.id; dsp.bindOutput(output.id, output.name);}
+          }}>
+            {#each players.filter(p => p.zone_id === player.activeId) as member (member.id)}<option value={member.id}>{member.name}</option>{/each}
+          </select>
+        </label>
+      {/if}
     </div>
     <div class="rail-top">
       <MetadataPanel />

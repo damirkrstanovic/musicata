@@ -101,7 +101,7 @@
   </div>
 
   <div class="transport-aux">
-    {#if audioDevices.hasPresets}
+    {#if audioDevices.hasPresets && player.isBrowserOutput}
       <div class="output-switch" role="group" aria-label="Output">
         {#each audioDevices.presets as preset (preset.id)}
           <button

@@ -96,6 +96,7 @@ class AudioDevices {
    *  explicit switch). `withVolume` is false on startup so we don't override the restored
    *  playback level just from booting. */
   applyActive(withVolume: boolean): void {
+    if (!player.isBrowserOutput) return;
     const preset = this.active;
     if (!preset) return;
     if (preset.profileId) dsp.setActive(preset.profileId);

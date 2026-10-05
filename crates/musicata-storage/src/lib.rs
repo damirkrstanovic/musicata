@@ -404,6 +404,21 @@ impl Database {
             set_user_version(&self.pool, 34).await?;
         }
 
+        if version < 35 {
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS player_dsp (
+                player_id TEXT PRIMARY KEY REFERENCES players(id) ON DELETE CASCADE,
+                profile_id TEXT,
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+                processor_host TEXT,
+                processor_port INTEGER CHECK (processor_port BETWEEN 1 AND 65535)
+            )",
+            )
+            .execute(&self.pool)
+            .await?;
+            set_user_version(&self.pool, 35).await?;
+        }
+
         Ok(())
     }
 
@@ -3470,6 +3485,71 @@ impl Database {
         Ok(())
     }
 
+    pub async fn player_dsp(
+        &self,
+        id: &str,
+    ) -> Result<Option<musicata_core::dsp::OutputDspSelection>> {
+        let row = sqlx::query("SELECT profile_id, enabled FROM player_dsp WHERE player_id = ?")
+            .bind(id)
+            .fetch_optional(&self.reads)
+            .await?;
+        row.map(|row| {
+            Ok(musicata_core::dsp::OutputDspSelection {
+                profile_id: row.try_get("profile_id")?,
+                enabled: row.try_get("enabled")?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn set_player_dsp(
+        &self,
+        id: &str,
+        selection: &musicata_core::dsp::OutputDspSelection,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO player_dsp (player_id, profile_id, enabled) VALUES (?, ?, ?)
+            ON CONFLICT(player_id) DO UPDATE SET profile_id = excluded.profile_id, enabled = excluded.enabled")
+            .bind(id).bind(&selection.profile_id).bind(selection.enabled).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn clear_dsp_profile_bindings(&self, profile_id: &str) -> Result<()> {
+        sqlx::query("UPDATE player_dsp SET profile_id=NULL, enabled=0 WHERE profile_id=?")
+            .bind(profile_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn player_dsp_processor(&self, id: &str) -> Result<Option<(String, u16)>> {
+        let row = sqlx::query(
+            "SELECT processor_host, processor_port FROM player_dsp
+            WHERE player_id = ? AND processor_host IS NOT NULL AND processor_port IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.reads)
+        .await?;
+        row.map(|row| {
+            Ok((
+                row.try_get("processor_host")?,
+                row.try_get("processor_port")?,
+            ))
+        })
+        .transpose()
+    }
+
+    pub async fn set_player_dsp_processor(
+        &self,
+        id: &str,
+        host: Option<&str>,
+        port: Option<u16>,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO player_dsp (player_id, processor_host, processor_port) VALUES (?, ?, ?)
+            ON CONFLICT(player_id) DO UPDATE SET processor_host = excluded.processor_host, processor_port = excluded.processor_port")
+            .bind(id).bind(host).bind(port).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn delete_player(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM player_queue_items WHERE player_id = ?1")
             .bind(id)
@@ -6261,6 +6341,43 @@ mod tests {
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[tokio::test]
+    async fn output_dsp_selection_survives_reopen_and_player_removal() {
+        use musicata_core::dsp::OutputDspSelection;
+        let path = temp_db_path("output-dsp");
+        let database = Database::connect(&path).await.unwrap();
+        database
+            .upsert_player(&super::PlayerRecord {
+                id: "output".into(),
+                name: "Output".into(),
+                kind: "native".into(),
+                address: "local".into(),
+                zone_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(database.player_dsp("output").await.unwrap().is_none());
+        let selection = OutputDspSelection {
+            profile_id: Some("headphones".into()),
+            enabled: true,
+        };
+        database.set_player_dsp("output", &selection).await.unwrap();
+        let reopened = Database::connect(&path).await.unwrap();
+        assert_eq!(
+            reopened.player_dsp("output").await.unwrap(),
+            Some(selection)
+        );
+        reopened.delete_player("output").await.unwrap();
+        assert!(reopened.player_dsp("output").await.unwrap().is_none());
+        assert!(
+            reopened
+                .set_player_dsp("missing", &OutputDspSelection::default())
+                .await
+                .is_err()
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn queued_writes_do_not_starve_foreground_reads() {

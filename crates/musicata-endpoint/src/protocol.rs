@@ -12,6 +12,8 @@ pub struct PlaybackState {
     /// "stopped" | "playing" | "paused" (snake_case, matching the server enum).
     #[serde(default)]
     pub status: String,
+    #[serde(default = "default_volume")]
+    pub volume: u8,
     #[serde(default)]
     pub now_playing: Option<QueueItem>,
     /// The track the server will play next (its prefetch hint). The endpoint loads this ahead
@@ -30,6 +32,10 @@ pub struct QueueItem {
     /// What the endpoint actually fetches — a library stream URL (relative) or an external one.
     #[serde(default)]
     pub stream_url: String,
+}
+
+fn default_volume() -> u8 {
+    100
 }
 
 impl PlaybackState {
@@ -157,6 +163,7 @@ mod tests {
                 ..Default::default()
             }),
             next_up: None,
+            volume: 100,
         }
     }
 

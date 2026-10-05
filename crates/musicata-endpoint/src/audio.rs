@@ -5,6 +5,7 @@
 use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
 
+use crate::dsp::{Control, DspSource};
 use anyhow::{Context, Result, anyhow};
 use rodio::{Decoder, OutputStream, Sink, Source};
 
@@ -27,6 +28,7 @@ pub struct AudioPlayer {
     // One long-lived sink for the player's lifetime: appending the next decoded track lets
     // rodio play it back-to-back with the current one (gapless). A per-track sink would gap.
     sink: Sink,
+    control: Control,
     agent: ureq::Agent,
     base_url: String,
     token: String,
@@ -58,7 +60,7 @@ fn resolve_request(base_url: &str, stream_url: &str) -> (String, bool) {
 }
 
 impl AudioPlayer {
-    pub fn new(base_url: String, token: String) -> Result<Self> {
+    pub fn new(base_url: String, token: String, control: Control) -> Result<Self> {
         let (stream, handle) =
             OutputStream::try_default().context("open the default audio output device")?;
         let sink = Sink::try_new(&handle).map_err(|error| anyhow!("create sink: {error}"))?;
@@ -68,6 +70,7 @@ impl AudioPlayer {
         Ok(Self {
             _stream: stream,
             sink,
+            control,
             agent,
             base_url: base_url.trim_end_matches('/').to_string(),
             token,
@@ -116,14 +119,17 @@ impl AudioPlayer {
     /// explicit (re)load (a new track, a seek), where a gap is acceptable.
     pub fn load(&mut self, stream_url: &str, play: bool) -> Result<()> {
         let (decoder, duration) = self.decode(stream_url)?;
+        let source = DspSource::new(decoder.convert_samples::<f32>(), self.control.clone())
+            .map_err(|e| anyhow!(e))?;
         self.sink.clear(); // stops + empties the queue, leaving the sink paused but reusable
-        self.sink.append(decoder);
+        self.sink.append(source);
         self.duration = duration;
         self.loaded = true;
         self.pending = None;
         self.appended = None;
         self.accumulated = Duration::ZERO;
         self.reported_ended = false;
+        self.control.set_playing(play);
         if play {
             self.sink.play();
             self.play_started = Some(Instant::now());
@@ -165,7 +171,17 @@ impl AudioPlayer {
             return;
         }
         if let Some(pending) = self.pending.take() {
-            self.sink.append(pending.source);
+            let source = match DspSource::new(
+                pending.source.convert_samples::<f32>(),
+                self.control.clone(),
+            ) {
+                Ok(source) => source,
+                Err(error) => {
+                    eprintln!("append failed: {error}");
+                    return;
+                }
+            };
+            self.sink.append(source);
             self.appended = Some(Appended {
                 track_id: pending.track_id,
                 duration: pending.duration,
@@ -175,6 +191,7 @@ impl AudioPlayer {
     }
 
     pub fn resume(&mut self) {
+        self.control.set_playing(true);
         if self.loaded {
             self.sink.play();
             if self.play_started.is_none() {
@@ -184,6 +201,7 @@ impl AudioPlayer {
     }
 
     pub fn pause(&mut self) {
+        self.control.set_playing(false);
         if self.loaded {
             self.sink.pause();
             if let Some(started) = self.play_started.take() {
@@ -193,6 +211,7 @@ impl AudioPlayer {
     }
 
     pub fn stop(&mut self) {
+        self.control.set_playing(false);
         self.sink.clear();
         self.loaded = false;
         self.duration = None;
@@ -216,6 +235,10 @@ impl AudioPlayer {
             total += started.elapsed();
         }
         total.as_secs_f64()
+    }
+
+    pub fn set_volume(&self, volume: u8) {
+        self.control.set_volume(volume);
     }
 
     pub fn duration_seconds(&self) -> Option<f64> {

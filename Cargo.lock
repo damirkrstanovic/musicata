@@ -2062,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "lofty",
  "serde",
@@ -2072,9 +2072,10 @@ dependencies = [
 
 [[package]]
 name = "musicata-endpoint"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
+ "musicata-core",
  "rodio",
  "serde",
  "serde_json",
@@ -2084,7 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-ml"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2101,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-server"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2132,13 +2133,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ts-rs",
+ "tungstenite 0.24.0",
  "ureq 2.12.1",
  "zip",
 ]
 
 [[package]]
 name = "musicata-storage"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "libsqlite3-sys",

@@ -1,6 +1,6 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
-  import { getAudio } from "../lib/playback";
+  import { outputAudio } from "../lib/outputAudio.svelte";
   import { meter } from "../lib/meter.svelte";
 
   // Smoothed needle positions (0..1) with VU-style ballistics: fast rise, slow fall.
@@ -9,6 +9,12 @@
   let raf = 0;
   let prevT = 0;
 
+  const points = {
+    browser_output: "Browser output, after correction and volume",
+    native_output: "Native output, after correction and volume",
+    snapcast_stream: "Shared Snapcast stream, before network buffering",
+    camilladsp_playback: "Output processor playback",
+  };
   const DB_MIN = -42;
   const DB_MAX = 3;
   function posFromRms(x: number): number {
@@ -22,14 +28,15 @@
   function frame(t: number) {
     const dt = prevT ? Math.min(0.05, (t - prevT) / 1000) : 0.016;
     prevT = t;
-    const lv = getAudio()?.levels();
-    posL = ballistic(posL, lv ? posFromRms(lv.l) : 0, dt);
-    posR = ballistic(posR, lv ? posFromRms(lv.r) : 0, dt);
+    const lv = outputAudio.levels;
+    posL = ballistic(posL, lv ? posFromRms(lv.rms_l) : 0, dt);
+    posR = ballistic(posR, lv ? posFromRms(lv.rms_r) : 0, dt);
     raf = requestAnimationFrame(frame);
   }
   // Only run the 60fps loop while the meter drawer is open; the work is wasted (and the
   // analyser untouched) when it's closed.
   $effect(() => {
+    outputAudio.setSubscribed(meter.open);
     if (!meter.open) return;
     prevT = 0;
     raf = requestAnimationFrame(frame);
@@ -101,7 +108,7 @@
 {/snippet}
 
 {#if meter.open}
-  <section class="vu-drawer" aria-label="Output level meters">
+  <section class="vu-drawer" data-available={!!outputAudio.levels} aria-label="Output level meters">
     <header class="vu-head">
       <strong>Output level</strong>
       <button class="ghost-button" type="button" onclick={() => meter.toggle()}>Close</button>
@@ -110,6 +117,6 @@
       {@render vu(posL, "L", "vu-grad-l")}
       {@render vu(posR, "R", "vu-grad-r")}
     </div>
-    <p class="vu-note">Browser output, post-EQ. Needle ballistics emulate a VU meter.</p>
+    <p class="vu-note">{outputAudio.name || "Selected output"} · {outputAudio.state ? points[outputAudio.state.measurement_point] : "Meter unavailable"}. Needle ballistics emulate a VU meter.</p>
   </section>
 {/if}

@@ -204,7 +204,8 @@ async fn resolve_user(
 /// Admin-only API surfaces — user management and the configuration panels. The player
 /// (listener) app never calls these; everything it needs only requires authentication.
 fn is_admin_path(path: &str) -> bool {
-    path.starts_with("/api/users")
+    (path.starts_with("/api/players/") && path.ends_with("/dsp/processor"))
+        || path.starts_with("/api/users")
         || path.starts_with("/api/sources")
         || path == "/api/settings"
         || path == "/api/history"
@@ -228,7 +229,7 @@ fn is_open_path(path: &str) -> bool {
 fn player_channel_id(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/api/players/")?;
     let (id, tail) = rest.split_once('/')?;
-    matches!(tail, "state" | "commands" | "ws").then_some(id)
+    matches!(tail, "state" | "commands" | "ws" | "audio/ws").then_some(id)
 }
 
 /// Whether `path` is a track audio stream — `/api/tracks/{id}/stream`. A native endpoint
@@ -294,6 +295,20 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
     // CLOSED on a DB error (only an explicit `Ok(0)` opens the API) so a transient query failure
     // can't drop auth on an instance that actually has users.
     if matches!(state.database.count_users().await, Ok(0)) {
+        if let (Some(player_id), Some(token)) = (player_channel_id(&path), api_token.as_deref()) {
+            if state
+                .database
+                .player_auth_token_hash(player_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|hash| hash == hash_token(token))
+            {
+                request
+                    .extensions_mut()
+                    .insert(crate::output_audio::EndpointIdentity(player_id.to_owned()));
+            }
+        }
         return next.run(request).await;
     }
     let Some(user) = resolve_user(&state, cookie, api_token.clone()).await else {
@@ -315,6 +330,9 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
                 && let Ok(Some(stored)) = state.database.player_auth_token_hash(player_id).await
                 && constant_time_eq(&stored, &hashed)
             {
+                request
+                    .extensions_mut()
+                    .insert(crate::output_audio::EndpointIdentity(player_id.to_string()));
                 return next.run(request).await;
             }
             if is_stream_path(&path)
@@ -863,6 +881,8 @@ mod tests {
         assert!(is_admin_path("/api/users"));
         assert!(is_admin_path("/api/sources/x"));
         assert!(is_admin_path("/api/settings"));
+        assert!(is_admin_path("/api/players/mpd/dsp/processor"));
+        assert!(!is_admin_path("/api/players/mpd/dsp"));
         assert!(!is_admin_path("/api/tracks"));
         assert!(!is_admin_path("/api/playlists"));
         assert!(is_open_path("/api/auth/login"));
@@ -874,6 +894,12 @@ mod tests {
         assert_eq!(player_channel_id("/api/players/mpd/state"), Some("mpd"));
         assert_eq!(player_channel_id("/api/players/mpd/commands"), Some("mpd"));
         assert_eq!(player_channel_id("/api/players/abc-1/ws"), Some("abc-1"));
+        assert_eq!(
+            player_channel_id("/api/players/abc-1/audio/ws"),
+            Some("abc-1")
+        );
+        assert_eq!(player_channel_id("/api/players/abc-1/dsp"), None);
+        assert_eq!(player_channel_id("/api/players/abc-1/dsp/processor"), None);
         // Management paths and unknown tails are NOT endpoint channels (stay user-gated).
         assert_eq!(player_channel_id("/api/players/mpd"), None);
         assert_eq!(player_channel_id("/api/players"), None);

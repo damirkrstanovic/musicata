@@ -19,6 +19,9 @@
 //! The initial implementation ships a local-disk provider, but the domain model
 //! deliberately describes music independently from the source that provided it.
 
+pub mod dsp;
+pub mod pcm_dsp;
+
 use lofty::{
     config::ParseOptions, file::AudioFile, file::FileType, file::TaggedFileExt,
     picture::PictureType, prelude::Accessor, probe::Probe, tag::ItemKey,

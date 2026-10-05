@@ -28,6 +28,11 @@ const api = (path, init = {}) =>
     r.ok ? r.json().catch(() => null) : null,
   );
 
+const remoteOutput = MODE === "behavior" ? await api("/api/players", {
+  method:"POST", headers:{"content-type":"application/json"},
+  body:JSON.stringify({kind:"native",address:"smoke-native",name:"Remote audio",issue_token:true}),
+}) : null;
+
 let failures = 0;
 function check(name, ok, detail = "") {
   console.log(`  ${ok ? "✓" : "✗"} ${name}${ok ? "" : "  <-- " + detail}`);
@@ -429,6 +434,7 @@ await js(`(()=>{const s=document.querySelector('.eq-field select:not(.leveling-s
 await sleep(500);
 check("eq preset applies bands", (await js(`document.querySelectorAll('.eq-band').length`)) > 0);
 check("eq response curve renders", await js(`!!document.querySelector('.eq-curve-line')?.getAttribute('d')`));
+check("browser EQ selection persists on its output", (await api("/api/players/browser-local/dsp"))?.selection?.profile_id === "demo-bass");
 // The biquad nodes are actually built and applied to the live graph (this is what regressed:
 // a short-circuited effect left the profile unapplied even though the DOM showed bands).
 check("eq biquads applied to graph", (await js(`window.__audio?.eqBands?.length ?? 0`)) > 0);
@@ -438,6 +444,15 @@ check(
   eqTitleBefore === (await js(`document.querySelector('#now-title')?.textContent`)),
   `${eqTitleBefore}`,
 );
+// The tap must include the final browser software volume, rather than only EQ gain.
+const priorVolume=(await api("/api/players/browser-local/state"))?.volume ?? 100;
+await js('window.__audio?.setVolume(100)');await sleep(180);
+const fullVolumeLevels=await js('window.__audio?.levels()');
+await js('window.__audio?.setVolume(10)');await sleep(180);
+const quietVolumeLevels=await js('window.__audio?.levels()');
+check("browser meter includes final software volume",quietVolumeLevels?.l < fullVolumeLevels?.l*0.2,JSON.stringify({fullVolumeLevels,quietVolumeLevels}));
+await js(`window.__audio?.setVolume(${priorVolume})`);
+
 // Listening stats view: open it from the footer and confirm it renders figures from
 // /api/history/stats (12 stat rows, even when history is empty → zeros).
 await js(`[...document.querySelectorAll('button')].find(b=>/listening stats/i.test(b.title))?.click()`);
@@ -517,8 +532,9 @@ check(
     headers: { "content-type": "application/json", cookie: COOKIE },
     body: JSON.stringify({ dsp_profile_id: "smoke-room" }),
   });
-  const snap = patched.ok ? await patched.json() : null;
-  check("snapcast server-side DSP profile selection persists", snap?.dsp_profile_id === "smoke-room");
+  check("Snapcast rejects unsupported room convolution",patched.status === 400);
+  const peq = await api("/api/snapcast/status",{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({dsp_profile_id:"demo-bass"})});
+  check("snapcast server-side DSP profile selection persists",peq?.dsp_profile_id === "demo-bass");
 }
 
 // VU meter: opening it renders the two (L/R) McIntosh-style meters.
@@ -527,6 +543,51 @@ await sleep(400);
 check("vu meter opens with L/R meters", (await js(`document.querySelectorAll('.vu-svg').length`)) >= 2);
 await clickText(".vu-head button", "Close");
 await sleep(300);
+
+// Remote controls consume the native renderer's measurements while this browser is silent.
+if (remoteOutput) {
+  const remoteSocket = new WebSocket(`ws://127.0.0.1:${PORT}/api/players/${remoteOutput.id}/audio/ws?token=${remoteOutput.auth_token}`);
+  let remoteConfig = null;
+  let remoteSequence = 0;
+  remoteSocket.onmessage = event => {
+    const frame = JSON.parse(event.data);
+    if (frame.type === "renderer_granted" || frame.type === "dsp_config") {
+      remoteConfig = frame.config;
+      remoteSocket.send(JSON.stringify({type:"dsp_applied",session_id:remoteConfig.state.session_id,revision:remoteConfig.state.desired_revision}));
+    }
+  };
+  await new Promise((resolve,reject) => {remoteSocket.onopen=resolve; remoteSocket.onerror=reject;});
+  remoteSocket.send(JSON.stringify({type:"renderer"}));
+  const remoteTrack = (await api("/api/tracks?limit=1")).items[0];
+  await api(`/api/players/${remoteOutput.id}/commands`, {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({command:"play_tracks",track_ids:[remoteTrack.id]})});
+  await js(`(()=>{const s=document.querySelector('select[aria-label="Output"]');s.value='player:${remoteOutput.id}';s.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await sleep(500);
+  await js(`[...document.querySelectorAll('.eq-btn')].find(b=>/equalizer/i.test(b.title))?.click()`);
+  await sleep(100);
+  await js(`(()=>{const s=document.querySelector('.eq-field select:not(.leveling-select)');if(s){s.value='demo-warm';s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
+  await sleep(500);
+  const selectedRemote = await api(`/api/players/${remoteOutput.id}/dsp`);
+  check("remote EQ writes the selected output",selectedRemote?.selection?.profile_id === "demo-warm",JSON.stringify(selectedRemote));
+  check("remote EQ does not change browser correction",(await api("/api/players/browser-local/dsp"))?.selection?.profile_id !== "demo-warm");
+  check("remote controller keeps browser audio silent",await js('document.querySelector("audio")?.paused === true'));
+  check("remote controls hide browser leveling",await js('!document.querySelector(".leveling-select")'));
+  await js(`[...document.querySelectorAll('.eq-btn')].find(b=>/vu/i.test(b.title))?.click()`);
+  await sleep(200);
+  const needlesBefore = await js('[...document.querySelectorAll(".vu-needle")].map(p=>p.getAttribute("d")).join()');
+  await js('window.__n=0');
+  const publish = setInterval(() => {if(remoteConfig) remoteSocket.send(JSON.stringify({type:"levels",session_id:remoteConfig.state.session_id,revision:remoteConfig.state.desired_revision,sequence:++remoteSequence,levels:{rms_l:0.2,rms_r:0.4,peak_l:0.3,peak_r:0.5}}));},100);
+  await sleep(700);
+  check("remote measured levels move both needles",(await js('[...document.querySelectorAll(".vu-needle")].map(p=>p.getAttribute("d")).join()')) !== needlesBefore);
+  check("meter frames do not sweep now-title",(await js('window.__n'))===0);
+  await mobileScreenshot("desktop-remote-eq-vu");
+  clearInterval(publish);
+  remoteSocket.close();
+  await sleep(1200);
+  check("disconnected remote levels expire",await js('document.querySelector(".vu-drawer")?.dataset.available === "false"'));
+  await clickText(".vu-head button", "Close");
+  await js(`(()=>{const s=document.querySelector('select[aria-label="Output"]');s.value='player:browser-local';s.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await sleep(300);
+}
 
 // Recommendations: "Start radio from this" returns the seed + similar tracks (the local
 // content fallback always yields the seed; ListenBrainz adds more when MBIDs + network exist).
@@ -704,7 +765,7 @@ await clickText(".queue-head button", "Close");
 // is to catch a gross regression (a path that got much slower or stopped responding), not to pin
 // a millisecond budget. Each playback check also asserts audio actually advances, so a fast-but-
 // silent "playing" still fails.
-await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>!/zone/i.test(o.textContent)); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`); // output → the browser player
+await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>o.value==='player:browser-local'); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`); // output → the browser player
 await sleep(700);
 await clickText(".seg", "Tracks");
 await sleep(500);
@@ -753,7 +814,7 @@ await sleep(400);
 // track, and the footer Play must actually play it on THIS tab. The bug — the footer sent a bare
 // `play` while the freshly-loaded tab had never claimed browser output, so `drive()` skipped it
 // and nothing played, even though picking a track from the library (which claims) worked.
-await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>!/zone/i.test(o.textContent)); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`); // output → the browser player itself, not the zone
+await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>o.value==='player:browser-local'); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`); // output → the browser player itself, not the zone
 await sleep(800);
 await clickText(".seg", "Tracks");
 await sleep(600);

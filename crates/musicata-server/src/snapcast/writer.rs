@@ -21,6 +21,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::decode::{CHANNELS, DecodedTrack};
 use super::dsp::StereoEq;
+use musicata_core::pcm_dsp::{AudioTap, StereoMeter};
+use std::sync::atomic::Ordering;
 
 /// PCM frames written per `write_all`. snapserver reads its pipe in small chunks paced to
 /// real time (its `chunk_ms`, default 20 ms); feeding in **matching ~20 ms granularity** keeps
@@ -72,7 +74,10 @@ pub enum WriterMsg {
     Seek { frame: usize },
     /// Replace the active EQ correction (or clear it with `None`). Applied per chunk before the
     /// FIFO — server-side correction for Snapcast, in-process (no CamillaDSP subprocess).
-    SetDsp(Box<Option<StereoEq>>),
+    SetDsp {
+        chain: Box<Option<StereoEq>>,
+        revision: u64,
+    },
     /// Stop and clear everything (Stop / Clear).
     Stop,
     /// Tear the thread down.
@@ -90,7 +95,12 @@ pub enum WriterEvent {
 /// Run the writer loop on the calling (dedicated) thread until `Shutdown` or the command
 /// channel disconnects. Opening the FIFO for writing blocks until snapserver opens the
 /// read end — by which point the stream is ready.
-pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<WriterEvent>) {
+pub fn run(
+    fifo_path: PathBuf,
+    rx: Receiver<WriterMsg>,
+    events: UnboundedSender<WriterEvent>,
+    tap: Arc<AudioTap>,
+) {
     let mut file = match OpenOptions::new().write(true).open(&fifo_path) {
         Ok(file) => file,
         Err(error) => {
@@ -105,6 +115,8 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
     let mut volume = 1.0f32;
     // Optional server-side EQ correction applied per chunk (stateful per channel).
     let mut eq: Option<StereoEq> = None;
+    let mut meter = StereoMeter::default();
+    let mut meter_frames = 0;
     // Wall-clock time the *next* frame to be written should reach the stream — the
     // real-time playout clock. `None` whenever we're idle (reset so a resume starts fresh,
     // not trying to "catch up" across the silent gap). The sample rate is fixed per stream.
@@ -123,6 +135,8 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
                         &mut playing,
                         &mut volume,
                         &mut eq,
+                        &mut meter,
+                        &tap,
                     ) {
                         return;
                     }
@@ -145,6 +159,8 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
                         &mut playing,
                         &mut volume,
                         &mut eq,
+                        &mut meter,
+                        &tap,
                     ) {
                         return;
                     }
@@ -187,6 +203,10 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
             if let Err(error) = file.write_all(&scratch) {
                 // snapserver likely restarted; try to reopen the FIFO once, then re-write
                 // this chunk so we don't silently drop ~20 ms of audio.
+                let revision = tap.applied_revision.swap(0, Ordering::AcqRel);
+                tap.clear();
+                meter.reset();
+                meter_frames = 0;
                 tracing::warn!(%error, "snapcast: FIFO write failed; reopening");
                 match OpenOptions::new().write(true).open(&fifo_path) {
                     Ok(mut reopened) => {
@@ -195,12 +215,25 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
                             return;
                         }
                         file = reopened;
+                        tap.applied_revision.store(revision, Ordering::Release);
                     }
                     Err(error) => {
                         tracing::error!(%error, "snapcast: FIFO reopen failed; writer stopping");
                         return;
                     }
                 }
+            }
+            for frame in scratch.chunks_exact(4) {
+                let l = i16::from_le_bytes([frame[0], frame[1]]) as f64 / 32768.0;
+                let r = i16::from_le_bytes([frame[2], frame[3]]) as f64 / 32768.0;
+                meter.push(l, r);
+            }
+            meter_frames += end - start;
+            if meter_frames >= loaded.track.sample_rate as usize / 20 {
+                if let Some(levels) = meter.take() {
+                    tap.publish(levels);
+                }
+                meter_frames = 0;
             }
             // Advance only after the chunk is actually written.
             loaded.cursor_frames = end;
@@ -228,6 +261,12 @@ pub fn run(fifo_path: PathBuf, rx: Receiver<WriterMsg>, events: UnboundedSender<
                 .map(|loaded| loaded.generation)
                 .unwrap_or_default();
             if let Some((track, gain)) = next.take() {
+                if let Some(eq) = eq.as_mut() {
+                    eq.reset();
+                }
+                meter.reset();
+                meter_frames = 0;
+                tap.clear();
                 current = Some(Loaded {
                     track,
                     cursor_frames: 0,
@@ -251,6 +290,8 @@ fn apply(
     playing: &mut bool,
     volume: &mut f32,
     eq: &mut Option<StereoEq>,
+    meter: &mut StereoMeter,
+    tap: &AudioTap,
 ) -> bool {
     match msg {
         WriterMsg::Load {
@@ -259,6 +300,8 @@ fn apply(
             gain,
             generation,
         } => {
+            meter.reset();
+            tap.clear();
             let cursor_frames = start_frame.min(track.frames());
             *current = Some(Loaded {
                 track,
@@ -285,9 +328,17 @@ fn apply(
                 *next = Some((track, gain));
             }
         }
-        WriterMsg::SetPlaying(value) => *playing = value,
+        WriterMsg::SetPlaying(value) => {
+            *playing = value;
+            if !value {
+                meter.reset();
+                tap.clear();
+            }
+        }
         WriterMsg::SetVolume(percent) => *volume = (percent.min(100) as f32) / 100.0,
         WriterMsg::Seek { frame } => {
+            meter.reset();
+            tap.clear();
             if let Some(loaded) = current.as_mut() {
                 loaded.cursor_frames = frame.min(loaded.track.frames());
             }
@@ -295,8 +346,15 @@ fn apply(
                 eq.reset();
             }
         }
-        WriterMsg::SetDsp(chain) => *eq = *chain,
+        WriterMsg::SetDsp { chain, revision } => {
+            *eq = *chain;
+            meter.reset();
+            tap.clear();
+            tap.applied_revision.store(revision, Ordering::Release);
+        }
         WriterMsg::Stop => {
+            meter.reset();
+            tap.clear();
             *current = None;
             *next = None;
             *playing = false;
@@ -304,4 +362,161 @@ fn apply(
         WriterMsg::Shutdown => return false,
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use musicata_core::dsp::{DspBand, DspProfile};
+
+    fn path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "musicata-writer-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn prefetched_track_starts_with_clean_filter_and_meter_history() {
+        let file = path("gapless");
+        std::fs::write(&file, []).unwrap();
+        let tap = Arc::new(AudioTap::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let profile = DspProfile {
+            id: "test".into(),
+            name: "Test".into(),
+            preamp_db: 0.,
+            bands: vec![DspBand {
+                band_type: "peaking".into(),
+                freq: 1000.,
+                gain: 6.,
+                q: 1.,
+            }],
+            kind: None,
+            room_ir: None,
+        };
+        tx.send(WriterMsg::SetDsp {
+            chain: Box::new(StereoEq::from_profile(&profile, 48000).unwrap()),
+            revision: 1,
+        })
+        .unwrap();
+        tx.send(WriterMsg::Load {
+            track: Arc::new(DecodedTrack {
+                samples: vec![16000; 200],
+                sample_rate: 48000,
+            }),
+            start_frame: 0,
+            gain: 1.,
+            generation: 1,
+        })
+        .unwrap();
+        tx.send(WriterMsg::Preload {
+            track: Arc::new(DecodedTrack {
+                samples: vec![0; 4800],
+                sample_rate: 48000,
+            }),
+            gain: 1.,
+            generation: 1,
+        })
+        .unwrap();
+        tx.send(WriterMsg::SetPlaying(true)).unwrap();
+        let writer_tap = tap.clone();
+        let writer_file = file.clone();
+        let writer = std::thread::spawn(move || run(writer_file, rx, events, writer_tap));
+        loop {
+            if matches!(received.blocking_recv(), Some(WriterEvent::Drained { .. })) {
+                break;
+            }
+        }
+        tx.send(WriterMsg::Shutdown).unwrap();
+        writer.join().unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        std::fs::remove_file(file).unwrap();
+        assert!(
+            bytes[400..].iter().all(|byte| *byte == 0),
+            "filter tail crossed the track boundary"
+        );
+        assert_eq!(
+            tap.read().unwrap().1.peak_l,
+            0.,
+            "old track contaminated the new meter window"
+        );
+    }
+
+    #[test]
+    fn fifo_reopen_recovers_the_applied_revision_and_output() {
+        use std::io::Read;
+        let fifo = path("recovery");
+        let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let tap = Arc::new(AudioTap::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(WriterMsg::SetDsp {
+            chain: Box::new(None),
+            revision: 9,
+        })
+        .unwrap();
+        tx.send(WriterMsg::Load {
+            track: Arc::new(DecodedTrack {
+                samples: vec![16000; 96000],
+                sample_rate: 48000,
+            }),
+            start_frame: 0,
+            gain: 1.,
+            generation: 1,
+        })
+        .unwrap();
+        tx.send(WriterMsg::SetPlaying(true)).unwrap();
+        let writer_file = fifo.clone();
+        let writer_tap = tap.clone();
+        let writer = std::thread::spawn(move || run(writer_file, rx, events, writer_tap));
+        let mut reader = std::fs::File::open(&fifo).unwrap();
+        reader.read_exact(&mut [0; 3840]).unwrap();
+        // The original reader disappears; reopen finds a replacement stream at the same path.
+        std::fs::remove_file(&fifo).unwrap();
+        std::fs::write(&fifo, []).unwrap();
+        drop(reader);
+        assert!(matches!(
+            received.blocking_recv(),
+            Some(WriterEvent::Drained { .. })
+        ));
+        assert_eq!(tap.applied_revision.load(Ordering::Acquire), 9);
+        assert!(tap.read().is_some());
+        tx.send(WriterMsg::Shutdown).unwrap();
+        writer.join().unwrap();
+        assert!(!std::fs::read(&fifo).unwrap().is_empty());
+        std::fs::remove_file(fifo).unwrap();
+    }
+
+    #[test]
+    fn failed_fifo_write_clears_applied_revision_and_meter() {
+        let tap = Arc::new(AudioTap::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(WriterMsg::SetDsp {
+            chain: Box::new(None),
+            revision: 9,
+        })
+        .unwrap();
+        tx.send(WriterMsg::Load {
+            track: Arc::new(DecodedTrack {
+                samples: vec![16000; 6000],
+                sample_rate: 48000,
+            }),
+            start_frame: 0,
+            gain: 1.,
+            generation: 1,
+        })
+        .unwrap();
+        tx.send(WriterMsg::SetPlaying(true)).unwrap();
+        run(PathBuf::from("/dev/full"), rx, events, tap.clone());
+        assert_eq!(tap.applied_revision.load(Ordering::Acquire), 0);
+        assert!(tap.read().is_none());
+    }
 }
