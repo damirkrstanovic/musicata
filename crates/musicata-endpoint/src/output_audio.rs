@@ -55,7 +55,7 @@ pub fn start(creds: &Creds, control: Control, registrations: Receiver<Registrati
                 &mut generation,
             );
             if let Err(error) = result {
-                eprintln!("audio channel: {error}");
+                crate::diagnostics::failure("native.dsp", &error.to_string());
             }
             std::thread::sleep(Duration::from_secs(2));
         }
@@ -184,6 +184,11 @@ fn session(
         });
         let applied = control.tap.applied_revision.load(Ordering::Acquire);
         if acknowledged != *generation && (applied == *generation || error.is_some()) {
+            if let Some(error) = error.as_ref() {
+                crate::diagnostics::failure("native.dsp", error);
+            } else {
+                crate::diagnostics::recovery("native.dsp");
+            }
             send(
                 &mut socket,
                 serde_json::json!({"type":"dsp_applied","session_id":config.state.session_id,"revision":config.state.desired_revision,"error":error}),

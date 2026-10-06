@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "musicata_ml=info".into()),
+                .unwrap_or_else(|_| "musicata_ml=error".into()),
         )
         .init();
 
@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
         model::ensure_model(&model_path, &url, data_url.as_deref())?;
     }
 
-    tracing::info!("loading model {model_path}");
+    tracing::debug!("loading model {model_path}");
     let model = AudioModel::load(&model_path)?;
     let tag_count = model.tag_count();
     let state = AppState {
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    tracing::info!("musicata-ml listening on {addr} (model {MODEL_ID})");
+    tracing::debug!("musicata-ml listening on {addr} (model {MODEL_ID})");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -174,18 +174,21 @@ async fn analyze(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<Json<Analysis>, (StatusCode, String)> {
-    let result = tokio::task::spawn_blocking(move || -> Result<Analysis, String> {
+    let result = tokio::task::spawn_blocking(move || -> Result<Analysis, (StatusCode, String)> {
         // Decode returns an already-centered ≤MAX_ANALYZE_SECONDS window at the model rate.
         let samples = decode::decode_to_mono(&body, SAMPLE_RATE, MAX_ANALYZE_SECONDS)
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| (StatusCode::BAD_REQUEST, "audio decode failed".into()))?;
         let excerpt = center_excerpt(&samples, MAX_ANALYZE_SECONDS * SAMPLE_RATE as usize);
         let mut model = lock_recovered(&state.model);
-        model.analyze(excerpt, 12).map_err(|e| e.to_string())
+        model.analyze(excerpt, 12).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "model inference failed".into(),
+            )
+        })
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "worker failed".into()))?;
 
-    result
-        .map(Json)
-        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+    result.map(Json)
 }

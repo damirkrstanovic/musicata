@@ -1,6 +1,7 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
   import Modal from "../lib/Modal.svelte";
+  import DiagnosticsPanel from "./DiagnosticsPanel.svelte";
   import StatusDashboard from "./StatusDashboard.svelte";
   import SourcesPanel from "./SourcesPanel.svelte";
   import ImportExportPanel from "./ImportExportPanel.svelte";
@@ -25,6 +26,7 @@
 
 <main class="admin-grid">
   <StatusDashboard />
+  <DiagnosticsPanel />
 
   <h2 class="admin-group-title">Library &amp; sources</h2>
   <SourcesPanel />

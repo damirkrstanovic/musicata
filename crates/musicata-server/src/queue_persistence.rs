@@ -54,6 +54,10 @@ impl QueuePersistence {
                         pending.update.take()
                     };
                     let Some(update) = update else { break };
+                    let started = std::time::Instant::now();
+                    let id = match &owner {
+                        QueueOwner::Player(id) | QueueOwner::Zone(id) => id,
+                    };
                     let result = match (&owner, &update) {
                         (QueueOwner::Player(id), QueuePersist::Playback(p)) => {
                             database.save_player_playback(id, p).await
@@ -68,11 +72,27 @@ impl QueuePersistence {
                             database.save_zone_queue(id, p, items).await
                         }
                     };
+                    if let Some(d) = crate::diagnostics::global() {
+                        d.observe(
+                            crate::diagnostics::Operation::DatabaseWrite,
+                            started.elapsed(),
+                            Default::default(),
+                        );
+                    }
+                    if result.is_ok() {
+                        crate::diagnostics::recovery("queue.persist", "storage", Some(id));
+                    }
                     if let Err(error) = result {
                         let id = match &owner {
                             QueueOwner::Player(id) | QueueOwner::Zone(id) => id,
                         };
-                        tracing::warn!(output = %id, %error, "queue checkpoint failed; live playback continues");
+                        crate::diagnostics::failure(
+                            "queue.persist",
+                            "storage",
+                            Some(id),
+                            &error.to_string(),
+                        );
+                        tracing::warn!(output = %id, %error, diagnostic_recorded=true, "queue checkpoint failed; live playback continues");
                         // Keep the latest state, including any unsaved queue change, and
                         // retry without holding a DB connection or an output state lock.
                         {

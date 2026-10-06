@@ -996,6 +996,29 @@ await mobileScreenshot('phone-radio');
 
 check("mobile: no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
 
+// Local diagnostics are available without shell or system-log access.
+await send("Emulation.setDeviceMetricsOverride", {width: 1280, height: 900, deviceScaleFactor: 1, mobile: false});
+await send("Page.navigate", {url: base + "/admin"});
+check("diagnostics: Settings panel appears", await waitUntil(`document.querySelector('[data-diagnostics]')`, 5000) < Infinity);
+check("diagnostics: controls finish loading",await waitUntil(`Array.from(document.querySelectorAll('[data-diagnostics] button')).some(button=>button.textContent.includes('Record more detail'))`,3000)<Infinity);
+await clickText('[data-diagnostics] button', 'Record more detail for 15 minutes');
+check("diagnostics: detailed recording starts", await waitUntil(`document.querySelector('[data-diagnostic-detail]')`, 3000) < Infinity);
+await clickText('[data-diagnostics] button', 'Stop detailed recording');
+check("diagnostics: detailed recording stops", await waitUntil(`!document.querySelector('[data-diagnostic-detail]')`, 3000) < Infinity);
+await clickText('[data-diagnostics] button', 'Prepare diagnostics');
+check("diagnostics: download becomes available", await waitUntil(`document.querySelector('[data-diagnostic-download]')`, 7000) < Infinity);
+const diagnosticDownload = await fetch(base+'/api/diagnostics/export/download',{headers:{cookie:COOKIE}});
+const diagnosticBytes = new Uint8Array(await diagnosticDownload.arrayBuffer());
+check("diagnostics: download is a ZIP", diagnosticDownload.ok && diagnosticBytes[0] === 80 && diagnosticBytes[1] === 75);
+if (process.env.MUSICATA_UI_SCREENSHOTS) {
+  const clip = await js(`(() => { const panel=document.querySelector('[data-diagnostics]'); panel.scrollIntoView(); const r=panel.getBoundingClientRect(); return {x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height,scale:1}; })()`);
+  const {data} = await send('Page.captureScreenshot', {format:'png',clip,captureBeyondViewport:true});
+  const {mkdir,writeFile} = await import('node:fs/promises');
+  await mkdir(process.env.MUSICATA_UI_SCREENSHOTS,{recursive:true});
+  await writeFile(`${process.env.MUSICATA_UI_SCREENSHOTS}/diagnostics-panel.png`,Buffer.from(data,'base64'));
+}
+
+
 check("no CSP violations", cspViolations.length === 0, cspViolations.slice(0, 3).join(" | "));
 console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);
 ws.close();

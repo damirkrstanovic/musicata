@@ -10,3 +10,7 @@
 
 # Persistent development cache/launchers in the Kubernetes workspace
 /.cluster/
+
+# Private, locally prepared support bundles
+*.diagnostics.zip
+*.diagnostics.zip.tmp

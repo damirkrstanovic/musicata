@@ -391,12 +391,81 @@ struct ListenSample {
     duration: Option<f64>,
 }
 
+#[cfg(test)]
+#[test]
+fn diagnostic_playback_history_ignores_position_ticks() {
+    let mut previous = None;
+    let mut sample = ListenSample {
+        status: PlaybackStatus::Playing,
+        track_id: Some("track".into()),
+        elapsed: Some(1.0),
+        duration: Some(60.0),
+    };
+    assert!(diagnostic_playback_change(&mut previous, &sample, "output").is_some());
+    sample.elapsed = Some(2.0);
+    assert!(diagnostic_playback_change(&mut previous, &sample, "output").is_none());
+    sample.status = PlaybackStatus::Paused;
+    assert!(diagnostic_playback_change(&mut previous, &sample, "output").is_some());
+}
+
+fn diagnostic_playback_change(
+    previous: &mut Option<(PlaybackStatus, Option<String>)>,
+    sample: &ListenSample,
+    output: &str,
+) -> Option<musicata_core::diagnostics::DiagnosticEvent> {
+    let current = (sample.status, sample.track_id.clone());
+    if previous.as_ref() == Some(&current) {
+        return None;
+    }
+    *previous = Some(current);
+    let status = match sample.status {
+        PlaybackStatus::Stopped => "stopped",
+        PlaybackStatus::Playing => "playing",
+        PlaybackStatus::Paused => "paused",
+    };
+    let mut event = crate::diagnostics::event(
+        &format!("playback.{status}"),
+        "player",
+        musicata_core::diagnostics::DiagnosticAction::Transition,
+        Some(output),
+        "",
+    );
+    event.context.track_id = sample.track_id.clone();
+    Some(event)
+}
+
 fn spawn_listen_recorder(
     player_id: String,
     mut events: broadcast::Receiver<ListenSample>,
     database: Database,
 ) -> JoinHandle<()> {
+    let mut diagnostic_events = events.resubscribe();
+    let diagnostic_player = player_id.clone();
+    let diagnostic_task = tokio::spawn(async move {
+        let mut previous = None;
+        loop {
+            match diagnostic_events.recv().await {
+                Ok(sample) => {
+                    if let Some(event) =
+                        diagnostic_playback_change(&mut previous, &sample, &diagnostic_player)
+                        && let Some(d) = crate::diagnostics::global()
+                    {
+                        d.record(event);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
     tokio::spawn(async move {
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _diagnostic_task = AbortOnDrop(diagnostic_task.abort_handle());
         let mut tracker = ListenTracker::default();
         loop {
             match events.recv().await {
@@ -1116,6 +1185,7 @@ impl MpdPlayer {
             match result {
                 Ok(status) => {
                     self.online.store(true, Ordering::Relaxed);
+                    crate::diagnostics::recovery("mpd.command", "mpd", Some(&self.id));
                     Some(status)
                 }
                 Err(_) => {
@@ -1200,7 +1270,13 @@ impl MpdPlayer {
                     // the held guard — re-locking the same mutex here would deadlock.
                     self.online.store(false, Ordering::Relaxed);
                     *guard = None;
-                    tracing::debug!(player = %self.id, %error, "mpd command failed; player offline");
+                    crate::diagnostics::failure(
+                        "mpd.command",
+                        "mpd",
+                        Some(&self.id),
+                        &error.to_string(),
+                    );
+                    tracing::debug!(player = %self.id, %error, diagnostic_recorded=true, "mpd command failed; player offline");
                     None
                 }
             }
@@ -1350,7 +1426,13 @@ impl MpdPlayer {
             loop {
                 if let Err(error) = self.run_idle_loop(&database).await {
                     self.online.store(false, Ordering::Relaxed);
-                    tracing::debug!(player = %self.id, %error, "mpd idle loop ended");
+                    crate::diagnostics::failure(
+                        "mpd.connection",
+                        "mpd",
+                        Some(&self.id),
+                        &error.to_string(),
+                    );
+                    tracing::debug!(player = %self.id, %error, diagnostic_recorded=true, "mpd idle loop ended");
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
@@ -1396,6 +1478,7 @@ impl MpdPlayer {
 
     async fn run_idle_loop(&self, database: &Database) -> Result<()> {
         let mut idle = MpdConnection::connect(&self.addr).await?;
+        crate::diagnostics::recovery("mpd.connection", "mpd", Some(&self.id));
         self.online.store(true, Ordering::Relaxed);
         // MPD just (re)connected — it may have restarted with an empty queue while we
         // were offline. Re-push the authoritative server queue and, if we were playing,
@@ -3067,9 +3150,33 @@ impl SnapcastPlayer {
 
         // A different track is now current — decode and load it.
         let decoded = match self.decode(&track_id).await {
-            Ok(decoded) => decoded,
+            Ok(decoded) => {
+                crate::diagnostics::record_context(
+                    "snapcast.decode",
+                    "snapcast",
+                    musicata_core::diagnostics::DiagnosticAction::Recovery,
+                    musicata_core::diagnostics::DiagnosticContext {
+                        output_id: Some(self.id.clone()),
+                        track_id: Some(track_id.clone()),
+                        ..Default::default()
+                    },
+                    "",
+                );
+                decoded
+            }
             Err(error) => {
-                tracing::warn!(player = %self.id, track = %track_id, %error, "snapcast: decode failed");
+                crate::diagnostics::record_context(
+                    "snapcast.decode",
+                    "snapcast",
+                    musicata_core::diagnostics::DiagnosticAction::Failure,
+                    musicata_core::diagnostics::DiagnosticContext {
+                        output_id: Some(self.id.clone()),
+                        track_id: Some(track_id.clone()),
+                        ..Default::default()
+                    },
+                    &error,
+                );
+                tracing::warn!(player = %self.id, track = %track_id, %error, diagnostic_recorded=true, "snapcast: decode failed");
                 return;
             }
         };
@@ -3123,8 +3230,24 @@ impl SnapcastPlayer {
         let (Some(track_id), Some(item)) = (next_track_id, next_item) else {
             return;
         };
+        let before = self.snapshot().await;
+        let remaining = before
+            .duration_seconds
+            .map(|duration| (duration - before.elapsed_seconds.unwrap_or(0.0)).max(0.0));
+        let started = std::time::Instant::now();
         match self.decode(&track_id).await {
             Ok(decoded) => {
+                crate::diagnostics::record_context(
+                    "snapcast.preload",
+                    "snapcast",
+                    musicata_core::diagnostics::DiagnosticAction::Recovery,
+                    musicata_core::diagnostics::DiagnosticContext {
+                        output_id: Some(self.id.clone()),
+                        track_id: Some(track_id.clone()),
+                        ..Default::default()
+                    },
+                    "",
+                );
                 let loaded = self.loaded.lock().await;
                 let state = self.state.lock().await;
                 let current_matches = state.status == PlaybackStatus::Playing
@@ -3147,6 +3270,16 @@ impl SnapcastPlayer {
                     && current_matches
                     && actual_next == Some(track_id.as_str())
                 {
+                    if remaining.is_some_and(|remaining| {
+                        remaining > 0.0 && started.elapsed().as_secs_f64() >= remaining
+                    }) {
+                        crate::diagnostics::failure(
+                            "snapcast.preload_deadline",
+                            "snapcast",
+                            Some(&self.id),
+                            "playback interrupted",
+                        );
+                    }
                     let _ = self.writer_tx.send(WriterMsg::Preload {
                         track: decoded,
                         gain: leveling_gain(&item),
@@ -3155,7 +3288,18 @@ impl SnapcastPlayer {
                 }
             }
             Err(error) => {
-                tracing::debug!(player = %self.id, track = %track_id, %error, "snapcast: preload decode failed");
+                crate::diagnostics::record_context(
+                    "snapcast.preload",
+                    "snapcast",
+                    musicata_core::diagnostics::DiagnosticAction::Failure,
+                    musicata_core::diagnostics::DiagnosticContext {
+                        output_id: Some(self.id.clone()),
+                        track_id: Some(track_id.clone()),
+                        ..Default::default()
+                    },
+                    &error,
+                );
+                tracing::debug!(player = %self.id, track = %track_id, %error, diagnostic_recorded=true, "snapcast: preload decode failed");
             }
         }
     }
@@ -3284,6 +3428,7 @@ impl SnapcastPlayer {
             }
             let _ = self.writer_tx.send(WriterMsg::Stop);
             state.status = PlaybackStatus::Stopped;
+            crate::diagnostics::failure("snapcast.stream", "snapcast", Some(&self.id), &error);
             state.queue_activity = Some(format!("Radio playback failed: {error}"));
             *loaded = LoadedTrack::default();
         }
@@ -3292,6 +3437,7 @@ impl SnapcastPlayer {
     }
 
     async fn decode(&self, track_id: &str) -> Result<Arc<DecodedTrack>, String> {
+        let _timing = crate::diagnostics::Timing::new(crate::diagnostics::Operation::Decode);
         crate::snapcast::decode_queue_item(
             &self.database,
             &self.providers,

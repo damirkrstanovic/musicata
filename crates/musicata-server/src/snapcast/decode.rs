@@ -76,8 +76,12 @@ pub fn decode_track(
     loop {
         let packet = match format.next_packet() {
             Ok(packet) => packet,
-            // End of stream (or an unrecoverable read) — stop with what we have.
-            Err(_) => break,
+            Err(error) => {
+                if let Some(cause) = terminal_decode_error(error) {
+                    return Err(cause);
+                }
+                break;
+            }
         };
         if packet.track_id() != track_id {
             continue;
@@ -99,8 +103,16 @@ pub fn decode_track(
                 }
             }
             // A single corrupt packet shouldn't abort the whole decode.
-            Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(_) => break,
+            Err(SymphoniaError::DecodeError(_)) => {
+                crate::diagnostics::failure(
+                    "snapcast.packet",
+                    "snapcast",
+                    None,
+                    "audio decode failed",
+                );
+                continue;
+            }
+            Err(error) => return Err(format!("decoder: {error}")),
         }
     }
 
@@ -232,5 +244,32 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(decode_track(b"not audio", "wav", 48_000).is_err());
+    }
+}
+
+fn terminal_decode_error(error: SymphoniaError) -> Option<String> {
+    match error {
+        SymphoniaError::IoError(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => None,
+        error => Some(format!("audio read failed: {error}")),
+    }
+}
+#[cfg(test)]
+mod diagnostic_error_tests {
+    use super::*;
+    #[test]
+    fn eof_is_expected_but_non_eof_read_failures_are_not_success() {
+        assert!(
+            terminal_decode_error(SymphoniaError::IoError(std::io::Error::from(
+                std::io::ErrorKind::UnexpectedEof
+            )))
+            .is_none()
+        );
+        assert!(
+            terminal_decode_error(SymphoniaError::IoError(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            )))
+            .is_some()
+        );
+        assert!(terminal_decode_error(SymphoniaError::ResetRequired).is_some());
     }
 }
