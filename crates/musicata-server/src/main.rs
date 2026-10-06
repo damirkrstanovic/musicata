@@ -2784,7 +2784,7 @@ fn app(
             patch(auth::update_user).delete(auth::delete_user),
         )
         .fallback(fallback)
-        // require_auth runs inner (closest to handlers); log_request wraps it so 401s are logged.
+        // require_auth runs inner (closest to handlers); debug request logging includes 401s.
         .layer(middleware::from_fn({
             let state = state.clone();
             move |request: Request, next: Next| {
@@ -2855,13 +2855,23 @@ async fn log_request(request: Request, next: Next) -> Response {
     let status = response.status();
     let elapsed_ms = started_at.elapsed().as_millis();
 
-    tracing::info!(
-        method = %method,
-        path = %path,
-        status = status.as_u16(),
-        elapsed_ms,
-        "request"
-    );
+    if status.is_server_error() {
+        tracing::error!(
+            method = %method,
+            path = %path,
+            status = status.as_u16(),
+            elapsed_ms,
+            "request failed"
+        );
+    } else {
+        tracing::debug!(
+            method = %method,
+            path = %path,
+            status = status.as_u16(),
+            elapsed_ms,
+            "request"
+        );
+    }
 
     response
 }
@@ -7745,6 +7755,90 @@ mod tests {
         bool_setting_default, normalize_size, parse_range, resize_to_jpeg,
         schedule_autoplay_refills,
     };
+
+    #[tokio::test]
+    async fn http_logging_is_quiet_unless_debug_or_server_failure() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for (level, status, visible) in [
+            (tracing::Level::INFO, axum::http::StatusCode::OK, false),
+            (
+                tracing::Level::INFO,
+                axum::http::StatusCode::NOT_FOUND,
+                false,
+            ),
+            (
+                tracing::Level::INFO,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                true,
+            ),
+            (tracing::Level::DEBUG, axum::http::StatusCode::OK, true),
+            (
+                tracing::Level::DEBUG,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                true,
+            ),
+        ] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let capture = Capture(bytes.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || capture.clone())
+                .finish();
+            let router = axum::Router::new()
+                .route("/test", axum::routing::get(move || async move { status }))
+                .layer(axum::middleware::from_fn(super::log_request));
+            let response = router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/test?token=never-record-this")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .with_subscriber(subscriber)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert_eq!(!log.is_empty(), visible, "{level} {status}: {log}");
+            assert!(!log.contains("never-record-this"));
+            if visible {
+                assert!(log.contains("path=/test"), "{log}");
+                assert!(
+                    log.contains(&format!("status={}", status.as_u16())),
+                    "{log}"
+                );
+                assert!(log.contains("elapsed_ms="), "{log}");
+                assert!(
+                    log.contains(if status.is_server_error() {
+                        "ERROR"
+                    } else {
+                        "DEBUG"
+                    }),
+                    "{log}"
+                );
+            }
+        }
+    }
 
     /// The registry is the single declaration of every boolean setting's default *and* its
     /// documentation. Both matter: a duplicate key would make one of two rows unreachable, and
