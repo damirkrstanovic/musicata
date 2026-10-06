@@ -1011,7 +1011,7 @@ const diagnosticDownload = await fetch(base+'/api/diagnostics/export/download',{
 const diagnosticBytes = new Uint8Array(await diagnosticDownload.arrayBuffer());
 check("diagnostics: download is a ZIP", diagnosticDownload.ok && diagnosticBytes[0] === 80 && diagnosticBytes[1] === 75);
 if (process.env.MUSICATA_UI_SCREENSHOTS) {
-  const clip = await js(`(() => { const panel=document.querySelector('[data-diagnostics]'); panel.scrollIntoView(); const r=panel.getBoundingClientRect(); return {x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height,scale:1}; })()`);
+  const clip = await js(`(() => { const panel=document.querySelector('[data-diagnostics]'); panel.scrollIntoView({block:"center"}); window.scrollBy(0,-90); const r=panel.getBoundingClientRect(); return {x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height,scale:1}; })()`);
   const {data} = await send('Page.captureScreenshot', {format:'png',clip,captureBeyondViewport:true});
   const {mkdir,writeFile} = await import('node:fs/promises');
   await mkdir(process.env.MUSICATA_UI_SCREENSHOTS,{recursive:true});

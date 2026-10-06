@@ -2,6 +2,8 @@
 
 Musicata retains operational problems locally. In **Settings → Diagnostics**, an
 administrator can prepare and download a ZIP to share when investigating a problem.
+![Diagnostics in Settings](images/diagnostics.png)
+
 Nothing is uploaded automatically. A description and approximate problem time are
 optional; the description becomes part of the download, so leave out private details.
 
