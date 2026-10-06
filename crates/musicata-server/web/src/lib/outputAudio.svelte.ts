@@ -3,10 +3,12 @@ import type { OutputDspState } from "../types/OutputDspState";
 import type { StereoLevels } from "../types/StereoLevels";
 import type { EqProfile } from "./dsp";
 import type { BrowserAudio } from "./audio";
+import { reportDiagnostic,setDiagnosticRendererToken } from "./diagnostics";
 
 export interface AudioConfig { state: OutputDspState; profile: EqProfile | null; meter_subscribed: boolean }
 interface AudioFrame {
   type: string;
+  reporter_token?:string;
   config?: AudioConfig;
   session_id?: string;
   revision?: number;
@@ -99,8 +101,8 @@ export function connectBrowserRenderer(id: string, audio: BrowserAudio) {
   let appliedRevision = -1;
   let lastRequest = 0;
   const channel = connect(id, frame => {
-    if (frame.type === "renderer_denied") { granted = false; requested = false; audio.setRendererAllowed(false); }
-    if (frame.type === "renderer_granted") { granted = true; audio.setRendererAllowed(true); }
+    if (frame.type === "renderer_denied") { setDiagnosticRendererToken(null); granted = false; requested = false; audio.setRendererAllowed(false); }
+    if (frame.type === "renderer_granted") { setDiagnosticRendererToken(frame.reporter_token??null); granted = true; audio.setRendererAllowed(true); }
     if (frame.config) {
       config = frame.config;
       if (granted && appliedRevision !== config.state.desired_revision) {
@@ -109,14 +111,17 @@ export function connectBrowserRenderer(id: string, audio: BrowserAudio) {
         appliedRevision = applying.state.desired_revision;
         sequence = 0;
         void audio.applyOutputEq(profile).then(() => {
-          if (config?.state.session_id === applying.state.session_id && config.state.desired_revision === applying.state.desired_revision)
-            channel.send({ type: "dsp_applied", session_id: applying.state.session_id, revision: applying.state.desired_revision });
+          if (!granted || config?.state.session_id !== applying.state.session_id || config.state.desired_revision !== applying.state.desired_revision) return;
+          reportDiagnostic("browser.dsp", false);
+          channel.send({ type: "dsp_applied", session_id: applying.state.session_id, revision: applying.state.desired_revision });
         }).catch(error => {
+          if (!granted || config?.state.session_id !== applying.state.session_id || config.state.desired_revision !== applying.state.desired_revision) return;
+          reportDiagnostic("browser.dsp", true);
           channel.send({ type: "dsp_applied", session_id: applying.state.session_id, revision: applying.state.desired_revision, error: String(error) });
         });
       }
     }
-  }, () => { requested = false; granted = false; appliedRevision = -1; }, () => { granted = false; requested = false; audio.setRendererAllowed(false); });
+  }, () => { requested = false; granted = false; appliedRevision = -1; }, () => { setDiagnosticRendererToken(null); granted = false; requested = false; audio.setRendererAllowed(false); });
   const timer = setInterval(() => {
     if (!audio.isClaimed) return;
     if (!requested && performance.now() - lastRequest > 2000) {
@@ -128,5 +133,5 @@ export function connectBrowserRenderer(id: string, audio: BrowserAudio) {
     if (levels) channel.send({ type: "levels", session_id: config.state.session_id, revision: appliedRevision,
       sequence: ++sequence, levels: { rms_l: levels.l, rms_r: levels.r, peak_l: levels.peakL, peak_r: levels.peakR } });
   }, 100);
-  return { close() { clearInterval(timer); channel.close(); } };
+  return { close() { setDiagnosticRendererToken(null); clearInterval(timer); channel.close(); } };
 }

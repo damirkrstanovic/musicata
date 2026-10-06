@@ -102,7 +102,7 @@ pub fn ensure_model(dest: &str, url: &str, data_url: Option<&str>) -> Result<()>
     if std::path::Path::new(dest).exists() {
         return Ok(());
     }
-    tracing::info!("downloading model {url} → {dest}");
+    tracing::debug!("downloading model {url} → {dest}");
     download(url, dest)?;
     if let Some(data_url) = data_url {
         download(data_url, &format!("{dest}.data"))?;

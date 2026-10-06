@@ -220,6 +220,7 @@ pub fn start(output: Arc<AudioOutput>) {
         let mut binding = None;
         let mut revision = 0;
         let mut sequence = 0;
+        let mut failed = false;
         loop {
             std::thread::sleep(Duration::from_millis(100));
             let Some(output) = weak.upgrade() else { break };
@@ -277,10 +278,22 @@ pub fn start(output: Arc<AudioOutput>) {
                     }
                     Ok(())
                 })();
+            if result.is_ok() && failed {
+                failed = false;
+                let id = output.runtime.blocking_lock().state.output_id.clone();
+                crate::diagnostics::recovery("dsp.processor", "camilladsp", Some(&id));
+            }
             if let Err(error) = result {
+                failed = true;
                 client = None;
                 let mut runtime = output.runtime.blocking_lock();
                 let message = error.to_string();
+                crate::diagnostics::failure(
+                    "dsp.processor",
+                    "camilladsp",
+                    Some(&runtime.state.output_id),
+                    &message,
+                );
                 let changed = runtime.state.error.as_deref() != Some(&message);
                 runtime.last_levels = None;
                 runtime.state.status = DspStatus::Unavailable;

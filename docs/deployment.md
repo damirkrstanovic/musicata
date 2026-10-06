@@ -247,3 +247,10 @@ Applying saves MPD and processor configuration for activation-failure rollback, 
 existing running processor, and removes a newly loaded loopback module if the kernel permits
 it. Existing unmanaged routing is refused. Existing playback hosts need a separately backed-up
 migration. See `docs/dsp.md` for capabilities, measurement points and hardware verification limits.
+
+## Support diagnostics
+
+Administrators can download local operational evidence in Settings → Diagnostics.
+Native and Docker upgrades retain it beside the library database in the persistent
+application-data directory. See [local diagnostics](diagnostics.md) for privacy,
+resource limits and detection limits.

@@ -22,6 +22,8 @@
 pub mod dsp;
 pub mod pcm_dsp;
 
+pub mod diagnostics;
+
 use lofty::{
     config::ParseOptions, file::AudioFile, file::FileType, file::TaggedFileExt,
     picture::PictureType, prelude::Accessor, probe::Probe, tag::ItemKey,

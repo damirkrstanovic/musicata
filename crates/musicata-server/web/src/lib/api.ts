@@ -457,3 +457,14 @@ export interface SessionUser {
   username: string;
   role: string;
 }
+
+// Diagnostic collection is local; download is an explicitly requested same-origin action.
+import type { DiagnosticStatus } from "../types/DiagnosticStatus";
+export type { DiagnosticStatus } from "../types/DiagnosticStatus";
+export async function diagnosticStatus(): Promise<DiagnosticStatus> { return getJson("/api/diagnostics"); }
+export async function setDiagnosticDetail(enabled: boolean): Promise<DiagnosticStatus> {
+  return (await sendJson<DiagnosticStatus>("/api/diagnostics/debug", "POST", { enabled }))!;
+}
+export async function prepareDiagnostics(description: string, problemTime: string): Promise<DiagnosticStatus["export"]> {
+  return (await sendJson<DiagnosticStatus["export"]>("/api/diagnostics/export", "POST", { description: description || null, problem_time_unix_seconds: problemTime ? Math.floor(new Date(problemTime).getTime() / 1000) : null }))!;
+}

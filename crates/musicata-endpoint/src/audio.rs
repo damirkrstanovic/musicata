@@ -177,7 +177,7 @@ impl AudioPlayer {
             ) {
                 Ok(source) => source,
                 Err(error) => {
-                    eprintln!("append failed: {error}");
+                    crate::diagnostics::failure("native.audio", &error.to_string());
                     return;
                 }
             };

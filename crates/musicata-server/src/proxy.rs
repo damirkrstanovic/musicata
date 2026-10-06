@@ -71,12 +71,18 @@ pub struct ProxiedResponse {
 ///
 /// Only `http`/`https` are accepted — a `file:` URL here would turn a podcast feed into a local
 /// file read.
-pub async fn fetch(url: &str, range: Option<&str>) -> anyhow::Result<ProxiedResponse> {
+pub async fn fetch(
+    url: &str,
+    range: Option<&str>,
+    context: musicata_core::diagnostics::DiagnosticContext,
+    diagnostics: crate::diagnostics::Diagnostics,
+) -> anyhow::Result<ProxiedResponse> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         anyhow::bail!("refusing to proxy a non-http(s) URL");
     }
 
     let url = url.to_string();
+    let started = std::time::Instant::now();
     let range = range.map(str::to_string);
     let response = tokio::task::spawn_blocking(move || {
         let agent = ureq::AgentBuilder::new()
@@ -111,10 +117,31 @@ pub async fn fetch(url: &str, range: Option<&str>) -> anyhow::Result<ProxiedResp
     let mut reader = response.into_reader();
     tokio::task::spawn_blocking(move || {
         let mut buffer = vec![0u8; CHUNK];
+        let mut first = true;
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
+                    if first {
+                        first = false;
+                        {
+                            let d = &diagnostics;
+                            d.observe(
+                                crate::diagnostics::Operation::SourceFirstByte,
+                                started.elapsed(),
+                                context.clone(),
+                            );
+                        }
+                        let mut event = crate::diagnostics::event(
+                            "source.stream",
+                            "source",
+                            musicata_core::diagnostics::DiagnosticAction::Recovery,
+                            None,
+                            "",
+                        );
+                        event.context = context.clone();
+                        diagnostics.record(event);
+                    }
                     // A closed channel means the browser hung up — stop pulling from upstream
                     // rather than draining a live radio stream into nowhere.
                     if tx.blocking_send(Ok(buffer[..read].to_vec())).is_err() {
@@ -122,6 +149,17 @@ pub async fn fetch(url: &str, range: Option<&str>) -> anyhow::Result<ProxiedResp
                     }
                 }
                 Err(error) => {
+                    if !tx.is_closed() {
+                        let mut event = crate::diagnostics::event(
+                            "source.stream",
+                            "source",
+                            musicata_core::diagnostics::DiagnosticAction::Failure,
+                            None,
+                            &error.to_string(),
+                        );
+                        event.context = context.clone();
+                        diagnostics.record(event);
+                    }
                     let _ = tx.blocking_send(Err(error));
                     break;
                 }
@@ -141,9 +179,70 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn diagnostic_source_recovery_cannot_close_another_stream_failure() {
+        use std::io::{Read, Write};
+        use tokio_stream::StreamExt;
+        fn upstream(truncated: bool) -> String {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                let _ = socket.read(&mut request);
+                let length = if truncated { 100 } else { 2 };
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\nhi"
+                )
+                .unwrap();
+            });
+            format!("http://{address}/stream")
+        }
+        let d = crate::diagnostics::Diagnostics::start(std::env::temp_dir().join(format!(
+                "diag-source-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+        for (source, truncated) in [("source-a", true), ("source-b", false)] {
+            let context = musicata_core::diagnostics::DiagnosticContext {
+                source_id: Some(source.into()),
+                ..Default::default()
+            };
+            let mut stream = fetch(&upstream(truncated), None, context, d.clone())
+                .await
+                .unwrap()
+                .stream;
+            while stream.next().await.is_some() {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let rows = d
+            .store()
+            .await
+            .unwrap()
+            .snapshot(0)
+            .await
+            .unwrap()
+            .incidents;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0]["recovered_at"].is_null());
+        assert_eq!(
+            rows[0]["context"]["source_id"],
+            crate::diagnostics::identity("source-a")
+        );
+    }
+    #[tokio::test]
     async fn refuses_non_http_schemes() {
         for url in ["file:///etc/passwd", "ftp://example.com/x", "/etc/passwd"] {
-            let Err(error) = fetch(url, None).await else {
+            let d = crate::diagnostics::Diagnostics::start(std::env::temp_dir().join(format!(
+                    "diag-proxy-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                )));
+            let Err(error) = fetch(url, None, Default::default(), d).await else {
                 panic!("should have refused {url}");
             };
             assert!(

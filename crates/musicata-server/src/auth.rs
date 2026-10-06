@@ -93,13 +93,13 @@ fn decoy_password_hash() -> &'static str {
 }
 
 /// A fresh 256-bit random secret as hex (session cookie value or API token).
-fn generate_token() -> String {
+pub(crate) fn generate_token() -> String {
     to_hex(&random_bytes::<32>())
 }
 
 /// Constant-time equality for equal-length secrets (e.g. token hashes), so a match can't
 /// be discovered byte-by-byte via timing. Length isn't secret here (both are sha256 hex).
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;
@@ -204,7 +204,8 @@ async fn resolve_user(
 /// Admin-only API surfaces — user management and the configuration panels. The player
 /// (listener) app never calls these; everything it needs only requires authentication.
 fn is_admin_path(path: &str) -> bool {
-    (path.starts_with("/api/players/") && path.ends_with("/dsp/processor"))
+    (path.starts_with("/api/diagnostics") && path != "/api/diagnostics/reports")
+        || (path.starts_with("/api/players/") && path.ends_with("/dsp/processor"))
         || path.starts_with("/api/users")
         || path.starts_with("/api/sources")
         || path == "/api/settings"
@@ -229,7 +230,11 @@ fn is_open_path(path: &str) -> bool {
 fn player_channel_id(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/api/players/")?;
     let (id, tail) = rest.split_once('/')?;
-    matches!(tail, "state" | "commands" | "ws" | "audio/ws").then_some(id)
+    matches!(
+        tail,
+        "state" | "commands" | "ws" | "audio/ws" | "diagnostics"
+    )
+    .then_some(id)
 }
 
 /// Track and radio audio relays that a playback endpoint may fetch with its token.

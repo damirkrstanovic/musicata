@@ -443,7 +443,10 @@ class DeploymentTests(unittest.TestCase):
 
     def test_upgrade_preserves_data_and_custom_unit(self):
         saved,old=self.existing()
+        diagnostics=m.DATA/'musicata.db.diagnostics.db'
+        diagnostics.write_bytes(b'private operational evidence')
         m.deploy(self.cfg,saved,'debian',[])
+        self.assertEqual(diagnostics.read_bytes(),b'private operational evidence')
         self.assertEqual((m.DATA/'musicata.db').read_bytes(),self.original_database)
         self.assertEqual(m.UNIT.read_text(),'custom original unit')
         self.assertNotEqual(m.CURRENT.resolve(),old)

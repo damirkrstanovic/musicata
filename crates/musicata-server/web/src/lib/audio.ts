@@ -4,6 +4,7 @@
 // feed the hot path. Only one tab outputs at a time (claimed via localStorage).
 import type { PlaybackState } from "../types/PlaybackState";
 import type { EqProfile } from "./dsp";
+import { reportDiagnostic } from "./diagnostics";
 
 // Volume-leveling target (LUFS) and the true-peak ceiling (dBTP) the combined gain must not
 // exceed. −14 LUFS is the streaming/Roon convention.
@@ -22,6 +23,7 @@ export class BrowserAudio {
   private onReport?: (msg: ProgressReport) => void;
   private onEnd?: () => void;
   private timer?: ReturnType<typeof setInterval>;
+  private bufferingTimer?: ReturnType<typeof setTimeout>;
 
   // Web Audio graph. Built once during a play gesture (claim()) so the AudioContext starts
   // running, then all browser audio flows through it:
@@ -78,6 +80,22 @@ export class BrowserAudio {
   constructor(el: HTMLAudioElement) {
     this.el = el;
     el.addEventListener("ended", () => this.onEnd?.());
+    el.addEventListener("error", () => {
+      if (this.rendererAllowed && this.claimed && this.el.error?.code !== 1)
+        reportDiagnostic("browser.audio", true, this.el.error?.code === 3 ? "audio decode failed" : "connection closed");
+    });
+    el.addEventListener("waiting", () => {
+      clearTimeout(this.bufferingTimer);
+      this.bufferingTimer = setTimeout(() => {
+        if (this.rendererAllowed && this.claimed && this.desiredPlayback?.status === "playing" && this.el.currentTime > 0 && !this.el.paused && this.el.readyState < 3)
+          reportDiagnostic("browser.buffering", true, "playback interrupted");
+      }, 2000);
+    });
+    el.addEventListener("playing", () => {
+      clearTimeout(this.bufferingTimer);
+      reportDiagnostic("browser.audio", false);
+      reportDiagnostic("browser.buffering", false);
+    });
     el.addEventListener("loadedmetadata", () => this.report());
     // Web Audio unlock: build + resume the graph on the first user gesture *anywhere*, so EQ
     // and metering engage no matter how playback is first triggered (footer Play, a track row,
@@ -194,11 +212,13 @@ export class BrowserAudio {
       if (!resp.ok) throw new Error("no impulse");
       decoded = await this.ctx.decodeAudioData(await resp.arrayBuffer());
     } catch {
+      if (generation === this.eqGeneration && this.convProfileId === id) reportDiagnostic("browser.dsp", true, "audio decode failed");
       decoded = null; // missing/undecodable → just skip convolution, never silence
     }
     // Only commit if this is still the active request — a newer profile switch (a later
     // loadRoomIr) must not be clobbered by this one's late-resolving fetch.
     if (generation !== this.eqGeneration || this.convProfileId !== id) return;
+    if (decoded) reportDiagnostic("browser.dsp", false);
     this.convBuffer = decoded;
     this.rebuildChain();
   }
@@ -225,7 +245,9 @@ export class BrowserAudio {
     if (!ctx || typeof ctx.setSinkId !== "function" || this.pendingSinkId === undefined) return;
     try {
       await ctx.setSinkId(this.pendingSinkId ?? "");
+      reportDiagnostic("browser.routing", false);
     } catch {
+      reportDiagnostic("browser.routing", true, "resource unavailable");
       // invalid / unplugged device — fall back to the OS default rather than dropping audio
     }
   }
@@ -267,6 +289,7 @@ export class BrowserAudio {
       void this.loadRoomIr(this.profile);
       void this.applySink();
     } catch {
+      reportDiagnostic("browser.graph", true);
       this.graphFailed = true; // already tapped, or Web Audio unavailable
       // If the element was already tapped before the failure, route it straight to output so
       // playback isn't lost (we just go without EQ/metering).
@@ -404,6 +427,7 @@ export class BrowserAudio {
     }, 1000);
   }
   stop(): void {
+    clearTimeout(this.bufferingTimer);
     if (this.timer) clearInterval(this.timer);
   }
 

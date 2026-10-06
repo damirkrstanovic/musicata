@@ -131,6 +131,7 @@ async fn ml_pass(
     service_url: &str,
     after: Option<(String, String, String)>,
 ) -> Option<(String, String, String)> {
+    let _timing = crate::diagnostics::Timing::new(crate::diagnostics::Operation::BackgroundJob);
     let after = after
         .as_ref()
         .map(|(artist, title, id)| (artist.as_str(), title.as_str(), id.as_str()));
@@ -173,18 +174,28 @@ async fn ml_pass(
             let target = target.clone();
             set.spawn(async move {
                 // An unreadable file is skipped (not marked), so it's retried next run.
-                let Ok(audio) = crate::read_track_source_file(&providers, &target).await else {
-                    return (target.track_id, None);
+                let context=musicata_core::diagnostics::DiagnosticContext {source_id:Some(target.provider_id.clone()),track_id:Some(target.track_id.clone()),..Default::default()};
+                let audio=match crate::read_track_source_file(&providers,&target).await {
+                    Ok(audio)=>audio,
+                    Err(error)=>{
+                        crate::diagnostics::record_context("source.read","ml",musicata_core::diagnostics::DiagnosticAction::Failure,context,&error.to_string());
+                        return (target.track_id,None);
+                    }
                 };
+                crate::diagnostics::record_context("source.read","ml",musicata_core::diagnostics::DiagnosticAction::Recovery,context.clone(),"");
                 let analysis =
                     tokio::task::spawn_blocking(move || analyze_via_service(&url, &audio))
                         .await
                         .unwrap_or_else(|_| Err("analysis task panicked".to_string()));
                 match analysis {
-                    Ok(analysis) => (target.track_id, Some(analysis)),
+                    Ok(analysis) => {
+                        crate::diagnostics::record_context("ml.analysis","ml",musicata_core::diagnostics::DiagnosticAction::Recovery,context.clone(),"");
+                        (target.track_id, Some(analysis))
+                    },
                     // Service down / track undecodable → skip (retried next run).
                     Err(error) => {
-                        tracing::debug!(track = %target.track_id, %error, "ml: analyze failed");
+                        crate::diagnostics::record_context("ml.analysis","ml",musicata_core::diagnostics::DiagnosticAction::Failure,context,&error);
+                        tracing::debug!(track = %target.track_id, %error, diagnostic_recorded=true, "ml: analyze failed");
                         (target.track_id, None)
                     }
                 }
@@ -192,6 +203,7 @@ async fn ml_pass(
         }
         while let Some(joined) = set.join_next().await {
             let Ok((track_id, analysis)) = joined else {
+                crate::diagnostics::failure("ml.worker", "ml", None, "worker panicked");
                 continue;
             };
             done += 1;
@@ -233,7 +245,20 @@ fn analyze_via_service(service_url: &str, audio: &[u8]) -> Result<ServiceAnalysi
         .post(&endpoint)
         .set("content-type", "application/octet-stream")
         .send_bytes(audio)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| match error {
+            ureq::Error::Status(_, response) => {
+                let mut body = String::new();
+                let _ = std::io::Read::read_to_string(
+                    &mut std::io::Read::take(response.into_reader(), 1024),
+                    &mut body,
+                );
+                match body.as_str() {
+                    "audio decode failed" | "model inference failed" | "worker failed" => body,
+                    _ => "analysis service failed".into(),
+                }
+            }
+            other => other.to_string(),
+        })?;
     response.into_json().map_err(|error| error.to_string())
 }
 
@@ -283,6 +308,22 @@ fn parse_schedule(raw: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn analysis_failure_retains_safe_service_stage() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            let _ = socket.read(&mut bytes);
+            let body = "model inference failed";
+            write!(socket,"HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        });
+        let error = analyze_via_service(&format!("http://{address}"), b"audio").unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error, "model inference failed");
+    }
 
     #[test]
     fn parses_schedule_with_defaults() {

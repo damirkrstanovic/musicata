@@ -33,6 +33,7 @@ pub struct EndpointIdentity(pub String);
 pub struct OutputRuntime {
     pub state: OutputDspState,
     owner: Option<u64>,
+    reporter_nonce: Option<String>,
     sequence: u64,
     pub last_levels: Option<(Instant, StereoLevels)>,
 }
@@ -71,6 +72,7 @@ impl OutputRuntime {
                 measurement_point: point,
             },
             owner: None,
+            reporter_nonce: None,
             sequence: 0,
             last_levels: None,
         }
@@ -92,6 +94,7 @@ impl OutputRuntime {
             return false;
         }
         if self.owner != Some(connection) {
+            self.reporter_nonce = Some(crate::auth::generate_token());
             self.state.session_id = format!(
                 "{}-{}-{connection}",
                 std::process::id(),
@@ -149,11 +152,23 @@ impl OutputRuntime {
         true
     }
 
+    fn reporter_token(&self) -> Option<String> {
+        self.reporter_nonce.clone()
+    }
+    fn owns_reporter_token(&self, token: &str) -> bool {
+        self.owner.is_some()
+            && self
+                .reporter_nonce
+                .as_ref()
+                .is_some_and(|expected| crate::auth::constant_time_eq(expected, token))
+    }
+
     fn release(&mut self, owner: u64) {
         if self.owner != Some(owner) {
             return;
         }
         self.owner = None;
+        self.reporter_nonce = None;
         self.last_levels = None;
         self.state.applied_revision = None;
         self.state.status = DspStatus::Unavailable;
@@ -306,6 +321,23 @@ impl OutputAudio {
         #[cfg(not(feature = "snapcast"))]
         let _ = players;
         Ok(entry)
+    }
+
+    pub async fn owns_browser_reporter(&self, token: &str) -> bool {
+        if token.len() != 64 {
+            return false;
+        }
+        let output = self
+            .entries
+            .lock()
+            .await
+            .get(crate::players::BROWSER_PLAYER_ID)
+            .cloned();
+        if let Some(output) = output {
+            output.runtime.lock().await.owns_reporter_token(token)
+        } else {
+            false
+        }
     }
 
     pub async fn remove(&self, id: &str) {
@@ -613,15 +645,22 @@ async fn socket_loop(
                     Inbound::Renderer => {
                         if can_render && output.runtime.lock().await.claim(connection) {
                             rendering = true;
+                            if output.kind=="native" {crate::diagnostics::recovery("native.connection","native",Some(&id));}
                             output.publish_state().await;
                             let config = output.config.borrow().clone();
-                            if !send(&mut socket, serde_json::json!({"type":"renderer_granted", "config":config})).await { break; }
+                            let reporter_token=output.runtime.lock().await.reporter_token();
+                            if !send(&mut socket, serde_json::json!({"type":"renderer_granted", "config":config,"reporter_token":reporter_token})).await { break; }
 
                         } else if !send(&mut socket, serde_json::json!({"type":"renderer_denied"})).await { break; }
                     }
                     Inbound::DspApplied { session_id, revision, error } => {
                         let mut runtime = output.runtime.lock().await;
                         if runtime.state.session_id == session_id && runtime.acknowledge(connection, revision, error.map(|e| e.chars().take(512).collect())) {
+                            if let Some(error)=runtime.state.error.as_deref() {
+                                crate::diagnostics::failure("dsp.renderer","audio",Some(&runtime.state.output_id),error);
+                            } else {
+                                crate::diagnostics::recovery("dsp.renderer","audio",Some(&runtime.state.output_id));
+                            }
                             drop(runtime);
                             output.publish_state().await;
                         }
@@ -649,6 +688,14 @@ async fn socket_loop(
             .config
             .send_modify(|config| config.meter_subscribed = active);
     }
+    if rendering && playing && output.kind == "native" && !output.closed.load(Ordering::Acquire) {
+        crate::diagnostics::failure(
+            "native.connection",
+            "native",
+            Some(&id),
+            "connection closed",
+        );
+    }
     output.runtime.lock().await.release(connection);
     output.publish_state().await;
 }
@@ -670,6 +717,23 @@ mod tests {
         )
     }
 
+    #[test]
+    fn diagnostic_reports_follow_current_renderer_lease() {
+        let mut runtime = runtime();
+        assert!(runtime.claim(1));
+        let old = runtime
+            .reporter_token()
+            .expect("lease needs private report capability");
+        assert!(runtime.owns_reporter_token(&old));
+        assert!(!runtime.claim(2));
+        runtime.release(1);
+        assert!(!runtime.owns_reporter_token(&old));
+        assert!(runtime.claim(2));
+        let new = runtime.reporter_token().unwrap();
+        assert_ne!(old, new);
+        assert!(!runtime.owns_reporter_token(&old));
+        assert!(runtime.owns_reporter_token(&new));
+    }
     #[test]
     fn renderer_lease_prevents_other_tabs_from_acknowledging_or_publishing() {
         let mut output = runtime();

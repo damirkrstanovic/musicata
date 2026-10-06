@@ -22,6 +22,7 @@ mod artwork_providers;
 mod auth;
 mod autoeq;
 mod backup;
+mod diagnostics;
 mod dsp;
 mod fingerprint;
 mod loudness;
@@ -108,6 +109,9 @@ const TAG_WRITE_BACK_DISABLED_REASON: &str =
 #[derive(Clone)]
 struct AppState {
     database: Database,
+    diagnostics: diagnostics::Diagnostics,
+    diagnostic_export: Arc<std::sync::Mutex<diagnostics::http::DiagnosticExportStatus>>,
+    diagnostic_reports: Arc<std::sync::Mutex<diagnostics::ReportLimits>>,
     output_audio: Arc<output_audio::OutputAudio>,
     providers: Arc<RwLock<ProviderRegistry>>,
     players: Arc<PlayerManager>,
@@ -179,6 +183,9 @@ async fn main() -> Result<()> {
     let database = Database::connect(&config.database)
         .await
         .with_context(|| format!("failed to open database {}", config.database.display()))?;
+    if !config.scan_once && config.reset_admin.is_none() {
+        let _ = diagnostics::Diagnostics::start(diagnostics::data_path(&config.database));
+    }
 
     // `--reset-admin USERNAME` is the locked-out recovery path: set the password (read from
     // stdin) and exit, without binding a port or scanning. Done here, before any providers
@@ -265,8 +272,12 @@ async fn main() -> Result<()> {
     // snapserver + the always-present "Multi-room (Snapcast)" player). Failures are
     // logged, never fatal — the rest of the server runs without it.
     #[cfg(feature = "snapcast")]
-    if let Err(error) = maybe_enable_snapcast(&database, &players).await {
-        tracing::warn!(%error, "snapcast: failed to start; multi-room disabled");
+    match maybe_enable_snapcast(&database, &players).await {
+        Ok(()) => diagnostics::recovery("snapcast.startup", "snapcast", None),
+        Err(error) => {
+            diagnostics::failure("snapcast.startup", "snapcast", None, &error.to_string());
+            tracing::warn!(diagnostic_recorded=true,%error,"snapcast: failed to start; multi-room disabled");
+        }
     }
 
     let listener = tokio::net::TcpListener::bind(config.addr)
@@ -714,7 +725,10 @@ async fn load_activity_log(database: &Database) -> activity::ActivityLog {
     let log = activity::ActivityLog::seeded(initial);
     // Persist the interrupted-marking now, even if nothing else changes this run.
     let records: Vec<_> = log.list().iter().map(activity_to_record).collect();
-    let _ = database.replace_activities(&records).await;
+    let _ = diagnostics::background_result(
+        database.replace_activities(&records).await,
+        "persistence.replace_activities",
+    );
     log
 }
 
@@ -1308,6 +1322,7 @@ async fn loudness_pass(
     activity: &Arc<activity::ActivityLog>,
     after: Option<(String, String, String)>,
 ) -> Option<(String, String, String)> {
+    let _timing = diagnostics::Timing::new(diagnostics::Operation::BackgroundJob);
     if !bool_setting(database, SETTING_LOUDNESS).await {
         return None;
     }
@@ -1357,10 +1372,15 @@ async fn loudness_pass(
         workers.spawn(async move {
             let _permit = permit;
             // An unreadable file is skipped (not marked), so a transient failure is retried.
-            let Ok(audio) = read_track_source_file(&providers, &target).await else {
-                done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
+            let audio = match read_track_source_file(&providers, &target).await {
+                Ok(audio) => audio,
+                Err(error) => {
+                    diagnostics::failure("source.read", "loudness", None, &error.to_string());
+                    done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
             };
+            diagnostics::recovery("source.read", "loudness", None);
             let extension = target.extension.clone();
             let result = tokio::task::spawn_blocking(move || {
                 loudness::analyze_loudness(&audio, &extension, LOUDNESS_MAX_WALL)
@@ -1370,16 +1390,17 @@ async fn loudness_pass(
             let now = now_unix_seconds();
             match result {
                 Ok((lufs, true_peak)) => {
-                    let _ = database
+                    let _ = diagnostics::background_result(database
                         .upsert_track_loudness(&target.track_id, Some(lufs), Some(true_peak), now)
-                        .await;
+                        .await, "persistence.upsert_track_loudness");
                 }
                 Err(error) => {
                     // Undecodable / un-measurable → mark analyzed (NULL) so it isn't retried.
-                    tracing::debug!(track = %target.track_id, %error, "loudness analysis failed");
-                    let _ = database
+                    diagnostics::failure("loudness.analysis", "loudness", None, &error);
+                    tracing::debug!(track = %target.track_id, %error, diagnostic_recorded=true, "loudness analysis failed");
+                    let _ = diagnostics::background_result(database
                         .upsert_track_loudness(&target.track_id, None, None, now)
-                        .await;
+                        .await, "persistence.upsert_track_loudness");
                 }
             }
             durable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1387,7 +1408,11 @@ async fn loudness_pass(
             activity.update(task, format!("Analyzing loudness ({count}/{total})"));
         });
     }
-    while workers.join_next().await.is_some() {}
+    while let Some(result) = workers.join_next().await {
+        if result.is_err() {
+            diagnostics::failure("loudness.worker", "loudness", None, "worker panicked");
+        }
+    }
     let durable = durable.load(std::sync::atomic::Ordering::Relaxed);
     if durable > 0 {
         activity.finish(
@@ -1649,8 +1674,14 @@ async fn migrate_identity(database: &Database) {
             tracing::warn!(%error, "identity: re-derive save failed");
             return;
         }
-        let _ = database.reapply_acquired_artwork().await;
-        let _ = database.reapply_acquired_artist_artwork().await;
+        let _ = diagnostics::background_result(
+            database.reapply_acquired_artwork().await,
+            "persistence.reapply_acquired_artwork",
+        );
+        let _ = diagnostics::background_result(
+            database.reapply_acquired_artist_artwork().await,
+            "persistence.reapply_acquired_artist_artwork",
+        );
     }
     if let Err(error) = database
         .set_setting(SETTING_IDENTITY_VERSION, &IDENTITY_VERSION.to_string())
@@ -1798,41 +1829,50 @@ async fn artwork_fill_pass(
                 let cache_key =
                     artwork_providers::acquired_cache_key(&target.album_id, &cover.image_url);
                 artwork_cache.put(&cache_key, ext, &bytes).await;
-                let _ = database
-                    .upsert_acquired_artwork(
-                        &target.album_id,
-                        cover.provider,
-                        Some(&cover.image_url),
-                        Some(&cache_key),
-                        Some(ext),
-                        cover.width,
-                        "acquired",
-                        now,
-                    )
-                    .await;
+                let _ = diagnostics::background_result(
+                    database
+                        .upsert_acquired_artwork(
+                            &target.album_id,
+                            cover.provider,
+                            Some(&cover.image_url),
+                            Some(&cache_key),
+                            Some(ext),
+                            cover.width,
+                            "acquired",
+                            now,
+                        )
+                        .await,
+                    "persistence.upsert_acquired_artwork",
+                );
                 let url = format!(
                     "/api/albums/{}/artwork?asset={}",
                     target.album_id, cache_key
                 );
-                let _ = database
-                    .set_album_artwork(&target.album_id, None, Some(&url))
-                    .await;
+                let _ = diagnostics::background_result(
+                    database
+                        .set_album_artwork(&target.album_id, None, Some(&url))
+                        .await,
+                    "persistence.set_album_artwork",
+                );
                 found += 1;
             }
             None => {
                 // Negative cache: don't re-query this album until the retry window.
-                let _ = database
-                    .upsert_acquired_artwork(
-                        &target.album_id,
-                        "none",
-                        None,
-                        None,
-                        None,
-                        None,
-                        "not_found",
-                        now,
-                    )
-                    .await;
+                let _ = diagnostics::background_result(
+                    database
+                        .upsert_acquired_artwork(
+                            &target.album_id,
+                            "none",
+                            None,
+                            None,
+                            None,
+                            None,
+                            "not_found",
+                            now,
+                        )
+                        .await,
+                    "persistence.upsert_acquired_artwork",
+                );
             }
         }
     }
@@ -1916,39 +1956,48 @@ async fn artist_artwork_fill_pass(
                 let cache_key =
                     artwork_providers::acquired_cache_key(&target.artist_id, &image.image_url);
                 artwork_cache.put(&cache_key, ext, &bytes).await;
-                let _ = database
-                    .upsert_acquired_artist_artwork(
-                        &target.artist_id,
-                        image.provider,
-                        Some(&image.image_url),
-                        Some(&cache_key),
-                        Some(ext),
-                        image.width,
-                        "acquired",
-                        now,
-                    )
-                    .await;
+                let _ = diagnostics::background_result(
+                    database
+                        .upsert_acquired_artist_artwork(
+                            &target.artist_id,
+                            image.provider,
+                            Some(&image.image_url),
+                            Some(&cache_key),
+                            Some(ext),
+                            image.width,
+                            "acquired",
+                            now,
+                        )
+                        .await,
+                    "persistence.upsert_acquired_artist_artwork",
+                );
                 found += 1;
             }
             None => {
-                let _ = database
-                    .upsert_acquired_artist_artwork(
-                        &target.artist_id,
-                        "none",
-                        None,
-                        None,
-                        None,
-                        None,
-                        "not_found",
-                        now,
-                    )
-                    .await;
+                let _ = diagnostics::background_result(
+                    database
+                        .upsert_acquired_artist_artwork(
+                            &target.artist_id,
+                            "none",
+                            None,
+                            None,
+                            None,
+                            None,
+                            "not_found",
+                            now,
+                        )
+                        .await,
+                    "persistence.upsert_acquired_artist_artwork",
+                );
             }
         }
     }
 
     // Publish artwork_url for the artists we just acquired images for.
-    let _ = database.reapply_acquired_artist_artwork().await;
+    let _ = diagnostics::background_result(
+        database.reapply_acquired_artist_artwork().await,
+        "persistence.reapply_acquired_artist_artwork",
+    );
 
     if found > 0 {
         activity.finish(
@@ -2088,30 +2137,36 @@ async fn fingerprint_pass(
             let now = now_unix_seconds();
             match outcome {
                 FingerprintOutcome::Resolved(found) => {
-                    let _ = database
-                        .upsert_track_fingerprint(
-                            &target.track_id,
-                            "resolved",
-                            found.recording_mbid.as_deref(),
-                            found.release_mbid.as_deref(),
-                            found.release_group_mbid.as_deref(),
-                            now,
-                        )
-                        .await;
+                    let _ = diagnostics::background_result(
+                        database
+                            .upsert_track_fingerprint(
+                                &target.track_id,
+                                "resolved",
+                                found.recording_mbid.as_deref(),
+                                found.release_mbid.as_deref(),
+                                found.release_group_mbid.as_deref(),
+                                now,
+                            )
+                            .await,
+                        "persistence.upsert_track_fingerprint",
+                    );
                     resolved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     durable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 FingerprintOutcome::NoMatch => {
-                    let _ = database
-                        .upsert_track_fingerprint(
-                            &target.track_id,
-                            "not_found",
-                            None,
-                            None,
-                            None,
-                            now,
-                        )
-                        .await;
+                    let _ = diagnostics::background_result(
+                        database
+                            .upsert_track_fingerprint(
+                                &target.track_id,
+                                "not_found",
+                                None,
+                                None,
+                                None,
+                                now,
+                            )
+                            .await,
+                        "persistence.upsert_track_fingerprint",
+                    );
                     durable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 // Transient: leave it untouched so the next pass tries again.
@@ -2390,30 +2445,36 @@ async fn musicbrainz_search_pass(
         let now = now_unix_seconds();
         match outcome {
             Some(Ok(Some(found))) if mb_search_match_is_confident(&found, &target) => {
-                let _ = database
-                    .upsert_track_fingerprint(
-                        &target.track_id,
-                        "resolved",
-                        Some(&found.recording_mbid),
-                        found.release_mbid.as_deref(),
-                        None,
-                        now,
-                    )
-                    .await;
+                let _ = diagnostics::background_result(
+                    database
+                        .upsert_track_fingerprint(
+                            &target.track_id,
+                            "resolved",
+                            Some(&found.recording_mbid),
+                            found.release_mbid.as_deref(),
+                            None,
+                            now,
+                        )
+                        .await,
+                    "persistence.upsert_track_fingerprint",
+                );
                 resolved += 1;
             }
             Some(Ok(_)) => {
                 // Searched, no confident match → terminal marker (don't re-search).
-                let _ = database
-                    .upsert_track_fingerprint(
-                        &target.track_id,
-                        "search_not_found",
-                        None,
-                        None,
-                        None,
-                        now,
-                    )
-                    .await;
+                let _ = diagnostics::background_result(
+                    database
+                        .upsert_track_fingerprint(
+                            &target.track_id,
+                            "search_not_found",
+                            None,
+                            None,
+                            None,
+                            now,
+                        )
+                        .await,
+                    "persistence.upsert_track_fingerprint",
+                );
             }
             // Transport error / task panic → leave it `not_found` to retry next pass.
             _ => {}
@@ -2523,20 +2584,26 @@ async fn musicbrainz_enrich_pass(
                         .or_else(|| target.release_group_mbid.clone()),
                     artist_mbid: enrichment.artist_mbid,
                 };
-                let _ = database
-                    .upsert_track_musicbrainz_metadata(&target.track_id, "resolved", &meta, now)
-                    .await;
+                let _ = diagnostics::background_result(
+                    database
+                        .upsert_track_musicbrainz_metadata(&target.track_id, "resolved", &meta, now)
+                        .await,
+                    "persistence.upsert_track_musicbrainz_metadata",
+                );
                 resolved += 1;
             }
             _ => {
-                let _ = database
-                    .upsert_track_musicbrainz_metadata(
-                        &target.track_id,
-                        "not_found",
-                        &ResolvedMusicBrainzMetadata::default(),
-                        now,
-                    )
-                    .await;
+                let _ = diagnostics::background_result(
+                    database
+                        .upsert_track_musicbrainz_metadata(
+                            &target.track_id,
+                            "not_found",
+                            &ResolvedMusicBrainzMetadata::default(),
+                            now,
+                        )
+                        .await,
+                    "persistence.upsert_track_musicbrainz_metadata",
+                );
             }
         }
     }
@@ -2569,6 +2636,11 @@ fn app(
         .map(|parent| parent.join("artwork"))
         .unwrap_or_else(|| PathBuf::from("artwork"));
     let state = AppState {
+        diagnostics: diagnostics::global()
+            .cloned()
+            .unwrap_or_else(|| diagnostics::Diagnostics::start(diagnostics::data_path(&db_path))),
+        diagnostic_export: Arc::new(std::sync::Mutex::new(Default::default())),
+        diagnostic_reports: Arc::new(std::sync::Mutex::new(Default::default())),
         output_audio: Arc::new(output_audio::OutputAudio::default()),
         database,
         providers,
@@ -2602,6 +2674,27 @@ fn app(
         }
     });
     Router::new()
+        .route("/api/diagnostics", get(diagnostics::http::status))
+        .route(
+            "/api/diagnostics/debug",
+            post(diagnostics::http::detail).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/diagnostics/reports",
+            post(diagnostics::http::browser_report).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/players/{id}/diagnostics",
+            post(diagnostics::http::native_report).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/diagnostics/export",
+            post(diagnostics::http::prepare_export).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/diagnostics/export/download",
+            get(diagnostics::http::download),
+        )
         .merge(subsonic::routes())
         // The embedded Svelte app (built from web/ by build.rs). Hashed bundles under
         // /assets/* are immutable; the HTML entries are no-cache.
@@ -2860,7 +2953,10 @@ async fn log_request(request: Request, next: Next) -> Response {
             method = %method,
             path = %path,
             status = status.as_u16(),
-            elapsed_ms,
+            elapsed_ms = elapsed_ms as u64,
+            diagnostic_recorded = response.extensions().get::<diagnostics::IncidentRecorded>().is_some() && response.extensions().get::<diagnostics::IncidentCause>().is_none(),
+            diagnostic_category = if response.extensions().get::<diagnostics::IncidentCause>().is_some() {"server.internal"} else {"http.failure"},
+            error = response.extensions().get::<diagnostics::IncidentCause>().map(|cause|cause.0.as_str()).unwrap_or(""),
             "request failed"
         );
     } else {
@@ -2868,7 +2964,7 @@ async fn log_request(request: Request, next: Next) -> Response {
             method = %method,
             path = %path,
             status = status.as_u16(),
-            elapsed_ms,
+            elapsed_ms = elapsed_ms as u64,
             "request"
         );
     }
@@ -3006,6 +3102,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>
 const NATIVE_API_VERSION: &str = "1";
 
 async fn library_summary(State(state): State<AppState>) -> Result<Json<LibrarySummary>, AppError> {
+    let _timing = diagnostics::Timing::new(diagnostics::Operation::DatabaseRead);
     let summary = state
         .database
         .summary()
@@ -3643,6 +3740,8 @@ async fn player_command(
         .get(&id)
         .await
         .ok_or_else(|| AppError::not_found(format!("unknown player: {id}")))?;
+    let _timing = diagnostics::Timing::new(diagnostics::Operation::Control);
+    diagnostics::transition("playback.command", "player", Some(&id));
     let pending_next = matches!(command, PlayerCommand::Next)
         && bool_setting(&state.database, SETTING_AUTOPLAY).await
         && player.request_autoplay_resume().await;
@@ -4008,12 +4107,21 @@ struct MergeArtistsRequest {
 /// synchronously; the library view reflects it once the regroup completes.
 fn spawn_apply_aliases(database: Database) {
     tokio::spawn(async move {
-        let _ = database.remap_identity_references().await;
+        let _ = diagnostics::background_result(
+            database.remap_identity_references().await,
+            "persistence.remap_identity_references",
+        );
         if let Err(error) = database.reapply_canonical_grouping().await {
             tracing::warn!(%error, "merge: reapply canonical grouping failed");
         }
-        let _ = database.reapply_acquired_artwork().await;
-        let _ = database.reapply_acquired_artist_artwork().await;
+        let _ = diagnostics::background_result(
+            database.reapply_acquired_artwork().await,
+            "persistence.reapply_acquired_artwork",
+        );
+        let _ = diagnostics::background_result(
+            database.reapply_acquired_artist_artwork().await,
+            "persistence.reapply_acquired_artist_artwork",
+        );
     });
 }
 
@@ -5791,9 +5899,18 @@ async fn stream_source_item(
         .map_err(|error| AppError::bad_request(error.to_string()))?;
 
     let range = headers.get(RANGE).and_then(|value| value.to_str().ok());
-    let relayed = proxy::fetch(&spec.url, range)
-        .await
-        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let relayed = proxy::fetch(
+        &spec.url,
+        range,
+        musicata_core::diagnostics::DiagnosticContext {
+            source_id: Some(id.clone()),
+            track_id: Some(query.item.clone()),
+            ..Default::default()
+        },
+        state.diagnostics.clone(),
+    )
+    .await
+    .map_err(|error| AppError::bad_request(error.to_string()))?;
     proxied_response(
         relayed,
         spec.content_type.as_deref().unwrap_or("audio/mpeg"),
@@ -5815,9 +5932,17 @@ async fn stream_radio_station(
         .ok_or_else(|| AppError::not_found(format!("unknown radio station: {id}")))?;
 
     let range = headers.get(RANGE).and_then(|value| value.to_str().ok());
-    let relayed = proxy::fetch(&station.stream_url, range)
-        .await
-        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let relayed = proxy::fetch(
+        &station.stream_url,
+        range,
+        musicata_core::diagnostics::DiagnosticContext {
+            source_id: Some(format!("radio:{id}")),
+            ..Default::default()
+        },
+        state.diagnostics.clone(),
+    )
+    .await
+    .map_err(|error| AppError::bad_request(error.to_string()))?;
     proxied_response(relayed, "audio/mpeg")
 }
 
@@ -5829,21 +5954,41 @@ struct AutoEqPresetQuery {
 
 /// The AutoEq model index, relayed. The browser can't fetch it directly under our CSP, and
 /// routing it here also keeps the user's IP from reaching a third party they didn't configure.
-async fn autoeq_index() -> Result<Response, AppError> {
-    let relayed = proxy::fetch(&autoeq::index_url(), None)
-        .await
-        .map_err(|error| AppError::bad_request(error.to_string()))?;
+async fn autoeq_index(State(state): State<AppState>) -> Result<Response, AppError> {
+    let relayed = proxy::fetch(
+        &autoeq::index_url(),
+        None,
+        musicata_core::diagnostics::DiagnosticContext {
+            source_id: Some("autoeq.index".into()),
+            ..Default::default()
+        },
+        state.diagnostics.clone(),
+    )
+    .await
+    .map_err(|error| AppError::bad_request(error.to_string()))?;
     proxied_response(relayed, "text/markdown; charset=utf-8")
 }
 
 /// One model's ParametricEQ file, relayed. [`autoeq::preset_url`] is what stops this from
 /// being an open proxy — the caller names a model, never a URL.
-async fn autoeq_preset(Query(query): Query<AutoEqPresetQuery>) -> Result<Response, AppError> {
+async fn autoeq_preset(
+    State(state): State<AppState>,
+    Query(query): Query<AutoEqPresetQuery>,
+) -> Result<Response, AppError> {
     let url = autoeq::preset_url(&query.path)
         .map_err(|error| AppError::bad_request(error.to_string()))?;
-    let relayed = proxy::fetch(&url, None)
-        .await
-        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let relayed = proxy::fetch(
+        &url,
+        None,
+        musicata_core::diagnostics::DiagnosticContext {
+            source_id: Some("autoeq.preset".into()),
+            track_id: Some(diagnostics::identity(&query.path)),
+            ..Default::default()
+        },
+        state.diagnostics.clone(),
+    )
+    .await
+    .map_err(|error| AppError::bad_request(error.to_string()))?;
     proxied_response(relayed, "text/plain; charset=utf-8")
 }
 
@@ -6735,22 +6880,28 @@ async fn warm_album_cover(
     // touching SMB again, even if a later scan fails to re-find the folder cover. Covers already
     // backed by an acquired row (external art) are skipped so their provider/remote_url survive.
     if all_cached && !cover.persisted {
-        let _ = database
-            .upsert_acquired_artwork(
-                id,
-                "local-cache",
-                None,
-                Some(&cover.key),
-                Some(&cover.cache_ext),
-                None,
-                "acquired",
-                now_unix_seconds(),
-            )
-            .await;
+        let _ = diagnostics::background_result(
+            database
+                .upsert_acquired_artwork(
+                    id,
+                    "local-cache",
+                    None,
+                    Some(&cover.key),
+                    Some(&cover.cache_ext),
+                    None,
+                    "acquired",
+                    now_unix_seconds(),
+                )
+                .await,
+            "persistence.upsert_acquired_artwork",
+        );
         // Apply the cover URL now so it shows immediately, rather than waiting for the next
         // post-scan `reapply_acquired_artwork` (the periodic scan is only an hourly safety net).
         let url = format!("/api/albums/{id}/artwork?asset={}", cover.key);
-        let _ = database.set_album_artwork_url(id, &url).await;
+        let _ = diagnostics::background_result(
+            database.set_album_artwork_url(id, &url).await,
+            "persistence.set_album_artwork_url",
+        );
     }
     all_cached
 }
@@ -7403,13 +7554,27 @@ impl From<anyhow::Error> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let incident = self.status.is_server_error() && self.code != "player_offline";
+        let recorded = incident || self.code == "player_offline";
+        let cause = incident.then(|| diagnostics::safe_cause(&self.message).to_owned());
         let body = Json(ErrorEnvelope {
             error: ErrorBody {
                 code: self.code,
                 message: self.message,
             },
         });
-        (self.status, body).into_response()
+        let mut response = (self.status, body).into_response();
+        if recorded {
+            response
+                .extensions_mut()
+                .insert(diagnostics::IncidentRecorded);
+        }
+        if let Some(cause) = cause {
+            response
+                .extensions_mut()
+                .insert(diagnostics::IncidentCause(cause));
+        }
+        response
     }
 }
 
@@ -7742,9 +7907,22 @@ fn unquote(value: &str) -> &str {
 }
 
 fn init_logging() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("musicata_server=info,musicata_core=info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+    let console = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("off"));
+    let diagnostic_filter = diagnostics::detail_filter(None);
+    let previous_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        diagnostics::failure("server.panic", "server", None, "worker panicked");
+        previous_panic_hook(info);
+    }));
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(console),
+        )
+        .with(diagnostics::DiagnosticLayer(None).with_filter(diagnostic_filter))
+        .init();
 }
 
 #[cfg(test)]
@@ -11711,6 +11889,284 @@ mod tests {
         assert!(content_type.starts_with("image/"), "got {content_type}");
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(!bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_are_not_exposed_during_setup() {
+        use tower::ServiceExt;
+        let fixture = TestFixture::new("diagnostics-setup");
+        let app = fixture.app().await;
+        for path in ["/api/diagnostics", "/api/diagnostics/export/download"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+    }
+    #[tokio::test]
+    async fn diagnostics_require_admin_and_browser_report_requires_renderer() {
+        use tower::ServiceExt;
+        let fixture = TestFixture::new("diagnostics-roles");
+        let (app, db) = fixture.app_with_library_db(fixture.library()).await;
+        for (id, role, token) in [
+            ("admin", "admin", "admin-token"),
+            ("listener", "listener", "listener-token"),
+        ] {
+            db.create_user(&musicata_storage::UserRecord {
+                id: id.into(),
+                username: id.into(),
+                password_hash: "unused".into(),
+                role: role.into(),
+                api_token: token.into(),
+                created_at_unix_seconds: 1,
+            })
+            .await
+            .unwrap();
+        }
+        for (token, want) in [
+            ("admin-token", StatusCode::OK),
+            ("listener-token", StatusCode::FORBIDDEN),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/diagnostics")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), want);
+        }
+        let report = serde_json::json!({"category":"browser.audio","component":"browser","action":"failure","context":{},"message":"decode failed"});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/diagnostics/reports")
+                    .header("authorization", "Bearer listener-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(report.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_export_remains_available_when_store_is_unwritable() {
+        use tower::ServiceExt;
+        let fixture = TestFixture::new("diagnostics-fallback");
+        fs::create_dir(fixture.root.join("musicata.db.diagnostics.db")).unwrap();
+        let (app, db) = fixture.app_with_library_db(fixture.library()).await;
+        db.create_user(&musicata_storage::UserRecord {
+            id: "admin".into(),
+            username: "admin".into(),
+            password_hash: "unused".into(),
+            role: "admin".into(),
+            api_token: "admin-token".into(),
+            created_at_unix_seconds: 1,
+        })
+        .await
+        .unwrap();
+        let request = |path: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", "Bearer admin-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap()
+        };
+        let registered = app
+            .clone()
+            .oneshot(request(
+                "/api/players",
+                r#"{"kind":"native","address":"diagnostic-test","issue_token":true}"#,
+            ))
+            .await
+            .unwrap();
+        let registered: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(registered.into_body(), 10000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let id = registered["id"].as_str().unwrap();
+        let token = registered["auth_token"].as_str().unwrap();
+        let report = r#"{"category":"native.audio","component":"native","action":"failure","context":{},"message":"decode failed https://private.invalid/?token=secret"}"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/players/{id}/diagnostics"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(report))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            app.clone()
+                .oneshot(request("/api/diagnostics/export", "{}"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/diagnostics/export/download")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let context: serde_json::Value =
+            serde_json::from_reader(zip.by_name("context.json").unwrap()).unwrap();
+        assert_eq!(context["history_scope"], "pending_memory_only");
+        let incidents: serde_json::Value =
+            serde_json::from_reader(zip.by_name("incidents.json").unwrap()).unwrap();
+        assert_eq!(incidents[0]["category"], "native.audio");
+        assert!(!incidents.to_string().contains("secret"));
+        let pool = sqlx::SqlitePool::connect(&format!(
+            "sqlite://{}",
+            fixture.root.join("musicata.db").display()
+        ))
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE players RENAME TO unavailable_players")
+            .execute(&pool)
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(request("/api/diagnostics/export", "{}"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/diagnostics/export/download")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "optional output summary must not block support export"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let context: serde_json::Value =
+            serde_json::from_reader(zip.by_name("context.json").unwrap()).unwrap();
+        assert_eq!(context["output_context_unavailable"], true);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_endpoint_token_is_scoped_and_lost_reports_are_accepted() {
+        use tower::ServiceExt;
+        let fixture = TestFixture::new("diagnostics-endpoint");
+        let (app, db) = fixture.app_with_library_db(fixture.library()).await;
+        db.create_user(&musicata_storage::UserRecord {
+            id: "admin".into(),
+            username: "admin".into(),
+            password_hash: "unused".into(),
+            role: "admin".into(),
+            api_token: "admin-token".into(),
+            created_at_unix_seconds: 1,
+        })
+        .await
+        .unwrap();
+        let registered = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/players")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"native","address":"diagnostics-test","issue_token":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), StatusCode::OK);
+        let player: serde_json::Value =
+            serde_json::from_str(&body_text(registered.into_body()).await).unwrap();
+        let id = player["id"].as_str().unwrap();
+        let token = player["auth_token"].as_str().unwrap();
+        let report = serde_json::json!({"category":"native.audio","component":"native","action":"failure","context":{},"message":"connection refused","measurements":{"lost_reports":2}});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/players/{id}/diagnostics"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(report.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        for path in [
+            "/api/players/someone-else/diagnostics",
+            "/api/diagnostics/export/download",
+            "/api/diagnostics",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/players/{id}/diagnostics"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("x".repeat(5000)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     struct TestFixture {

@@ -33,6 +33,7 @@
 //! Only `ws://` (LAN) is supported; put it behind a TLS reverse proxy for `wss://`.
 
 mod audio;
+mod diagnostics;
 mod dsp;
 mod output_audio;
 mod protocol;
@@ -66,6 +67,7 @@ struct Creds {
 fn main() -> Result<()> {
     let args = Args::parse(std::env::args().skip(1))?;
     let creds = resolve_creds(&args)?;
+    diagnostics::start(&creds);
     eprintln!(
         "musicata-endpoint: player {} on {} — Ctrl-C to quit",
         creds.id, creds.server
@@ -80,8 +82,8 @@ fn main() -> Result<()> {
     // Reconnect forever; a dropped connection just reconnects.
     loop {
         match run_session(&creds, &mut audio, &mut view) {
-            Ok(()) => eprintln!("connection closed; reconnecting in 2s…"),
-            Err(error) => eprintln!("error: {error}; reconnecting in 2s…"),
+            Ok(()) => diagnostics::failure("native.connection", "connection closed"),
+            Err(error) => diagnostics::failure("native.connection", &error.to_string()),
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -165,7 +167,7 @@ fn run_session(creds: &Creds, audio: &mut AudioPlayer, view: &mut EndpointView) 
         .get_ref()
         .set_read_timeout(Some(Duration::from_millis(500)))
         .context("set read timeout")?;
-    eprintln!("connected.");
+    diagnostics::recovery("native.connection");
 
     let mut last_tick = Instant::now();
     // The library track to prefetch next (from the server's `next_up` hint), if any.
@@ -215,9 +217,25 @@ fn run_session(creds: &Creds, audio: &mut AudioPlayer, view: &mut EndpointView) 
                     if remaining <= PREFETCH_LEAD_SECS
                         && let Some((stream_url, track_id)) = &next_target
                     {
+                        let already_prefetched =
+                            view.prefetched.as_deref() == Some(track_id.as_str());
+                        let started = Instant::now();
                         match audio.prefetch(stream_url, track_id) {
-                            Ok(()) => view.prefetched = Some(track_id.clone()),
-                            Err(error) => eprintln!("prefetch failed: {error}"),
+                            Ok(()) => {
+                                view.prefetched = Some(track_id.clone());
+                                diagnostics::recovery("native.decode");
+                                if !already_prefetched
+                                    && started.elapsed().as_secs_f64() > remaining.max(0.0)
+                                {
+                                    diagnostics::failure(
+                                        "native.buffering",
+                                        "playback interrupted",
+                                    );
+                                } else if !already_prefetched {
+                                    diagnostics::recovery("native.buffering");
+                                }
+                            }
+                            Err(error) => diagnostics::failure("native.decode", &error.to_string()),
                         }
                     }
                     if remaining <= APPEND_WINDOW_SECS {
@@ -246,11 +264,11 @@ fn apply(audio: &mut AudioPlayer, view: &mut EndpointView, next: &PlaybackState)
             title,
             play,
         } => {
-            if !title.is_empty() {
-                eprintln!("▶ {title}");
-            }
+            let _ = title;
             if let Err(error) = audio.load(&stream_url, play) {
-                eprintln!("load failed: {error}");
+                diagnostics::failure("native.decode", &error.to_string());
+            } else {
+                diagnostics::recovery("native.decode");
             }
             view.track_id = next
                 .now_playing
@@ -269,7 +287,8 @@ fn apply(audio: &mut AudioPlayer, view: &mut EndpointView, next: &PlaybackState)
             // The cursor reached the track we already appended — it's playing gaplessly. Adopt
             // it as current; only sync the pause state, since the audio already advanced.
             if !title.is_empty() {
-                eprintln!("▶ {title}");
+                diagnostics::recovery("native.decode");
+                let _ = title;
             }
             view.track_id = track_id;
             view.stream_url = Some(stream_url);
