@@ -3,8 +3,9 @@
 // (so presets follow the user across devices — see crate::dsp), loaded via `load()`. The
 // Selection and bypass belong to each server output. Volume leveling and physical browser
 // sink bindings remain local. The owning renderer applies the audio-channel configuration.
-import { parseParametricEq, BUILT_IN_PROFILES, type EqProfile } from "./dsp";
+import { parseParametricEq, newProfileId, BUILT_IN_PROFILES, type EqProfile } from "./dsp";
 import { api } from "./api";
+import { session } from "./session.svelte";
 import { outputAudio, type AudioConfig } from "./outputAudio.svelte";
 import type { OutputDspSelection } from "../types/OutputDspSelection";
 
@@ -22,6 +23,10 @@ function isLevelingMode(value: unknown): value is LevelingMode {
 class Dsp {
   enabled = $state(false);
   activeId = $state<string | null>(null);
+  correctionEnabled = $state(true);
+  listeningId = $state<string | null>(null);
+  listeningEnabled = $state(false);
+  effective = $state<EqProfile | null>(null);
   /** The server-stored profile library (built-ins live in `dsp.ts` and are merged in). */
   custom = $state<EqProfile[]>([]);
   panelOpen = $state(false);
@@ -31,6 +36,7 @@ class Dsp {
   outputId = $state<string | null>(null);
   error = $state<string | null>(null);
   private writes = Promise.resolve();
+  private pendingLegacy: EqProfile[] = [];
   private legacySelection: OutputDspSelection | null = null;
   private migrating = false;
 
@@ -38,6 +44,10 @@ class Dsp {
     this.outputId = id;
     this.enabled = false;
     this.activeId = null;
+    this.correctionEnabled = true;
+    this.listeningId = null;
+    this.listeningEnabled = false;
+    this.effective = null;
     this.error = null;
     outputAudio.select(id, name, config => this.adopt(config));
   }
@@ -47,7 +57,14 @@ class Dsp {
     if (!config.state.configured && config.state.measurement_point === "browser_output") void this.migrateLegacy();
     this.enabled = config.state.selection.enabled;
     this.activeId = config.state.selection.profile_id;
-    if (config.profile) this.custom = [...this.custom.filter(p => p.id !== config.profile!.id), config.profile];
+    this.correctionEnabled = config.state.selection.correction_enabled ?? true;
+    this.listeningId = config.state.selection.listening_profile_id ?? null;
+    this.listeningEnabled = config.state.selection.listening_enabled ?? false;
+    this.effective = config.profile;
+    // The effective renderer profile contains both layers; never put it in the raw library.
+    for (const profile of [config.correction_profile, config.listening_profile]) {
+      if (profile) this.custom = [...this.custom.filter(p => p.id !== profile.id), profile];
+    }
   }
 
   private async migrateLegacy(): Promise<void> {
@@ -58,7 +75,6 @@ class Dsp {
     if (!profile) return;
     this.migrating = true;
     try {
-      if (!this.isCustom(profile.id)) await api.saveDspProfile(profile);
       await api.saveOutputDsp(id, selection, true);
       this.legacySelection = null;
       this.saveLocal();
@@ -66,14 +82,22 @@ class Dsp {
     finally {this.migrating = false;}
   }
 
-  private write(id = this.outputId, selection: OutputDspSelection = {profile_id: this.activeId, enabled: this.enabled}): void {
+  private selection(): OutputDspSelection {
+    return {profile_id: this.activeId, enabled: this.enabled, correction_enabled: this.correctionEnabled,
+      listening_profile_id: this.listeningId, listening_enabled: this.listeningEnabled};
+  }
+
+  private write(id = this.outputId, selection: OutputDspSelection = this.selection()): void {
     if (!id) return;
-    const profile = this.profiles.find(p => p.id === selection.profile_id);
+    const profiles = this.profiles.filter(p => p.id === selection.profile_id || p.id === selection.listening_profile_id);
+    this.error = null;
     this.writes = this.writes.then(async () => {
-      if (profile && !this.isCustom(profile.id)) {
-        const existing = (await api.dspProfiles()).find(p => p.id === profile.id);
-        if (!existing) await api.saveDspProfile(profile);
-        this.custom = [...this.custom.filter(p => p.id !== profile.id), existing ?? profile];
+      for (const profile of profiles) {
+        if (!this.isCustom(profile.id)) {
+          const existing = (await api.dspProfiles()).find(p => p.id === profile.id);
+          if (!existing) await api.saveDspProfile(profile);
+          this.custom = [...this.custom.filter(p => p.id !== profile.id), existing ?? profile];
+        }
       }
       await api.saveOutputDsp(id, selection);
     }).catch(error => { if (id === this.outputId) this.error = String(error); });
@@ -85,13 +109,15 @@ class Dsp {
       if (raw) {
         const p = JSON.parse(raw) as {
           enabled?: boolean;
+          custom?: EqProfile[];
           activeId?: string | null;
           levelingMode?: unknown;
           leveling?: boolean; // legacy boolean toggle (pre-album mode)
         };
+        this.pendingLegacy = Array.isArray(p.custom) ? p.custom : [];
         this.enabled = !!p.enabled;
         this.activeId = p.activeId ?? null;
-        if (this.activeId) this.legacySelection = {profile_id:this.activeId, enabled:this.enabled};
+        if (this.activeId) this.legacySelection = {profile_id:this.activeId, enabled:this.enabled, correction_enabled:true, listening_profile_id:null, listening_enabled:false};
         // Prefer the new mode; fall back to the legacy boolean (on → album, the Auto behavior).
         this.levelingMode = isLevelingMode(p.levelingMode)
           ? p.levelingMode
@@ -112,16 +138,17 @@ class Dsp {
   async load(): Promise<void> {
     try {
       let server = await api.dspProfiles();
-      const legacy = this.legacyCustom();
-      if (server.length === 0 && legacy.length > 0) {
-        for (const p of legacy) await api.saveDspProfile(p);
-        server = legacy;
+      const missing = this.pendingLegacy.filter(profile => !server.some(stored => stored.id === profile.id));
+      if (missing.length > 0 && !session.isAdmin) {
+        this.custom = server;
+        this.error = "Your saved local sound profiles are preserved. Ask an administrator to sign in on this browser to import them before applying them.";
+      } else {
+        for (const profile of missing) await api.saveDspProfile(profile);
+        server = [...server, ...missing];
+        this.custom = server;
+        this.pendingLegacy = [];
       }
-      this.custom = server;
-      // Only now is it safe to rewrite localStorage without the legacy `custom` key — the
-      // migration fully succeeded (or there was nothing to migrate / the server already had
-      // profiles). On a failure above we fall to `catch` and leave localStorage intact so the
-      // un-uploaded profiles survive for the next load's retry.
+      // Pending imports survive preference changes and reloads until an administrator saves them.
       this.saveLocal();
     } catch {
       this.custom = [];
@@ -136,13 +163,35 @@ class Dsp {
   get active(): EqProfile | null {
     return this.profiles.find((p) => p.id === this.activeId) ?? null;
   }
+  isBuiltIn(id: string | null): boolean {
+    return BUILT_IN_PROFILES.some(profile => profile.id === id);
+  }
   isCustom(id: string | null): boolean {
     return id != null && this.custom.some((p) => p.id === id);
   }
 
   setEnabled(v: boolean): void {
-    if (v && !this.activeId) this.activeId = this.profiles[0]?.id ?? null;
-    this.enabled = v && this.activeId !== null;
+    if (v && !this.activeId && !this.listeningId) {
+      this.activeId = this.profiles.find(profile => profile.kind !== "listening")?.id ?? null;
+      this.correctionEnabled = true;
+    }
+    this.enabled = v && !!((this.correctionEnabled && this.activeId) || (this.listeningEnabled && this.listeningId));
+    this.write();
+  }
+  setCorrectionEnabled(v: boolean): void {
+    this.correctionEnabled = v && this.activeId !== null;
+    this.enabled = !!((this.correctionEnabled && this.activeId) || (this.listeningEnabled && this.listeningId));
+    this.write();
+  }
+  setListeningEnabled(v: boolean): void {
+    this.listeningEnabled = v && this.listeningId !== null;
+    this.enabled = !!((this.correctionEnabled && this.activeId) || (this.listeningEnabled && this.listeningId));
+    this.write();
+  }
+  setListening(id: string | null): void {
+    this.listeningId = id;
+    this.listeningEnabled = id !== null;
+    this.enabled = !!((this.correctionEnabled && this.activeId) || this.listeningEnabled);
     this.write();
   }
   setLevelingMode(mode: LevelingMode): void {
@@ -151,31 +200,38 @@ class Dsp {
   }
   setActive(id: string | null): void {
     this.activeId = id;
-    this.enabled = id !== null;
+    this.correctionEnabled = id !== null;
+    this.enabled = !!(id || (this.listeningEnabled && this.listeningId));
     this.write();
   }
 
-  /** Persist a profile to the server library, select it, and enable. */
-  async saveProfile(prof: EqProfile): Promise<void> {
+  /** Save a profile; administration can preserve the current listening selection. */
+  async saveProfile(prof: EqProfile, activate = true): Promise<void> {
     const output = this.outputId;
+    const selection = {...this.selection(), profile_id: prof.id, correction_enabled: true, enabled: true};
     await api.saveDspProfile(prof);
     this.custom = [...this.custom.filter((p) => p.id !== prof.id), prof];
-    if (output === this.outputId) { this.activeId = prof.id; this.enabled = true; }
-    this.write(output, {profile_id: prof.id, enabled: true});
+    if (!activate) return;
+    if (output === this.outputId) { this.activeId = prof.id; this.correctionEnabled = true; this.enabled = true; }
+    this.write(output, selection);
   }
 
   /** Parse + save a ParametricEQ.txt preset. Returns null if nothing parsed. */
-  async importText(text: string, name: string): Promise<EqProfile | null> {
+  async importText(text: string, name: string, activate = true, kind?: EqProfile["kind"]): Promise<EqProfile | null> {
     const prof = parseParametricEq(text, name);
     if (prof.bands.length === 0) return null;
-    await this.saveProfile(prof);
+    if (!activate) prof.id = newProfileId();
+    if (kind) prof.kind = kind;
+    await this.saveProfile(prof, activate);
     return prof;
   }
 
   async remove(id: string): Promise<void> {
     await api.deleteDspProfile(id);
     this.custom = this.custom.filter((p) => p.id !== id);
-    if (this.activeId === id) this.activeId = null;
+    if (this.activeId === id) { this.activeId = null; this.correctionEnabled = false; }
+    if (this.listeningId === id) { this.listeningId = null; this.listeningEnabled = false; }
+    this.enabled = this.enabled && !!((this.correctionEnabled && this.activeId) || (this.listeningEnabled && this.listeningId));
     this.saveLocal();
   }
 
@@ -187,19 +243,11 @@ class Dsp {
           enabled: this.legacySelection?.enabled ?? false,
           activeId: this.legacySelection?.profile_id ?? null,
           levelingMode: this.levelingMode,
+          ...(this.pendingLegacy.length ? {custom: this.pendingLegacy} : {}),
         }),
       );
     } catch {
       // private mode — fine
-    }
-  }
-
-  private legacyCustom(): EqProfile[] {
-    try {
-      const p = JSON.parse(localStorage.getItem(LS_KEY) || "{}") as { custom?: EqProfile[] };
-      return Array.isArray(p.custom) ? p.custom : [];
-    } catch {
-      return [];
     }
   }
 }

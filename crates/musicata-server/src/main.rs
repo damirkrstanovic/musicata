@@ -4556,6 +4556,9 @@ struct UpdatePlaylistRequest {
     comment: Option<String>,
     /// Replace the whole track list, in this order (used for reorder).
     track_ids: Option<Vec<String>>,
+    /// Ordered ids observed when the client began a reorder. Required with `track_ids` so an
+    /// older controller cannot replace membership another controller just changed.
+    expected_track_ids: Option<Vec<String>>,
     /// Append these tracks.
     add_track_ids: Option<Vec<String>>,
     /// Remove the tracks currently at these positions.
@@ -4618,6 +4621,52 @@ async fn update_playlist_route(
     playlist_detail_response(&state, &id).await?;
     let now = now_unix_seconds();
 
+    if let Some(track_ids) = request.track_ids {
+        let expected = request.expected_track_ids.ok_or_else(|| {
+            AppError::bad_request("expected_track_ids is required when replacing playlist tracks")
+        })?;
+        let replaced = state
+            .database
+            .replace_playlist_tracks_if_current(&id, &expected, &track_ids, now)
+            .await
+            .map_err(db_error)?;
+        if !replaced {
+            return Err(AppError::conflict(
+                "Playlist changed on another controller. Refresh it before reordering again.",
+            ));
+        }
+    } else if request.add_track_ids.is_some() || request.remove_indices.is_some() {
+        let expected = request
+            .remove_indices
+            .is_some()
+            .then(|| {
+                request.expected_track_ids.as_deref().ok_or_else(|| {
+                    AppError::bad_request(
+                        "expected_track_ids is required when removing playlist tracks",
+                    )
+                })
+            })
+            .transpose()?;
+        let changed = state
+            .database
+            .edit_playlist_tracks(
+                expected,
+                &id,
+                request.add_track_ids.as_deref().unwrap_or_default(),
+                request.remove_indices.as_deref().unwrap_or_default(),
+                now,
+            )
+            .await
+            .map_err(db_error)?;
+        if !changed {
+            return Err(AppError::conflict(
+                "Playlist changed on another controller. Refresh it before removing tracks again.",
+            ));
+        }
+    }
+
+    // Validate and commit membership first. A stale/invalid membership request must not partly
+    // rename the playlist before returning its 400/409 response.
     if request.name.is_some() || request.comment.is_some() {
         state
             .database
@@ -4627,38 +4676,6 @@ async fn update_playlist_route(
                 request.comment.as_deref(),
                 now,
             )
-            .await
-            .map_err(db_error)?;
-    }
-
-    if let Some(track_ids) = request.track_ids {
-        state
-            .database
-            .set_playlist_tracks(&id, &track_ids, now)
-            .await
-            .map_err(db_error)?;
-    } else if request.add_track_ids.is_some() || request.remove_indices.is_some() {
-        let mut ids = state
-            .database
-            .playlist_track_ids(&id)
-            .await
-            .map_err(db_error)?;
-        if let Some(remove) = request.remove_indices {
-            let mut remove: Vec<usize> = remove;
-            remove.sort_unstable();
-            remove.dedup();
-            for index in remove.into_iter().rev() {
-                if index < ids.len() {
-                    ids.remove(index);
-                }
-            }
-        }
-        if let Some(add) = request.add_track_ids {
-            ids.extend(add);
-        }
-        state
-            .database
-            .set_playlist_tracks(&id, &ids, now)
             .await
             .map_err(db_error)?;
     }
@@ -5317,10 +5334,16 @@ async fn snapcast_update(
             .map_err(db_error)?
             .is_some()
         {
-            let selection = musicata_core::dsp::OutputDspSelection {
-                profile_id: (!profile_id.is_empty()).then(|| profile_id.to_owned()),
-                enabled: !profile_id.is_empty(),
-            };
+            // The legacy Snapcast setting controls only equipment correction. Retain a
+            // listening layer selected through the common output endpoint.
+            let output = state
+                .output_audio
+                .entry(&state.database, &state.players, players::SNAPCAST_PLAYER_ID)
+                .await?;
+            let mut selection = output.runtime.lock().await.state.selection.clone();
+            selection.profile_id = (!profile_id.is_empty()).then(|| profile_id.to_owned());
+            selection.correction_enabled = !profile_id.is_empty();
+            selection.enabled = selection.correction_enabled || selection.listening_enabled;
             let _ = output_audio::set_selection(
                 State(state.clone()),
                 Path(players::SNAPCAST_PLAYER_ID.into()),
@@ -7486,6 +7509,14 @@ impl AppError {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_request",
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
             message: message.into(),
         }
     }
@@ -9717,6 +9748,7 @@ mod tests {
                 &musicata_core::dsp::OutputDspSelection {
                     profile_id: Some("deleted-profile".into()),
                     enabled: true,
+                    ..Default::default()
                 },
             )
             .await
@@ -9748,6 +9780,284 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn listeners_can_select_sound_but_cannot_manage_shared_profiles() {
+        let fixture = TestFixture::new("dsp-roles");
+        let (router, db) = fixture.app_with_library_db(fixture.library()).await;
+        db.create_user(&musicata_storage::UserRecord {
+            id: "listener".into(),
+            username: "listener".into(),
+            password_hash: "unused".into(),
+            role: "listener".into(),
+            api_token: "listener-token".into(),
+            created_at_unix_seconds: 1,
+        })
+        .await
+        .unwrap();
+        for (method, path, body) in [
+            (
+                "PUT",
+                "/api/dsp/profiles/new",
+                r#"{"id":"new","name":"New","preampDb":0,"bands":[]}"#,
+            ),
+            ("DELETE", "/api/dsp/profiles/new", ""),
+            ("POST", "/api/dsp/profiles/new/impulse", ""),
+            ("DELETE", "/api/dsp/profiles/new/impulse", ""),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("authorization", "Bearer listener-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dsp/profiles")
+                    .header("authorization", "Bearer listener-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let profiles: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert!(
+            profiles
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|profile| profile["id"] == "taste-techno-bass")
+        );
+        let response = router.oneshot(Request::builder().method("PUT").uri("/api/players/browser-local/dsp")
+            .header("authorization", "Bearer listener-token").header("content-type", "application/json")
+            .body(Body::from(r#"{"profile_id":null,"enabled":true,"correction_enabled":false,"listening_profile_id":"taste-techno-bass","listening_enabled":true}"#)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn deleting_correction_keeps_active_listening_layer() {
+        // A regression here causes profile deletion to bypass an independent listening layer.
+        let fixture = TestFixture::new("dsp-delete-one-layer");
+        let (router, database) = fixture.app_with_library_db(fixture.library()).await;
+        async fn request(
+            router: axum::Router,
+            method: &str,
+            path: &str,
+            body: &str,
+        ) -> axum::response::Response {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_owned()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+        for (id, name) in [("room", "Room"), ("late-night", "Late night")] {
+            assert_eq!(
+                request(
+                    router.clone(),
+                    "PUT",
+                    &format!("/api/dsp/profiles/{id}"),
+                    &format!(r#"{{"id":"{id}","name":"{name}","preampDb":0,"bands":[]}}"#),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            request(
+                router.clone(),
+                "PUT",
+                "/api/players/browser-local/dsp",
+                r#"{"profile_id":"room","enabled":true,"correction_enabled":true,"listening_profile_id":"late-night","listening_enabled":true}"#,
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            request(router.clone(), "DELETE", "/api/dsp/profiles/room", "")
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let Some(selection) = database.player_dsp("browser-local").await.unwrap() else {
+                    continue;
+                };
+                if selection.profile_id.is_none() {
+                    break selection;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("deletion checkpoint persists");
+        let response = request(router, "GET", "/api/players/browser-local/dsp", "").await;
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(body["selection"]["profile_id"], serde_json::Value::Null);
+        assert_eq!(body["selection"]["correction_enabled"], false);
+        assert_eq!(body["selection"]["listening_profile_id"], "late-night");
+        assert_eq!(body["selection"]["listening_enabled"], true);
+        assert_eq!(body["selection"]["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn profile_edit_rejects_invalid_composition_on_a_disconnected_output() {
+        let fixture = TestFixture::new("dsp-cold-edit");
+        let (router, database) = fixture.app_with_library_db(fixture.library()).await;
+        for id in ["correction", "adjustment"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/dsp/profiles/{id}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"id":"{id}","name":"{id}","preampDb":-20,"bands":[]}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        // Persist directly without opening its audio channel: the renderer is disconnected.
+        database
+            .set_player_dsp(
+                "browser-local",
+                &musicata_core::dsp::OutputDspSelection {
+                    profile_id: Some("correction".into()),
+                    enabled: true,
+                    correction_enabled: true,
+                    listening_profile_id: Some("adjustment".into()),
+                    listening_enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/dsp/profiles/correction")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":"correction","name":"correction","preampDb":-50,"bands":[]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dsp/profiles")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let profiles: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(
+            profiles
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|profile| profile["id"] == "correction")
+                .unwrap()["preampDb"]
+                .as_f64(),
+            Some(-20.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn uploading_an_impulse_rejects_a_legacy_profile_selected_for_listening() {
+        // Kind-less profiles remain compatible in either selector, but a listening selection
+        // must never acquire room convolution through a later upload.
+        let fixture = TestFixture::new("dsp-listening-impulse");
+        let (router, _) = fixture.app_with_library_db(fixture.library()).await;
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/api/dsp/profiles/legacy-tone")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"id":"legacy-tone","name":"Legacy tone","preampDb":0,"bands":[]}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/api/players/browser-local/dsp")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"profile_id":null,"enabled":true,"correction_enabled":false,"listening_profile_id":"legacy-tone","listening_enabled":true}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let mut wav = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&[0; 4]);
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        assert_eq!(
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/dsp/profiles/legacy-tone/impulse")
+                        .body(Body::from(wav))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
@@ -9870,7 +10180,9 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Vec<crate::dsp::DspProfile>>(&json)
                 .unwrap()
-                .len(),
+                .iter()
+                .filter(|profile| profile.id.starts_with("profile-"))
+                .count(),
             20
         );
         for n in 0..20 {
@@ -9937,8 +10249,15 @@ mod tests {
             .unwrap()
         }
 
-        // Empty to start.
-        assert_eq!(profiles(&app).await.as_array().unwrap().len(), 0);
+        // Built-ins may already be available, but this custom profile does not exist yet.
+        assert!(
+            profiles(&app)
+                .await
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|profile| profile["id"] != "hd600")
+        );
 
         // Upsert: the path id wins over the body, and the camelCase shape matches the web client.
         let put = app
@@ -9960,7 +10279,14 @@ mod tests {
             serde_json::from_str(&body_text(put.into_body()).await).unwrap();
         assert_eq!(saved["id"], "hd600");
         assert_eq!(saved["preampDb"], -6.8);
-        assert_eq!(profiles(&app).await.as_array().unwrap().len(), 1);
+        assert!(
+            profiles(&app)
+                .await
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|profile| profile["id"] == "hd600")
+        );
 
         // Upload a WAV impulse response (raw body) → 204, and the profile records its rate.
         let mut wav = Vec::new();
@@ -9979,13 +10305,22 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/dsp/profiles/hd600/impulse")
-                    .body(Body::from(wav))
+                    .body(Body::from(wav.clone()))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(upload.status(), StatusCode::NO_CONTENT);
-        assert_eq!(profiles(&app).await[0]["roomIr"]["sampleRate"], 48_000);
+        assert_eq!(
+            profiles(&app)
+                .await
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|profile| profile["id"] == "hd600")
+                .unwrap()["roomIr"]["sampleRate"],
+            48_000
+        );
 
         // Served back as audio/wav.
         let got = app
@@ -10007,22 +10342,72 @@ mod tests {
                 .is_empty()
         );
 
-        // Delete the impulse → roomIr cleared; delete the profile → empty again.
-        for uri in ["/api/dsp/profiles/hd600/impulse", "/api/dsp/profiles/hd600"] {
-            let del = app
+        // Deleting either the impulse metadata/file or its profile makes it unavailable.
+        let delete_impulse = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/dsp/profiles/hd600/impulse")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_impulse.status(), StatusCode::NO_CONTENT);
+        for (method, body) in [("GET", Body::empty()), ("POST", Body::from(wav))] {
+            let response = app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .method("DELETE")
-                        .uri(uri)
-                        .body(Body::empty())
+                        .method(method)
+                        .uri("/api/dsp/profiles/hd600/impulse")
+                        .body(body)
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(del.status(), StatusCode::NO_CONTENT, "DELETE {uri}");
+            assert_eq!(
+                response.status(),
+                if method == "GET" {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::NO_CONTENT
+                }
+            );
         }
-        assert_eq!(profiles(&app).await.as_array().unwrap().len(), 0);
+        let delete_profile = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/dsp/profiles/hd600")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_profile.status(), StatusCode::NO_CONTENT);
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dsp/profiles/hd600/impulse")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::NOT_FOUND);
+        assert!(!fixture.root.join("dsp/hd600.wav").exists());
+        assert!(
+            profiles(&app)
+                .await
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|profile| profile["id"] != "hd600")
+        );
     }
 
     /// Library export → download → re-import round-trip stages the archive (gap #4).
@@ -11250,6 +11635,90 @@ mod tests {
         .unwrap();
         assert_eq!(created["name"], "Mix");
         assert_eq!(created["tracks"].as_array().unwrap().len(), 1);
+
+        // A controller holding an older membership snapshot cannot replace this list.
+        // This is the HTTP boundary for the storage CAS used by playlist reordering.
+        let stale_reorder = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/playlists/{}",
+                        created["id"].as_str().unwrap()
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"track_ids":["{track_id}"],"expected_track_ids":[]}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_reorder.status(), StatusCode::CONFLICT);
+
+        // Membership validation and a CAS conflict must leave an accompanying metadata edit
+        // untouched. In particular, remove-by-index must have the same snapshot protection as
+        // a full reorder because another controller could have shifted that index.
+        let missing_remove_snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/playlists/{}",
+                        created["id"].as_str().unwrap()
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"name":"Should not rename","remove_indices":[0]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_remove_snapshot.status(), StatusCode::BAD_REQUEST);
+
+        let stale_remove = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/playlists/{}",
+                        created["id"].as_str().unwrap()
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"name":"Should not rename","remove_indices":[0],"expected_track_ids":[]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_remove.status(), StatusCode::CONFLICT);
+
+        let unchanged: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!(
+                                "/api/playlists/{}",
+                                created["id"].as_str().unwrap()
+                            ))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(unchanged["name"], "Mix");
+        assert_eq!(unchanged["tracks"].as_array().unwrap().len(), 1);
 
         // It shows up in the list.
         let list: serde_json::Value = serde_json::from_str(

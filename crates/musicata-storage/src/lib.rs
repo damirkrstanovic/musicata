@@ -421,6 +421,31 @@ impl Database {
             set_user_version(&self.pool, 35).await?;
         }
 
+        if version < 36 {
+            ensure_column(
+                &self.pool,
+                "player_dsp",
+                "correction_enabled",
+                "ALTER TABLE player_dsp ADD COLUMN correction_enabled INTEGER NOT NULL DEFAULT 1 CHECK (correction_enabled IN (0, 1))",
+            )
+            .await?;
+            ensure_column(
+                &self.pool,
+                "player_dsp",
+                "listening_profile_id",
+                "ALTER TABLE player_dsp ADD COLUMN listening_profile_id TEXT",
+            )
+            .await?;
+            ensure_column(
+                &self.pool,
+                "player_dsp",
+                "listening_enabled",
+                "ALTER TABLE player_dsp ADD COLUMN listening_enabled INTEGER NOT NULL DEFAULT 0 CHECK (listening_enabled IN (0, 1))",
+            )
+            .await?;
+            set_user_version(&self.pool, 36).await?;
+        }
+
         Ok(())
     }
 
@@ -3491,7 +3516,7 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<Option<musicata_core::dsp::OutputDspSelection>> {
-        let row = sqlx::query("SELECT profile_id, enabled FROM player_dsp WHERE player_id = ?")
+        let row = sqlx::query("SELECT profile_id, enabled, correction_enabled, listening_profile_id, listening_enabled FROM player_dsp WHERE player_id = ?")
             .bind(id)
             .fetch_optional(&self.reads)
             .await?;
@@ -3499,6 +3524,9 @@ impl Database {
             Ok(musicata_core::dsp::OutputDspSelection {
                 profile_id: row.try_get("profile_id")?,
                 enabled: row.try_get("enabled")?,
+                correction_enabled: row.try_get("correction_enabled")?,
+                listening_profile_id: row.try_get("listening_profile_id")?,
+                listening_enabled: row.try_get("listening_enabled")?,
             })
         })
         .transpose()
@@ -3509,14 +3537,56 @@ impl Database {
         id: &str,
         selection: &musicata_core::dsp::OutputDspSelection,
     ) -> Result<()> {
-        sqlx::query("INSERT INTO player_dsp (player_id, profile_id, enabled) VALUES (?, ?, ?)
-            ON CONFLICT(player_id) DO UPDATE SET profile_id = excluded.profile_id, enabled = excluded.enabled")
-            .bind(id).bind(&selection.profile_id).bind(selection.enabled).execute(&self.pool).await?;
+        sqlx::query("INSERT INTO player_dsp (player_id, profile_id, enabled, correction_enabled, listening_profile_id, listening_enabled) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(player_id) DO UPDATE SET profile_id = excluded.profile_id, enabled = excluded.enabled, correction_enabled = excluded.correction_enabled, listening_profile_id = excluded.listening_profile_id, listening_enabled = excluded.listening_enabled")
+            .bind(id).bind(&selection.profile_id).bind(selection.enabled).bind(selection.correction_enabled).bind(&selection.listening_profile_id).bind(selection.listening_enabled).execute(&self.pool).await?;
         Ok(())
     }
 
+    pub async fn all_player_dsp(
+        &self,
+    ) -> Result<Vec<(String, musicata_core::dsp::OutputDspSelection)>> {
+        let rows = sqlx::query(
+            "SELECT player_id, profile_id, enabled, correction_enabled, listening_profile_id, listening_enabled FROM player_dsp",
+        )
+        .fetch_all(&self.reads)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("player_id")?,
+                    musicata_core::dsp::OutputDspSelection {
+                        profile_id: row.try_get("profile_id")?,
+                        enabled: row.try_get("enabled")?,
+                        correction_enabled: row.try_get("correction_enabled")?,
+                        listening_profile_id: row.try_get("listening_profile_id")?,
+                        listening_enabled: row.try_get("listening_enabled")?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
     pub async fn clear_dsp_profile_bindings(&self, profile_id: &str) -> Result<()> {
-        sqlx::query("UPDATE player_dsp SET profile_id=NULL, enabled=0 WHERE profile_id=?")
+        sqlx::query("UPDATE player_dsp SET
+                profile_id=CASE WHEN profile_id=? THEN NULL ELSE profile_id END,
+                correction_enabled=CASE WHEN profile_id=? THEN 0 ELSE correction_enabled END,
+                listening_profile_id=CASE WHEN listening_profile_id=? THEN NULL ELSE listening_profile_id END,
+                listening_enabled=CASE WHEN listening_profile_id=? THEN 0 ELSE listening_enabled END,
+                enabled=CASE WHEN (profile_id=? OR listening_profile_id=?)
+                    AND NOT ((profile_id IS NOT NULL AND profile_id != ? AND correction_enabled=1)
+                             OR (listening_profile_id IS NOT NULL AND listening_profile_id != ? AND listening_enabled=1))
+                    THEN 0 ELSE enabled END
+            WHERE profile_id=? OR listening_profile_id=?")
+            .bind(profile_id)
+            .bind(profile_id)
+            .bind(profile_id)
+            .bind(profile_id)
+            .bind(profile_id)
+            .bind(profile_id)
+            .bind(profile_id)
+            .bind(profile_id)
+            .bind(profile_id)
             .bind(profile_id)
             .execute(&self.pool)
             .await?;
@@ -4325,6 +4395,72 @@ impl Database {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Apply membership changes while holding SQLite's writer lock, so concurrent controllers
+    /// cannot both derive a replacement list from the same stale snapshot.
+    pub async fn edit_playlist_tracks(
+        &self,
+        expected_track_ids: Option<&[String]>,
+        id: &str,
+        add_track_ids: &[String],
+        remove_indices: &[usize],
+        now: i64,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let rows = sqlx::query(
+            "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut ids: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("track_id"))
+            .collect::<std::result::Result<_, sqlx::Error>>()?;
+        if expected_track_ids.is_some_and(|expected| ids != expected) {
+            return Ok(false);
+        }
+        let mut remove = remove_indices.to_vec();
+        remove.sort_unstable();
+        remove.dedup();
+        for index in remove.into_iter().rev() {
+            if index < ids.len() {
+                ids.remove(index);
+            }
+        }
+        ids.extend_from_slice(add_track_ids);
+        write_playlist_tracks(&mut *tx, id, &ids, now).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Replace a playlist only when its current ordered ids equal the caller's snapshot.
+    /// Returns false on a stale snapshot without changing the playlist.
+    pub async fn replace_playlist_tracks_if_current(
+        &self,
+        id: &str,
+        expected_track_ids: &[String],
+        track_ids: &[String],
+        now: i64,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let rows = sqlx::query(
+            "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let current: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("track_id"))
+            .collect::<std::result::Result<_, sqlx::Error>>()?;
+        if current != expected_track_ids {
+            return Ok(false);
+        }
+        write_playlist_tracks(&mut *tx, id, track_ids, now).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn delete_playlist(&self, id: &str) -> Result<()> {
@@ -5143,6 +5279,34 @@ fn source_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SourceRecord> {
         domain: row.try_get("domain")?,
         created_at_unix_seconds: row.try_get("created_at_unix_seconds")?,
     })
+}
+
+async fn write_playlist_tracks(
+    connection: &mut sqlx::SqliteConnection,
+    id: &str,
+    track_ids: &[String],
+    now: i64,
+) -> Result<()> {
+    sqlx::query("DELETE FROM playlist_tracks WHERE playlist_id = ?1")
+        .bind(id)
+        .execute(&mut *connection)
+        .await?;
+    for (position, track_id) in track_ids.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?1, ?2, ?3)",
+        )
+        .bind(id)
+        .bind(position as i64)
+        .bind(track_id)
+        .execute(&mut *connection)
+        .await?;
+    }
+    sqlx::query("UPDATE playlists SET updated_at_unix_seconds = ?2 WHERE id = ?1")
+        .bind(id)
+        .bind(now)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
 }
 
 fn playlist_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Playlist> {
@@ -6363,6 +6527,7 @@ mod tests {
         let selection = OutputDspSelection {
             profile_id: Some("headphones".into()),
             enabled: true,
+            ..Default::default()
         };
         database.set_player_dsp("output", &selection).await.unwrap();
         let reopened = Database::connect(&path).await.unwrap();
@@ -6377,6 +6542,106 @@ mod tests {
                 .set_player_dsp("missing", &OutputDspSelection::default())
                 .await
                 .is_err()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn clearing_one_dsp_profile_binding_preserves_the_other_layer() {
+        // A regression here makes deleting a correction preset also erase a user's separate
+        // listening adjustment.
+        let path = temp_db_path("output-dsp-selective-clear");
+        let database = Database::connect(&path).await.unwrap();
+        database
+            .upsert_player(&super::PlayerRecord {
+                id: "output".into(),
+                name: "Output".into(),
+                kind: "native".into(),
+                address: "local".into(),
+                zone_id: None,
+            })
+            .await
+            .unwrap();
+        database
+            .set_player_dsp(
+                "output",
+                &musicata_core::dsp::OutputDspSelection {
+                    profile_id: Some("room".into()),
+                    enabled: true,
+                    correction_enabled: true,
+                    listening_profile_id: Some("late-night".into()),
+                    listening_enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        database.clear_dsp_profile_bindings("room").await.unwrap();
+
+        assert_eq!(
+            database.player_dsp("output").await.unwrap(),
+            Some(musicata_core::dsp::OutputDspSelection {
+                profile_id: None,
+                enabled: true,
+                correction_enabled: false,
+                listening_profile_id: Some("late-night".into()),
+                listening_enabled: true,
+            })
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn migration_036_preserves_legacy_correction_checkpoint() {
+        use musicata_core::dsp::OutputDspSelection;
+        let path = temp_db_path("output-dsp-migration-036");
+        let database = Database::connect(&path).await.unwrap();
+        database
+            .upsert_player(&super::PlayerRecord {
+                id: "output".into(),
+                name: "Output".into(),
+                kind: "native".into(),
+                address: "local".into(),
+                zone_id: None,
+            })
+            .await
+            .unwrap();
+        database
+            .set_player_dsp(
+                "output",
+                &OutputDspSelection {
+                    profile_id: Some("legacy".into()),
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for column in [
+            "correction_enabled",
+            "listening_profile_id",
+            "listening_enabled",
+        ] {
+            sqlx::query(&format!("ALTER TABLE player_dsp DROP COLUMN {column}"))
+                .execute(&database.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("PRAGMA user_version = 35")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        drop(database);
+        let upgraded = Database::connect(&path).await.unwrap();
+        assert_eq!(
+            upgraded.player_dsp("output").await.unwrap(),
+            Some(OutputDspSelection {
+                profile_id: Some("legacy".into()),
+                enabled: true,
+                correction_enabled: true,
+                listening_profile_id: None,
+                listening_enabled: false,
+            })
         );
         let _ = std::fs::remove_file(path);
     }
@@ -7106,6 +7371,98 @@ mod tests {
             ["t1", "t2"],
             "a failed replace must not leave the playlist emptied or half-written"
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn playlist_track_edits_are_serialized_and_stale_reorders_are_rejected() {
+        // A controller can append while another removes: each edit must observe the previous
+        // committed result, not an out-of-transaction snapshot. A full reorder is different:
+        // it must fail rather than silently discard a newly appended track.
+        let db_path = temp_db_path("playlist-cas");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let playlist = database
+            .create_playlist("P", None, &["a".into(), "b".into()], 100)
+            .await
+            .expect("create playlist");
+
+        database
+            .edit_playlist_tracks(None, &playlist, &["c".into()], &[0], 101)
+            .await
+            .expect("append and remove atomically");
+        assert_eq!(
+            database.playlist_track_ids(&playlist).await.unwrap(),
+            ["b", "c"],
+        );
+
+        let removed = database
+            .edit_playlist_tracks(Some(&["a".into(), "b".into()]), &playlist, &[], &[0], 102)
+            .await
+            .expect("compare and swap remove");
+        assert!(
+            !removed,
+            "a stale removal must not target a shifted duplicate slot"
+        );
+        assert_eq!(
+            database.playlist_track_ids(&playlist).await.unwrap(),
+            ["b", "c"],
+        );
+
+        let replaced = database
+            .replace_playlist_tracks_if_current(
+                &playlist,
+                &["a".into(), "b".into()],
+                &["b".into(), "a".into()],
+                103,
+            )
+            .await
+            .expect("compare and swap");
+        assert!(
+            !replaced,
+            "a stale reorder must not overwrite the current items"
+        );
+        assert_eq!(
+            database.playlist_track_ids(&playlist).await.unwrap(),
+            ["b", "c"],
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn concurrent_playlist_appends_keep_both_new_tracks() {
+        let db_path = temp_db_path("playlist-concurrent-appends");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let playlist = database
+            .create_playlist("P", None, &["base".into()], 100)
+            .await
+            .expect("create playlist");
+
+        let first = database.clone();
+        let second = database.clone();
+        let first_playlist = playlist.clone();
+        let second_playlist = playlist.clone();
+        let (first_result, second_result) = tokio::join!(
+            async move {
+                first
+                    .edit_playlist_tracks(None, &first_playlist, &["first".into()], &[], 101)
+                    .await
+            },
+            async move {
+                second
+                    .edit_playlist_tracks(None, &second_playlist, &["second".into()], &[], 102)
+                    .await
+            },
+        );
+        assert!(first_result.expect("first append"));
+        assert!(second_result.expect("second append"));
+
+        let tracks = database.playlist_track_ids(&playlist).await.unwrap();
+        assert_eq!(tracks[0], "base", "appends must retain existing membership");
+        let mut appended = tracks[1..].to_vec();
+        appended.sort();
+        assert_eq!(appended, ["first", "second"]);
 
         let _ = std::fs::remove_file(db_path);
     }

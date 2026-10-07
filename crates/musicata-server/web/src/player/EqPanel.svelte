@@ -5,9 +5,17 @@
   import { outputAudio } from "../lib/outputAudio.svelte";
   import { audioDevices } from "../lib/audioDevices.svelte";
   import { api } from "../lib/api";
-  import { parseParametricEq } from "../lib/dsp";
+  import { parseParametricEq, newProfileId } from "../lib/dsp";
   import { responseCurveDb, logFreqs } from "../lib/eqcurve";
   import { loadIndex, searchIndex, fetchPreset, type AutoEqEntry } from "../lib/autoeq";
+  import { nav } from "../lib/nav.svelte";
+  import { session } from "../lib/session.svelte";
+
+  let {management = false}: {management?: boolean} = $props();
+  let editingId = $state<string | null>(null);
+  let savedMessage = $state("");
+  const selectedId = $derived(management ? editingId : dsp.activeId);
+  const profile = $derived(management ? dsp.profiles.find(p => p.id === selectedId) ?? null : dsp.effective ?? dsp.active);
 
   function addOutput() {
     audioDevices.addPreset(audioDevices.presets.length === 0 ? "Speakers" : "Headphones");
@@ -48,7 +56,9 @@
         return;
       }
       prof.kind = "headphones";
-      await dsp.saveProfile(prof);
+      if (management) prof.id = newProfileId();
+      await dsp.saveProfile(prof, !management);
+      if (management) {editingId = prof.id; savedMessage = `Saved ${prof.name}. Choose it from the playback EQ controls when ready.`;}
       hpSearch = "";
     } catch {
       hpError = "Couldn't download that preset from AutoEq. Try again, or paste one below.";
@@ -58,29 +68,32 @@
   // Room correction: a speakers profile (no EQ bands needed) that carries a measured WAV
   // impulse response, applied via a ConvolverNode in the browser graph.
   async function newRoomProfile() {
+    const id = newProfileId();
     await dsp.saveProfile({
-      id: `room-${Date.now().toString(36)}`,
+      id,
       name: "Room correction",
       preampDb: 0,
       bands: [],
       kind: "speakers",
-    });
+    }, !management);
+    if (management) editingId = id;
   }
   async function uploadRoomIr(event: Event) {
     const file = (event.currentTarget as HTMLInputElement).files?.[0];
-    const id = dsp.activeId;
+    const id = selectedId;
     if (!file || !id) return;
     await api.uploadRoomIr(id, await file.arrayBuffer());
     await dsp.load(); // profile.roomIr now set → the App $effect re-applies → convolver loads
   }
   async function clearRoomIr() {
-    const id = dsp.activeId;
+    const id = selectedId;
     if (!id) return;
     await api.deleteRoomIr(id);
     await dsp.load();
   }
 
   let importName = $state("");
+  let importKind = $state<"headphones" | "speakers" | "listening">("headphones");
   let importText = $state("");
   let importError = $state("");
 
@@ -93,7 +106,7 @@
   const CW = 280;
   const CH = 116;
   const PADX = 6;
-  const curve = $derived(dsp.active ? responseCurveDb(dsp.active, FREQS) : null);
+  const curve = $derived(profile ? responseCurveDb(profile, FREQS) : null);
   const range = $derived(
     curve ? Math.min(24, Math.max(6, Math.ceil(Math.max(...curve.map((d) => Math.abs(d)))))) : 12,
   );
@@ -118,26 +131,35 @@
 
   async function doImport() {
     importError = "";
-    const name = importName.trim() || "Imported preset";
-    const prof = await dsp.importText(importText, name);
-    if (!prof) {
-      importError =
-        "No filters found. Paste a ParametricEQ.txt — lines like 'Filter 1: ON PK Fc 100 Hz Gain 3 dB Q 1'.";
-      return;
+    savedMessage = "";
+    try {
+      const name = importName.trim() || "Imported preset";
+      const prof = await dsp.importText(importText, name, !management, importKind);
+      if (!prof) {
+        importError = "No filters found. Paste a ParametricEQ.txt — lines like 'Filter 1: ON PK Fc 100 Hz Gain 3 dB Q 1'.";
+        return;
+      }
+      importName = "";
+      importText = "";
+      if (management) {
+        editingId = prof.id;
+        savedMessage = `Saved ${prof.name}. Current playback is unchanged.`;
+      }
+    } catch (error) {
+      importError = `Could not save profile: ${String(error)}`;
     }
-    importName = "";
-    importText = "";
   }
+
 </script>
 
-{#if dsp.panelOpen}
-  <section class="eq-drawer" aria-label="Equalizer">
+{#if management || dsp.panelOpen}
+  <section class="eq-drawer" class:profile-management={management} data-profile-management={management || undefined} aria-label={management ? "Sound profiles" : "Equalizer"}>
     <header class="eq-head">
-      <strong>Equalizer</strong>
-      <button class="ghost-button" type="button" onclick={() => (dsp.panelOpen = false)}>Close</button>
+      <strong>{management ? "Sound profiles" : "Equalizer"}</strong>
+      {#if !management}<button class="ghost-button" type="button" onclick={() => (dsp.panelOpen = false)}>Close</button>{/if}
     </header>
 
-    {#if player.isBrowserOutput}
+    {#if !management && player.isBrowserOutput}
     <label class="eq-field">
       <span>Volume leveling</span>
       <select
@@ -159,32 +181,59 @@
     {/if}
     <div class="eq-divider"></div>
 
+    {#if !management}
     <label class="eq-toggle">
       <input
         type="checkbox"
         checked={dsp.enabled}
         onchange={(e) => dsp.setEnabled((e.currentTarget as HTMLInputElement).checked)}
       />
-      <span>Enable equalizer</span>
+      <span>Enable sound processing</span>
     </label>
     {#if dsp.error || outputAudio.state?.error}<p role="alert">{dsp.error || outputAudio.state?.error}</p>{/if}
     {#if outputAudio.state?.measurement_point === "snapcast_stream"}<p class="eq-note">EQ affects every client receiving this shared stream.</p>{/if}
     <p class="eq-note">{outputAudio.name || "Selected output"} · {outputAudio.state?.status ?? "Unavailable"}</p>
+    {:else}<p class="eq-note">Create and manage profiles here. Saving a new profile leaves the current playback selection unchanged.</p>{/if}
 
     <label class="eq-field">
-      <span>Preset</span>
+      <span>{management ? "Profile to manage" : "Equipment correction"}</span>
       <select
-        value={dsp.activeId ?? ""}
-        onchange={(e) => dsp.setActive((e.currentTarget as HTMLSelectElement).value || null)}
+        data-correction-select={!management || undefined}
+        value={selectedId ?? ""}
+        onchange={(e) => {const id = (e.currentTarget as HTMLSelectElement).value || null; if (management) editingId = id; else dsp.setActive(id);}}
       >
         <option value="">None</option>
-        {#each dsp.profiles as p (p.id)}
+        {#each dsp.profiles.filter(p => management || p.kind !== "listening") as p (p.id)}
           <option value={p.id}>{p.name}</option>
         {/each}
       </select>
     </label>
 
-    {#if dsp.active && curve}
+    {#if !management}
+      <label class="eq-toggle">
+        <input data-correction-enabled type="checkbox" checked={dsp.correctionEnabled && !!dsp.activeId} disabled={!dsp.activeId}
+          onchange={e => dsp.setCorrectionEnabled(e.currentTarget.checked)} />
+        <span>Apply equipment correction</span>
+      </label>
+      <label class="eq-field">
+        <span>Listening adjustment</span>
+        <select data-listening-select value={dsp.listeningId ?? ""}
+          onchange={e => dsp.setListening(e.currentTarget.value || null)}>
+          <option value="">Neutral</option>
+          {#each dsp.profiles.filter(p => !p.roomIr && (p.kind === "listening" || !p.kind)) as p (p.id)}
+            <option value={p.id}>{p.name}</option>
+          {/each}
+        </select>
+      </label>
+      <label class="eq-toggle">
+        <input data-listening-enabled type="checkbox" checked={dsp.listeningEnabled} disabled={!dsp.listeningId}
+          onchange={e => dsp.setListeningEnabled(e.currentTarget.checked)} />
+        <span>Apply listening adjustment</span>
+      </label>
+      <p class="eq-note">Correction matches your equipment. Listening adjustments change the music's tone. Each layer can be bypassed independently; both are remembered for this output.</p>
+    {/if}
+
+    {#if profile && curve}
       <div class="eq-curve-wrap">
         <svg viewBox={`0 0 ${CW} ${CH}`} class="eq-curve" role="img" aria-label="EQ response curve">
           <line x1={PADX} y1={CH / 2} x2={CW - PADX} y2={CH / 2} class="eq-grid-0" />
@@ -199,12 +248,12 @@
       </div>
       <div class="eq-bands">
         <div class="eq-band-head">
-          Preamp {dsp.active.preampDb.toFixed(1)} dB · {dsp.active.bands.length} band{dsp.active.bands
+          Preamp {profile.preampDb.toFixed(1)} dB · {profile.bands.length} band{profile.bands
             .length === 1
             ? ""
             : "s"}
         </div>
-        {#each dsp.active.bands as b, i (i)}
+        {#each profile.bands as b, i (i)}
           <div class="eq-band">
             <span class="eq-b-type">{bandLabel(b.type)}</span>
             <span>{b.freq} Hz</span>
@@ -212,14 +261,16 @@
             <span class="eq-b-q">Q {b.q}</span>
           </div>
         {/each}
-        {#if dsp.isCustom(dsp.activeId)}
-          <button class="ghost-button" type="button" onclick={() => dsp.remove(dsp.activeId!)}>
+        {#if management && dsp.isCustom(selectedId) && !dsp.isBuiltIn(selectedId)}
+          <button class="ghost-button" type="button" onclick={() => selectedId && dsp.remove(selectedId)}>
             Delete preset
           </button>
         {/if}
       </div>
     {/if}
 
+    {#if management}
+    {#if savedMessage}<p class="eq-note" role="status">{savedMessage}</p>{/if}
     {#if player.isBrowserOutput}
     <details class="eq-import">
       <summary>Outputs (speakers / headphones)</summary>
@@ -275,10 +326,10 @@
         Apply a measured room-correction filter (a WAV impulse response from REW/DRC). Stereo;
         corrects bass/low-mids. Create a profile, then upload its IR.
       </p>
-      {#if dsp.activeId && dsp.isCustom(dsp.activeId)}
-        {#if dsp.active?.roomIr}
+      {#if selectedId && dsp.isCustom(selectedId) && !dsp.isBuiltIn(selectedId) && profile?.kind !== "listening"}
+        {#if profile?.roomIr}
           <p class="eq-note">
-            Impulse response loaded ({dsp.active.roomIr.sampleRate || "?"} Hz).
+            Impulse response loaded ({profile.roomIr.sampleRate || "?"} Hz).
           </p>
           <button class="ghost-button" type="button" onclick={clearRoomIr}>Remove impulse response</button>
         {:else}
@@ -298,9 +349,9 @@
     <details class="eq-import" ontoggle={(e) => e.currentTarget.open && ensureIndex()}>
       <summary>Pick your headphone (AutoEq)</summary>
       <p class="eq-note">
-        Zero-effort correction — pick your model and it's applied instantly. Presets are
+        Pick your model to save a correction profile. Presets are
         downloaded from the AutoEq project as you pick them, so this needs an internet
-        connection. They target a preference curve, so nudge the bass to taste.
+        connection. Choose the saved profile from the playback EQ controls when ready.
       </p>
       <input
         class="eq-name"
@@ -330,12 +381,20 @@
     </details>
 
     <details class="eq-import">
-      <summary>Import a headphone preset</summary>
+      <summary>Import a sound profile</summary>
       <p class="eq-note">
-        Find your headphone on <strong>autoeq.app</strong> (or the AutoEq project) and paste its
-        ParametricEQ text below.
+        Paste ParametricEQ text from a measurement or your own filters. Choose whether it
+        corrects equipment or is a listening adjustment, such as extra bass for techno.
       </p>
       <input class="eq-name" type="text" placeholder="Preset name (e.g. HD 600)" bind:value={importName} />
+      <label class="eq-field">
+        <span>Profile purpose</span>
+        <select data-profile-purpose bind:value={importKind}>
+          <option value="headphones">Headphone correction</option>
+          <option value="speakers">Speaker / room correction</option>
+          <option value="listening">Listening adjustment</option>
+        </select>
+      </label>
       <textarea
         class="eq-text"
         rows="6"
@@ -344,12 +403,16 @@
         bind:value={importText}
       ></textarea>
       {#if importError}<p class="eq-error">{importError}</p>{/if}
-      <button class="primary-button" type="button" onclick={doImport}>Import &amp; apply</button>
+      <button class="primary-button" type="button" onclick={doImport}>Save profile</button>
     </details>
+    {:else if session.isAdmin}
+      <button type="button" class="ghost-button" onclick={() => nav.push({name: "settings", category: "sound"})}>Manage sound profiles</button>
+    {/if}
   </section>
 {/if}
 
 <style>
+  .profile-management { position: static; width: 100%; max-height: none; }
   .hp-matches {
     list-style: none;
     margin: 0.4rem 0 0;

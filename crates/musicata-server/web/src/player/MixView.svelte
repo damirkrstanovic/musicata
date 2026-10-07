@@ -6,6 +6,20 @@
   import { player } from "../lib/player.svelte";
   import { playQueueIndex } from "../lib/playback";
   import { initial } from "../lib/dom";
+  import { api } from "../lib/api";
+  import { nav } from "../lib/nav.svelte";
+  import { promptText } from "../lib/modal";
+
+  async function saveMix() {
+    const trackIds = player.queue.flatMap((item) => item.track_id ? [item.track_id] : []);
+    if (!trackIds.length) return;
+    const name = await promptText({ title: "Save mix as playlist", label: "Name", confirmLabel: "Save" });
+    if (!name) return;
+    const playlist = await api.createPlaylist(name, trackIds);
+    if (playlist) {
+      nav.push({ name: "playlist", id: playlist.id, label: playlist.name });
+    }
+  }
 </script>
 
 {#if radioMix.active && radioMix.matches(player.target)}
@@ -13,6 +27,7 @@
     <div class="hero-info">
       <h2 class="hero-title">Mix</h2>
       <p class="hero-sub">{radioMix.seed ? `Sounds like ${radioMix.seed} · ` : ""}{player.queue.length} tracks</p>
+        <button class="ghost-button save-mix-playlist" type="button" disabled={!player.queue.some((item) => item.track_id)} onclick={saveMix}>Save as playlist</button>
       {#if radioMix.loading}<p class="admin-hint" data-mix-status="loading" role="status" aria-live="polite">Finding more tracks…</p>{/if}
       {#if player.queueActivity}<p class="admin-hint" data-mix-status="activity" role="status" aria-live="polite">{player.queueActivity}</p>{/if}
       {#if radioMix.empty}<p class="admin-hint" data-mix-status="empty">No tracks found for this mix.</p>{/if}

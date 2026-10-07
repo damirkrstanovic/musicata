@@ -366,7 +366,14 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
         }
         return AppError::unauthorized("sign in to continue").into_response();
     };
-    if is_admin_path(&path) && !user.is_admin() {
+    if (is_admin_path(&path)
+        || (path.starts_with("/api/dsp/profiles")
+            && !matches!(
+                *request.method(),
+                axum::http::Method::GET | axum::http::Method::HEAD
+            )))
+        && !user.is_admin()
+    {
         return AppError::forbidden("administrator access required").into_response();
     }
     request.extensions_mut().insert(user);

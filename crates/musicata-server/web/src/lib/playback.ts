@@ -55,6 +55,19 @@ export function playQueueIndex(index: number): void {
   void sendCommand(target, { command: "play_queue_index", index });
 }
 
+/** Append tracks without interrupting the current queue or taking browser audio output. */
+export async function enqueueTracks(tracks: TrackRow[]): Promise<boolean> {
+  if (!player.target || !tracks.length) return false;
+  return sendCommand(player.target, { command: "enqueue", track_ids: tracks.map((track) => track.id) });
+}
+
+/** Queue one track immediately after the current item without interrupting playback. */
+export async function playNext(track: TrackRow): Promise<boolean> {
+  const target = player.target;
+  if (!target) return false;
+  return sendCommand(target, { command: "enqueue", track_ids: [track.id], next: true });
+}
+
 // ---- Transport verbs ----
 // EVERY playback-affecting command goes through these so no caller can forget the "claim +
 // prime the browser output inside the gesture" ritual. Sending a raw `play`/`next`/… command

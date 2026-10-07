@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Browser history is the source of truth for routes and temporary playback/drawer views.
+import type { SettingsCategory } from "./settings-nav";
 export type Route =
   | { name: "tracks" }
   | { name: "library" }
@@ -8,6 +9,8 @@ export type Route =
   | { name: "playlists" }
   | { name: "radio" }
   | { name: "mix" }
+  | { name: "queue" }
+  | { name: "settings"; category: SettingsCategory }
   | { name: "album"; id: string; title: string }
   | { name: "artist"; id: string; label: string }
   | { name: "playlist"; id: string; label: string }
@@ -45,7 +48,7 @@ class Nav {
       const saved = localStorage.getItem("musicata.browse-view");
       if (saved === "library" || saved === "tracks" || saved === "artists") this.browseView = saved;
     } catch { /* Browsing still works when storage is unavailable. */ }
-    this.initial = { name: this.browseView };
+    this.initial = location.pathname === "/admin" ? {name: "settings", category: "sources"} : { name: this.browseView };
     history.scrollRestoration = "manual";
     window.addEventListener("scroll", this.rememberScroll, true);
     window.addEventListener("wheel", this.cancelScrollRestore, {passive: true});
@@ -156,3 +159,9 @@ class Nav {
 }
 
 export const nav = new Nav();
+
+export function activityFor(route: Route): "browse" | "listen" | "settings" {
+  if (route.name === "settings") return "settings";
+  if (["queue", "playlists", "playlist", "smart", "radio", "mix"].includes(route.name)) return "listen";
+  return "browse";
+}

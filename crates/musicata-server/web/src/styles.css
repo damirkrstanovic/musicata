@@ -560,13 +560,24 @@ h1 {
   text-align: right;
 }
 
-/* Per-row actions: favorite heart, add/remove, metadata. */
+/* Per-row listening and playlist actions. */
 .track-actions {
   display: flex;
+  flex-wrap: wrap;
+  max-width: min(22rem, 100%);
   align-items: center;
   gap: 2px;
   justify-self: end;
   padding-right: 6px;
+}
+
+.track-add-playlist {
+  max-width: 16ch;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.3rem;
 }
 
 .icon-toggle {
@@ -2123,6 +2134,13 @@ h1 {
   display: none;
 }
 
+/* Listen embeds its queue in the content column, rather than a right-rail overlay. */
+.content .queue-drawer.embedded {
+  position: static;
+  inset: auto;
+  background: var(--panel);
+}
+
 @keyframes queue-rise {
   from {
     transform: translateY(12px);
@@ -2400,6 +2418,18 @@ body.admin {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 20px;
+}
+
+.listen-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 20px;
+}
+
+.listen-tabs [aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .admin-panel {
@@ -3442,6 +3472,7 @@ body.admin {
   .right-rail.overlay-open { z-index: 75; }
   .right-rail .queue-drawer { padding-bottom: env(safe-area-inset-bottom); }
   .queue-head { padding: 10px; gap: 8px; flex-wrap: wrap; }
+  .queue-head-actions { max-width: 100%; flex-wrap: wrap; }
   .queue-list { padding-inline: 4px; }
   .queue-row { gap: 6px; padding-inline: 4px; }
   .queue-row .q-art { display: none; }

@@ -6,6 +6,7 @@
 // Args: <port> <basePath> <mode=behavior|scale>. Assumes Chrome CDP on :9222. Exits
 // non-zero on any failed assertion.
 import { radioFlows } from "./radio-flows.mjs";
+import { curationFlows } from "./curation-flows.mjs";
 
 const PORT = process.argv[2];
 const PATH = process.argv[3] || "/v2";
@@ -117,8 +118,14 @@ const send = (method, params = {}) =>
   new Promise((res) => (pending.set(++id, res), ws.send(JSON.stringify({ id, method, params }))));
 const js = async (expr) =>
   (await send("Runtime.evaluate", { expression: expr, returnByValue: true })).result?.value;
-const clickText = (sel, text) =>
-  js(`[...document.querySelectorAll(${JSON.stringify(sel)})].find(b=>b.textContent.trim()===${JSON.stringify(text)})?.click()`);
+const clickText = async (sel, text) => {
+  // Browse tabs are contextual now: leave Listen before choosing a library segment.
+  if (sel === '.seg' && !await js(`document.querySelector('.seg')`)) {
+    await js(`document.querySelector('[data-activity="browse"]')?.click()`);
+    await waitUntil(`document.querySelector('.seg')`, 2000);
+  }
+  return js(`[...document.querySelectorAll(${JSON.stringify(sel)})].find(b=>b.textContent.trim()===${JSON.stringify(text)})?.click()`);
+};
 // Poll `boolExpr` (evaluated in the page) until true, returning the elapsed ms, or Infinity if it
 // never became true within `budgetMs`. Used for the latency checks below. Coarse by design — the
 // value includes CDP round-trips + the poll granularity — so budgets are generous.
@@ -187,9 +194,9 @@ if (MODE === "behavior") {
   await clickText('.library-nav button', 'Playlists');
   await sleep(400);
   check('desktop exposes saved playlists destination', await js(`document.querySelectorAll('.saved-playlist').length > 0`));
-  await clickText('.library-nav button', 'Library');
+  await clickText('.library-nav button', 'Browse');
   await sleep(400);
-  check('Library returns to preferred browsing view', await js(`document.querySelectorAll('.artist-card').length > 0`));
+  check('Browse returns to preferred browsing view', await js(`document.querySelectorAll('.artist-card').length > 0`));
   await js(`document.querySelector('.now-title-button')?.click()`);
   await sleep(300);
   check('desktop title opens Now Playing beside the library', await js(`document.querySelector('.shell').classList.contains('np-open') && !!document.querySelector('.right-rail .queue-drawer') && document.querySelector('.content').getBoundingClientRect().right <= document.querySelector('.right-rail').getBoundingClientRect().left + 1`));
@@ -471,6 +478,10 @@ check(
 );
 await js(`document.querySelector('section[aria-label="Listening stats"] .ghost-button')?.click()`);
 // AutoEq picker: search the bundled curated set + pick a real model → it becomes a saved profile.
+await clickText('.eq-head button', 'Close');
+await js(`document.querySelector('[data-activity="settings"]')?.click()`);
+await js(`document.querySelector('[data-settings-category="sound"]')?.click()`);
+await waitUntil(`document.querySelector('[data-profile-management]')`, 2000);
 await js(`(()=>{
   const d=[...document.querySelectorAll('details.eq-import')].find(x=>x.querySelector('summary')?.textContent.includes('Pick your headphone'));
   if(d){ d.open=true; const i=d.querySelector('input'); if(i){ i.value='HD 600'; i.dispatchEvent(new Event('input',{bubbles:true})); } }
@@ -490,7 +501,8 @@ check(
 );
 
 await js(`(()=>{const s=document.querySelector('.eq-field select'); if(s){s.value=''; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
-await clickText(".eq-head button", "Close");
+await js(`document.querySelector('[data-activity="browse"]')?.click()`);
+await clickText('.seg', 'Tracks');
 await sleep(300);
 
 // Output switcher: the seeded presets render in the footer; switching to "Headphones" applies
@@ -689,6 +701,22 @@ if (appendTrack) {
       JSON.stringify(afterSelection?.queue?.slice(0, originalIds.length).map((item) => item.track_id)) === JSON.stringify(originalIds),
     `position ${afterSelection?.queue_position}, queue ${originalIds.length} -> ${afterSelection?.queue?.length}`,
   );
+  const mixQueueTitles = await js(`[...document.querySelectorAll('.mix-queue .q-title')].map(row => row.textContent)`);
+  const saveMix = await js(`!!document.querySelector('.save-mix-playlist:not(:disabled)')`);
+  check("mix queue can be saved as a playlist", saveMix);
+  if (saveMix) {
+    await js(`document.querySelector('.save-mix-playlist')?.click()`);
+    await waitUntil(`document.querySelector('.modal input[name=value]')`, 1000);
+    await js(`(() => { const input = document.querySelector('.modal input[name=value]'); if (input) { input.value = 'Smoke saved mix'; input.form.requestSubmit(); } })()`);
+    const savedMix = await waitUntil(`document.querySelector('.hero-title')?.textContent === 'Smoke saved mix'`, 3000) < Infinity;
+    check("saving mix opens its playlist", savedMix);
+    check("saved mix is not covered by the queue drawer", savedMix && !(await js(`document.querySelector('.queue-drawer')`)));
+    const savedMixList = await api('/api/playlists');
+    const savedMixDetail = savedMixList?.find((playlist) => playlist.name === 'Smoke saved mix');
+    const savedMixTracks = savedMixDetail && await api(`/api/playlists/${savedMixDetail.id}`);
+    check("saved mix preserves queue order", !!savedMixTracks && JSON.stringify(savedMixTracks.tracks.map((track) => track.title)) === JSON.stringify(mixQueueTitles));
+    await clickText('.seg', 'Tracks');
+  }
 }
 
 // A held older response must not replace a newer radio request, or spill onto a newly selected
@@ -746,6 +774,7 @@ await sleep(900);
 check("radio play sets now-playing", /smoke fm/i.test((await js(`document.querySelector('#now-title')?.textContent`)) || ""));
 
 await radioFlows({js, api, check, waitUntil, clickText, screenshot: mobileScreenshot});
+if (MODE === "behavior") await curationFlows({js, api, check, waitUntil, clickText});
 
 // Zone: switch the output to the zone (which holds the browser player) and play.
 await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>/zone/i.test(o.textContent)); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
@@ -925,7 +954,8 @@ for (const [width, height] of [[360, 800], [800, 360], [320, 568]]) {
   check(`${label}: now playing closes`, await tapMobile('[aria-label="Close Now Playing"]'));
   check(`${label}: navigation opens`, await tapMobile('[aria-label="Open navigation"]'));
   check(`${label}: covered content cannot take focus`, await js(`document.querySelector('.content').inert && document.querySelector('.right-rail').inert`));
-  check(`${label}: saved playlist is tappable`, await tapMobile('.playlist-list .nav-link', true));
+  await js(`[...document.querySelectorAll('.playlist-list .nav-link')].find(button=>button.textContent.trim()==='Phone playlist')?.setAttribute('data-smoke-playlist','phone')`);
+  check(`${label}: saved playlist is tappable`, await tapMobile('[data-smoke-playlist=phone]', true));
   check(`${label}: saved playlist opens and closes navigation`, await waitUntil(`document.querySelector('.hero-title')?.textContent === 'Phone playlist' && document.querySelector('.hero-sub')?.textContent === '2 tracks' && !document.querySelector('.shell').classList.contains('nav-open')`, 2000) < Infinity);
   await tapMobile('[aria-label="Open navigation"]');
   check(`${label}: navigation closes`, await tapMobile('[aria-label="Close navigation"]'));
@@ -999,6 +1029,8 @@ check("mobile: no uncaught exceptions", exceptions.length === 0, exceptions.slic
 // Local diagnostics are available without shell or system-log access.
 await send("Emulation.setDeviceMetricsOverride", {width: 1280, height: 900, deviceScaleFactor: 1, mobile: false});
 await send("Page.navigate", {url: base + "/admin"});
+await waitUntil(`document.querySelector('[data-settings-category="system"]')`, 5000);
+await js(`document.querySelector('[data-settings-category="system"]')?.click()`);
 check("diagnostics: Settings panel appears", await waitUntil(`document.querySelector('[data-diagnostics]')`, 5000) < Infinity);
 check("diagnostics: controls finish loading",await waitUntil(`Array.from(document.querySelectorAll('[data-diagnostics] button')).some(button=>button.textContent.includes('Record more detail'))`,3000)<Infinity);
 await clickText('[data-diagnostics] button', 'Record more detail for 15 minutes');
@@ -1021,5 +1053,7 @@ if (process.env.MUSICATA_UI_SCREENSHOTS) {
 
 check("no CSP violations", cspViolations.length === 0, cspViolations.slice(0, 3).join(" | "));
 console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);
+// Release this renderer before the next independent activity-flow tab claims the output.
+await fetch(`http://127.0.0.1:9222/json/close/${target.id}`);
 ws.close();
 process.exit(failures ? 1 : 0);

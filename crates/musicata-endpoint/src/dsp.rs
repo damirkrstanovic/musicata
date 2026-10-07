@@ -222,6 +222,27 @@ mod tests {
     }
 
     #[test]
+    fn composed_preamp_changes_native_pcm_by_the_sum_of_both_layers() {
+        // A regression here applies only one enabled layer to a native output.
+        let (control, registrations) = Control::new();
+        let profile = musicata_core::dsp::DspProfile {
+            id: "room".into(),
+            name: "Room plus listening".into(),
+            preamp_db: -12.0,
+            bands: vec![],
+            kind: None,
+            room_ir: None,
+        };
+        *control.desired.lock().unwrap() = Some((8, Ok(Some(profile))));
+        let mut source =
+            DspSource::new(SamplesBuffer::new(2, 48_000, vec![0.5f32, 0.5]), control).unwrap();
+        let _registration = registrations.recv().unwrap();
+
+        assert!((source.next().unwrap() - 0.125_594_32).abs() < 1e-6);
+        assert!((source.next().unwrap() - 0.125_594_32).abs() < 1e-6);
+    }
+
+    #[test]
     fn mono_maps_to_stereo_and_meters_final_gain() {
         let (control, registrations) = Control::new();
         control.set_volume(50);

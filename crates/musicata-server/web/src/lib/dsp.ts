@@ -5,6 +5,8 @@
 // either from a built-in demo preset or by importing a headphone preset from autoeq.app /
 // the AutoEq project. Browser-output only; the CamillaDSP/DAC path reuses the same model.
 
+import presets from "./dsp-presets.json";
+
 export type EqBandType = "peaking" | "lowshelf" | "highshelf";
 
 export interface EqBand {
@@ -23,9 +25,14 @@ export interface EqProfile {
   preampDb: number;
   bands: EqBand[];
   /** "headphones" | "speakers" — drives the output switcher; room IR only on speakers. */
-  kind?: "headphones" | "speakers";
+  kind?: "headphones" | "speakers" | "listening";
   /** Set when a room-correction WAV impulse response is stored for this profile (speakers). */
   roomIr?: { sampleRate: number };
+}
+
+/** New library profiles have their own identity, even when names or measurements match. */
+export function newProfileId(): string {
+  return `eq-${Array.from(crypto.getRandomValues(new Uint32Array(4)), value => value.toString(16).padStart(8, "0")).join("")}`;
 }
 
 // AutoEq/REW filter-type tokens → biquad kind. PK = peaking, LSC/LS = low shelf, HSC/HS = high
@@ -83,27 +90,4 @@ export function parseParametricEq(text: string, name = "Imported preset"): EqPro
 
 // Generic demo presets so the engine is immediately audible without an import. These are NOT
 // model-specific corrections — real headphone correction comes from importing an AutoEq preset.
-export const BUILT_IN_PROFILES: EqProfile[] = [
-  {
-    id: "demo-bass",
-    name: "Bass boost (demo)",
-    preampDb: -4,
-    bands: [{ type: "lowshelf", freq: 100, gain: 6, q: 0.7 }],
-  },
-  {
-    id: "demo-vshape",
-    name: "V-shape (demo)",
-    preampDb: -5,
-    bands: [
-      { type: "lowshelf", freq: 90, gain: 5, q: 0.7 },
-      { type: "peaking", freq: 900, gain: -3, q: 1.0 },
-      { type: "highshelf", freq: 6000, gain: 4, q: 0.7 },
-    ],
-  },
-  {
-    id: "demo-warm",
-    name: "Warm / treble cut (demo)",
-    preampDb: 0,
-    bands: [{ type: "highshelf", freq: 5000, gain: -4, q: 0.7 }],
-  },
-];
+export const BUILT_IN_PROFILES: EqProfile[] = presets as EqProfile[];

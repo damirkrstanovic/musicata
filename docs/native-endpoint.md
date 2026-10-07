@@ -113,6 +113,12 @@ channel (`/api/players/{id}/state` → 200) while a wrong/absent token is reject
 
 ## EQ and output levels
 
+Equipment correction and listening adjustments are selected independently per output in the
+web controller. The endpoint receives one composed profile (combined bands and summed preamp),
+so switching a listening preset preserves the measured correction. Either layer or the complete
+processing chain can be bypassed without deleting its selection.
+
+
 The endpoint connects a separate scoped `/api/players/{id}/audio/ws` worker, so transport-thread
 track downloads do not block live correction or meter reporting. Mono sources map to stereo;
 stereo channels stay separate, and other layouts are rejected. The shared core PEQ/preamp runs

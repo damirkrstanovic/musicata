@@ -8,6 +8,32 @@ Date: 2026-06-07
 > signal-path badge are still open — see roadmap M11 for the current state. Read the rest
 > as the design behind what shipped.
 
+## Correction and listening adjustments
+
+Each output remembers two independent layers: equipment correction and a listening adjustment.
+Import measured headphone/speaker profiles under **Settings → Sound profiles**. For a tone
+preset, choose **Listening adjustment** as the import purpose; the built-in **Techno bass**
+provides a starting point. Saving a new profile does not change playback.
+
+Open the playback EQ controls to choose or bypass either layer. **Neutral** removes the
+listening adjustment while keeping equipment correction. The master processing switch bypasses
+both without discarding their selections. Snapcast controls affect every client of the shared
+stream. Volume leveling remains a separate browser playback control.
+
+The server combines enabled layers into one validated profile: correction bands followed by
+listening bands, summed preamp, and the correction's optional room impulse response. Browser,
+native, MPD/CamillaDSP and Snapcast renderers consume this same effective configuration.
+Room impulse responses remain limited to outputs advertising convolution support; a listening
+adjustment cannot contain an impulse response. Composition respects the existing filter-count
+and gain limits. Raw stored profiles remain separate and unchanged.
+
+Upgrades retain the old selection as equipment correction with no listening adjustment.
+Legacy browser-only profiles remain stored locally until an administrator signs in on that
+browser to import them; unavailable profiles are bypassed with an explanation.
+Deleting or losing one profile bypasses its layer; another valid selected layer continues.
+The original master `enabled` field and composed `profile` remain compatible with renderers
+that understand the earlier single-profile protocol.
+
 ## Context
 
 Milestone 11 reserves a **per-zone DSP pipeline** and names CamillaDSP as the engine.
