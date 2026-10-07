@@ -5,7 +5,7 @@ import type { EqProfile } from "./dsp";
 import type { BrowserAudio } from "./audio";
 import { reportDiagnostic,setDiagnosticRendererToken } from "./diagnostics";
 
-export interface AudioConfig { state: OutputDspState; profile: EqProfile | null; meter_subscribed: boolean }
+export interface AudioConfig { state: OutputDspState; profile: EqProfile | null; correction_profile: EqProfile | null; listening_profile: EqProfile | null; meter_subscribed: boolean }
 interface AudioFrame {
   type: string;
   reporter_token?:string;

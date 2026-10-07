@@ -278,9 +278,12 @@ export const api = {
   // Playlists, smart playlists, favorites
   playlists: () => getJson<Playlist[]>("/api/playlists"),
   playlistDetail: (id: string) => getJson<PlaylistDetail>(`/api/playlists/${encodeURIComponent(id)}`),
-  createPlaylist: (name: string) => sendJson<Playlist>("/api/playlists", "POST", { name }),
+  createPlaylist: (name: string, trackIds: string[] = []) =>
+    sendJson<Playlist>("/api/playlists", "POST", { name, track_ids: trackIds }),
+  updatePlaylist: (id: string, patch: { name?: string; track_ids?: string[]; expected_track_ids?: string[]; remove_indices?: number[] }) =>
+    sendJson<PlaylistDetail>(`/api/playlists/${encodeURIComponent(id)}`, "PATCH", patch),
   addToPlaylist: (id: string, trackIds: string[]) =>
-    sendJson(`/api/playlists/${encodeURIComponent(id)}`, "PATCH", { add_track_ids: trackIds }),
+    sendJson<PlaylistDetail>(`/api/playlists/${encodeURIComponent(id)}`, "PATCH", { add_track_ids: trackIds }),
   deletePlaylist: (id: string) => sendJson(`/api/playlists/${encodeURIComponent(id)}`, "DELETE"),
   smartPlaylists: () => getJson<SmartPlaylist[]>("/api/smart-playlists"),
   smartPlaylistDetail: (id: string) =>

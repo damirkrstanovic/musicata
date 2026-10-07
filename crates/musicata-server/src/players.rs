@@ -1579,10 +1579,24 @@ async fn apply_command(
             }
             Ok(())
         }
-        PlayerCommand::Enqueue { track_ids } => {
+        PlayerCommand::Enqueue { track_ids, next } => {
             let urls = resolve_urls(database, public_base_url, track_ids, stream_auth).await?;
-            for url in &urls {
-                connection.add(url).await?;
+            if *next {
+                let playback = connection.playback_state().await?;
+                let insert_at = playback.queue_position.map_or(0, |position| position + 1);
+                let appended_at = playback.queue.len();
+                for url in &urls {
+                    connection.add_next(url).await?;
+                }
+                for offset in 0..urls.len() {
+                    connection
+                        .move_item(appended_at + offset, insert_at + offset)
+                        .await?;
+                }
+            } else {
+                for url in &urls {
+                    connection.add(url).await?;
+                }
             }
             Ok(())
         }
@@ -2180,7 +2194,10 @@ impl ZonePlayer {
         };
         self.broadcast().await;
         self.drive_members(
-            &PlayerCommand::Enqueue { track_ids },
+            &PlayerCommand::Enqueue {
+                track_ids,
+                next: false,
+            },
             members,
             database,
             public_base_url,
@@ -2424,10 +2441,12 @@ async fn apply_to_queue_state(
             state.duration_seconds = None;
             state.elapsed_seconds = Some(0.0);
         }
-        PlayerCommand::Enqueue { track_ids } => {
-            state
-                .queue
-                .extend(resolve_queue_items(database, &track_ids).await?);
+        PlayerCommand::Enqueue { track_ids, next } => {
+            enqueue_queue_items(
+                state,
+                resolve_queue_items(database, &track_ids).await?,
+                next,
+            );
         }
         PlayerCommand::RemoveQueueItem { index } => remove_queue_item(state, index),
         PlayerCommand::MoveQueueItem { from, to } => move_queue_item(state, from, to),
@@ -2724,6 +2743,44 @@ fn move_queue_item(state: &mut QueueState, from: usize, to: usize) {
     }
 }
 
+/// Add items at the end, or directly after the current slot. This is one state mutation so a
+/// second controller cannot move a just-appended duplicate before its intended position.
+fn enqueue_queue_items(state: &mut QueueState, items: Vec<QueueItem>, next: bool) {
+    if items.is_empty() || !next || state.position.is_none() {
+        state.queue.extend(items);
+        return;
+    }
+    let current = state.position.expect("checked above");
+    let insert_at = current + 1;
+    let count = items.len();
+    state.queue.splice(insert_at..insert_at, items);
+    if state.shuffle
+        && shuffle_order_valid(
+            &state.shuffle_order,
+            state.queue.len() - count,
+            Some(current),
+        )
+    {
+        for index in &mut state.shuffle_order {
+            if *index >= insert_at {
+                *index += count;
+            }
+        }
+        let order_at = state
+            .shuffle_order
+            .iter()
+            .position(|index| *index == current)
+            .expect("valid shuffle order")
+            + 1;
+        state
+            .shuffle_order
+            .splice(order_at..order_at, insert_at..insert_at + count);
+    } else if state.shuffle {
+        state.shuffle_order =
+            build_shuffle_order(state.queue.len(), state.position, shuffle_seed());
+    }
+}
+
 /// New index of the element previously at `pos` after moving `from` -> `to`.
 fn reindex_after_move(pos: usize, from: usize, to: usize) -> usize {
     if pos == from {
@@ -2979,7 +3036,11 @@ impl SnapcastPlayer {
         };
         self.persist(resume);
         self.broadcast().await;
-        self.reconcile(&PlayerCommand::Enqueue { track_ids }).await;
+        self.reconcile(&PlayerCommand::Enqueue {
+            track_ids,
+            next: false,
+        })
+        .await;
         Ok(())
     }
 
@@ -5260,6 +5321,66 @@ mod tests {
             repeat,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn enqueue_next_inserts_after_the_paused_current_item() {
+        // A paused queue must keep its cursor and status: "Play next" curates what will
+        // follow, it must not resume playback or replace the current item.
+        let mut state = sequential_state(3, 1, RepeatMode::Off);
+        state.status = PlaybackStatus::Paused;
+        state.queue[0].title = "first".into();
+        state.queue[1].title = "current".into();
+        state.queue[2].title = "later".into();
+
+        enqueue_queue_items(
+            &mut state,
+            vec![QueueItem {
+                title: "next".into(),
+                ..Default::default()
+            }],
+            true,
+        );
+
+        assert_eq!(state.status, PlaybackStatus::Paused);
+        assert_eq!(state.position, Some(1));
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "current", "next", "later"],
+        );
+    }
+
+    #[test]
+    fn enqueue_next_keeps_current_track_and_shuffle_order_valid() {
+        // The queue may contain duplicate tracks, so preserve the current *slot*, not a
+        // track id, and make the inserted item the next shuffled slot atomically.
+        let mut state = shuffled_state(vec![1, 2, 0], 1, RepeatMode::Off);
+        state.queue[0].title = "duplicate".into();
+        state.queue[1].title = "current".into();
+        state.queue[2].title = "duplicate".into();
+
+        enqueue_queue_items(
+            &mut state,
+            vec![QueueItem {
+                title: "next".into(),
+                ..Default::default()
+            }],
+            true,
+        );
+
+        assert_eq!(state.position, Some(1));
+        assert_eq!(state.queue[2].title, "next");
+        assert_eq!(state.shuffle_order, vec![1, 2, 3, 0]);
+        assert!(shuffle_order_valid(
+            &state.shuffle_order,
+            state.queue.len(),
+            state.position
+        ));
+        assert_eq!(peek_next_index(&state), Some(2));
     }
 
     #[test]

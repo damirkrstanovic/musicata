@@ -6,19 +6,23 @@ binary via `rust-embed` from `web/dist/`. Components are `PascalCase.svelte`.
 
 ## Surfaces
 
-- **Player** (`/`, the `player/App.svelte` component tree) — listening: library, playlists,
-  radio, the now-playing transport, and the active-output switcher. Playback only.
-- **Admin** (`/admin`, the `admin/App.svelte` component tree) — management: music sources,
-  players & zones, and the activity/error log. Anything administrative or
-  long-running lives here, never crowding the player.
+- **Browse** — artists, albums, tracks, favorites, search and library filters.
+- **Listen** — queue, playlists, similarity mixes and internet radio stations.
+- **Settings** — administrator-only configuration inside the shared player shell:
+  Music sources, Outputs & groups, Sound profiles, Metadata & artwork,
+  History & services, and System & accounts. Categories are tabs; search indexes
+  named destinations and keywords, never current values or credentials.
 
-Keep the split clean: configuration and maintenance progress belong on `/admin`.
+The `/` and compatible `/admin` entry points mount the same player component tree.
+Internal Settings navigation must preserve the audio element, renderer, output,
+WebSocket and transport. `/admin` starts at Settings and remains administrator-gated.
+Keep the activity split clean: configuration and maintenance progress belong in Settings.
 Playback work initiated by the listener (creating a mix or finding the next song) shows
 its loading, empty, and error states in the player, where the action was taken.
 
 ## Browsing (player)
 
-The content header carries a **segmented switcher** — Tracks · Albums · Artists — driven by
+Only Browse carries the **segmented switcher** — Tracks · Albums · Artists — driven by
 the runes nav store (`lib/nav.svelte.ts`, a `Nav` instance); the sidebar nav keeps the
 *smart* views (Favorites / Recently / Most) plus Playlists and Radio. Browse state (filters,
 sort, paging) lives in `lib/browse.svelte.ts`. **Albums and Artists render as cover-forward
@@ -35,7 +39,7 @@ the `?size=300` thumbnail; hero covers `?size=600`.
 ## Listening flow across screens
 
 A fresh visit on any screen starts with album covers. The last Albums, Artists or Tracks
-choice is remembered in this browser; Library returns to that choice. Detail routes
+choice is remembered in this browser; Browse returns to that choice on desktop. Detail routes
 and temporary playback panels are restored by history, not saved as the browsing preference. Persistent bottom destinations are
 **Library · Playlists · Now Playing**, with the compact player above them. Artists and
 Tracks remain available in the browsing switcher. The top bar keeps the current output
@@ -45,10 +49,28 @@ The compact player's title and artwork open Now Playing: controls followed direc
 the active queue, with its current track highlighted. Saved playlists have a separate
 browse screen. Back closes the current playback/drawer view before returning through
 library navigation, and Forward restores that view. Desktop retains its three-column
-layout and exposes the same Library, Playlists and Now Playing destinations in the sidebar.
+layout and exposes Browse, Listen and Settings in the sidebar, with listening shortcuts.
 Clicking its current song or Now Playing opens the queue alongside the transport, leaving
 the library available. Output selection and playback controls stay visible. The optional
 install prompt sits in the page flow on all screen sizes so it cannot cover browsing controls.
+
+Sound-profile creation, import, deletion, room-filter uploads and browser device bindings
+live in Settings → Sound profiles. Profile selection, bypass and volume leveling remain
+in the playback EQ drawer. Saving a new profile in Settings does not activate it; selecting
+an existing profile for management must not change the output's listening selection.
+Equipment correction and listening adjustments have separate selection and bypass controls,
+remembered per output. Neutral removes the listening adjustment without changing correction.
+The response curve describes their combined processing. A master bypass retains both choices.
+Profile-management mutations require administrator authorization; listeners can read profiles
+and change per-output selections. Built-in presets are supplied by one shared preset file,
+so selecting one never requires a profile-management write.
+Settings imports classify profiles as headphone correction, speaker/room correction, or a
+listening adjustment. Room impulse responses belong only to equipment correction.
+
+Tracks offer Play, Add to queue, Play next and Add to playlist. Queue and similarity mixes
+can save their ordered library tracks as playlists; transient streams cannot become library
+track entries. Playlist details support naming, ordering and removing individual occurrences
+without changing the active playback queue.
 
 ## Aesthetic
 

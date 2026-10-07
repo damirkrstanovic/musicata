@@ -19,14 +19,18 @@ no phoning home — your library and listening history stay on your machine.
   keep listening.
 - **Play it everywhere, in sync.** Stream to your browser, drive an MPD player, or play the
   same track *perfectly in sync across rooms* with Snapcast.
-- **Sounds the way you want.** Per-output EQ and room/headphone correction, plus loudness
-  leveling so albums and playlists play at an even volume.
+- **Sounds the way you want.** Independent equipment correction and listening
+  adjustments per output, plus loudness leveling so albums and playlists play at an even volume.
 - **No config files.** Every user-facing setting lives in the app — add a music source, a
   player, or an API key right in the Settings page. Live, no restart.
 - **Works with what you already use.** Musicata speaks the OpenSubsonic API, so existing
   Subsonic apps can browse and stream your library too.
 
 ## Features
+
+Browse artists, albums and tracks; switch to Listen for queues, playlists, similarity mixes
+and internet stations. Settings keeps sources, outputs, sound profiles and other configuration
+in searchable categories. Playback and the selected output stay available while you navigate.
 
 - A central server with a SQLite-backed library that rescans incrementally as your files
   change.
@@ -102,7 +106,7 @@ Musicata is free software licensed under the **GNU Affero General Public License
 or later** — see [COPYING](COPYING) for the full text. If you run a modified Musicata as a
 network service, AGPL section 13 requires you to offer its source to your users — and Musicata
 does that for you. A **Source code** link, with the running version beside it, appears on the
-sign-in screen and in the player's account menu. Point it at your fork under **Settings → About
+sign-in screen and in the player's account menu. Point it at your fork under **Settings → System & accounts → About
 & source**: it's a setting, so complying with the license never means rebuilding.
 
 Third-party material stored in this repository (the AudioSet class labels) is attributed in

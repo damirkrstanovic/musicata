@@ -2,7 +2,7 @@
   // SPDX-License-Identifier: AGPL-3.0-or-later
   import { api, type PlaylistDetail } from "../lib/api";
   import { playTracks } from "../lib/playback";
-  import { confirmAction } from "../lib/modal";
+  import { confirmAction, promptText } from "../lib/modal";
   import { nav } from "../lib/nav.svelte";
   import TrackList from "./TrackList.svelte";
 
@@ -38,6 +38,14 @@
     await api.deletePlaylist(detail.id);
     nav.pop();
   }
+
+  async function rename() {
+    if (!detail) return;
+    const name = await promptText({ title: "Rename playlist", label: "Name", value: detail.name, confirmLabel: "Save" });
+    if (!name) return;
+    const updated = await api.updatePlaylist(detail.id, { name });
+    if (updated) detail = updated;
+  }
 </script>
 
 {#if detail}
@@ -49,11 +57,12 @@
         <button class="primary-button" type="button" onclick={() => detail && playTracks(detail.tracks, 0)}>
           Play
         </button>
+        <button class="ghost-button rename-playlist" type="button" onclick={rename}>Rename</button>
         <button class="ghost-button danger" type="button" onclick={remove}>Delete</button>
       </div>
     </div>
   </section>
-  <TrackList tracks={detail.tracks} />
+  <TrackList tracks={detail.tracks} playlistId={detail.id} onPlaylistChanged={(updated) => detail = updated} />
 {:else if failed}
   <p class="admin-hint">Couldn't load this playlist. Try again.</p>
 {:else}

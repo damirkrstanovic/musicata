@@ -4,6 +4,9 @@
   import { autoplay } from "../lib/autoplay.svelte";
   import { sendCommand } from "../lib/commands";
   import { playQueueIndex } from "../lib/playback";
+  import { api } from "../lib/api";
+  import { nav } from "../lib/nav.svelte";
+  import { promptText } from "../lib/modal";
   import { initial } from "../lib/dom";
   import { tick } from "svelte";
 
@@ -28,6 +31,17 @@
   function close() {
     player.queueOpen = false;
   }
+
+  async function saveQueue() {
+    const trackIds = player.queue.flatMap((item) => item.track_id ? [item.track_id] : []);
+    if (!trackIds.length) return;
+    const name = await promptText({ title: "Save queue as playlist", label: "Name", confirmLabel: "Save" });
+    if (!name) return;
+    const playlist = await api.createPlaylist(name, trackIds);
+    if (playlist) {
+      nav.push({ name: "playlist", id: playlist.id, label: playlist.name });
+    }
+  }
 </script>
 
 {#if embedded || player.queueOpen}
@@ -45,6 +59,9 @@
         </label>
         <button class="ghost-button" type="button" onclick={() => sendCommand(player.target, { command: "clear" })}>
           Clear
+        </button>
+        <button class="ghost-button save-queue-playlist" type="button" disabled={!player.queue.some((item) => item.track_id)} onclick={saveQueue}>
+          Save as playlist
         </button>
         {#if !embedded}<button class="ghost-button" type="button" aria-label="Close queue" onclick={close}>Close</button>{/if}
       </div>

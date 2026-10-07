@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use musicata_core::{PlaybackState, PlaybackStatus, QueueItem, RepeatMode};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -180,6 +180,14 @@ impl MpdConnection {
 
     pub async fn add(&mut self, uri: &str) -> Result<()> {
         self.command(&format!("add {}", quote_arg(uri))).await?;
+        Ok(())
+    }
+
+    /// Add a queue item with MPD's highest priority so it wins over random playback too.
+    pub async fn add_next(&mut self, uri: &str) -> Result<()> {
+        let response = self.command(&format!("addid {}", quote_arg(uri))).await?;
+        let id = find(&response, "Id").context("MPD addid did not return an id")?;
+        self.command(&format!("prioid 255 {id}")).await?;
         Ok(())
     }
 
@@ -532,6 +540,26 @@ mod tests {
         // No `play`/`play 0` was scripted; the fake server replies OK to anything, so
         // the assertion that matters is exercised by the live test. Here we just
         // confirm the call sequence completes without a play command erroring.
+    }
+
+    #[tokio::test]
+    async fn add_next_assigns_mpd_priority_for_random_playback() {
+        // Physical queue order alone cannot promise "next" when MPD random is enabled.
+        // MPD's priority queue is the mechanism that wins over random selection.
+        let addr = fake_mpd(vec![
+            (
+                "addid \"http://host/api/tracks/track_2/stream\"",
+                "Id: 42\n",
+            ),
+            ("prioid 255 42", ""),
+        ])
+        .await;
+        let mut connection = MpdConnection::connect(&addr).await.expect("connect");
+
+        connection
+            .add_next("http://host/api/tracks/track_2/stream")
+            .await
+            .expect("enqueue next");
     }
 
     #[tokio::test]

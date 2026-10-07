@@ -27,13 +27,25 @@ const DSP_PROFILES_KEY: &str = "dsp_profiles";
 pub use musicata_core::dsp::DspBand;
 pub use musicata_core::dsp::{DspProfile, RoomIr};
 
+fn built_in_profiles() -> Vec<DspProfile> {
+    serde_json::from_str(include_str!("../web/src/lib/dsp-presets.json"))
+        .expect("bundled DSP presets are valid profiles")
+}
+
 async fn load_profiles(db: &Database) -> Vec<DspProfile> {
-    db.get_setting(DSP_PROFILES_KEY)
+    let mut profiles = db
+        .get_setting(DSP_PROFILES_KEY)
         .await
         .ok()
         .flatten()
         .and_then(|json| serde_json::from_str::<Vec<DspProfile>>(&json).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for preset in built_in_profiles() {
+        if !profiles.iter().any(|profile| profile.id == preset.id) {
+            profiles.push(preset);
+        }
+    }
+    profiles
 }
 
 async fn store_profiles(db: &Database, profiles: &[DspProfile]) -> Result<(), AppError> {
@@ -49,7 +61,7 @@ pub async fn profile_by_id(db: &Database, id: &str) -> Option<DspProfile> {
 }
 
 /// The profile library, in stored order. Authenticated but not admin-only — EQ is a playback
-/// preference, so any signed-in user can read it (and edit it via PUT/DELETE).
+/// preference, so any signed-in user can read it. Management mutations require an admin.
 pub async fn list_profiles(State(state): State<AppState>) -> Json<Vec<DspProfile>> {
     Json(load_profiles(&state.database).await)
 }
@@ -66,6 +78,10 @@ pub async fn upsert_profile(
         return Err(AppError::bad_request("profile name is required"));
     }
     profile.validate().map_err(AppError::bad_request)?;
+    state
+        .output_audio
+        .validate_profile_update(&state.database, &profile)
+        .await?;
     let mut profiles = load_profiles(&state.database).await;
     profiles.retain(|p| p.id != profile.id);
     profiles.push(profile.clone());
@@ -93,6 +109,12 @@ pub async fn delete_profile(
             .clear_dsp_profile_bindings(&id)
             .await
             .map_err(crate::db_error)?;
+    }
+    // Retry deletion also cleans a file stranded by an interrupted earlier request.
+    match tokio::fs::remove_file(impulse_path(&state, &id)).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(AppError::internal(error.to_string())),
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -167,9 +189,20 @@ pub async fn upload_impulse(
         .iter_mut()
         .find(|p| p.id == id)
         .ok_or_else(|| AppError::not_found("unknown profile"))?;
-    if wav_sample_rate(&body) == 0 {
+    if profile.kind.as_deref() == Some("listening") {
+        return Err(AppError::bad_request(
+            "listening adjustments cannot include room convolution",
+        ));
+    }
+    let sample_rate = wav_sample_rate(&body);
+    if sample_rate == 0 {
         return Err(AppError::bad_request("expected a WAV impulse response"));
     }
+    profile.room_ir = Some(RoomIr { sample_rate });
+    state
+        .output_audio
+        .validate_profile_update(&state.database, profile)
+        .await?;
     let dir = dsp_dir(&state);
     tokio::fs::create_dir_all(&dir)
         .await
@@ -177,9 +210,6 @@ pub async fn upload_impulse(
     tokio::fs::write(impulse_path(&state, &id), &body)
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
-    profile.room_ir = Some(RoomIr {
-        sample_rate: wav_sample_rate(&body),
-    });
     store_profiles(&state.database, &profiles).await?;
     state
         .output_audio
@@ -193,6 +223,13 @@ pub async fn get_impulse(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
+    if !load_profiles(&state.database)
+        .await
+        .into_iter()
+        .any(|profile| profile.id == id && profile.room_ir.is_some())
+    {
+        return Err(AppError::not_found("no impulse response for this profile"));
+    }
     let bytes = tokio::fs::read(impulse_path(&state, &id))
         .await
         .map_err(|_| AppError::not_found("no impulse response for this profile"))?;

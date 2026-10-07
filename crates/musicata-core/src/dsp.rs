@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "camelCase")]
 pub struct DspBand {
@@ -17,7 +17,7 @@ pub struct DspBand {
 
 /// `sampleRate` of a stored room impulse response (the WAV bytes live in a file served by
 /// `/api/dsp/profiles/{id}/impulse`; see Phase 4).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "camelCase")]
 pub struct RoomIr {
@@ -68,15 +68,68 @@ impl DspProfile {
                 return Err("invalid filter frequency, Q or gain");
             }
         }
+        if self.kind.as_deref() == Some("listening") && self.room_ir.is_some() {
+            return Err("listening adjustments cannot include room convolution");
+        }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// Compose the active correction and listening layers for every renderer.
+pub fn compose_profiles(
+    correction: Option<&DspProfile>,
+    listening: Option<&DspProfile>,
+) -> Result<Option<DspProfile>, DspError> {
+    if let Some(profile) = correction {
+        profile.validate()?;
+    }
+    if let Some(profile) = listening {
+        profile.validate()?;
+        if profile.room_ir.is_some() {
+            return Err("listening adjustments cannot include room convolution");
+        }
+    }
+    let Some(mut effective) = correction.cloned().or_else(|| listening.cloned()) else {
+        return Ok(None);
+    };
+    if correction.is_none() {
+        effective.room_ir = None;
+    }
+    if let (Some(_), Some(listening)) = (correction, listening) {
+        effective.preamp_db += listening.preamp_db;
+        effective.bands.extend(listening.bands.clone());
+    }
+    effective.validate()?;
+    Ok(Some(effective))
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct OutputDspSelection {
     pub profile_id: Option<String>,
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub correction_enabled: bool,
+    #[serde(default)]
+    pub listening_profile_id: Option<String>,
+    #[serde(default)]
+    pub listening_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for OutputDspSelection {
+    fn default() -> Self {
+        Self {
+            profile_id: None,
+            enabled: false,
+            correction_enabled: true,
+            listening_profile_id: None,
+            listening_enabled: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -190,5 +243,82 @@ mod tests {
         p.bands[0].gain = 6.0;
         p.bands = vec![p.bands[0].clone(); 129];
         assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn composes_correction_and_listening_with_correction_impulse_identity() {
+        // A regression here would send the room IR request to the listening profile, or drop
+        // either layer's headroom/filter contribution before a renderer sees it.
+        let correction = DspProfile {
+            id: "room-speakers".into(),
+            name: "Room correction".into(),
+            preamp_db: -4.0,
+            bands: vec![DspBand {
+                band_type: "lowshelf".into(),
+                freq: 90.0,
+                gain: -3.0,
+                q: 0.7,
+            }],
+            kind: Some("speakers".into()),
+            room_ir: Some(RoomIr {
+                sample_rate: 48_000,
+            }),
+        };
+        let listening = DspProfile {
+            id: "late-night".into(),
+            name: "Late night".into(),
+            preamp_db: -2.0,
+            bands: vec![DspBand {
+                band_type: "peaking".into(),
+                freq: 2_500.0,
+                gain: 1.5,
+                q: 1.2,
+            }],
+            kind: Some("headphones".into()),
+            room_ir: None,
+        };
+
+        let effective = compose_profiles(Some(&correction), Some(&listening))
+            .expect("valid layers compose")
+            .expect("at least one enabled layer produces a renderer profile");
+
+        assert_eq!(effective.id, "room-speakers");
+        assert_eq!(effective.preamp_db, -6.0);
+        assert_eq!(
+            effective.room_ir,
+            Some(RoomIr {
+                sample_rate: 48_000
+            })
+        );
+        assert_eq!(effective.bands.len(), 2);
+        assert_eq!(effective.bands[0].freq, 90.0);
+        assert_eq!(effective.bands[1].freq, 2_500.0);
+    }
+
+    #[test]
+    fn composition_rejects_two_layers_that_exceed_the_shared_filter_limit() {
+        // Each profile is individually valid; accepting the pair would let renderers receive
+        // more than the documented 128-filter maximum.
+        let mut correction = profile();
+        correction.bands = vec![correction.bands[0].clone(); 64];
+        let mut listening = profile();
+        listening.id = "listening".into();
+        listening.bands = vec![listening.bands[0].clone(); 65];
+
+        assert!(correction.validate().is_ok());
+        assert!(listening.validate().is_ok());
+        assert!(matches!(
+            compose_profiles(Some(&correction), Some(&listening)),
+            Err("invalid preamp or too many filters")
+        ));
+    }
+
+    #[test]
+    fn default_selection_enables_correction_and_disables_listening() {
+        let selection = OutputDspSelection::default();
+
+        assert!(selection.correction_enabled);
+        assert_eq!(selection.listening_profile_id, None);
+        assert!(!selection.listening_enabled);
     }
 }

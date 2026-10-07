@@ -1,6 +1,7 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
   import { api, ApiError, type About, type AppSettings } from "../lib/api";
+  let {group = "metadata"}: {group?: "metadata" | "history" | "system"} = $props();
 
   let settings = $state<AppSettings>({
     artwork_fetch: false,
@@ -94,6 +95,7 @@
 </script>
 
 <section class="admin-panel">
+  {#if group === "metadata"}
   <div class="admin-panel-head"><h2>Artwork &amp; identification</h2></div>
   <p class="admin-hint">All on-device. Identification uses AcoustID + MusicBrainz; files are never modified.</p>
 
@@ -120,6 +122,8 @@
     </div>
   </form>
 
+  {/if}
+  {#if group === "history"}
   <div class="admin-panel-head"><h2>Audio analysis (“sounds-like”)</h2></div>
   <p class="admin-hint">
     Analyzes tracks with the optional <code>musicata-ml</code> service to power audio “sounds-like”
@@ -169,7 +173,8 @@
       <input type="checkbox" bind:checked={settings.history_enabled} />
       <span>Record what I play (turn off for private listening)</span>
     </label>
-    <p class="admin-hint">Saved with the settings above. Turning it off keeps existing history until you clear it.</p>
+    <p class="admin-hint">Turning it off keeps existing history until you clear it.</p>
+    <form onsubmit={save}><button type="submit" class="primary-button" disabled={busy}>Save history preference</button></form>
     <div class="field-actions">
       <button type="button" class="ghost-button danger" class:confirming={confirmClear} onclick={clearHistory}>
         {confirmClear ? "Confirm — clear all history?" : "Clear listening history"}
@@ -198,6 +203,8 @@
     </div>
   </form>
 
+  {/if}
+  {#if group === "system"}
   <div class="admin-panel-head"><h2>About &amp; source</h2></div>
   <p class="admin-hint">
     Musicata is free software under the AGPL. If you run a <strong>modified</strong> build, section
@@ -221,6 +228,7 @@
       <span class="form-status" class:error>{status}</span>
     </div>
   </form>
+  {/if}
 </section>
 
 <style>

@@ -12,12 +12,12 @@ use axum::{
 };
 use musicata_core::dsp::{
     AudioCapabilities, DspProfile, DspStatus, MeasurementPoint, OutputDspSelection, OutputDspState,
-    StereoLevels,
+    StereoLevels, compose_profiles,
 };
 use musicata_storage::Database;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -178,8 +178,30 @@ impl OutputRuntime {
 #[derive(Clone, Serialize)]
 pub struct AudioConfig {
     pub state: OutputDspState,
+    /// The composed profile renderers consume.
     pub profile: Option<DspProfile>,
+    /// Raw layers let the controller edit each selection without mistaking the effective
+    /// renderer profile for a library entry.
+    pub correction_profile: Option<DspProfile>,
+    pub listening_profile: Option<DspProfile>,
     pub meter_subscribed: bool,
+}
+
+fn effective_profile(
+    selection: &OutputDspSelection,
+    correction: Option<&DspProfile>,
+    listening: Option<&DspProfile>,
+) -> Result<Option<DspProfile>, AppError> {
+    compose_profiles(
+        selection.correction_enabled.then_some(correction).flatten(),
+        selection.listening_enabled.then_some(listening).flatten(),
+    )
+    .map_err(AppError::bad_request)
+}
+
+fn active_layer(selection: &OutputDspSelection) -> bool {
+    (selection.correction_enabled && selection.profile_id.is_some())
+        || (selection.listening_enabled && selection.listening_profile_id.is_some())
 }
 
 pub struct AudioOutput {
@@ -209,6 +231,77 @@ pub struct OutputAudio {
 }
 
 impl OutputAudio {
+    /// Reject a profile edit before it can leave any active output with an invalid combined
+    /// filter chain. The caller already holds `profile_changes`.
+    pub async fn validate_profile_update(
+        &self,
+        database: &Database,
+        candidate: &DspProfile,
+    ) -> Result<(), AppError> {
+        let entries: Vec<_> = self.entries.lock().await.values().cloned().collect();
+        let mut live_ids = BTreeSet::new();
+        for entry in entries {
+            let config = entry.config.borrow().clone();
+            live_ids.insert(config.state.output_id.clone());
+            let selection = &config.state.selection;
+            let correction = if selection.profile_id.as_deref() == Some(&candidate.id) {
+                Some(candidate)
+            } else {
+                config.correction_profile.as_ref()
+            };
+            let listening = if selection.listening_profile_id.as_deref() == Some(&candidate.id) {
+                Some(candidate)
+            } else {
+                config.listening_profile.as_ref()
+            };
+            let effective = effective_profile(selection, correction, listening)?;
+            if selection.enabled
+                && selection.correction_enabled
+                && effective
+                    .as_ref()
+                    .is_some_and(|profile| profile.room_ir.is_some())
+                && !config.state.capabilities.room_ir
+            {
+                return Err(AppError::bad_request(
+                    "this output does not support room convolution",
+                ));
+            }
+        }
+        // Check checkpoints for outputs that have not connected since startup as well.
+        for (id, selection) in database.all_player_dsp().await.map_err(db_error)? {
+            if live_ids.contains(&id) {
+                continue;
+            }
+            let correction = match selection.profile_id.as_deref() {
+                Some(id) if id == candidate.id => Some(candidate.clone()),
+                Some(id) => crate::dsp::profile_by_id(database, id).await,
+                None => None,
+            };
+            let listening = match selection.listening_profile_id.as_deref() {
+                Some(id) if id == candidate.id => Some(candidate.clone()),
+                Some(id) => crate::dsp::profile_by_id(database, id).await,
+                None => None,
+            };
+            let effective = effective_profile(&selection, correction.as_ref(), listening.as_ref())?;
+            if selection.enabled
+                && selection.correction_enabled
+                && effective
+                    .as_ref()
+                    .is_some_and(|profile| profile.room_ir.is_some())
+                && database
+                    .player_record(&id)
+                    .await
+                    .map_err(db_error)?
+                    .is_some_and(|record| record.kind != "browser")
+            {
+                return Err(AppError::bad_request(
+                    "this output does not support room convolution",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn entry(
         &self,
         database: &Database,
@@ -238,6 +331,7 @@ impl OutputAudio {
                 selection = OutputDspSelection {
                     profile_id: Some(profile_id),
                     enabled: true,
+                    ..Default::default()
                 };
                 configured = true;
             }
@@ -253,21 +347,42 @@ impl OutputAudio {
             room_ir: record.kind == "browser",
             meter: record.kind != "mpd",
         };
-        let profile = match selection.profile_id.as_deref() {
+        let mut correction_profile = match selection.profile_id.as_deref() {
+            Some(id) => crate::dsp::profile_by_id(database, id).await,
+            None => None,
+        };
+        let mut listening_profile = match selection.listening_profile_id.as_deref() {
             Some(id) => crate::dsp::profile_by_id(database, id).await,
             None => None,
         };
         // A checkpoint may survive a profile deletion if the process crashes before its
-        // coalesced bypass write. Never restore correction for a profile that no longer exists.
-        let missing_profile = selection.profile_id.is_some() && profile.is_none();
+        // coalesced bypass write. Clear only the missing layer, retaining the other one.
+        let missing_profile = selection.profile_id.is_some() && correction_profile.is_none();
         if missing_profile {
-            selection = OutputDspSelection::default();
+            selection.profile_id = None;
+            selection.correction_enabled = false;
         }
+        let missing_listening =
+            selection.listening_profile_id.is_some() && listening_profile.is_none();
+        if missing_listening {
+            selection.listening_profile_id = None;
+            selection.listening_enabled = false;
+        }
+        if !active_layer(&selection) {
+            selection.enabled = false;
+        }
+        let profile = effective_profile(
+            &selection,
+            correction_profile.as_ref(),
+            listening_profile.as_ref(),
+        )?;
         let mut runtime = OutputRuntime::new(id.into(), selection.clone(), point, capabilities);
         runtime.state.configured = configured;
         let (config, _) = watch::channel(AudioConfig {
             state: runtime.state.clone(),
             profile,
+            correction_profile: correction_profile.take(),
+            listening_profile: listening_profile.take(),
             meter_subscribed: false,
         });
         let (persist, mut writes) = watch::channel::<Option<OutputDspSelection>>(None);
@@ -303,6 +418,7 @@ impl OutputAudio {
             subscribers: AtomicUsize::new(0),
         });
         if missing_profile
+            || missing_listening
             || (configured && database.player_dsp(id).await.map_err(db_error)?.is_none())
         {
             entry.persist.send_replace(Some(selection));
@@ -350,17 +466,52 @@ impl OutputAudio {
         let entries: Vec<_> = self.entries.lock().await.values().cloned().collect();
         for entry in entries {
             let mut runtime = entry.runtime.lock().await;
-            if runtime.state.selection.profile_id.as_deref() != Some(id) {
+            let correction_matches = runtime.state.selection.profile_id.as_deref() == Some(id);
+            let listening_matches =
+                runtime.state.selection.listening_profile_id.as_deref() == Some(id);
+            if !correction_matches && !listening_matches {
                 continue;
             }
             let mut selection = runtime.state.selection.clone();
-            if profile.is_none() {
-                selection = OutputDspSelection::default();
+            let mut correction = entry.config.borrow().correction_profile.clone();
+            let mut listening = entry.config.borrow().listening_profile.clone();
+            if correction_matches {
+                correction = profile.clone();
+                if profile.is_none() {
+                    selection.profile_id = None;
+                    selection.correction_enabled = false;
+                }
             }
+            if listening_matches {
+                listening = profile.clone();
+                if profile.is_none() {
+                    selection.listening_profile_id = None;
+                    selection.listening_enabled = false;
+                }
+            }
+            if !active_layer(&selection) {
+                selection.enabled = false;
+            }
+            let (effective, error) =
+                match effective_profile(&selection, correction.as_ref(), listening.as_ref()) {
+                    Ok(effective) => (effective, None),
+                    Err(error) => {
+                        // Stored data predating aggregate validation must never be acknowledged as
+                        // applied with a silent bypass. Preserve the raw selections for repair.
+                        selection.enabled = false;
+                        (None, Some(error.message))
+                    }
+                };
             runtime.select(selection.clone());
+            if let Some(error) = error {
+                runtime.state.status = DspStatus::Error;
+                runtime.state.error = Some(error);
+            }
             entry.config.send_replace(AudioConfig {
                 state: runtime.state.clone(),
-                profile: profile.clone(),
+                profile: effective,
+                correction_profile: correction,
+                listening_profile: listening,
                 meter_subscribed: entry.subscribers.load(Ordering::Acquire) > 0,
             });
             entry.persist.send_replace(Some(selection));
@@ -390,19 +541,20 @@ pub async fn set_selection(
     State(state): State<AppState>,
     Path(id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<SelectionQuery>,
-    Json(selection): Json<OutputDspSelection>,
+    Json(mut selection): Json<OutputDspSelection>,
 ) -> Result<Json<OutputDspState>, AppError> {
     let _profiles = state.output_audio.profile_changes.lock().await;
     let output = state
         .output_audio
         .entry(&state.database, &state.players, &id)
         .await?;
-    let profile = if let Some(id) = selection.profile_id.as_deref() {
+    let correction_profile = if let Some(id) = selection.profile_id.as_deref() {
         let profile = crate::dsp::profile_by_id(&state.database, id)
             .await
             .ok_or_else(|| AppError::bad_request("unknown correction profile"))?;
         profile.validate().map_err(AppError::bad_request)?;
         if selection.enabled
+            && selection.correction_enabled
             && profile.room_ir.is_some()
             && !output.runtime.lock().await.state.capabilities.room_ir
         {
@@ -412,13 +564,42 @@ pub async fn set_selection(
         }
         Some(profile)
     } else {
-        if selection.enabled {
-            return Err(AppError::bad_request(
-                "select a correction profile before enabling EQ",
-            ));
-        }
         None
     };
+    let listening_profile = if let Some(id) = selection.listening_profile_id.as_deref() {
+        let profile = crate::dsp::profile_by_id(&state.database, id)
+            .await
+            .ok_or_else(|| AppError::bad_request("unknown listening adjustment"))?;
+        profile.validate().map_err(AppError::bad_request)?;
+        if profile.room_ir.is_some() {
+            return Err(AppError::bad_request(
+                "listening adjustments cannot include room convolution",
+            ));
+        }
+        Some(profile)
+    } else {
+        None
+    };
+    // Legacy bypass requests have no profile and default correction_enabled to true.
+    // An empty correction slot is bypassed; it must not reject clearing the output.
+    if correction_profile.is_none() {
+        selection.correction_enabled = false;
+    }
+    if selection.listening_enabled && listening_profile.is_none() {
+        return Err(AppError::bad_request(
+            "select a listening adjustment before enabling it",
+        ));
+    }
+    if selection.enabled && !active_layer(&selection) {
+        return Err(AppError::bad_request(
+            "enable an equipment correction or listening adjustment before enabling sound processing",
+        ));
+    }
+    let profile = effective_profile(
+        &selection,
+        correction_profile.as_ref(),
+        listening_profile.as_ref(),
+    )?;
     let mut runtime = output.runtime.lock().await;
     if query.migrate && runtime.state.configured {
         return Ok(Json(runtime.state.clone()));
@@ -428,6 +609,8 @@ pub async fn set_selection(
     output.config.send_replace(AudioConfig {
         state: response.clone(),
         profile,
+        correction_profile,
+        listening_profile,
         meter_subscribed: output.subscribers.load(Ordering::Acquire) > 0,
     });
     output.persist.send_replace(Some(selection));
@@ -754,6 +937,7 @@ mod tests {
         output.select(OutputDspSelection {
             profile_id: Some("new".into()),
             enabled: true,
+            ..Default::default()
         });
         assert!(!output.acknowledge(1, old, None));
         assert_eq!(output.state.status, DspStatus::Pending);

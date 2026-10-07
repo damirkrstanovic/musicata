@@ -3,7 +3,8 @@
   import { onDestroy } from "svelte";
   import { api, type Playlist, type SmartPlaylist } from "../lib/api";
   import { radio } from "../lib/radio.svelte";
-  import { nav } from "../lib/nav.svelte";
+  import { nav, activityFor } from "../lib/nav.svelte";
+  import { session } from "../lib/session.svelte";
   import { search } from "../lib/search.svelte";
   import { promptText } from "../lib/modal";
   import { playStream } from "../lib/playback";
@@ -15,6 +16,7 @@
 
   let playlists = $state<Playlist[]>([]);
   let smart = $state<SmartPlaylist[]>([]);
+  const activity = $derived(activityFor(nav.current));
 
   async function load() {
     try {
@@ -53,13 +55,18 @@
     <button class="np-chevron" type="button" aria-label="Close navigation" onclick={onclose}>×</button>
   </div>
 
+  {#if activity === "browse"}
   <label class="search">
     <input type="search" autocomplete="off" placeholder="Search" oninput={(e) => onSearch(e.currentTarget.value)} />
   </label>
+  {/if}
 
   <nav class="library-nav" aria-label="Views">
-    <button class="nav-link desktop-destination" class:is-active={!["playlists", "playlist", "smart", "favorites", "mix", "radio"].includes(nav.current.name) && !nav.overlays.includes("nowPlaying")} type="button" onclick={() => nav.root({name: nav.browseView})}>Library</button>
-    <button class="nav-link desktop-destination" class:is-active={["playlists", "playlist", "smart"].includes(nav.current.name) && !nav.overlays.includes("nowPlaying")} type="button" onclick={() => nav.root({name: "playlists"})}>Playlists</button>
+    <button class="nav-link desktop-destination" data-activity="browse" class:is-active={activity === "browse"} type="button" onclick={() => nav.root({name: nav.browseView})}>Browse</button>
+    <button class="nav-link desktop-destination" data-activity="listen" class:is-active={activity === "listen"} type="button" onclick={() => nav.root({name: "queue"})}>Listen</button>
+    {#if session.isAdmin}<button class="nav-link desktop-destination" data-activity="settings" class:is-active={activity === "settings"} type="button" onclick={() => nav.root({name: "settings", category: "sources"})}>Settings</button>{/if}
+    {#if activity !== "settings"}
+    <button class="nav-link desktop-destination" class:is-active={["playlists", "playlist", "smart"].includes(nav.current.name)} type="button" onclick={() => nav.root({name: "playlists"})}>Playlists</button>
     <button class="nav-link desktop-destination" class:is-active={nav.overlays.includes("nowPlaying")} type="button" onclick={onnowplaying}>Now Playing</button>
     <button
       class="nav-link"
@@ -75,13 +82,17 @@
         onclick={() => nav.push({ name: "mix" })}>Mix</button
       >
     {/if}
+    {/if}
   </nav>
 
+  {#if activity === "browse"}
   <section class="section">
     <h2>Browse</h2>
     <BrowseFilters />
   </section>
+  {/if}
 
+  {#if activity !== "settings"}
   <section class="section">
     <div class="section-head">
       <h2>Playlists</h2>
@@ -125,6 +136,7 @@
       {/each}
     </div>
   </section>
+  {/if}
 
   <AccountMenu />
 </aside>

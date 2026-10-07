@@ -18,7 +18,7 @@ export type PlayerCommand =
   | { command: "set_shuffle"; enabled: boolean }
   | { command: "clear" }
   | { command: "play_tracks"; track_ids: string[]; start_index: number }
-  | { command: "enqueue"; track_ids: string[] }
+  | { command: "enqueue"; track_ids: string[]; next?: boolean }
   | { command: "play_queue_index"; index: number }
   | { command: "remove_queue_item"; index: number }
   | { command: "move_queue_item"; from: number; to: number }

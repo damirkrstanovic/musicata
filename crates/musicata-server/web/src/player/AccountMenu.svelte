@@ -6,6 +6,7 @@
   // bottom of the sidebar.
   import { api, ApiError, type About } from "../lib/api";
   import { session } from "../lib/session.svelte";
+  import { nav } from "../lib/nav.svelte";
   import { openModal } from "../lib/modal";
 
   // AGPL section 13: anyone interacting with Musicata over a network must be offered its
@@ -61,7 +62,7 @@
   {#if open}
     <div class="account-menu" role="menu">
       {#if session.isAdmin}
-        <a class="item" href="/admin">Admin</a>
+        <button type="button" class="item" onclick={() => {open = false; nav.push({name: "settings", category: "system"});}}>Settings</button>
       {/if}
       <button type="button" class="item" onclick={changePassword}>Change password</button>
       <button type="button" class="item" onclick={showToken}>Subsonic token</button>

@@ -3,7 +3,9 @@
   import { onMount, onDestroy, tick } from "svelte";
   import { api } from "../lib/api";
   import { player } from "../lib/player.svelte";
-  import { nav } from "../lib/nav.svelte";
+  import { nav, activityFor } from "../lib/nav.svelte";
+  import { session } from "../lib/session.svelte";
+  import SettingsWorkspace from "../admin/App.svelte";
   import { connectPlayer, type PlayerSocket, type ProgressTick } from "../lib/playerWs";
   import { BrowserAudio } from "../lib/audio";
   import { setAudio, resume, pause, next as skipNext, previous as skipPrevious } from "../lib/playback";
@@ -88,6 +90,11 @@
 
   // A value (not a getter call) so TS narrows `route` in each branch below.
   const route = $derived(nav.current);
+  const activity = $derived(activityFor(route));
+  const listenTabs = [
+    {name: "queue", label: "Queue"}, {name: "playlists", label: "Playlists"},
+    {name: "mix", label: "Mixes"}, {name: "radio", label: "Stations"},
+  ] as const;
 
   // Center-panel title for the current route.
   const isSegment = $derived(
@@ -103,7 +110,13 @@
           : route.name === "artists"
             ? "Artists"
             : route.name === "radio"
-              ? "Radio"
+              ? "Stations"
+            : route.name === "queue"
+              ? "Queue"
+            : route.name === "mix"
+              ? "Mixes"
+            : route.name === "settings"
+              ? "Settings"
             : route.name === "favorites"
               ? "Favorites"
               : route.name === "playlists"
@@ -327,7 +340,7 @@
       <strong>{(player.activeKind === "zone" ? zones : players).find(p => p.id === player.activeId)?.name ?? "Connecting…"}</strong>
       <span aria-hidden="true">⌄</span>
     </button>
-    <a class="bar-icon" href="/admin" aria-label="Settings">⚙</a>
+    {#if session.isAdmin}<button class="bar-icon" type="button" aria-label="Settings" onclick={() => nav.push({name: "settings", category: "sources"})}>⚙</button>{/if}
   </header>
   <button class="scrim" type="button" hidden={!navOpen} aria-label="Dismiss navigation" onclick={closeNavigation}></button>
   <Sidebar onnowplaying={() => setNowPlaying(true)} onclose={closeNavigation} inert={mobile && !navOpen} />
@@ -339,9 +352,10 @@
         <button class="back-btn" type="button" onclick={() => nav.pop()}>‹ Back</button>
       {/if}
       <div class="content-title">
-        <p class="eyebrow">Library</p>
+        <p class="eyebrow">{activity === "browse" ? "Browse" : activity === "listen" ? "Listen" : "Administration"}</p>
         <h2>{title}</h2>
       </div>
+      {#if activity === "browse"}
       <div class="content-controls">
         <div class="segmented" role="tablist" aria-label="Browse">
           <button
@@ -364,7 +378,17 @@
           >
         </div>
       </div>
+      {/if}
     </header>
+
+    {#if activity === "listen"}
+      <nav class="listen-tabs" aria-label="Listening activities">
+        {#each listenTabs as tab}
+          <button class="ghost-button" type="button" data-listen-tab={tab.name} aria-pressed={route.name === tab.name}
+            onclick={() => nav.root({name: tab.name})}>{tab.label}</button>
+        {/each}
+      </nav>
+    {/if}
 
     {#if route.name === "tracks"}
       <TracksView />
@@ -388,6 +412,11 @@
       <RadioView />
     {:else if route.name === "mix"}
       <MixView />
+    {:else if route.name === "queue"}
+      <QueueDrawer embedded />
+    {:else if route.name === "settings"}
+      {#if session.isAdmin}<SettingsWorkspace category={route.category} />
+      {:else}<p>Administrator access required.</p>{/if}
     {/if}
   </section>
 

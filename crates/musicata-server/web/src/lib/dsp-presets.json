@@ -1,0 +1,67 @@
+[
+  {
+    "id": "taste-techno-bass",
+    "name": "Techno bass",
+    "kind": "listening",
+    "preampDb": -4,
+    "bands": [
+      {
+        "type": "lowshelf",
+        "freq": 90,
+        "gain": 4,
+        "q": 0.7
+      }
+    ]
+  },
+  {
+    "id": "demo-bass",
+    "name": "Bass boost (demo)",
+    "preampDb": -4,
+    "bands": [
+      {
+        "type": "lowshelf",
+        "freq": 100,
+        "gain": 6,
+        "q": 0.7
+      }
+    ]
+  },
+  {
+    "id": "demo-vshape",
+    "name": "V-shape (demo)",
+    "preampDb": -5,
+    "bands": [
+      {
+        "type": "lowshelf",
+        "freq": 90,
+        "gain": 5,
+        "q": 0.7
+      },
+      {
+        "type": "peaking",
+        "freq": 900,
+        "gain": -3,
+        "q": 1
+      },
+      {
+        "type": "highshelf",
+        "freq": 6000,
+        "gain": 4,
+        "q": 0.7
+      }
+    ]
+  },
+  {
+    "id": "demo-warm",
+    "name": "Warm / treble cut (demo)",
+    "preampDb": 0,
+    "bands": [
+      {
+        "type": "highshelf",
+        "freq": 5000,
+        "gain": -4,
+        "q": 0.7
+      }
+    ]
+  }
+]

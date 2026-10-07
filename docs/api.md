@@ -132,7 +132,7 @@ streaming fetches only the requested byte range.
 | GET | `/api/playlists` | List playlists (id, name, comment, song_count, timestamps). |
 | POST | `/api/playlists` | Create: `{ "name", "comment"?, "track_ids"? }`; returns the playlist with its tracks. |
 | GET | `/api/playlists/{id}` | Playlist with its ordered `tracks`. |
-| PATCH | `/api/playlists/{id}` | `name`/`comment` to edit; `track_ids` to replace/reorder; or `add_track_ids` + `remove_indices`. |
+| PATCH | `/api/playlists/{id}` | `name`/`comment` to edit; `track_ids` + `expected_track_ids` to replace/reorder; `add_track_ids` appends atomically; `remove_indices` requires `expected_track_ids` and returns 409 if the list changed. |
 | DELETE | `/api/playlists/{id}` | Delete a playlist. |
 | GET | `/api/favorites` | Starred `{ tracks, albums, artists }`. |
 | PUT | `/api/favorites/{kind}/{id}` | Star (`kind` = `track`/`album`/`artist`). |
@@ -179,7 +179,7 @@ consume the connections needed for authentication and browsing.
 | `set_repeat` | `mode` (`off`/`all`/`one`) |
 | `set_shuffle` | `enabled` (bool) |
 | `play_tracks` | `track_ids` (string[]) — replace queue and play; `start_index` (number, optional, default 0) — queue position to start at |
-| `enqueue` | `track_ids` (string[]) |
+| `enqueue` | `track_ids` (string[]); `next` (boolean, optional, default false) inserts immediately after the current item without resuming playback |
 | `play_queue_index` | `index` (number) |
 | `remove_queue_item` | `index` (number) |
 | `move_queue_item` | `from`, `to` (numbers) |
@@ -294,7 +294,7 @@ event stream keeps it alive.
 
 ### DSP profiles
 
-EQ + room/headphone correction profiles. Authenticated (not admin-only).
+EQ + room/headphone correction profiles. Reads and per-output selection require authentication; profile and impulse-response mutations require an administrator. Built-in presets are available without a management write.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
@@ -319,7 +319,7 @@ has nowhere to send what it reads. `scripts/ui-smoke.sh` fails on any CSP violat
 ### Audio ML (embeddings & tags)
 
 Drives the optional `musicata-ml` service (see [musicata-ml.md](musicata-ml.md)). Enabled and
-pointed at a service URL from **/admin → Settings**; the analysis itself runs on its own
+pointed at a service URL from **Settings → History & services → Audio analysis**; the analysis itself runs on its own
 background worker.
 
 | Method | Path | Purpose |
@@ -428,13 +428,16 @@ opaque. `coverArt` on albums and songs is the album id.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET/PUT | `/api/players/{id}/dsp` | Desired `{profile_id, enabled}` selection; response includes capabilities, desired/applied revisions, status/error and measurement point. `?migrate=true` writes only if no explicit selection exists. |
+| GET/PUT | `/api/players/{id}/dsp` | Desired `{profile_id, enabled, correction_enabled, listening_profile_id, listening_enabled}` selection; response includes capabilities, desired/applied revisions, status/error and measurement point. `?migrate=true` writes only if no explicit selection exists. |
 | GET | `/api/players/{id}/audio/ws` | Dedicated audio config/telemetry channel. User session or that native endpoint's scoped token. |
 | GET/PUT | `/api/players/{id}/dsp/processor` | Admin-only MPD processor `{host, port}` binding; `null` disconnects it. |
 
 Audio sockets begin with `dsp_state`. A renderer sends `{type:"renderer"}` and receives
 `renderer_granted` or `renderer_denied`. The granted/config frames include `config.state`,
-`config.profile` and `config.meter_subscribed`. Apply confirmations use `dsp_applied` with
+`config.profile` (the validated effective profile), `config.correction_profile` and
+`config.listening_profile` (raw library profiles), and `config.meter_subscribed`.
+`enabled` is the master bypass; correction and listening flags bypass their respective layers.
+Legacy requests default to correction enabled and no listening adjustment. Apply confirmations use `dsp_applied` with
 `session_id`, `revision`, and optional `error`. Renderer `levels` adds a monotonic `sequence`
 and `{rms_l,rms_r,peak_l,peak_r}`. Stale/unowned/unapplied generations are rejected.
 Controllers send `{type:"meter_subscription",enabled:true}` and receive at most 20 snapshots/s;

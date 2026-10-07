@@ -706,6 +706,9 @@ pub enum PlayerCommand {
     },
     Enqueue {
         track_ids: Vec<String>,
+        /// Insert after the current queue item without interrupting playback.
+        #[serde(default)]
+        next: bool,
     },
     PlayQueueIndex {
         index: usize,
