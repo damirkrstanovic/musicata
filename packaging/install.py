@@ -52,6 +52,8 @@ CLOUDFLARE_IMAGE = f'ghcr.io/{REPO}-caddy:1.3.1'
 COMPONENTS = {'caddy', 'dsp', 'mpd', 'snapcast', 'airplay', 'spotify', 'discovery', 'ml'}
 LIBRESPOT = Path('/usr/local/bin/librespot')
 SNAPCAST_BIN = Path('/usr/local/bin')
+SNAPSERVER_CONFIG = Path('/etc/snapserver.conf')
+SNAPSERVER_DEFAULTS = Path('/etc/default/snapserver')
 SNAPCAST_REVISION = 'f12373479243e93a97237592d6a3703539ec41d5'  # 0.35.0, GPL-3.0-or-later
 AUDIO_SERVICES = {
     'mpd': ['mpd.service', 'mpd.socket'],
@@ -697,8 +699,93 @@ def healthy_tls(domain, timeout=180):
     raise InstallError(f'Caddy HTTPS health/certificate check failed for {domain}. Check Caddy logs, DNS validation credentials/permissions, outbound DNS/HTTPS, or public ports 80/443 when using public validation.')
 
 
-def preflight(cfg, saved, family):
+def snapserver_unit_fingerprint(service):
+    """Identify an unchanged inert utility, including its systemd overrides/config."""
+    text = run(['systemctl', 'cat', service])
+    for path in (SNAPSERVER_CONFIG, SNAPSERVER_DEFAULTS):
+        if path.is_file(): text += '\n'+str(path)+'\n'+path.read_text()
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def managed_snapserver_pids(saved):
+    if not saved or saved.get('mode') != 'docker' or not shutil.which('docker'): return set()
+    try:
+        rows = run(['docker','top','musicata','-eo','pid,comm']).splitlines()[1:]
+        return {int(row.split()[0]) for row in rows
+                if len(row.split()) == 2 and row.split()[1] == 'snapserver'}
+    except (InstallError, ValueError): return set()
+
+
+def snapserver_processes():
+    result = []
+    for path in Path('/proc').glob('[0-9]*/comm'):
+        try:
+            if path.read_text().strip() == 'snapserver': result.append(int(path.parent.name))
+        except (FileNotFoundError, ProcessLookupError, PermissionError): pass
+    return result
+
+
+def snapcast_port_conflicts(managed_pids):
+    # ss reports IPv4/IPv6 listeners and their owners; permission-limited checks never
+    # assume that an unidentified listener belongs to the managed container.
+    if not shutil.which('ss'):
+        raise InstallError('Install iproute2 (ss) to check Snapcast port ownership before Docker installation.')
+    conflicts = []
+    for line in run(['ss','-H','-ltnp']).splitlines():
+        fields = line.split()
+        if len(fields) < 4: continue
+        port = fields[3].rsplit(':',1)[-1]
+        if port not in ('1704','1705','1780'): continue
+        owners = {int(pid) for pid in re.findall(r'pid=(\d+)',line)}
+        if not owners or not owners <= managed_pids: conflicts.append(int(port))
+    return sorted(set(conflicts))
+
+
+def legacy_snapserver_utility(saved, service):
+    """1.6.1 did not save utility fingerprints. Accept only unchanged distro files."""
+    if not saved or saved.get('version') != '1.6.1' or service != 'snapserver.service': return False
+    try:
+        # Debian is the only native-package Snapserver route in 1.6.1; other distros
+        # received binaries from source, without a unit. dpkg verifies package files
+        # and conffiles; local units/drop-ins are never eligible for this exception.
+        if any(p.exists() for p in (Path('/etc/systemd/system')/service,
+                                   Path('/etc/systemd/system')/(service+'.d'))): return False
+        fragment = run(['systemctl','show',service,'--property','FragmentPath','--value']).strip()
+        dropins = run(['systemctl','show',service,'--property','DropInPaths','--value']).strip()
+        if fragment not in ('/lib/systemd/system/'+service, '/usr/lib/systemd/system/'+service) or dropins:
+            return False
+        return succeeds(['dpkg-query','-W','snapserver']) and not run(['dpkg','--verify','snapserver']).strip()
+    except InstallError: return False
+
+
+def docker_snapserver_conflicts(saved):
     issues = []
+    owned = (saved or {}).get('inactive_snapserver_units', {})
+    for service in ('snapserver.service','snapcast.service'):
+        active = succeeds(['systemctl','is-active','--quiet',service])
+        enabled = succeeds(['systemctl','is-enabled','--quiet',service])
+        installed = succeeds(['systemctl','cat',service])
+        inert = installed and not active and not enabled and (
+            (service in owned and owned[service] == snapserver_unit_fingerprint(service))
+            or legacy_snapserver_utility(saved, service))
+        if active or enabled or (installed and not inert):
+            issues.append(f'Standalone {service} exists (active={active}, enabled={enabled}).')
+    if SNAPSERVER_CONFIG.is_file() and not any(succeeds(['systemctl','cat',unit]) for unit in ('snapserver.service','snapcast.service')):
+        issues.append('Standalone /etc/snapserver.conf exists without a recognized utility service.')
+    managed = managed_snapserver_pids(saved)
+    for pid in snapserver_processes():
+        if pid not in managed: issues.append(f'Standalone snapserver process PID {pid} exists.')
+    try:
+        for port in snapcast_port_conflicts(managed):
+            issues.append(f'Snapcast TCP port {port} is occupied outside the verified Musicata Snapserver process (or its owner is unavailable; rerun with sudo).')
+    except InstallError as error: issues.append(str(error))
+    if issues:
+        issues.append('Docker includes its own Snapserver. Resolve/remove the standalone deployment or port conflict before retrying; the installer will not stop it or change its configuration.')
+    return issues
+
+
+def preflight(cfg, saved, family):
+    issues = docker_snapserver_conflicts(saved) if cfg['mode']=='docker' else []
     flags = set()
     for line in Path('/proc/cpuinfo').read_text().splitlines():
         if line.startswith('flags'):
@@ -790,7 +877,13 @@ def deploy(cfg, saved, family, missing):
     # Reject unavailable releases before making package-manager changes.
     version, release = release_metadata(cfg['version'])
     cfg['version'] = version
+    new_snapserver_units = [unit for unit in ('snapserver.service','snapcast.service')
+                            if not succeeds(['systemctl','cat',unit]) or legacy_snapserver_utility(saved, unit)]
     install_packages(family,missing)
+    cfg['inactive_snapserver_units'] = dict((saved or {}).get('inactive_snapserver_units', {}))
+    for unit in new_snapserver_units:
+        if succeeds(['systemctl','cat',unit]) and not succeeds(['systemctl','is-active','--quiet',unit]) and not succeeds(['systemctl','is-enabled','--quiet',unit]):
+            cfg['inactive_snapserver_units'][unit] = snapserver_unit_fingerprint(unit)
     if 'caddy' in missing and cfg['mode']=='native':
         # A newly installed distro package may auto-start its stock example service.
         if succeeds(['systemctl','cat','caddy.service']): run(['systemctl','disable','--now','caddy.service'])

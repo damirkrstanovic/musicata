@@ -285,3 +285,22 @@ to a downloaded portable 1.0.9 archive if it is not at the harness's default pat
 It builds a local image from that release binary and substitutes only registry lookups,
 so it tests real container execution and persistent data, but not GHCR authentication.
 This test passed on lizard10 without replacing its existing ML container.
+
+### Existing Snapserver on a Docker host
+
+Before installing or upgrading Docker, the installer checks for standalone host
+Snapserver services/processes and listeners on TCP 1704, 1705 and 1780. The same
+checks run with `--check` and `--dry-run`. It refuses conflicts before changing
+packages, services or containers and leaves the existing deployment intact.
+
+Back up and remove the standalone server deployment, or resolve the reported port
+conflict, before retrying. Stopping an independently configured service alone is
+not sufficient: an installed standalone service can start again later. Keep
+Snapclient on the playback host; only the conflicting Snapserver is involved.
+Use sudo when process ownership is unavailable in a read-only check.
+
+An unchanged, disabled utility installed by Musicata is permitted, as is Snapserver
+inside the existing installer-managed Musicata container. New installations record
+unit/config fingerprints. For legacy 1.6.1 upgrades, only disabled, unmodified
+Debian package files without local service overrides qualify as inert utilities;
+custom configurations need explicit conflict resolution.

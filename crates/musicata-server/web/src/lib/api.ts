@@ -322,6 +322,7 @@ export const api = {
   // Snapcast multi-room (synchronized playback across rooms)
   snapcastStatus: () => getJson<SnapcastStatus>("/api/snapcast/status"),
   updateSnapcast: (update: {
+    buffer_ms?: number;
     enabled?: boolean;
     auth_enabled?: boolean;
     server_host?: string;

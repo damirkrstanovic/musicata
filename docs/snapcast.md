@@ -35,8 +35,8 @@ snapserver installed," like the SMB source.
 Musicata plays the same music **perfectly in sync across rooms**. A zone's queue is decoded to
 PCM on the server and streamed through a managed `snapserver` to lightweight `snapclient`
 players — a Raspberry Pi by the speakers, a desktop, a phone, or the in-browser Snapweb client.
-Each client buffers ~1 s and plays on a server-stamped timestamp, so rooms stay sample-accurate
-(at a deliberate ~0.5–1 s latency — great for music, not for tight A/V sync). This is also how
+Each client uses a configurable playback buffer (1,000 ms by default) and plays on a
+server-stamped timestamp so rooms stay synchronized. This is also how
 server-side per-zone DSP is applied (see [dsp.md](dsp.md)).
 
 **Prerequisites** (the Linux installer supplies these utilities by default from 1.6.1):
@@ -59,6 +59,29 @@ server-side per-zone DSP is applied (see [dsp.md](dsp.md)).
    `snapclient` command to run on that device. Repeat per device.
 3. Pick which input the rooms play, and set per-room volume live. To stream from a phone
    instead, enable the AirPlay/Spotify inputs and cast to "Musicata".
+
+**Playback buffer:** Settings → Outputs & groups → Multi-room exposes a 100–5,000 ms
+buffer for Musicata-managed Snapserver. The default remains 1,000 ms. A 250 ms value
+is a trial for local/wired playback, not a guarantee for every network. Applying it
+briefly restarts Snapserver, preserving the Musicata queue and using Snapserver's
+saved client/group state. A failed apply restores the previous configuration/process;
+if recovery also fails, the error is shown. External servers must be configured by
+their owner. When multi-room is stopped, the saved value applies at startup; the UI
+reports an applied value only for a running managed server.
+
+Lowering this buffer and the producer backlog addresses different delays. Audio
+already timestamped in Snapclients remains subject to their transport buffer; track
+changes do not promise zero audible latency. Listening and multi-room stability need
+verification on the actual network and playback hardware.
+
+**Transport regression check:** in an isolated Linux test pod with `snapserver`,
+`snapclient`, Python 3 and FFmpeg installed, run
+`python3 tests/audio/snapcast_latency.py --server /path/to/fresh/musicata-server`.
+It uses temporary state and two localhost file-output clients, checks 1,000/250 ms
+track switching and retained client volume across restart, then checks MP3, 44.1→48 kHz
+resampling and HTTP-radio continuity. It binds Snapcast's standard ports, so use a
+dedicated pod without another server. Every child has a deadline and is cleaned up.
+This checks software delivery; it does not establish DAC latency or Wi-Fi reliability.
 
 **Internet radio:** choose the Snapcast output, open **Browse radio**, and play a discovered
 or saved station. Musicata decodes direct HTTP(S) audio streams incrementally and sends them
@@ -269,9 +292,12 @@ Built and verified end-to-end with the real `snapserver`/`snapclient` 0.35:
 1. **The writer must self-pace to real time.** snapserver never backpressures our pipe writes
    here — it reads the pipe at real time and relays to each snapclient (which buffers ~1 s) —
    so a writer with no pacing spins a CPU and races the queue forward. `writer.rs` keeps a
-   playout clock at most `PACING_LEAD` (1 s) ahead of now and sleeps: it bursts up front to
-   prime the client buffer, then feeds at real time, and the lead doubles as the runaway cap
-   when no client is connected.
+   playout clock with a 20 ms producer lead. The Linux FIFO is reduced to one page
+   (4,096 bytes on common hosts, about 21 ms at 48 kHz stereo 16-bit). Client buffering
+   belongs to Snapserver; the producer no longer tries to prime a second of it.
+   Capacity checks precede PCM consumption, so commands remain responsive without a
+   reader. A non-reading O_RDWR descriptor keeps the FIFO open across server restarts;
+   inode replacement is detected explicitly. No second reader consumes or flushes audio.
 2. **Feed in snapserver-sized chunks.** snapserver reads its pipe in small chunks paced to real
    time (its `chunk_ms`, default 20 ms). Writing coarse chunks (the first cut used 85 ms) makes
    the pipe sawtooth; matching ~20 ms (`CHUNK_FRAMES = 960`) keeps its input smooth and makes
@@ -288,9 +314,13 @@ Built and verified end-to-end with the real `snapserver`/`snapclient` 0.35:
    (This was the actual cause of "gappy audio" in testing — accumulated orphan snapservers all
    draining one FIFO; verified fixed by killing Musicata with `-9` and watching snapserver exit.)
 
-(Also: in **debug** builds rubato's FFT resample of a multi-minute track takes several seconds,
-so the first `play` is slow and `execute` blocks on it; release is < 1 s. A future refinement
-is to decode off the command's response path.)
+Library preparation runs outside command acknowledgements. `library.rs` incrementally
+reads local files or bounded SMB ranges, decodes/resamples into an eight-chunk PCM
+channel, and cancels obsolete work. Manual Next reuses the prepared decoder rather
+than reopening the file. Natural EOF flushes the resampler tail and advances to the
+prepared next track. Seeking opens a new decoder at the requested position; stale
+loads/events cannot replace a newer selection. The retained full-file decoder is a
+test reference, not the playback path.
 
 ### How it was verified
 

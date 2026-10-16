@@ -34,7 +34,7 @@ use crate::mpd::{MpdConnection, MpdStatus};
 use crate::providers::ProviderRegistry;
 use crate::queue_persistence::{QueueOwner, QueuePersist, QueuePersistence};
 #[cfg(feature = "snapcast")]
-use crate::snapcast::{DecodedTrack, SnapcastManager, StereoEq, WriterEvent, WriterMsg};
+use crate::snapcast::{SnapcastManager, StereoEq, WriterEvent, WriterMsg};
 
 /// Stable id of the always-present local browser player.
 pub const BROWSER_PLAYER_ID: &str = "browser-local";
@@ -2872,6 +2872,8 @@ pub struct SnapcastPlayer {
     writer_generation: AtomicU64,
     audio_tap: Arc<musicata_core::pcm_dsp::AudioTap>,
     writer_alive: Arc<AtomicBool>,
+    reconcile_tx: tokio::sync::watch::Sender<PlayerCommand>,
+    load_revision: AtomicU64,
 }
 
 /// What the writer thread is currently rendering / has preloaded.
@@ -2880,15 +2882,18 @@ pub struct SnapcastPlayer {
 struct LoadedTrack {
     track_id: Option<String>,
     stream_url: Option<String>,
+    radio_queued: bool,
     position: Option<usize>,
     next_track_id: Option<String>,
+    next_stream: Option<Arc<crate::snapcast::LibraryStream>>,
+    load_revision: u64,
     generation: u64,
 }
 
 #[cfg(feature = "snapcast")]
 impl SnapcastPlayer {
-    /// Build the player and spawn its FIFO writer thread (which blocks opening the FIFO
-    /// until snapserver is reading). Call [`restore`](Self::restore) then
+    /// Build the player and spawn its nonblocking FIFO writer thread.
+    /// Call [`restore`](Self::restore) then
     /// [`spawn_control_task`](Self::spawn_control_task) to bring it fully up.
     fn new(
         id: String,
@@ -2936,6 +2941,8 @@ impl SnapcastPlayer {
             writer_generation: AtomicU64::new(1),
             audio_tap,
             writer_alive,
+            reconcile_tx: tokio::sync::watch::channel(PlayerCommand::Stop).0,
+            load_revision: AtomicU64::new(0),
         })
     }
 
@@ -3036,11 +3043,10 @@ impl SnapcastPlayer {
         };
         self.persist(resume);
         self.broadcast().await;
-        self.reconcile(&PlayerCommand::Enqueue {
+        self.reconcile_tx.send_replace(PlayerCommand::Enqueue {
             track_ids,
             next: false,
-        })
-        .await;
+        });
         Ok(())
     }
 
@@ -3099,17 +3105,47 @@ impl SnapcastPlayer {
             };
             self.persist(persist);
         }
+        if matches!(
+            command,
+            PlayerCommand::Seek { .. }
+                | PlayerCommand::Next
+                | PlayerCommand::Previous
+                | PlayerCommand::PlayTracks { .. }
+                | PlayerCommand::PlayQueueIndex { .. }
+                | PlayerCommand::Stop
+                | PlayerCommand::Clear
+                | PlayerCommand::PlayStream { .. }
+        ) {
+            self.load_revision.fetch_add(1, Ordering::Relaxed);
+        }
+        // Transport commands never wait for source I/O or decoding.
+        if matches!(command, PlayerCommand::Pause) {
+            let mut loaded = self.loaded.lock().await;
+            if loaded.stream_url.is_some() {
+                let _ = self.writer_tx.send(WriterMsg::Stop);
+                *loaded = LoadedTrack::default();
+                self.state.lock().await.queue_activity = None;
+            } else {
+                let _ = self.writer_tx.send(WriterMsg::SetPlaying(false));
+            }
+        }
+        if matches!(
+            command,
+            PlayerCommand::Stop | PlayerCommand::Clear | PlayerCommand::PlayStream { .. }
+        ) {
+            let _ = self.writer_tx.send(WriterMsg::Stop);
+            *self.loaded.lock().await = LoadedTrack::default();
+        }
         self.broadcast().await;
-        self.reconcile(&command).await;
+        self.reconcile_tx.send_replace(command);
         Ok(())
     }
 
     /// Drive the FIFO writer to match the queue state after a command: pause/stop, resume,
     /// seek, or decode+load a new current track (and preload the next for gapless output).
     async fn reconcile(&self, command: &PlayerCommand) {
-        if let PlayerCommand::SetVolume { volume } = command {
-            let _ = self.writer_tx.send(WriterMsg::SetVolume(*volume));
-        }
+        let volume = self.state.lock().await.volume.unwrap_or(100);
+        let _ = self.writer_tx.send(WriterMsg::SetVolume(volume));
         let (status, position, item, elapsed, next_item) = {
             let state = self.state.lock().await;
             let position = state.position;
@@ -3155,10 +3191,13 @@ impl SnapcastPlayer {
             return;
         };
 
+        let revision = self.load_revision.load(Ordering::Relaxed);
         let is_seek = matches!(command, PlayerCommand::Seek { .. });
         let same = {
             let loaded = self.loaded.lock().await;
-            if loaded.track_id.as_deref() != Some(track_id.as_str()) || loaded.position != position
+            if loaded.track_id.as_deref() != Some(track_id.as_str())
+                || loaded.position != position
+                || loaded.load_revision != revision
             {
                 false
             } else {
@@ -3174,10 +3213,6 @@ impl SnapcastPlayer {
                         .and_then(|item| item.track_id.as_deref())
                         == Some(track_id.as_str());
                 if current_matches {
-                    if is_seek {
-                        let frame = (elapsed * self.sample_rate as f64) as usize;
-                        let _ = self.writer_tx.send(WriterMsg::Seek { frame });
-                    }
                     let _ = self.writer_tx.send(WriterMsg::SetPlaying(true));
                 }
                 current_matches
@@ -3188,179 +3223,152 @@ impl SnapcastPlayer {
             return;
         }
 
-        // Disconnect live radio before waiting on a potentially slow library source.
-        {
+        let cached = {
             let mut loaded = self.loaded.lock().await;
-            let mut state = self.state.lock().await;
-            if state.status != PlaybackStatus::Playing
-                || state.position != position
-                || state
-                    .position
-                    .and_then(|i| state.queue.get(i))
-                    .and_then(|item| item.track_id.as_deref())
-                    != Some(track_id.as_str())
+            let cached = if !is_seek
+                && elapsed == 0.0
+                && loaded.next_track_id.as_deref() == Some(track_id.as_str())
             {
-                return;
+                loaded.next_stream.take()
+            } else {
+                None
+            };
+            let _ = self.writer_tx.send(WriterMsg::Stop);
+            *loaded = LoadedTrack::default();
+            cached
+        };
+        self.state.lock().await.queue_activity = Some("Preparing audio…".into());
+        self.broadcast().await;
+        let source = match cached {
+            Some(source) => Ok(source),
+            None => {
+                crate::snapcast::stream_library_track(
+                    &self.database,
+                    &self.providers,
+                    &track_id,
+                    self.sample_rate,
+                    elapsed,
+                )
+                .await
             }
-            if loaded.stream_url.is_some() {
-                let _ = self.writer_tx.send(WriterMsg::Stop);
-                *loaded = LoadedTrack::default();
-                state.queue_activity = None;
-            }
-        }
-
-        // A different track is now current — decode and load it.
-        let decoded = match self.decode(&track_id).await {
-            Ok(decoded) => {
-                crate::diagnostics::record_context(
-                    "snapcast.decode",
-                    "snapcast",
-                    musicata_core::diagnostics::DiagnosticAction::Recovery,
-                    musicata_core::diagnostics::DiagnosticContext {
-                        output_id: Some(self.id.clone()),
-                        track_id: Some(track_id.clone()),
-                        ..Default::default()
-                    },
-                    "",
-                );
-                decoded
-            }
+        };
+        let source = match source {
+            Ok(source) => source,
             Err(error) => {
-                crate::diagnostics::record_context(
-                    "snapcast.decode",
-                    "snapcast",
-                    musicata_core::diagnostics::DiagnosticAction::Failure,
-                    musicata_core::diagnostics::DiagnosticContext {
-                        output_id: Some(self.id.clone()),
-                        track_id: Some(track_id.clone()),
-                        ..Default::default()
-                    },
-                    &error,
-                );
-                tracing::warn!(player = %self.id, track = %track_id, %error, diagnostic_recorded=true, "snapcast: decode failed");
+                let mut state = self.state.lock().await;
+                if state.status == PlaybackStatus::Playing
+                    && state.position == position
+                    && self.load_revision.load(Ordering::Relaxed) == revision
+                {
+                    state.status = PlaybackStatus::Stopped;
+                    state.queue_activity = Some(format!("Playback failed: {error}"));
+                    crate::diagnostics::failure(
+                        "snapcast.decode",
+                        "snapcast",
+                        Some(&self.id),
+                        &error,
+                    );
+                }
+                drop(state);
+                self.broadcast().await;
+                self.persist_playback().await;
                 return;
             }
         };
-        let duration = decoded.frames() as f64 / self.sample_rate as f64;
-        let gain = leveling_gain(&item);
-        let frame = (elapsed * self.sample_rate as f64) as usize;
+        let duration = self
+            .database
+            .track(&track_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|t| t.duration_seconds);
         {
             let mut loaded = self.loaded.lock().await;
             let mut state = self.state.lock().await;
             if state.status != PlaybackStatus::Playing
                 || state.position != position
+                || self.load_revision.load(Ordering::Relaxed) != revision
                 || state
                     .position
                     .and_then(|i| state.queue.get(i))
-                    .and_then(|item| item.track_id.as_deref())
+                    .and_then(|i| i.track_id.as_deref())
                     != Some(track_id.as_str())
             {
-                return; // A user command overtook the decode; it owns the output now.
+                return;
             }
             let generation = self.writer_generation.fetch_add(1, Ordering::Relaxed);
-            let _ = self.writer_tx.send(WriterMsg::Load {
-                track: decoded,
-                start_frame: frame,
-                gain,
+            let _ = self.writer_tx.send(WriterMsg::LoadLibrary {
+                stream: source,
+                gain: leveling_gain(&item),
                 generation,
             });
             let _ = self.writer_tx.send(WriterMsg::SetPlaying(true));
-            loaded.track_id = Some(track_id);
-            loaded.stream_url = None;
-            loaded.position = position;
-            loaded.next_track_id = None;
-            loaded.generation = generation;
-            state.duration_seconds = Some(duration);
+            *loaded = LoadedTrack {
+                track_id: Some(track_id),
+                position,
+                generation,
+                load_revision: revision,
+                ..Default::default()
+            };
+            state.duration_seconds = duration;
         }
-        self.broadcast().await;
         self.preload(next_item).await;
     }
 
-    /// Decode the next queue item and hand it to the writer for gapless continuation —
-    /// unless it is already preloaded (so this is cheap to call on every command).
+    /// Prepare only a bounded prefix. The same decoder/receiver is reused by manual Next.
     async fn preload(&self, next_item: Option<QueueItem>) {
         let next_track_id = next_item.as_ref().and_then(|item| item.track_id.clone());
         let generation = {
             let mut loaded = self.loaded.lock().await;
-            if loaded.next_track_id == next_track_id {
+            if loaded.next_track_id == next_track_id && loaded.next_stream.is_some() {
                 return;
             }
             loaded.next_track_id = next_track_id.clone();
+            loaded.next_stream = None;
+            let _ = self.writer_tx.send(WriterMsg::ClearPreload {
+                generation: loaded.generation,
+            });
             loaded.generation
         };
         let (Some(track_id), Some(item)) = (next_track_id, next_item) else {
             return;
         };
-        let before = self.snapshot().await;
-        let remaining = before
-            .duration_seconds
-            .map(|duration| (duration - before.elapsed_seconds.unwrap_or(0.0)).max(0.0));
-        let started = std::time::Instant::now();
-        match self.decode(&track_id).await {
-            Ok(decoded) => {
-                crate::diagnostics::record_context(
-                    "snapcast.preload",
-                    "snapcast",
-                    musicata_core::diagnostics::DiagnosticAction::Recovery,
-                    musicata_core::diagnostics::DiagnosticContext {
-                        output_id: Some(self.id.clone()),
-                        track_id: Some(track_id.clone()),
-                        ..Default::default()
-                    },
-                    "",
-                );
-                let loaded = self.loaded.lock().await;
+        match crate::snapcast::stream_library_track(
+            &self.database,
+            &self.providers,
+            &track_id,
+            self.sample_rate,
+            0.0,
+        )
+        .await
+        {
+            Ok(source) => {
+                let mut loaded = self.loaded.lock().await;
                 let state = self.state.lock().await;
-                let current_matches = state.status == PlaybackStatus::Playing
-                    && state.position == loaded.position
-                    && state
-                        .position
-                        .and_then(|index| state.queue.get(index))
-                        .and_then(|item| item.track_id.as_deref())
-                        == loaded.track_id.as_deref();
                 let actual_next = next_index(
                     state.position,
                     state.queue.len(),
                     state.repeat,
                     active_shuffle(&state),
                 )
-                .and_then(|index| state.queue.get(index))
-                .and_then(|item| item.track_id.as_deref());
+                .and_then(|i| state.queue.get(i))
+                .and_then(|i| i.track_id.as_deref());
                 if loaded.generation == generation
+                    && state.status == PlaybackStatus::Playing
+                    && state.position == loaded.position
                     && loaded.next_track_id.as_deref() == Some(track_id.as_str())
-                    && current_matches
                     && actual_next == Some(track_id.as_str())
                 {
-                    if remaining.is_some_and(|remaining| {
-                        remaining > 0.0 && started.elapsed().as_secs_f64() >= remaining
-                    }) {
-                        crate::diagnostics::failure(
-                            "snapcast.preload_deadline",
-                            "snapcast",
-                            Some(&self.id),
-                            "playback interrupted",
-                        );
-                    }
-                    let _ = self.writer_tx.send(WriterMsg::Preload {
-                        track: decoded,
+                    let _ = self.writer_tx.send(WriterMsg::PreloadLibrary {
+                        stream: source.clone(),
                         gain: leveling_gain(&item),
                         generation,
                     });
+                    loaded.next_stream = Some(source);
                 }
             }
             Err(error) => {
-                crate::diagnostics::record_context(
-                    "snapcast.preload",
-                    "snapcast",
-                    musicata_core::diagnostics::DiagnosticAction::Failure,
-                    musicata_core::diagnostics::DiagnosticContext {
-                        output_id: Some(self.id.clone()),
-                        track_id: Some(track_id.clone()),
-                        ..Default::default()
-                    },
-                    &error,
-                );
-                tracing::debug!(player = %self.id, track = %track_id, %error, diagnostic_recorded=true, "snapcast: preload decode failed");
+                crate::diagnostics::failure("snapcast.preload", "snapcast", Some(&self.id), &error)
             }
         }
     }
@@ -3380,7 +3388,8 @@ impl SnapcastPlayer {
             {
                 return;
             }
-            if loaded.stream_url.as_deref() == Some(item.stream_url.as_str())
+            if loaded.radio_queued
+                && loaded.stream_url.as_deref() == Some(item.stream_url.as_str())
                 && loaded.position == position
             {
                 let _ = self.writer_tx.send(WriterMsg::SetPlaying(true));
@@ -3422,7 +3431,7 @@ impl SnapcastPlayer {
             }
         };
         let sent = {
-            let loaded = self.loaded.lock().await;
+            let mut loaded = self.loaded.lock().await;
             let state = self.state.lock().await;
             if loaded.generation != generation
                 || state.status != PlaybackStatus::Playing
@@ -3436,10 +3445,11 @@ impl SnapcastPlayer {
                 return;
             }
             let stream = crate::snapcast::stream_radio(url, self.sample_rate);
-            self.writer_tx
+            loaded.radio_queued = self
+                .writer_tx
                 .send(WriterMsg::LoadStream { stream, generation })
-                .is_ok()
-                && self.writer_tx.send(WriterMsg::SetPlaying(true)).is_ok()
+                .is_ok();
+            loaded.radio_queued && self.writer_tx.send(WriterMsg::SetPlaying(true)).is_ok()
         };
         if !sent {
             self.on_stream_failed(
@@ -3455,14 +3465,19 @@ impl SnapcastPlayer {
             let loaded = self.loaded.lock().await;
             let mut state = self.state.lock().await;
             if loaded.generation != generation
-                || loaded.stream_url.is_none()
-                || state.status != PlaybackStatus::Playing
+                || (loaded.stream_url.is_none() && loaded.track_id.is_none())
+                || !matches!(
+                    state.status,
+                    PlaybackStatus::Playing | PlaybackStatus::Paused
+                )
                 || state.position != loaded.position
-                || state
-                    .position
-                    .and_then(|i| state.queue.get(i))
-                    .map(|i| &i.stream_url)
-                    != loaded.stream_url.as_ref()
+                || state.position.and_then(|i| state.queue.get(i)).map(|i| {
+                    if loaded.track_id.is_some() {
+                        i.track_id.as_deref()
+                    } else {
+                        Some(i.stream_url.as_str())
+                    }
+                }) != Some(loaded.track_id.as_deref().or(loaded.stream_url.as_deref()))
             {
                 return;
             }
@@ -3476,37 +3491,27 @@ impl SnapcastPlayer {
             let mut loaded = self.loaded.lock().await;
             let mut state = self.state.lock().await;
             if loaded.generation != generation
-                || loaded.stream_url.is_none()
+                || (loaded.stream_url.is_none() && loaded.track_id.is_none())
                 || state.status != PlaybackStatus::Playing
                 || state.position != loaded.position
-                || state
-                    .position
-                    .and_then(|i| state.queue.get(i))
-                    .map(|i| &i.stream_url)
-                    != loaded.stream_url.as_ref()
+                || state.position.and_then(|i| state.queue.get(i)).map(|i| {
+                    if loaded.track_id.is_some() {
+                        i.track_id.as_deref()
+                    } else {
+                        Some(i.stream_url.as_str())
+                    }
+                }) != Some(loaded.track_id.as_deref().or(loaded.stream_url.as_deref()))
             {
                 return;
             }
             let _ = self.writer_tx.send(WriterMsg::Stop);
             state.status = PlaybackStatus::Stopped;
             crate::diagnostics::failure("snapcast.stream", "snapcast", Some(&self.id), &error);
-            state.queue_activity = Some(format!("Radio playback failed: {error}"));
+            state.queue_activity = Some(format!("Playback failed: {error}"));
             *loaded = LoadedTrack::default();
         }
         self.broadcast().await;
         self.persist_playback().await;
-    }
-
-    async fn decode(&self, track_id: &str) -> Result<Arc<DecodedTrack>, String> {
-        let _timing = crate::diagnostics::Timing::new(crate::diagnostics::Operation::Decode);
-        crate::snapcast::decode_queue_item(
-            &self.database,
-            &self.providers,
-            track_id,
-            self.sample_rate,
-        )
-        .await
-        .map(Arc::new)
     }
 
     /// Spawn the control task: it advances the queue on writer drain/advance events and
@@ -3518,7 +3523,28 @@ impl SnapcastPlayer {
             .expect("events lock")
             .take()
             .expect("control task spawned once");
+        let mut requests = self.reconcile_tx.subscribe();
+        let worker_player = self.clone();
+        let worker = tokio::spawn(async move {
+            while requests.changed().await.is_ok() {
+                loop {
+                    let command = requests.borrow_and_update().clone();
+                    tokio::select! {
+                        biased;
+                        changed = requests.changed() => { if changed.is_err() { return; } }
+                        _ = worker_player.reconcile(&command) => break,
+                    }
+                }
+            }
+        });
         tokio::spawn(async move {
+            struct AbortWorker(JoinHandle<()>);
+            impl Drop for AbortWorker {
+                fn drop(&mut self) {
+                    self.0.abort();
+                }
+            }
+            let _worker = AbortWorker(worker);
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -3581,6 +3607,7 @@ impl SnapcastPlayer {
             loaded.track_id = new_track_id.clone();
             loaded.stream_url = None;
             loaded.next_track_id = None;
+            loaded.next_stream = None;
             (new_position, new_track_id, next)
         };
         // Best-effort: set the seek-bar duration for the new current track.
@@ -3601,7 +3628,11 @@ impl SnapcastPlayer {
         }
         self.broadcast().await;
         self.persist_playback().await;
-        self.preload(next_item).await;
+        let _ = next_item;
+        self.reconcile_tx.send_replace(PlayerCommand::Enqueue {
+            track_ids: Vec::new(),
+            next: false,
+        });
     }
 
     /// The queue drained with nothing preloaded — stop.
@@ -3653,7 +3684,7 @@ impl SnapcastPlayer {
         self.broadcast().await;
         self.persist_playback().await;
         if advance {
-            self.reconcile(&PlayerCommand::Next).await;
+            self.reconcile_tx.send_replace(PlayerCommand::Next);
         }
     }
 
@@ -3663,7 +3694,10 @@ impl SnapcastPlayer {
     async fn on_tick(&self) {
         let mut state = self.state.lock().await;
         let playback = {
-            if state.status != PlaybackStatus::Playing {
+            if state.status != PlaybackStatus::Playing
+                || state.queue_activity.as_deref() == Some("Preparing audio…")
+                || state.queue_activity.as_deref() == Some("Connecting to radio…")
+            {
                 return;
             }
             let mut elapsed = state.elapsed_seconds.unwrap_or(0.0) + 1.0;
@@ -5547,6 +5581,149 @@ mod tests {
 
     #[cfg(feature = "snapcast")]
     #[tokio::test]
+    async fn snapcast_pending_radio_retries_and_paused_library_records_readiness() {
+        let path = temp_db("snapcast-pending-state");
+        let database = Database::connect(&path).await.unwrap();
+        let manager = Arc::new(
+            SnapcastManager::start(crate::snapcast::SnapcastSettings {
+                manage_server: false,
+                fifo_path: path.with_extension("fifo"),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let player = SnapcastPlayer::new(
+            "pending".into(),
+            database,
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+            manager,
+        );
+        let item = QueueItem {
+            stream_url: "/api/radio/removed/stream".into(),
+            ..Default::default()
+        };
+        {
+            let mut state = player.state.lock().await;
+            state.queue = vec![item.clone()];
+            state.position = Some(0);
+            state.status = PlaybackStatus::Playing;
+        }
+        // Exact state left when a new control cancels the station lookup. Reconciliation
+        // must retry it: the removed station should fail, not remain connecting forever.
+        *player.loaded.lock().await = LoadedTrack {
+            stream_url: Some(item.stream_url.clone()),
+            position: Some(0),
+            ..Default::default()
+        };
+        player.reconcile_radio(&item, Some(0)).await;
+        assert_eq!(player.snapshot().await.status, PlaybackStatus::Stopped);
+        {
+            let mut state = player.state.lock().await;
+            state.queue = vec![QueueItem {
+                track_id: Some("track".into()),
+                ..Default::default()
+            }];
+            state.status = PlaybackStatus::Paused;
+            state.queue_activity = Some("Preparing audio…".into());
+        }
+        *player.loaded.lock().await = LoadedTrack {
+            track_id: Some("track".into()),
+            position: Some(0),
+            generation: 42,
+            ..Default::default()
+        };
+        player.on_stream_started(41).await;
+        assert!(player.state.lock().await.queue_activity.is_some());
+        player.on_stream_started(42).await;
+        assert!(player.state.lock().await.queue_activity.is_none());
+        assert_eq!(player.snapshot().await.status, PlaybackStatus::Paused);
+        let _ = player.writer_tx.send(WriterMsg::Shutdown);
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
+    async fn snapcast_manual_next_reuses_preload_after_source_removed() {
+        let path = temp_db("snapcast-preload-reuse");
+        let database = Database::connect(&path).await.unwrap();
+        let mut library = library_with_tracks(2);
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata-fixture/Harbourmaster/Long Player/Disc 1/01 Movement.mp3");
+        for (index, track) in library.tracks.iter_mut().enumerate() {
+            track.path = path.with_extension(format!("{index}.mp3"));
+            std::fs::copy(&fixture, &track.path).unwrap();
+        }
+        let second_path = library.tracks[1].path.clone();
+        database.save_library(&mut library).await.unwrap();
+        let providers = Arc::new(RwLock::new(ProviderRegistry::new()));
+        let manager = Arc::new(
+            SnapcastManager::start(crate::snapcast::SnapcastSettings {
+                manage_server: false,
+                fifo_path: path.with_extension("fifo"),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        // A regular-file sink lets this test inspect decoding without physical audio.
+        std::fs::remove_file(manager.fifo_path()).unwrap();
+        std::fs::write(manager.fifo_path(), []).unwrap();
+        let player =
+            SnapcastPlayer::new("test-preload".into(), database.clone(), providers, manager);
+        let control = player.clone().spawn_control_task();
+        player
+            .execute(
+                PlayerCommand::PlayTracks {
+                    track_ids: vec!["track_1".into(), "track_2".into()],
+                    start_index: 0,
+                },
+                &database,
+                "http://localhost",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if player.loaded.lock().await.next_stream.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_file(second_path).unwrap();
+        player
+            .execute(PlayerCommand::Next, &database, "http://localhost")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if player.loaded.lock().await.track_id.as_deref() == Some("track_2") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(player.snapshot().await.status, PlaybackStatus::Playing);
+        player
+            .execute(PlayerCommand::Stop, &database, "http://localhost")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(player.loaded.lock().await.track_id.is_none());
+        control.abort();
+        let _ = player.writer_tx.send(WriterMsg::Shutdown);
+        for track in library.tracks {
+            let _ = std::fs::remove_file(track.path);
+        }
+        let _ = std::fs::remove_file(path.with_extension("fifo"));
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
     async fn snapcast_drain_after_refill_advances_appended_track_and_ignores_stale_event() {
         let path = temp_db("snapcast-drain-refill-race");
         let database = Database::connect(&path).await.unwrap();
@@ -5799,6 +5976,15 @@ mod tests {
             )
             .await
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while player.loaded.lock().await.generation == 0
+                || player.loaded.lock().await.generation == resumed_generation
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert_ne!(player.loaded.lock().await.generation, resumed_generation);
         player
             .on_stream_failed(resumed_generation, "replaced station".into())
@@ -5859,8 +6045,19 @@ mod tests {
                 "old radio audio continued while the library source was blocked"
             );
         }
+        assert!(
+            change.is_finished(),
+            "library command waited for blocked provider access"
+        );
         drop(provider_guard);
         change.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while player.loaded.lock().await.track_id.as_deref() != Some("track_1") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(
             player.loaded.lock().await.track_id.as_deref(),
             Some("track_1")
@@ -5906,7 +6103,12 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            player.snapshot().await.queue_activity.is_none(),
+            !player
+                .snapshot()
+                .await
+                .queue_activity
+                .as_deref()
+                .is_some_and(|s| s.contains("failed")),
             "radio failure remained visible during library playback"
         );
         let previous_connections = connections.load(Ordering::Relaxed);
@@ -5921,6 +6123,13 @@ mod tests {
             )
             .await
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while player.snapshot().await.status != PlaybackStatus::Stopped {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(player.snapshot().await.status, PlaybackStatus::Stopped);
         assert!(
             player

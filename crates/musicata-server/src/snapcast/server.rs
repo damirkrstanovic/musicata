@@ -22,7 +22,17 @@ use serde::{Deserialize, Serialize};
 
 use super::decode::CHANNELS;
 
-/// The fixed stream name snapserver advertises for Musicata's own decoded library audio.
+/// Preserve Snapserver's conservative default until the user's network is tested.
+pub const DEFAULT_BUFFER_MS: u32 = 1000;
+
+pub fn validate_buffer_ms(value: u32) -> Result<()> {
+    if !(100..=5000).contains(&value) {
+        return Err(anyhow!("Playback buffer must be between 100 and 5000 ms"));
+    }
+    Ok(())
+}
+
+/// The fixed stream name Snapserver advertises for Musicata's decoded library audio.
 pub const STREAM_NAME: &str = "Musicata";
 /// Stream id for the AirPlay input (snapserver spawns shairport-sync and exposes it as a stream).
 pub const AIRPLAY_STREAM_NAME: &str = "AirPlay";
@@ -87,6 +97,7 @@ pub struct SnapcastSettings {
     pub fifo_path: PathBuf,
     /// Stream sample rate (snapserver runs at one fixed rate; we resample to it).
     pub sample_rate: u32,
+    pub buffer_ms: u32,
     /// snapserver JSON-RPC control endpoint (TCP, newline-delimited).
     pub control_host: String,
     pub control_port: u16,
@@ -127,6 +138,7 @@ impl Default for SnapcastSettings {
             server_binary: "snapserver".to_string(),
             fifo_path: std::env::temp_dir().join("musicata-snapcast/musicata.fifo"),
             sample_rate: 48_000,
+            buffer_ms: DEFAULT_BUFFER_MS,
             control_host: "127.0.0.1".to_string(),
             control_port: 1705,
             http_port: 1780,
@@ -149,15 +161,18 @@ impl Default for SnapcastSettings {
 pub struct SnapcastManager {
     settings: SnapcastSettings,
     child: Mutex<Option<Child>>,
+    buffer_ms: std::sync::atomic::AtomicU32,
+    apply_lock: tokio::sync::Mutex<()>,
 }
 
 impl SnapcastManager {
     /// Ensure the FIFO exists and — when managing — snapserver is running against it.
     pub async fn start(settings: SnapcastSettings) -> Result<Self> {
+        validate_buffer_ms(settings.buffer_ms)?;
         ensure_fifo(&settings.fifo_path).await?;
         let mut child = None;
         if settings.manage_server {
-            child = Some(spawn_server(&settings).await?);
+            child = Some(start_checked(&settings).await?);
             tracing::info!(
                 stream = STREAM_NAME,
                 fifo = %settings.fifo_path.display(),
@@ -170,9 +185,98 @@ impl SnapcastManager {
             );
         }
         Ok(Self {
+            buffer_ms: std::sync::atomic::AtomicU32::new(settings.buffer_ms),
+            apply_lock: tokio::sync::Mutex::new(()),
             settings,
             child: Mutex::new(child),
         })
+    }
+
+    pub fn managed(&self) -> bool {
+        self.settings.manage_server
+    }
+
+    pub fn is_running(&self) -> bool {
+        !self.managed()
+            || self
+                .child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .is_some_and(|child| child.try_wait().is_ok_and(|exit| exit.is_none()))
+    }
+
+    pub fn buffer_ms(&self) -> Option<u32> {
+        (self.managed() && self.is_running())
+            .then(|| self.buffer_ms.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Complete process replacement and persistence even if the HTTP caller disconnects.
+    pub async fn apply_buffer_and_save(
+        self: std::sync::Arc<Self>,
+        database: musicata_storage::Database,
+        value: u32,
+    ) -> Result<()> {
+        tokio::spawn(async move {
+            let _apply = self.apply_lock.lock().await;
+            let previous = self.buffer_ms().ok_or_else(|| {
+                anyhow!("Snapserver is not running; restart Musicata before applying the buffer")
+            })?;
+            self.apply_buffer(value).await?;
+            if let Err(error) = database
+                .set_setting("snapcast.buffer_ms", &value.to_string())
+                .await
+            {
+                self.apply_buffer(previous).await.map_err(|restore| {
+                    anyhow!("Could not save buffer ({error}) or restore it ({restore})")
+                })?;
+                return Err(error.into());
+            }
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Caller holds apply_lock through persistence as well as process replacement.
+    async fn apply_buffer(&self, value: u32) -> Result<()> {
+        validate_buffer_ms(value)?;
+        if !self.managed() {
+            return Err(anyhow!(
+                "Configure the playback buffer on the external Snapserver"
+            ));
+        }
+        let previous = self.buffer_ms.load(std::sync::atomic::Ordering::Acquire);
+        if previous == value {
+            return Ok(());
+        }
+        let old_child = self.child.lock().unwrap().take();
+        if let Some(child) = old_child {
+            stop_server(child).await;
+        }
+        let mut candidate = self.settings.clone();
+        candidate.buffer_ms = value;
+        match start_checked(&candidate).await {
+            Ok(child) => {
+                *self.child.lock().unwrap() = Some(child);
+                self.buffer_ms
+                    .store(value, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                candidate.buffer_ms = previous;
+                match start_checked(&candidate).await {
+                    Ok(child) => {
+                        *self.child.lock().unwrap() = Some(child);
+                        Err(anyhow!(
+                            "Buffer change failed; previous buffer restored: {error}"
+                        ))
+                    }
+                    Err(restore) => Err(anyhow!(
+                        "Buffer change failed: {error}; restoring previous server also failed: {restore}"
+                    )),
+                }
+            }
+        }
     }
 
     pub fn fifo_path(&self) -> PathBuf {
@@ -272,6 +376,7 @@ fn render_config(settings: &SnapcastSettings) -> String {
         "[server]\n\
          datadir = {state_dir}\n\
          [stream]\n\
+         buffer = {buffer}\n\
          source = pipe://{fifo}?name={name}&sampleformat={rate}:16:{channels}&codec=flac&mode=read\n",
         // The service account may have no home directory (especially in Docker).
         // ensure_fifo creates this writable directory before spawning Snapserver.
@@ -284,6 +389,7 @@ fn render_config(settings: &SnapcastSettings) -> String {
         name = STREAM_NAME,
         rate = settings.sample_rate,
         channels = CHANNELS,
+        buffer = settings.buffer_ms,
     );
     // Optional inputs *into* Musicata. AirPlay/librespot run at 44.1 kHz; the per-stream
     // sampleformat says so (only one stream plays per group at a time, so mixed rates are fine).
@@ -334,6 +440,55 @@ fn render_config(settings: &SnapcastSettings) -> String {
     config
 }
 
+/// Own every intermediate process across await points, including task cancellation.
+struct ChildGuard(Option<Child>);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+async fn stop_server(child: Child) {
+    let mut guard = ChildGuard(Some(child));
+    let child = guard.0.as_mut().unwrap();
+    // SIGTERM lets Snapserver persist client volume/group/stream state in its datadir.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    for _ in 0..80 {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+async fn start_checked(settings: &SnapcastSettings) -> Result<Child> {
+    let mut guard = ChildGuard(Some(spawn_server(settings).await?));
+    let control = super::control::SnapControl::new(format!(
+        "{}:{}",
+        settings.control_host, settings.control_port
+    ));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = guard.0.as_mut().unwrap().try_wait()? {
+            return Err(anyhow!("Snapserver exited during apply: {status}"));
+        }
+        match tokio::time::timeout_at(deadline, control.streams()).await {
+            Ok(Ok(_)) => return Ok(guard.0.take().unwrap()),
+            result if tokio::time::Instant::now() >= deadline => {
+                return Err(anyhow!("Snapserver did not become ready: {result:?}"));
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+}
+
 /// Write the snapserver config for our streams and spawn the process.
 async fn spawn_server(settings: &SnapcastSettings) -> Result<Child> {
     let config_path = settings
@@ -372,11 +527,148 @@ async fn spawn_server(settings: &SnapcastSettings) -> Result<Child> {
 mod tests {
     use super::*;
 
+    struct TestDir(PathBuf);
+    impl TestDir {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn test_dir() -> TestDir {
+        let path = std::env::temp_dir().join(format!(
+            "musicata-buffer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        TestDir(path)
+    }
+
     fn room(name: &str, pw: &str) -> SnapRoom {
         SnapRoom {
             name: name.to_string(),
             password: pw.to_string(),
         }
+    }
+
+    #[test]
+    fn playback_buffer_is_explicit_and_validated() {
+        let mut settings = SnapcastSettings::default();
+        assert!(render_config(&settings).contains("buffer = 1000\n"));
+        settings.buffer_ms = 250;
+        assert!(render_config(&settings).contains("buffer = 250\n"));
+        assert!(validate_buffer_ms(250).is_ok());
+        assert!(validate_buffer_ms(0).is_err());
+        assert!(validate_buffer_ms(5001).is_err());
+    }
+
+    #[tokio::test]
+    async fn buffer_apply_restarts_and_rolls_back_failed_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = test_dir();
+        let binary = root.path().join("fake-snapserver");
+        std::fs::write(
+            &binary,
+            r#"#!/usr/bin/python3
+import sys, socket, json, re, time
+config = open(sys.argv[2]).read()
+if 'buffer = 250\n' in config: sys.exit(1)
+time.sleep(0.5) # Healthy slow startup must be retried, including rollback.
+port = int(re.search(r'\[tcp\]\nenabled = true\nport = (\d+)', config).group(1))
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', port)); s.listen()
+while True:
+ c, _ = s.accept()
+ with c:
+  c.recv(65536)
+  c.sendall((json.dumps({'id': 1, 'result': {'server': {'streams': []}}})+'\n').encode())
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let manager = SnapcastManager::start(SnapcastSettings {
+            server_binary: binary.to_string_lossy().into_owned(),
+            fifo_path: root.path().join("audio.fifo"),
+            control_port: port,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let manager = std::sync::Arc::new(manager);
+        let database = musicata_storage::Database::connect(root.path().join("settings.db"))
+            .await
+            .unwrap();
+        let pending = tokio::spawn(manager.clone().apply_buffer_and_save(database.clone(), 500));
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !std::fs::read_to_string(root.path().join("snapserver.conf"))
+                .unwrap()
+                .contains("buffer = 500\n")
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Cancel the caller while the slow candidate has not bound its port yet.
+        pending.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while database
+                .get_setting("snapcast.buffer_ms")
+                .await
+                .unwrap()
+                .as_deref()
+                != Some("500")
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(manager.buffer_ms(), Some(500));
+        let error = manager.apply_buffer(250).await.unwrap_err().to_string();
+        assert!(error.contains("previous buffer restored"), "{error}");
+        assert_eq!(manager.buffer_ms(), Some(500));
+        assert!(
+            manager
+                .child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            std::fs::read_to_string(root.path().join("snapserver.conf"))
+                .unwrap()
+                .contains("buffer = 500\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn external_server_buffer_is_not_reported_or_modified() {
+        let root = test_dir();
+        let manager = SnapcastManager::start(SnapcastSettings {
+            manage_server: false,
+            fifo_path: root.path().join("audio.fifo"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(manager.buffer_ms(), None);
+        assert!(manager.apply_buffer(250).await.is_err());
+        assert!(!root.path().join("snapserver.conf").exists());
     }
 
     #[test]

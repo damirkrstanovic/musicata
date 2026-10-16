@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The FIFO writer: a dedicated OS thread that streams decoded PCM into the named
 //! pipe snapserver reads. snapserver paces its pipe reads to real time (see
-//! `../snapcast` `asio_stream.hpp` `nextTick_`), so our **blocking writes backpressure
-//! automatically** — there is no clock here. Pausing simply stops writing (snapserver's
+//! `../snapcast` `asio_stream.hpp` `nextTick_`). Nonblocking writes and a small producer
+//! lead bound queued audio while keeping commands responsive. Pausing stops writing (snapserver's
 //! stream goes idle → silence to clients); seeking/skipping repositions the cursor.
 //!
-//! The thread is intentionally async-free: it owns the blocking pipe `File` and talks to
+//! The thread is intentionally async-free: it owns the pipe `File` and talks to
 //! the async control task (`super::SnapcastPlayer`) only through channels — commands in
 //! over a `std::sync::mpsc` (so it can block waiting for one while idle), events out over
 //! a tokio unbounded channel (whose `send` is callable from any thread).
 
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
@@ -21,6 +22,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::decode::{CHANNELS, DecodedTrack};
 use super::dsp::StereoEq;
+use super::library::LibraryStream;
 use super::stream::LiveStream;
 use musicata_core::pcm_dsp::{AudioTap, StereoMeter};
 use std::sync::atomic::Ordering;
@@ -31,19 +33,15 @@ use std::sync::atomic::Ordering;
 /// 960 frames = 20 ms at 48 kHz. Also small enough that seek/skip/pause react within a chunk.
 const CHUNK_FRAMES: usize = 960;
 
-/// How far ahead of real time we let the writer get before it sleeps. snapserver relays the
-/// pipe to each snapclient, which buffers ~1 s and plays at the server-stamped presentation
-/// time — snapserver does **not** backpressure our pipe writes. So we (a) burst up to this far
-/// ahead at the start to prime the client buffer, then (b) feed at real time to keep it full.
-/// Matching snapserver's default ~1 s client buffer primes it without overflowing; combined
-/// with small (20 ms) chunks the feed is smooth. It is also the runaway cap that stops us
-/// spinning a CPU when no client is connected (snapserver then drains the pipe greedily).
-const PACING_LEAD: Duration = Duration::from_millis(1000);
+/// Keep one chunk of producer lead; client synchronization buffering belongs to Snapserver.
+/// The FIFO is separately limited to one Linux page (~21 ms of stereo 48 kHz PCM).
+const PACING_LEAD: Duration = Duration::from_millis(20);
 
 /// One decoded track queued for output, plus the playback cursor into it (in frames) and
 /// a per-track linear gain (volume leveling — see Phase 4 in docs/snapcast.md).
 struct Loaded {
     track: Arc<DecodedTrack>,
+    stream: Option<Arc<LibraryStream>>,
     cursor_frames: usize,
     gain: f32,
     generation: u64,
@@ -58,9 +56,23 @@ struct LoadedStream {
 
 /// Commands from the async control task to the writer thread.
 pub enum WriterMsg {
+    LoadLibrary {
+        stream: Arc<LibraryStream>,
+        gain: f32,
+        generation: u64,
+    },
+    PreloadLibrary {
+        stream: Arc<LibraryStream>,
+        gain: f32,
+        generation: u64,
+    },
+    ClearPreload {
+        generation: u64,
+    },
     /// Start (or restart) at this track at `start_frame`, replacing whatever was
     /// playing and clearing any preloaded next track. `gain` is the per-track leveling
     /// factor (1.0 = unchanged).
+    #[cfg(test)]
     Load {
         track: Arc<DecodedTrack>,
         start_frame: usize,
@@ -69,8 +81,12 @@ pub enum WriterMsg {
     },
     /// Replace library PCM with a live decoded stream. Its receiver is deliberately consumed
     /// only by this thread so cancellation and output order stay coupled.
-    LoadStream { stream: LiveStream, generation: u64 },
+    LoadStream {
+        stream: LiveStream,
+        generation: u64,
+    },
     /// Queue the next track for gapless continuation when the current one drains.
+    #[cfg(test)]
     Preload {
         track: Arc<DecodedTrack>,
         gain: f32,
@@ -81,8 +97,6 @@ pub enum WriterMsg {
     /// Master output volume (0–100%), applied live to every client uniformly. Per-room
     /// trim is done via snapserver (the JSON-RPC control client / admin).
     SetVolume(u8),
-    /// Reposition the current track's cursor (seek), in frames from the start.
-    Seek { frame: usize },
     /// Replace the active EQ correction (or clear it with `None`). Applied per chunk before the
     /// FIFO — server-side correction for Snapcast, in-process (no CamillaDSP subprocess).
     SetDsp {
@@ -108,24 +122,38 @@ pub enum WriterEvent {
 }
 
 /// Run the writer loop on the calling (dedicated) thread until `Shutdown` or the command
-/// channel disconnects. Opening the FIFO for writing blocks until snapserver opens the
-/// read end — by which point the stream is ready.
+/// channel disconnects. Opening the FIFO is nonblocking, including when Snapserver is absent.
 pub fn run(
     fifo_path: PathBuf,
     rx: Receiver<WriterMsg>,
     events: UnboundedSender<WriterEvent>,
     tap: Arc<AudioTap>,
 ) {
-    let mut file = match OpenOptions::new().write(true).open(&fifo_path) {
+    // O_RDWR avoids an uninterruptible open/reopen when Snapserver is absent. This
+    // descriptor never reads: it only keeps the FIFO alive across server restarts.
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo_path)
+    {
         Ok(file) => file,
         Err(error) => {
             tracing::error!(path = %fifo_path.display(), %error, "snapcast: cannot open FIFO");
             return;
         }
     };
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) } < 0 {
+        use std::os::unix::fs::FileTypeExt;
+        if file.metadata().is_ok_and(|m| m.file_type().is_fifo()) {
+            tracing::warn!(
+                "snapcast: could not reduce FIFO capacity; producer pacing remains bounded"
+            );
+        }
+    }
     let mut current: Option<Loaded> = None;
     let mut stream: Option<LoadedStream> = None;
-    let mut next: Option<(Arc<DecodedTrack>, f32)> = None;
+    let mut next: Option<Loaded> = None;
     let mut playing = false;
     // Master volume as a linear factor (0.0–1.0); defaults to full scale.
     let mut volume = 1.0f32;
@@ -144,6 +172,9 @@ pub fn run(
         loop {
             match rx.try_recv() {
                 Ok(msg) => {
+                    if resets_clock(&msg) {
+                        clock = None;
+                    }
                     if !apply(
                         msg,
                         &mut current,
@@ -169,6 +200,9 @@ pub fn run(
             clock = None;
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(msg) => {
+                    if resets_clock(&msg) {
+                        clock = None;
+                    }
                     if !apply(
                         msg,
                         &mut current,
@@ -185,6 +219,57 @@ pub fn run(
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
+            }
+            continue;
+        }
+
+        // Check capacity before consuming/processing a chunk. Each write is <= PIPE_BUF,
+        // so a single owned writer can write it atomically once POLLOUT reports space.
+        // Continue servicing commands when Snapserver is stalled or disconnected.
+        let mut poll = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut poll, 1, 0) } <= 0 {
+            clock = None;
+            // A server/setup restart may replace the FIFO inode. Our own read end keeps
+            // the old inode alive, so detect replacement explicitly instead of relying on EPIPE.
+            use std::os::unix::fs::MetadataExt;
+            if let (Ok(open), Ok(path)) = (file.metadata(), std::fs::metadata(&fifo_path)) {
+                if (open.dev(), open.ino()) != (path.dev(), path.ino()) {
+                    if let Ok(reopened) = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&fifo_path)
+                    {
+                        unsafe {
+                            libc::fcntl(reopened.as_raw_fd(), libc::F_SETPIPE_SZ, 4096);
+                        }
+                        file = reopened;
+                        continue;
+                    }
+                }
+            }
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(msg) => {
+                    if !apply(
+                        msg,
+                        &mut current,
+                        &mut stream,
+                        &mut next,
+                        &mut playing,
+                        &mut volume,
+                        &mut eq,
+                        &mut meter,
+                        &tap,
+                    ) {
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Timeout) => {}
             }
             continue;
         }
@@ -239,27 +324,71 @@ pub fn run(
         // Write one chunk from the current track, then self-pace to real time.
         let (drained, frames_written, sample_rate) = {
             let loaded = current.as_mut().expect("current checked above");
-            let total = loaded.track.frames();
-            let start = loaded.cursor_frames.min(total);
-            let end = (start + CHUNK_FRAMES).min(total);
-            let chunk = &loaded.track.samples[start * CHANNELS..end * CHANNELS];
-            if !write_pcm(
-                &mut file,
-                &fifo_path,
-                chunk,
-                loaded.gain * volume,
-                &mut eq,
-                &mut meter,
-                &mut meter_frames,
-                &tap,
-                &mut scratch,
-                loaded.track.sample_rate,
-            ) {
-                return;
+            if let Some(source) = &loaded.stream {
+                let received = source
+                    .chunks
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(20));
+                match received {
+                    Ok(Ok(samples)) => {
+                        let frames = samples.len() / CHANNELS;
+                        if !write_pcm(
+                            &mut file,
+                            &fifo_path,
+                            &samples,
+                            loaded.gain * volume,
+                            &mut eq,
+                            &mut meter,
+                            &mut meter_frames,
+                            &tap,
+                            &mut scratch,
+                            source.sample_rate,
+                        ) {
+                            return;
+                        }
+                        if loaded.cursor_frames == 0 && frames > 0 {
+                            let _ = events.send(WriterEvent::StreamStarted {
+                                generation: loaded.generation,
+                            });
+                        }
+                        loaded.cursor_frames += frames;
+                        (false, frames, source.sample_rate)
+                    }
+                    Ok(Err(error)) => {
+                        let _ = events.send(WriterEvent::StreamFailed {
+                            generation: loaded.generation,
+                            error,
+                        });
+                        current = None;
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => (true, 0, source.sample_rate),
+                }
+            } else {
+                let total = loaded.track.frames();
+                let start = loaded.cursor_frames.min(total);
+                let end = (start + CHUNK_FRAMES).min(total);
+                let chunk = &loaded.track.samples[start * CHANNELS..end * CHANNELS];
+                if !write_pcm(
+                    &mut file,
+                    &fifo_path,
+                    chunk,
+                    loaded.gain * volume,
+                    &mut eq,
+                    &mut meter,
+                    &mut meter_frames,
+                    &tap,
+                    &mut scratch,
+                    loaded.track.sample_rate,
+                ) {
+                    return;
+                }
+                // Advance only after the chunk is actually written.
+                loaded.cursor_frames = end;
+                (end >= total, end - start, loaded.track.sample_rate)
             }
-            // Advance only after the chunk is actually written.
-            loaded.cursor_frames = end;
-            (end >= total, end - start, loaded.track.sample_rate)
         };
 
         // Pace to real time: keep the playout clock at most PACING_LEAD ahead of now (see the
@@ -272,19 +401,15 @@ pub fn run(
                 .as_ref()
                 .map(|loaded| loaded.generation)
                 .unwrap_or_default();
-            if let Some((track, gain)) = next.take() {
+            if let Some(mut preloaded) = next.take() {
                 if let Some(eq) = eq.as_mut() {
                     eq.reset();
                 }
                 meter.reset();
                 meter_frames = 0;
                 tap.clear();
-                current = Some(Loaded {
-                    track,
-                    cursor_frames: 0,
-                    gain,
-                    generation,
-                });
+                preloaded.generation = generation;
+                current = Some(preloaded);
                 let _ = events.send(WriterEvent::Advanced { generation });
             } else {
                 current = None;
@@ -294,12 +419,37 @@ pub fn run(
     }
 }
 
+fn resets_clock(msg: &WriterMsg) -> bool {
+    match msg {
+        WriterMsg::LoadLibrary { .. }
+        | WriterMsg::LoadStream { .. }
+        | WriterMsg::Stop
+        | WriterMsg::SetPlaying(_) => true,
+        #[cfg(test)]
+        WriterMsg::Load { .. } => true,
+        _ => false,
+    }
+}
+
+fn library_loaded(stream: Arc<LibraryStream>, gain: f32, generation: u64) -> Loaded {
+    Loaded {
+        track: Arc::new(DecodedTrack {
+            samples: Vec::new(),
+            sample_rate: stream.sample_rate,
+        }),
+        stream: Some(stream),
+        cursor_frames: 0,
+        gain,
+        generation,
+    }
+}
+
 /// Apply one command to the writer's local state. Returns `false` on `Shutdown`.
 fn apply(
     msg: WriterMsg,
     current: &mut Option<Loaded>,
     stream: &mut Option<LoadedStream>,
-    next: &mut Option<(Arc<DecodedTrack>, f32)>,
+    next: &mut Option<Loaded>,
     playing: &mut bool,
     volume: &mut f32,
     eq: &mut Option<StereoEq>,
@@ -307,6 +457,41 @@ fn apply(
     tap: &AudioTap,
 ) -> bool {
     match msg {
+        WriterMsg::LoadLibrary {
+            stream: source,
+            gain,
+            generation,
+        } => {
+            *current = Some(library_loaded(source, gain, generation));
+            *stream = None;
+            *next = None;
+            meter.reset();
+            tap.clear();
+            if let Some(eq) = eq.as_mut() {
+                eq.reset();
+            }
+        }
+        WriterMsg::PreloadLibrary {
+            stream: source,
+            gain,
+            generation,
+        } => {
+            if current
+                .as_ref()
+                .is_some_and(|loaded| loaded.generation == generation)
+            {
+                *next = Some(library_loaded(source, gain, generation));
+            }
+        }
+        WriterMsg::ClearPreload { generation } => {
+            if current
+                .as_ref()
+                .is_some_and(|loaded| loaded.generation == generation)
+            {
+                *next = None;
+            }
+        }
+        #[cfg(test)]
         WriterMsg::Load {
             track,
             start_frame,
@@ -319,6 +504,7 @@ fn apply(
             let cursor_frames = start_frame.min(track.frames());
             *current = Some(Loaded {
                 track,
+                stream: None,
                 cursor_frames,
                 gain,
                 generation,
@@ -345,6 +531,7 @@ fn apply(
                 started: false,
             });
         }
+        #[cfg(test)]
         WriterMsg::Preload {
             track,
             gain,
@@ -356,7 +543,13 @@ fn apply(
                 .as_ref()
                 .is_some_and(|loaded| loaded.generation == generation)
             {
-                *next = Some((track, gain));
+                *next = Some(Loaded {
+                    track,
+                    stream: None,
+                    cursor_frames: 0,
+                    gain,
+                    generation,
+                });
             }
         }
         WriterMsg::SetPlaying(value) => {
@@ -367,16 +560,6 @@ fn apply(
             }
         }
         WriterMsg::SetVolume(percent) => *volume = (percent.min(100) as f32) / 100.0,
-        WriterMsg::Seek { frame } => {
-            meter.reset();
-            tap.clear();
-            if let Some(loaded) = current.as_mut() {
-                loaded.cursor_frames = frame.min(loaded.track.frames());
-            }
-            if let Some(eq) = eq.as_mut() {
-                eq.reset();
-            }
-        }
         WriterMsg::SetDsp { chain, revision } => {
             *eq = *chain;
             meter.reset();
@@ -437,8 +620,16 @@ fn write_pcm(
         meter.reset();
         *meter_frames = 0;
         tracing::warn!(%error, "snapcast: FIFO write failed; reopening");
-        match OpenOptions::new().write(true).open(fifo_path) {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(fifo_path)
+        {
             Ok(mut reopened) => {
+                unsafe {
+                    libc::fcntl(reopened.as_raw_fd(), libc::F_SETPIPE_SZ, 4096);
+                }
                 if let Err(error) = reopened.write_all(scratch) {
                     tracing::error!(%error, "snapcast: FIFO write failed after reopen; writer stopping");
                     return false;
@@ -474,7 +665,8 @@ fn pace(clock: &mut Option<Instant>, frames: usize, sample_rate: u32) {
     }
     let chunk = Duration::from_secs_f64(frames as f64 / sample_rate as f64);
     let slot = clock.get_or_insert_with(Instant::now);
-    let deadline = *slot + chunk;
+    // Never burst to catch up after a blocked source/reader or a transport discontinuity.
+    let deadline = (*slot).max(Instant::now()) + chunk;
     *slot = deadline;
     let target = deadline.checked_sub(PACING_LEAD).unwrap_or(deadline);
     let now = Instant::now();
@@ -530,6 +722,77 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn producer_does_not_burst_a_second_of_audio() {
+        let (file, tx, _, _, writer) = spawn_regular_writer("bounded-lead");
+        tx.send(WriterMsg::Load {
+            track: Arc::new(DecodedTrack {
+                samples: vec![1000; 48000 * 2 * 5],
+                sample_rate: 48000,
+            }),
+            start_frame: 0,
+            gain: 1.0,
+            generation: 1,
+        })
+        .unwrap();
+        tx.send(WriterMsg::SetPlaying(true)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let bytes = std::fs::metadata(&file).unwrap().len();
+        tx.send(WriterMsg::Shutdown).unwrap();
+        writer.join().unwrap();
+        std::fs::remove_file(file).unwrap();
+        assert!(
+            bytes <= 32_000,
+            "producer queued {bytes} bytes within 100 ms"
+        );
+    }
+
+    #[test]
+    fn absent_fifo_reader_does_not_block_shutdown() {
+        let file = path("blocked-reader");
+        let name = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        let fifo = file.clone();
+        let writer = std::thread::spawn(move || {
+            run(fifo, rx, events, Arc::new(AudioTap::default()));
+            let _ = done.send(());
+        });
+        tx.send(WriterMsg::Load {
+            track: Arc::new(DecodedTrack {
+                samples: vec![1000; 48000 * 2],
+                sample_rate: 48000,
+            }),
+            start_frame: 0,
+            gain: 1.0,
+            generation: 1,
+        })
+        .unwrap();
+        tx.send(WriterMsg::SetPlaying(true)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        tx.send(WriterMsg::Stop).unwrap();
+        tx.send(WriterMsg::Shutdown).unwrap();
+        let responsive = finished.recv_timeout(Duration::from_millis(500)).is_ok();
+        // Release the original blocking implementation too, so the RED test cannot leak.
+        if !responsive {
+            let _reader = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file)
+                .unwrap();
+            writer.join().unwrap();
+        } else {
+            writer.join().unwrap();
+        }
+        std::fs::remove_file(file).unwrap();
+        assert!(
+            responsive,
+            "writer blocked on a missing/slow Snapserver reader"
+        );
     }
 
     #[test]

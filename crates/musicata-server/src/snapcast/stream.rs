@@ -119,6 +119,7 @@ fn decode_radio(
     let mut source_rate = 0;
     let mut source_channels = 0;
     let mut resampler: Option<StreamResampler> = None;
+    let mut pcm_pending = Vec::with_capacity(CHUNK_FRAMES * CHANNELS);
 
     loop {
         if cancelled.load(Ordering::Acquire) {
@@ -153,9 +154,9 @@ fn decode_radio(
                 buf.copy_interleaved_ref(decoded);
                 let stereo = to_stereo(buf.samples(), source_channels);
                 if let Some(resampler) = resampler.as_mut() {
-                    resampler.push(&stereo, tx, cancelled)?;
+                    resampler.push(&stereo, &mut pcm_pending, tx, cancelled)?;
                 } else {
-                    send_samples(&stereo, tx, cancelled)?;
+                    send_samples(&stereo, &mut pcm_pending, tx, cancelled)?;
                 }
             }
             // Streams occasionally carry a corrupt frame; retain the decoder state and continue.
@@ -167,17 +168,18 @@ fn decode_radio(
 
 fn send_samples(
     samples: &[f32],
+    pending: &mut Vec<i16>,
     tx: &SyncSender<Result<Vec<i16>, String>>,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    for frames in samples.chunks(CHUNK_FRAMES * CHANNELS) {
-        if frames.len() < CHANNELS {
-            continue;
-        }
-        let length = frames.len() / CHANNELS * CHANNELS;
-        let chunk = frames[..length].iter().map(to_i16).collect();
-        if !send_chunk(tx, Ok(chunk), cancelled) {
-            return Ok(());
+    // Keep packet/resampler tails until a complete FIFO-sized chunk is available.
+    for sample in samples {
+        pending.push(to_i16(sample));
+        if pending.len() == CHUNK_FRAMES * CHANNELS {
+            let chunk = std::mem::replace(pending, Vec::with_capacity(CHUNK_FRAMES * CHANNELS));
+            if !send_chunk(tx, Ok(chunk), cancelled) {
+                return Ok(());
+            }
         }
     }
     Ok(())
@@ -274,6 +276,7 @@ impl StreamResampler {
     fn push(
         &mut self,
         samples: &[f32],
+        pcm_pending: &mut Vec<i16>,
         tx: &SyncSender<Result<Vec<i16>, String>>,
         cancelled: &AtomicBool,
     ) -> Result<(), String> {
@@ -294,7 +297,12 @@ impl StreamResampler {
                 .map_err(|error| format!("radio resample: {error}"))?;
             let start = self.trim.min(frames);
             self.trim -= start;
-            send_samples(&output[start * CHANNELS..frames * CHANNELS], tx, cancelled)?;
+            send_samples(
+                &output[start * CHANNELS..frames * CHANNELS],
+                pcm_pending,
+                tx,
+                cancelled,
+            )?;
         }
         Ok(())
     }
@@ -426,7 +434,7 @@ mod tests {
         while Instant::now() < deadline {
             match stream.chunks.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(chunk)) => {
-                    assert!(chunk.len() <= CHUNK_FRAMES * CHANNELS);
+                    assert_eq!(chunk.len(), CHUNK_FRAMES * CHANNELS);
                     assert_eq!(chunk.len() % CHANNELS, 0);
                     frames += chunk.len() / CHANNELS;
                 }
@@ -453,7 +461,7 @@ mod tests {
         loop {
             match stream.chunks.recv_timeout(Duration::from_secs(5)).unwrap() {
                 Ok(chunk) => {
-                    assert!(chunk.len() <= CHUNK_FRAMES * CHANNELS);
+                    assert_eq!(chunk.len(), CHUNK_FRAMES * CHANNELS);
                     frames += chunk.len() / CHANNELS;
                 }
                 Err(error) => {
