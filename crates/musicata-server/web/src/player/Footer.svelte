@@ -139,7 +139,7 @@
         if (id) startRadio(id);
       }}
     >
-      ((•))
+      Radio
     </button>
     <button
       class="eq-btn"
@@ -149,7 +149,7 @@
       aria-pressed={meter.open}
       onclick={() => meter.toggle()}
     >
-      ▮▮
+      VU
     </button>
     <button
       class="eq-btn"
@@ -159,7 +159,7 @@
       aria-pressed={statsPanel.open}
       onclick={() => statsPanel.toggle()}
     >
-      ◔
+      Stats
     </button>
     <button
       class="eq-btn"
@@ -175,10 +175,11 @@
       class="queue-btn"
       type="button"
       title="Queue"
+      aria-label="Queue"
       aria-pressed={player.queueOpen}
       onclick={() => (player.queueOpen = !player.queueOpen)}
     >
-      <span class="queue-glyph">≣</span><span class="queue-count">{player.queue.length}</span>
+      <span class="queue-glyph">Queue</span><span class="queue-count">{player.queue.length}</span>
     </button>
   </div>
 </footer>

@@ -38,6 +38,7 @@ class Nav {
     if (!this.pendingScroll) this.positions.set(this.index, this.snapshot().scroll);
   };
   private cancelScrollRestore = () => { this.pendingScroll = null; };
+  private lastBrowse: {route: Route; scroll: Scroll} | null = null;
   private initial: Route = { name: "library" };
   browseView = $state<"library" | "tracks" | "artists">("library");
 
@@ -78,6 +79,9 @@ class Nav {
 
   private save(): void {
     const entry = this.snapshot();
+    if (["library", "tracks", "artists"].includes(entry.route.name)) {
+      this.lastBrowse = {route: entry.route, scroll: entry.scroll};
+    }
     this.positions.set(this.index, entry.scroll);
     history.replaceState(entry, "");
   }
@@ -125,6 +129,23 @@ class Nav {
 
   /** Both root choices and detail views participate in browser Back/Forward. */
   root(route: Route): void { this.push(route); }
+
+  captureBrowse() {
+    const entry = this.snapshot();
+    if (["library", "tracks", "artists"].includes(entry.route.name)) return {route: entry.route, scroll: entry.scroll};
+    return this.lastBrowse ?? {route: {name: this.browseView} as Route, scroll: {page: 0, content: 0}};
+  }
+
+  returnToBrowse(saved: {route: Route; scroll: Scroll}): void {
+    this.save();
+    const replace = this.overlays.length > 0;
+    const entry: Entry = {musicata: 1, index: this.index + (replace ? 0 : 1),
+      route: saved.route, overlays: [], scroll: saved.scroll};
+    if (replace) history.replaceState(entry, "");
+    else history.pushState(entry, "");
+    this.positions.set(entry.index, entry.scroll);
+    this.apply(entry);
+  }
 
   push(route: Route): void {
     if (JSON.stringify(route) === JSON.stringify(this.current)) {

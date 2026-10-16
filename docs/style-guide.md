@@ -10,7 +10,7 @@ binary via `rust-embed` from `web/dist/`. Components are `PascalCase.svelte`.
 - **Listen** — queue, playlists, similarity mixes and internet radio stations.
 - **Settings** — administrator-only configuration inside the shared player shell:
   Music sources, Outputs & groups, Sound profiles, Metadata & artwork,
-  History & services, and System & accounts. Categories are tabs; search indexes
+  History & services, and System & accounts. Categories are tabs on desktop and a labeled select on compact screens; search indexes
   named destinations and keywords, never current values or credentials.
 
 The `/` and compatible `/admin` entry points mount the same player component tree.
@@ -48,8 +48,10 @@ visible and exposes Back whenever there is an in-app history entry.
 The compact player's title and artwork open Now Playing: controls followed directly by
 the active queue, with its current track highlighted. Saved playlists have a separate
 browse screen. Back closes the current playback/drawer view before returning through
-library navigation, and Forward restores that view. Desktop retains its three-column
-layout and exposes Browse, Listen and Settings in the sidebar, with listening shortcuts.
+library navigation, and Forward restores that view. Desktop starts with a sidebar, a wide library, and a bottom transport bar. Expanding the
+player or opening queue, metadata, EQ, metering, or statistics adds a side rail. Browse,
+Listen and Settings remain primary sidebar destinations; playlists and radio have named
+sections. The compact layout applies below 1024 px, including landscape phones.
 Clicking its current song or Now Playing opens the queue alongside the transport, leaving
 the library available. Output selection and playback controls stay visible. The optional
 install prompt sits in the page flow on all screen sizes so it cannot cover browsing controls.
@@ -66,6 +68,16 @@ and change per-output selections. Built-in presets are supplied by one shared pr
 so selecting one never requires a profile-management write.
 Settings imports classify profiles as headphone correction, speaker/room correction, or a
 listening adjustment. Room impulse responses belong only to equipment correction.
+
+Search results expose Clear search. Submitting search closes the navigation drawer;
+Clear search and Library/Browse restore the pre-search browsing segment and scroll position.
+Switching Tracks/Albums/Artists within search retains the query.
+
+Tracks keep Play and an actions disclosure visible; desktop also shows Favorite. The
+disclosure provides named favorite, radio, queue, playlist, and metadata actions, with
+44 px touch targets. Escape closes it and returns focus to its trigger. Queue reorder
+and remove controls are exposed through Edit queue, leaving titles room when browsing.
+Album detail uses one primary title and a compact artwork/metadata header on phones.
 
 Tracks offer Play, Add to queue, Play next and Add to playlist. Queue and similarity mixes
 can save their ordered library tracks as playlists; transient streams cannot become library

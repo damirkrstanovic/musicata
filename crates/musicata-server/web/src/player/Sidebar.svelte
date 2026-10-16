@@ -12,7 +12,7 @@
   import BrowseFilters from "./BrowseFilters.svelte";
   import AccountMenu from "./AccountMenu.svelte";
 
-  let { onclose, onnowplaying, inert = false }: { onclose: () => void; onnowplaying: () => void; inert?: boolean } = $props();
+  let { onclose, inert = false }: { onclose: () => void; inert?: boolean } = $props();
 
   let playlists = $state<Playlist[]>([]);
   let smart = $state<SmartPlaylist[]>([]);
@@ -31,14 +31,8 @@
   }
   load();
 
-  // Search is a live filter on the current Tracks/Albums/Artists segment (not a separate
-  // view), so it persists when you switch segments. The grid views react to search.query.
-  let searchTimer: ReturnType<typeof setTimeout> | undefined;
-  function onSearch(value: string) {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => (search.query = value), 220);
-  }
-  onDestroy(() => clearTimeout(searchTimer));
+  // Query changes are debounced centrally so exiting search cancels pending input.
+  onDestroy(() => search.cancelPending());
 
   async function newPlaylist() {
     const name = await promptText({ title: "New playlist", label: "Name", confirmLabel: "Create" });
@@ -56,18 +50,21 @@
   </div>
 
   {#if activity === "browse"}
-  <label class="search">
-    <input type="search" autocomplete="off" placeholder="Search" oninput={(e) => onSearch(e.currentTarget.value)} />
-  </label>
+  <form class="search" role="search" onsubmit={(event) => {
+    event.preventDefault();
+    const input = event.currentTarget.querySelector('input')!;
+    search.update(input.value);
+    onclose();
+  }}>
+    <input type="search" aria-label="Search library" autocomplete="off" placeholder="Search" bind:value={search.draft} oninput={(e) => search.schedule(e.currentTarget.value)} />
+  </form>
   {/if}
 
   <nav class="library-nav" aria-label="Views">
-    <button class="nav-link desktop-destination" data-activity="browse" class:is-active={activity === "browse"} type="button" onclick={() => nav.root({name: nav.browseView})}>Browse</button>
+    <button class="nav-link desktop-destination" data-activity="browse" class:is-active={activity === "browse"} type="button" onclick={() => search.clear()}>Browse</button>
     <button class="nav-link desktop-destination" data-activity="listen" class:is-active={activity === "listen"} type="button" onclick={() => nav.root({name: "queue"})}>Listen</button>
     {#if session.isAdmin}<button class="nav-link desktop-destination" data-activity="settings" class:is-active={activity === "settings"} type="button" onclick={() => nav.root({name: "settings", category: "sources"})}>Settings</button>{/if}
     {#if activity !== "settings"}
-    <button class="nav-link desktop-destination" class:is-active={["playlists", "playlist", "smart"].includes(nav.current.name)} type="button" onclick={() => nav.root({name: "playlists"})}>Playlists</button>
-    <button class="nav-link desktop-destination" class:is-active={nav.overlays.includes("nowPlaying")} type="button" onclick={onnowplaying}>Now Playing</button>
     <button
       class="nav-link"
       class:is-active={nav.current.name === "favorites"}
@@ -87,7 +84,7 @@
 
   {#if activity === "browse"}
   <section class="section">
-    <h2>Browse</h2>
+    <h2>Filter library</h2>
     <BrowseFilters />
   </section>
   {/if}
@@ -95,7 +92,7 @@
   {#if activity !== "settings"}
   <section class="section">
     <div class="section-head">
-      <h2>Playlists</h2>
+      <h2><button class="section-link" type="button" onclick={() => nav.root({name: "playlists"})}>Playlists</button></h2>
       <button class="ghost-button mini" type="button" title="New playlist" onclick={newPlaylist}>＋</button>
     </div>
     <div class="playlist-list">

@@ -6,6 +6,7 @@
 // Args: <port> <basePath> <mode=behavior|scale>. Assumes Chrome CDP on :9222. Exits
 // non-zero on any failed assertion.
 import { radioFlows } from "./radio-flows.mjs";
+import { uxFlows } from "./ux-flows.mjs";
 import { curationFlows } from "./curation-flows.mjs";
 
 const PORT = process.argv[2];
@@ -174,6 +175,12 @@ if (process.env.MUSICATA_RADIO_ONLY) {
   process.exit(failures ? 1 : 0);
 }
 
+if (process.env.MUSICATA_UX_ONLY) {
+  await uxFlows({js, send, check, waitUntil, tap: tapMobile, screenshot: mobileScreenshot});
+  ws.close();
+  process.exit(failures ? 1 : 0);
+}
+
 // Desktop shares the listening destinations, while keeping the library visible.
 if (MODE === "behavior") {
   await js(`localStorage.removeItem('musicata.browse-view'); history.replaceState(null, '')`);
@@ -191,7 +198,7 @@ if (MODE === "behavior") {
   await send('Page.reload');
   await sleep(1200);
   check('desktop remembers browsing choice on a new visit', await js(`document.querySelectorAll('.artist-card').length > 0`));
-  await clickText('.library-nav button', 'Playlists');
+  await clickText('.section-link', 'Playlists');
   await sleep(400);
   check('desktop exposes saved playlists destination', await js(`document.querySelectorAll('.saved-playlist').length > 0`));
   await clickText('.library-nav button', 'Browse');
@@ -370,6 +377,7 @@ await js(`document.querySelector('.queue-btn')?.click()`);
 await sleep(500);
 check("queue drawer lists tracks", (await js(`document.querySelectorAll('.queue-row').length`)) > 0);
 // Reorder: move the first row down → a different track heads the queue.
+await js(`document.querySelector('.queue-edit')?.click()`);
 const qFirst = await js(`document.querySelector('.queue-row .q-title')?.textContent`);
 const qLen = await js(`document.querySelectorAll('.queue-row').length`);
 await js(`document.querySelector('.queue-row .q-actions button[title="Move down"]')?.click()`);
@@ -1068,6 +1076,7 @@ if (process.env.MUSICATA_UI_SCREENSHOTS) {
 }
 
 
+if (MODE === "behavior") await uxFlows({js, send, check, waitUntil, tap: tapMobile, screenshot: mobileScreenshot});
 check("no CSP violations", cspViolations.length === 0, cspViolations.slice(0, 3).join(" | "));
 console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);
 // Release this renderer before the next independent activity-flow tab claims the output.

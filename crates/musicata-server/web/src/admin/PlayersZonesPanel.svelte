@@ -126,7 +126,7 @@
   }
 </script>
 
-<section class="admin-panel">
+<section class="admin-panel players-panel">
   <div class="admin-panel-head"><h2>Players &amp; zones</h2></div>
   <p class="admin-hint">MPD players you control, optionally grouped into zones.</p>
 
@@ -142,6 +142,7 @@
         </div>
         <select
           class="zone-select"
+          aria-label="Zone for {player.name}"
           value={player.zone_id ?? ""}
           onchange={(e) => assignZone(player, (e.currentTarget as HTMLSelectElement).value)}
         >

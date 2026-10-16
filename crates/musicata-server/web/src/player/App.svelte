@@ -11,6 +11,9 @@
   import { setAudio, resume, pause, next as skipNext, previous as skipPrevious } from "../lib/playback";
   import { sendCommand } from "../lib/commands";
   import { setMediaMetadata, setMediaPosition, setMediaHandlers } from "../lib/media";
+  import { metadata } from "../lib/metadata.svelte";
+  import { meter } from "../lib/meter.svelte";
+  import { statsPanel } from "../lib/statsPanel.svelte";
   import { favorites } from "../lib/favorites.svelte";
   import { search } from "../lib/search.svelte";
   import { dsp } from "../lib/dsp.svelte";
@@ -48,9 +51,11 @@
   const navOpen = $derived(nav.overlays.includes("navigation"));
   const nowPlayingOpen = $derived(nav.overlays.includes("nowPlaying"));
   let mobile = $state(false);
+  let railExpanded = $state(false);
+  const railOpen = $derived(railExpanded || nowPlayingOpen || player.queueOpen || dsp.panelOpen || metadata.trackId !== null || meter.open || statsPanel.open);
 
   onMount(() => {
-    const query = matchMedia("(max-width: 820px)");
+    const query = matchMedia("(max-width: 1023px)");
     const update = () => { mobile = query.matches; };
     update();
     nav.start();
@@ -325,13 +330,14 @@
   else if (wasNavigation && !navOpen) document.querySelector<HTMLButtonElement>('[aria-label="Open navigation"]')?.focus({preventScroll: true});
 }} onkeydown={(event) => {
   if (event.key === "Escape") {
+    if (document.querySelector(".track-menu[open]")) return;
     if (player.queueOpen) player.queueOpen = false;
     else if (nowPlayingOpen) void setNowPlaying(false);
     else void closeNavigation();
   }
 }} />
 
-<main class="shell" class:nav-open={navOpen} class:np-open={nowPlayingOpen}>
+<main class="shell" class:nav-open={navOpen} class:np-open={nowPlayingOpen} class:rail-open={railOpen}>
   <header class="mobile-bar" inert={mobile && (navOpen || nowPlayingOpen || player.queueOpen)}>
     {#if nav.canGoBack}<button class="bar-icon mobile-back" type="button" aria-label="Back" onclick={() => nav.pop()}>‹</button>{/if}
     <button class="bar-icon" type="button" aria-label="Open navigation" aria-expanded={navOpen} onclick={openNavigation}>☰</button>
@@ -343,17 +349,17 @@
     {#if session.isAdmin}<button class="bar-icon" type="button" aria-label="Settings" onclick={() => nav.push({name: "settings", category: "sources"})}>⚙</button>{/if}
   </header>
   <button class="scrim" type="button" hidden={!navOpen} aria-label="Dismiss navigation" onclick={closeNavigation}></button>
-  <Sidebar onnowplaying={() => setNowPlaying(true)} onclose={closeNavigation} inert={mobile && !navOpen} />
+  <Sidebar onclose={closeNavigation} inert={mobile && !navOpen} />
 
   <section class="content" inert={mobile && (navOpen || nowPlayingOpen || player.queueOpen)}>
-    <InstallPrompt inline />
+    {#if activity !== "settings"}<InstallPrompt inline />{/if}
     <header class="content-header">
       {#if nav.canGoBack}
         <button class="back-btn" type="button" onclick={() => nav.pop()}>‹ Back</button>
       {/if}
       <div class="content-title">
         <p class="eyebrow">{activity === "browse" ? "Browse" : activity === "listen" ? "Listen" : "Administration"}</p>
-        <h2>{title}</h2>
+        {#if route.name !== "album" && route.name !== "artist"}<h2>{title}</h2>{/if}
       </div>
       {#if activity === "browse"}
       <div class="content-controls">
@@ -378,6 +384,13 @@
           >
         </div>
       </div>
+      {/if}
+      {#if search.query.trim() && activity === "browse"}
+        <button class="ghost-button clear-search" type="button" aria-label="Clear search" onclick={async () => {
+          search.clear();
+          await tick();
+          document.querySelector<HTMLButtonElement>('.seg.is-active')?.focus({preventScroll: true});
+        }}>Clear search</button>
       {/if}
     </header>
 
@@ -422,6 +435,10 @@
 
   <aside class="right-rail" class:overlay-open={player.queueOpen} inert={mobile && navOpen}>
     <div class="rail-header" inert={mobile && player.queueOpen}>
+      <button class="rail-toggle ghost-button" type="button" aria-expanded={railOpen} onclick={() => {
+        railExpanded = !railOpen;
+        if (!railExpanded) { if (nowPlayingOpen) void setNowPlaying(false); player.queueOpen = false; dsp.panelOpen = false; metadata.close(); if (meter.open) meter.toggle(); statsPanel.open = false; }
+      }}>{railOpen ? "Collapse player" : "Expand player"}</button>
       {#if nowPlayingOpen}<span class="desktop-now-heading">Now Playing</span>{/if}
       <button class="np-chevron" type="button" aria-label="Close Now Playing" onclick={() => setNowPlaying(false)}>⌄</button>
       <div class="player-switch">
@@ -462,7 +479,7 @@
     {#if mobile && nowPlayingOpen && !player.queueOpen}<QueueDrawer embedded />{/if}
   </aside>
   <nav class="mobile-tabs" aria-label="Main navigation" inert={navOpen || player.queueOpen}>
-    <button type="button" data-tab="library" aria-current={!nowPlayingOpen && !["playlists", "playlist", "smart"].includes(route.name) ? "page" : undefined} class:active={!nowPlayingOpen && !["playlists", "playlist", "smart"].includes(route.name)} onclick={() => nav.root({name: nav.browseView})}>Library</button>
+    <button type="button" data-tab="library" aria-current={!nowPlayingOpen && !["playlists", "playlist", "smart"].includes(route.name) ? "page" : undefined} class:active={!nowPlayingOpen && !["playlists", "playlist", "smart"].includes(route.name)} onclick={() => search.clear()}>Library</button>
     <button type="button" data-tab="playlists" aria-current={!nowPlayingOpen && ["playlists", "playlist", "smart"].includes(route.name) ? "page" : undefined} class:active={!nowPlayingOpen && ["playlists", "playlist", "smart"].includes(route.name)} onclick={() => nav.root({name: "playlists"})}>Playlists</button>
     <button type="button" data-tab="now-playing" aria-current={nowPlayingOpen ? "page" : undefined} class:active={nowPlayingOpen} onclick={() => setNowPlaying(true)}>Now Playing</button>
   </nav>

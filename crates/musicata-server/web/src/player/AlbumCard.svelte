@@ -20,6 +20,7 @@
   tabindex="0"
   onclick={onopen}
   onkeydown={(e) => {
+    if (e.target !== e.currentTarget) return;
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       onopen();
@@ -31,7 +32,8 @@
     <button class="card-play" type="button" title="Play album" aria-label="Play album" onclick={playAlbum}>▶</button>
   </div>
   <div class="card-text">
-    <strong>{album.title}</strong>
-    <span>{album.artist_name}{album.year ? ` · ${album.year}` : ""}</span>
+    <strong title={album.title}>{album.title}</strong>
+    <span title={album.artist_name}>{album.artist_name}{album.year ? ` · ${album.year}` : ""}</span>
+    {#if album.title.toLowerCase().startsWith("unknown album")}<span>{album.track_count} tracks · Open for details</span>{/if}
   </div>
 </div>
