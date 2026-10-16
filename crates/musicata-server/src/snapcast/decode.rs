@@ -1,24 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Server-side decode of a library track to the fixed PCM format snapserver consumes.
-//!
-//! Snapcast broadcasts one continuous PCM stream per zone, so — unlike every other
-//! Musicata playback path, where the endpoint fetches a per-track URL and decodes it
-//! itself — the server must decode here. This mirrors the `symphonia` loop in
-//! `loudness.rs`/`fingerprint.rs`, but full-length and to `f32`: we downmix to stereo
-//! and `rubato` resamples to the one fixed stream rate (the library is mixed
-//! 44.1/48/96 kHz; snapserver runs at a single rate). Output is interleaved `i16`,
-//! ready to write to the FIFO. Pure + blocking — call it from `spawn_blocking`.
+//! PCM format types and the full-file reference decoder used by regression tests.
+//! Production playback uses the bounded incremental decoder in `library.rs`.
 
+#[cfg(test)]
 use std::io::Cursor;
 
+#[cfg(test)]
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
+#[cfg(test)]
 use rubato::{Fft, FixedSync, Resampler};
+#[cfg(test)]
 use symphonia::core::audio::SampleBuffer;
+#[cfg(test)]
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+#[cfg(test)]
 use symphonia::core::errors::Error as SymphoniaError;
+#[cfg(test)]
 use symphonia::core::formats::FormatOptions;
+#[cfg(test)]
 use symphonia::core::io::MediaSourceStream;
+#[cfg(test)]
 use symphonia::core::meta::MetadataOptions;
+#[cfg(test)]
 use symphonia::core::probe::Hint;
 
 /// The stream is always stereo — it matches snapserver's `sampleformat` channel count.
@@ -38,6 +41,7 @@ impl DecodedTrack {
 }
 
 /// Decode a complete encoded file to interleaved stereo `i16` at `target_rate`.
+#[cfg(test)]
 pub fn decode_track(
     audio: &[u8],
     extension: &str,
@@ -137,6 +141,7 @@ pub fn decode_track(
 
 /// Append a packet's interleaved samples to `out` as stereo, downmixing/upmixing as
 /// needed: mono is duplicated to both channels; >2-channel takes the front L/R pair.
+#[cfg(test)]
 fn append_stereo(out: &mut Vec<f32>, interleaved: &[f32], channels: usize) {
     match channels {
         0 => {}
@@ -158,6 +163,7 @@ fn append_stereo(out: &mut Vec<f32>, interleaved: &[f32], channels: usize) {
 
 /// Resample interleaved stereo f32 from `from` Hz to `to` Hz with rubato's FFT
 /// resampler, processing the whole clip in one call (initial-delay silence trimmed).
+#[cfg(test)]
 fn resample_stereo(input: &[f32], from: u32, to: u32) -> Result<Vec<f32>, String> {
     let frames_in = input.len() / CHANNELS;
     // Fixed-input FFT resampler, ~1024-frame chunks split into 2 sub-chunks (rubato's
@@ -185,6 +191,7 @@ fn resample_stereo(input: &[f32], from: u32, to: u32) -> Result<Vec<f32>, String
 }
 
 /// Quantize a normalized f32 sample (`-1.0..=1.0`) to `i16`, clamping out-of-range peaks.
+#[cfg(test)]
 fn to_i16(sample: &f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
 }
@@ -247,6 +254,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 fn terminal_decode_error(error: SymphoniaError) -> Option<String> {
     match error {
         SymphoniaError::IoError(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => None,

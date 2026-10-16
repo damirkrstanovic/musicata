@@ -1026,6 +1026,23 @@ await mobileScreenshot('phone-radio');
 
 check("mobile: no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
 
+// Buffer configuration is persisted and validated even before multi-room is enabled.
+await send("Emulation.setDeviceMetricsOverride", {width: 1280, height: 900, deviceScaleFactor: 1, mobile: false});
+await send("Page.navigate", {url: base + "/admin"});
+await waitUntil(`document.querySelector('[data-settings-category="outputs"]')`, 5000);
+await js(`document.querySelector('[data-settings-category="outputs"]')?.click()`);
+check("Snapcast: buffer control appears", await waitUntil(`document.querySelector('[data-snapcast-buffer]')`, 5000) < Infinity);
+await js(`(() => { const input = document.querySelector('[data-snapcast-buffer]'); input.value = '250'; input.dispatchEvent(new Event('input', {bubbles:true})); })()`);
+await clickText('button', 'Apply buffer');
+check("Snapcast: buffer save completes", await waitUntil(`document.querySelector('[data-snapcast-buffer]')?.value === '250' && [...document.querySelectorAll('button')].some(b => b.textContent.includes('Apply buffer') && b.disabled)`, 3000) < Infinity);
+const bufferSaved = await api('/api/snapcast/status');
+check("Snapcast: desired buffer persists without claiming it is applied", bufferSaved?.buffer_ms === 250 && bufferSaved?.applied_buffer_ms === null);
+await js(`document.querySelector('[data-snapcast-buffer]')?.scrollIntoView({block:'center'})`);
+await mobileScreenshot('snapcast-buffer');
+const invalidBuffer = await fetch(base + '/api/snapcast/status', {method:'PATCH', headers:{'content-type':'application/json',cookie:COOKIE}, body:JSON.stringify({buffer_ms:0})});
+check("Snapcast: invalid buffer rejected without changing saved value", invalidBuffer.status === 400 && (await api('/api/snapcast/status'))?.buffer_ms === 250);
+await api('/api/snapcast/status', {method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({buffer_ms:1000})});
+
 // Local diagnostics are available without shell or system-log access.
 await send("Emulation.setDeviceMetricsOverride", {width: 1280, height: 900, deviceScaleFactor: 1, mobile: false});
 await send("Page.navigate", {url: base + "/admin"});

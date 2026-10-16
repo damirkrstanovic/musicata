@@ -2272,6 +2272,12 @@ async fn snapcast_settings_from_db(
     {
         settings.sample_rate = rate;
     }
+    if let Some(value) = get("snapcast.buffer_ms").await?
+        && let Ok(value) = value.parse::<u32>()
+        && snapcast::validate_buffer_ms(value).is_ok()
+    {
+        settings.buffer_ms = value;
+    }
     if let Some(value) = get("snapcast.control_host").await?
         && !value.is_empty()
     {
@@ -5162,6 +5168,9 @@ async fn snapcast_server_host(database: &Database) -> String {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct SnapcastStatus {
     /// Persisted enable flag (a disable takes full effect on restart).
+    buffer_ms: u32,
+    applied_buffer_ms: Option<u32>,
+    manage_server: bool,
     enabled: bool,
     /// Whether the managed snapserver + player are actually running this session.
     running: bool,
@@ -5216,9 +5225,17 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
         .flatten()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "librespot".to_string());
+    let settings = snapcast_settings_from_db(&state.database)
+        .await
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
     Ok(Json(SnapcastStatus {
+        buffer_ms: settings.buffer_ms,
+        applied_buffer_ms: manager.as_ref().and_then(|m| m.buffer_ms()),
+        manage_server: manager
+            .as_ref()
+            .map_or(settings.manage_server, |m| m.managed()),
         enabled,
-        running: manager.is_some(),
+        running: manager.as_ref().is_some_and(|m| m.is_running()),
         auth_enabled,
         server_host,
         clients,
@@ -5235,6 +5252,7 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
 #[cfg(feature = "snapcast")]
 #[derive(Debug, Deserialize)]
 struct SnapcastSettingsUpdate {
+    buffer_ms: Option<u32>,
     enabled: Option<bool>,
     auth_enabled: Option<bool>,
     server_host: Option<String>,
@@ -5253,6 +5271,26 @@ async fn snapcast_update(
     State(state): State<AppState>,
     Json(update): Json<SnapcastSettingsUpdate>,
 ) -> Result<Json<SnapcastStatus>, AppError> {
+    if let Some(value) = update.buffer_ms {
+        snapcast::validate_buffer_ms(value).map_err(|e| AppError::bad_request(e.to_string()))?;
+        if !bool_setting(&state.database, SETTING_SNAPCAST_MANAGE_SERVER).await {
+            return Err(AppError::bad_request(
+                "Configure the buffer on the external Snapserver",
+            ));
+        }
+        if let Some(manager) = state.players.snapcast_manager().await {
+            manager
+                .apply_buffer_and_save(state.database.clone(), value)
+                .await
+                .map_err(|e| AppError::bad_request(e.to_string()))?;
+        } else {
+            state
+                .database
+                .set_setting("snapcast.buffer_ms", &value.to_string())
+                .await
+                .map_err(db_error)?;
+        }
+    }
     if let Some(enabled) = update.enabled {
         state
             .database
@@ -8187,6 +8225,44 @@ mod tests {
         assert!(config.rescan);
         assert!(config.no_incremental_rescan);
         assert!(config.scan_once);
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
+    async fn snapcast_buffer_defaults_and_persists_across_reload() {
+        let fixture = TestFixture::new("snapcast-buffer-settings");
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            super::snapcast_settings_from_db(&database)
+                .await
+                .unwrap()
+                .buffer_ms,
+            1000
+        );
+        database
+            .set_setting("snapcast.buffer_ms", "250")
+            .await
+            .unwrap();
+        assert_eq!(
+            super::snapcast_settings_from_db(&database)
+                .await
+                .unwrap()
+                .buffer_ms,
+            250
+        );
+        database
+            .set_setting("snapcast.buffer_ms", "0")
+            .await
+            .unwrap();
+        assert_eq!(
+            super::snapcast_settings_from_db(&database)
+                .await
+                .unwrap()
+                .buffer_ms,
+            1000
+        );
     }
 
     #[tokio::test]

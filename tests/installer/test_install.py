@@ -11,6 +11,89 @@ sys.modules[spec.name] = m
 spec.loader.exec_module(m)
 
 class PlanningTests(unittest.TestCase):
+    def test_legacy_snapserver_rejects_runtime_overrides(self):
+        from unittest.mock import patch
+        for fragment, dropins, expected in [
+            ('/lib/systemd/system/snapserver.service', '', True),
+            ('/run/systemd/system/snapserver.service', '', False),
+            ('/lib/systemd/system/snapserver.service', '/run/systemd/system/snapserver.service.d/audio.conf', False),
+        ]:
+            def run(argv):
+                if 'FragmentPath' in argv: return fragment
+                if 'DropInPaths' in argv: return dropins
+                return ''
+            with patch.object(m, 'run', side_effect=run), patch.object(m, 'succeeds', return_value=True), patch.object(Path, 'exists', return_value=False):
+                self.assertEqual(m.legacy_snapserver_utility({'version': '1.6.1'}, 'snapserver.service'), expected)
+
+    def setUp(self):
+        from unittest.mock import patch
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.snapserver_root = Path(directory.name)
+        for key, name in [('SNAPSERVER_CONFIG', 'snapserver.conf'), ('SNAPSERVER_DEFAULTS', 'snapserver-defaults')]:
+            patched = patch.object(m, key, self.snapserver_root/name)
+            patched.start()
+            self.addCleanup(patched.stop)
+
+    def test_standalone_snapserver_config_without_service_blocks(self):
+        from unittest.mock import patch
+        m.SNAPSERVER_CONFIG.write_text('[stream]\nsource = pipe:///custom\n')
+        with patch.object(m, 'succeeds', return_value=False), patch.object(m, 'snapserver_processes', return_value=[]), patch.object(m, 'snapcast_port_conflicts', return_value=[]):
+            self.assertTrue(any('/etc/snapserver.conf' in issue for issue in m.docker_snapserver_conflicts(None)))
+
+    def test_docker_snapserver_conflicts_include_inactive_service(self):
+        from unittest.mock import patch
+        for active in (False, True):
+            def succeeds(argv):
+                return argv == ['systemctl', 'cat', 'snapserver.service'] or (
+                    active and argv == ['systemctl', 'is-active', '--quiet', 'snapserver.service'])
+            with patch.object(m, 'succeeds', side_effect=succeeds), patch.object(m, 'snapserver_processes', return_value=[]), patch.object(m, 'snapcast_port_conflicts', return_value=[]):
+                issues = m.docker_snapserver_conflicts(None)
+            self.assertTrue(any('snapserver.service' in issue for issue in issues), issues)
+
+    def test_docker_snapserver_inert_owned_utility_is_allowed(self):
+        from unittest.mock import patch
+        saved = {'mode': 'docker', 'inactive_snapserver_units': {'snapserver.service': 'fixture'}}
+        with patch.object(m, 'succeeds', side_effect=lambda a: a == ['systemctl', 'cat', 'snapserver.service']), patch.object(m, 'snapserver_unit_fingerprint', return_value='fixture'), patch.object(m, 'snapserver_processes', return_value=[]), patch.object(m, 'snapcast_port_conflicts', return_value=[]):
+            self.assertEqual(m.docker_snapserver_conflicts(saved), [])
+            saved['inactive_snapserver_units']['snapserver.service'] = 'changed'
+            self.assertTrue(m.docker_snapserver_conflicts(saved))
+
+    def test_docker_snapserver_host_process_and_ports_block(self):
+        from unittest.mock import patch
+        with patch.object(m, 'succeeds', return_value=False), patch.object(m, 'snapserver_processes', return_value=[123]), patch.object(m, 'snapcast_port_conflicts', return_value=[1704]):
+            issues = m.docker_snapserver_conflicts(None)
+            self.assertTrue(any('123' in issue for issue in issues))
+            self.assertTrue(any('1704' in issue for issue in issues))
+
+    def test_snapcast_ports_exclude_only_verified_managed_owners(self):
+        from unittest.mock import patch
+        listeners = '\n'.join([
+            'LISTEN 0 128 0.0.0.0:1704 0.0.0.0:* users:(("snapserver",pid=42,fd=7))',
+            'LISTEN 0 128 [::]:1705 [::]:* users:(("snapserver",pid=43,fd=8))',
+            'LISTEN 0 128 0.0.0.0:1780 0.0.0.0:*',
+            'LISTEN 0 128 0.0.0.0:3030 0.0.0.0:*',
+        ])
+        with patch.object(m.shutil, 'which', return_value='/usr/bin/ss'), patch.object(m, 'run', return_value=listeners):
+            self.assertEqual(m.snapcast_port_conflicts({42}), [1705, 1780])
+            self.assertEqual(m.snapcast_port_conflicts(set()), [1704, 1705, 1780])
+
+    def test_snapserver_managed_process_is_allowed_but_host_process_blocks(self):
+        from unittest.mock import patch
+        with patch.object(m, 'succeeds', return_value=False), patch.object(m, 'managed_snapserver_pids', return_value={42}), patch.object(m, 'snapserver_processes', return_value=[42]), patch.object(m, 'snapcast_port_conflicts', return_value=[]):
+            self.assertEqual(m.docker_snapserver_conflicts({'mode': 'docker'}), [])
+            with patch.object(m, 'snapserver_processes', return_value=[42, 43]):
+                self.assertTrue(any('43' in issue for issue in m.docker_snapserver_conflicts({'mode': 'docker'})))
+
+    def test_snapserver_blocker_prevents_deployment_for_check_dry_run_and_install(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, patch.object(m, 'CONFIG', Path(directory)/'install.json'), patch.object(m, 'distro_family', return_value='debian'), patch.object(m, 'package_installed', return_value=True), patch.object(m.shutil, 'which', return_value='/usr/bin/utility'), patch.object(m, 'preflight', return_value=['Standalone snapserver.service exists']), patch.object(m, 'deploy') as deploy:
+            for flag in ('--check', '--dry-run'):
+                self.assertEqual(m.main([flag]), 1)
+            with self.assertRaisesRegex(m.InstallError, 'blockers'):
+                m.main(['--yes'])
+            deploy.assert_not_called()
+
     def test_default_dependencies_do_not_activate_playback(self):
         for mode in ('native', 'docker'):
             cfg = m.options(['--mode', mode])

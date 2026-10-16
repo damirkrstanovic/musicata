@@ -11,6 +11,7 @@
   let dspProfiles = $state<EqProfile[]>([]);
   let newRoom = $state("");
   let host = $state("");
+  let bufferMs = $state(1000);
   let message = $state("");
   let error = $state(false);
   let busy = $state(false);
@@ -19,6 +20,7 @@
     try {
       status = await api.snapcastStatus();
       host = status.server_host;
+      bufferMs = status.buffer_ms;
       if (status.running) rooms = await api.snapcastRooms();
       dspProfiles = await api.dspProfiles().catch(() => []);
     } catch {
@@ -30,6 +32,7 @@
 
   async function update(
     patch: {
+      buffer_ms?: number;
       enabled?: boolean;
       auth_enabled?: boolean;
       server_host?: string;
@@ -48,12 +51,14 @@
       if (next) {
         status = next;
         host = next.server_host;
+        bufferMs = next.buffer_ms;
       }
       if (status?.running) rooms = await api.snapcastRooms();
       message = note;
     } catch (e) {
       message = e instanceof ApiError ? e.message : String(e);
       error = true;
+      status = await api.snapcastStatus().catch(() => null);
     } finally {
       busy = false;
     }
@@ -127,6 +132,21 @@
     {#if status.enabled && !status.running}
       <p class="admin-hint">Enabled, but not running this session — restart the server to start it.</p>
     {/if}
+
+    <label class="field">
+      <span>Playback buffer (milliseconds)</span>
+      <div class="host-row">
+        <input data-snapcast-buffer type="number" min="100" max="5000" step="1" bind:value={bufferMs} disabled={busy || !status.manage_server} />
+        <button class="ghost-button" disabled={busy || !status.manage_server || bufferMs === status.buffer_ms || !Number.isInteger(bufferMs) || bufferMs < 100 || bufferMs > 5000}
+          onclick={() => update({ buffer_ms: bufferMs }, status?.running ? "Playback buffer applied." : "Saved. Applies when multi-room starts.")}>Apply buffer</button>
+      </div>
+    </label>
+    <p class="admin-hint">
+      Smaller buffers respond sooner but tolerate less network jitter. Default: 1,000 ms.
+      Try 250 ms for local or wired playback; increase it if audio drops out.
+      Applying briefly restarts the multi-room server and interrupts all its inputs.
+      {#if !status.manage_server}Configure this on your external Snapserver.{:else if status.applied_buffer_ms !== null}Currently applied: {status.applied_buffer_ms} ms.{/if}
+    </p>
 
     <!-- Access control: per-room passwords. NOTE: snapserver 0.35 doesn't enforce them yet. -->
     <div class="admin-subhead">Access</div>

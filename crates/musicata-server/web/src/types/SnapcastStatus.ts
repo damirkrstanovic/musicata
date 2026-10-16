@@ -6,7 +6,7 @@ export type SnapcastStatus = {
 /**
  * Persisted enable flag (a disable takes full effect on restart).
  */
-enabled: boolean, 
+buffer_ms: number, applied_buffer_ms: number | null, manage_server: boolean, enabled: boolean,
 /**
  * Whether the managed snapserver + player are actually running this session.
  */
