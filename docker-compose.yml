@@ -9,7 +9,8 @@
 #   • in /admin → Settings, enable audio analysis and set the service URL to  http://ml:3091
 #     (the server reaches the ml service by name on this compose network).
 #
-# Snapcast multi-room is not included here (it needs host audio devices); see docs/snapcast.md.
+# Snapcast/cast-in utilities are bundled. This bridge-network example does not configure
+# LAN discovery; use the Linux installer for host networking + Avahi, or see docs/snapcast.md.
 services:
   server:
     image: ghcr.io/damirkrstanovic/musicata-server:${MUSICATA_TAG:-latest}
@@ -22,6 +23,10 @@ services:
       MUSICATA_ML_SERVICE_URL: http://ml:3091
     ports:
       - "3030:3030"
+      # Managed Snapcast audio, control, and Snapweb (active only when enabled in /admin).
+      - "1704:1704"
+      - "1705:1705"
+      - "1780:1780"
     volumes:
       # DB + artwork cache + saved sources/credentials + exports — persist this.
       - musicata-data:/data

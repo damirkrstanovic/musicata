@@ -39,15 +39,17 @@ Each client buffers ~1 s and plays on a server-stamped timestamp, so rooms stay 
 (at a deliberate ~0.5–1 s latency — great for music, not for tight A/V sync). This is also how
 server-side per-zone DSP is applied (see [dsp.md](dsp.md)).
 
-**Prerequisites** (Snapcast is built into the default binary, but the daemons are not bundled):
+**Prerequisites** (the Linux installer supplies these utilities by default from 1.6.1):
 
 - `snapserver` on the Musicata host.
 - `snapclient` on each playback device (or use the Snapweb browser client snapserver serves on
   port 1780).
 - Optional cast-*in*: `shairport-sync` (AirPlay) and/or `librespot` (Spotify Connect) on the
   host — snapserver exposes each as an input you can play to all rooms.
-- **In Docker:** the slim image does **not** include `snapserver`; add it in a derived image
-  (`apt-get install snapserver`) or run snapserver on the host and point Musicata at it.
+- **In Docker:** the published image includes `snapserver`, `shairport-sync`, and
+  `librespot`. Use host networking and mount `/run/dbus:/run/dbus:ro` for host Avahi
+  discovery; the Linux installer configures both. No host audio device is needed on the
+  server; Snapclient accesses audio on each playback endpoint.
 
 **Set it up** — all in the web UI, no flags or config files:
 

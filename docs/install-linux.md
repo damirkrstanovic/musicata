@@ -151,29 +151,26 @@ cast-in and rooms in Musicata's Multi-room settings; account/subscription requir
 upstream services still apply. Snapclient runs on each playback endpoint; installing a
 server does not create rooms or select a DAC automatically.
 
-Native optional packages come from the host repositories. Docker's optional Snapcast and
-cast-in executables are installed into a derived server image, because host packages alone
-are not visible inside a container. Docker uses the host network for LAN playback and
-discovery; AirPlay also shares the host system D-Bus socket to reach Avahi. ML has no GPU
-access and binds only `127.0.0.1`. Docker bind mounts use SELinux labels (`Z` for private
-state, `z` for the shared read-only music directory), including on Fedora.
+Since 1.6.1, both installation modes install host playback utilities by default: MPD,
+ALSA tools, Snapserver/Snapclient, Shairport Sync, Librespot, and Avahi/mDNS. Storage and
+system troubleshooting tools are also included: `smartctl`, `nvme`, `sensors`, `iostat`,
+and `lspci`. Installing these tools does not select a DAC, create rooms, enable cast-in,
+or start a new standalone audio service. Configure playback in the web UI; `--with mpd`
+explicitly configures the dedicated MPD service. Existing audio services are preserved.
 
-Verified official-repository availability during implementation:
+Debian/Ubuntu use official distribution packages for Snapcast. On Fedora and Arch,
+missing Snapcast executables are built from pinned upstream 0.35.0 source (build tools
+are installed as needed). Librespot 0.8.0 is bundled with the checksum-verified native
+release archives, including its license notices; an existing host executable is preserved.
+No AUR helper, COPR, or third-party package repository is enabled.
 
-| Host / image | Docker engine | Snapcast | AirPlay | Librespot |
-|---|---|---|---|---|
-| Ubuntu 24.04 / 26.04 | `docker.io` | `snapserver`, `snapclient` | `shairport-sync` | unavailable |
-| Debian 13 (trixie) | `docker.io` | `snapserver`, `snapclient` | `shairport-sync` | unavailable |
-| Fedora 43 / 44 | `moby-engine` | unavailable | `shairport-sync` | unavailable |
-| Arch rolling / derivatives | `docker` | unavailable in current official repositories | `shairport-sync` | `librespot` |
-| Docker server's Debian bookworm base | host engine | `snapserver` | `shairport-sync` | unavailable |
-
-**Unavailable selections stop preparation with a package error.** No AUR helper, COPR or
-third-party repository is enabled automatically. In particular, `--with spotify` cannot
-currently complete with the stock Docker image's repositories. Native Spotify also needs
-Snapcast; its availability must be resolved on Arch even though Librespot itself is packaged.
-Install a supported upstream dependency/package or configure an existing external playback
-service instead. These are reported limitations, not silently skipped components.
+The published server image includes Snapserver, Shairport Sync, and Librespot with pipe
+output support. The installer uses this image directly, without building a derived image.
+It uses host networking and shares `/run/dbus` read-only for host Avahi discovery. Host
+MPD, endpoint Snapclient, and hardware diagnostic tools remain host utilities; no audio
+device access or privileged container is needed for managed server streaming. ML has no
+GPU access and binds only `127.0.0.1`. Docker bind mounts use SELinux labels (`Z` for
+private state, `z` for the shared read-only music directory), including on Fedora.
 
 Packaged Snapcast versions differ: bookworm 0.26, Ubuntu 24.04 0.27, Debian 13 0.31, Ubuntu
 26.04 0.34. The project's detailed multi-room validation used 0.35; older distro packages

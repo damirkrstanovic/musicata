@@ -269,8 +269,17 @@ pub fn install_command(host: &str, room: &SnapRoom) -> String {
 fn render_config(settings: &SnapcastSettings) -> String {
     // Musicata's own decoded library audio.
     let mut config = format!(
-        "[stream]\n\
+        "[server]\n\
+         datadir = {state_dir}\n\
+         [stream]\n\
          source = pipe://{fifo}?name={name}&sampleformat={rate}:16:{channels}&codec=flac&mode=read\n",
+        // The service account may have no home directory (especially in Docker).
+        // ensure_fifo creates this writable directory before spawning Snapserver.
+        state_dir = settings
+            .fifo_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .display(),
         fifo = settings.fifo_path.display(),
         name = STREAM_NAME,
         rate = settings.sample_rate,
@@ -395,6 +404,15 @@ mod tests {
         assert!(config.contains(&format!("name={STREAM_NAME}")));
         assert!(!config.contains("airplay://"));
         assert!(!config.contains("librespot://"));
+    }
+
+    #[test]
+    fn managed_state_uses_writable_fifo_directory() {
+        let settings = SnapcastSettings {
+            fifo_path: "/data/snapcast/audio.fifo".into(),
+            ..SnapcastSettings::default()
+        };
+        assert!(render_config(&settings).contains("[server]\ndatadir = /data/snapcast\n"));
     }
 
     #[test]

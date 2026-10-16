@@ -5,8 +5,9 @@
 set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-archive=${MUSICATA_RELEASE_ARCHIVE:-/tmp/musicata-release-1.0.9/musicata-x86_64-linux.tar.gz}
+archive=${MUSICATA_RELEASE_ARCHIVE:-/tmp/musicata-release-1.6.1/musicata-x86_64-linux.tar.gz}
 port=${MUSICATA_INSTALLER_TEST_PORT:-19930}
+version=${MUSICATA_TEST_VERSION:-1.6.1}
 [[ -f $archive ]] || { echo "missing release archive: $archive" >&2; exit 2; }
 command -v docker >/dev/null || { echo 'docker is required' >&2; exit 2; }
 docker info >/dev/null
@@ -68,6 +69,7 @@ cat >"$scratch/context/Dockerfile.outer" <<'EOF'
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl docker.io python3 util-linux && rm -rf /var/lib/apt/lists/* \
  && useradd --system --no-create-home --uid 10001 musicata && mkdir -p /run/systemd/system /it/bin
+COPY musicata-x86_64-linux/librespot /usr/local/bin/librespot
 COPY install.py /it/install.py
 COPY docker-wrapper /it/bin/docker
 COPY systemctl-stub /it/bin/systemctl
@@ -179,7 +181,7 @@ health() {
     curl -fsS --retry 20 --retry-connrefused --retry-delay 1 --max-time 5 "$1"
 }
 
-run_installer --mode docker --version 1.0.9 --library /srv/music --port "$port" --yes
+run_installer --mode docker --version "$version" --library /srv/music --port "$port" --yes
 health "http://127.0.0.1:$port/api/health" >"$scratch/first-health.json"
 printf sentinel >"$data/installer-persistence-sentinel"
 

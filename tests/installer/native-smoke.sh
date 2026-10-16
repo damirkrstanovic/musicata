@@ -10,6 +10,7 @@ set -euo pipefail
 namespace="musicata-installer-test-$(date +%s)-$$"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 log_dir=${MUSICATA_INSTALLER_SMOKE_LOG_DIR:-/tmp}
+version=${MUSICATA_TEST_VERSION:-1.6.1}
 trap 'kubectl delete namespace "$namespace" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1 || true' EXIT
 
 kubectl create namespace "$namespace" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -17,7 +18,7 @@ kubectl create namespace "$namespace" --dry-run=client -o yaml | kubectl apply -
 run_one() {
     local name=$1 image=$2
     local pod="native-${name}"
-    kubectl -n "$namespace" run "$pod" --image="$image" --restart=Never --command -- sleep 900 >/dev/null
+    kubectl -n "$namespace" run "$pod" --image="$image" --restart=Never --command -- sleep 3600 >/dev/null
     kubectl -n "$namespace" wait --for=condition=Ready "pod/$pod" --timeout=90s >/dev/null
     kubectl -n "$namespace" exec "$pod" -- mkdir -p /work/bin /run/systemd/system /run/lock /srv/music
     # `install.sh` falls back to an adjacent install.py in extracted releases.
@@ -29,7 +30,7 @@ set -eu
 action="${1:-}"; shift || true
 case "$action" in
   is-active|cat) exit 3 ;;
-  daemon-reload|enable|disable) exit 0 ;;
+  daemon-reload|enable|disable|mask|unmask) exit 0 ;;
   stop)
     test ! -f /run/musicata.pid || kill "$(cat /run/musicata.pid)" 2>/dev/null || true
     rm -f /run/musicata.pid
@@ -48,9 +49,9 @@ SYSTEMCTL
     # The installer downloads release metadata and the archive itself, then
     # verifies GitHub's published asset digest before activation.
     # shellcheck disable=SC2016 # $PATH expands in the pod, not in this harness.
-    kubectl -n "$namespace" exec "$pod" -- sh -c 'PATH=/work/bin:$PATH /work/install.sh --mode native --version 1.0.9 --yes'
+    kubectl -n "$namespace" exec "$pod" -- env MUSICATA_TEST_VERSION="$version" sh -c 'PATH=/work/bin:$PATH /work/install.sh --mode native --version "$MUSICATA_TEST_VERSION" --yes'
     # shellcheck disable=SC2016 # $PATH and $(cat ...) expand in the pod.
-    kubectl -n "$namespace" exec "$pod" -- sh -c 'echo persisted >/var/lib/musicata/installer-smoke-sentinel; PATH=/work/bin:$PATH /work/install.sh --upgrade --version 1.0.9 --yes; test "$(cat /var/lib/musicata/installer-smoke-sentinel)" = persisted; curl -fsS http://127.0.0.1:3030/api/health >/dev/null'
+    kubectl -n "$namespace" exec "$pod" -- env MUSICATA_TEST_VERSION="$version" sh -c 'echo persisted >/var/lib/musicata/installer-smoke-sentinel; PATH=/work/bin:$PATH /work/install.sh --upgrade --version "$MUSICATA_TEST_VERSION" --yes; test "$(cat /var/lib/musicata/installer-smoke-sentinel)" = persisted; curl -fsS http://127.0.0.1:3030/api/health >/dev/null'
     echo "PASS $name"
 }
 
