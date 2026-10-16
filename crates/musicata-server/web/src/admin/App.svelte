@@ -40,6 +40,11 @@
   <label class="settings-search">Find a setting
     <input type="search" data-settings-search bind:value={search} placeholder="Search EQ, sources, scrobbling…" />
   </label>
+  <label class="settings-category">Category
+    <select class="settings-category-select" value={category} onchange={event => open(event.currentTarget.value as SettingsCategory)}>
+      {#each SETTINGS_CATEGORIES as item}<option value={item.id}>{item.label}</option>{/each}
+    </select>
+  </label>
   <div class="settings-tabs" role="tablist" aria-label="Settings categories">
     {#each SETTINGS_CATEGORIES as item, index}
       <button type="button" class="ghost-button" class:active={category === item.id}
@@ -70,6 +75,12 @@
 </div>
 
 <style>
+  .settings-category { display: none; }
+  @media (max-width: 1023px) {
+    .settings-category { display: grid; gap: .4rem; margin: .8rem 0; }
+    .settings-category-select { min-height: 44px; width: 100%; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .5rem; }
+    .settings-tabs { display: none !important; }
+  }
   .settings-search { display: grid; gap: 0.5rem; color: var(--muted); }
   .settings-search input { width: 100%; padding: 0.8rem; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; color: var(--text); }
   .settings-tabs { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 1.2rem 0; }

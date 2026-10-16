@@ -34,6 +34,7 @@ async function screenshot(name) {
 await send('Runtime.enable');await send('Log.enable');await send('Network.enable');
 await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
 await send('Network.setCookie',{name:'musicata_session',value:cookie.slice(cookie.indexOf('=')+1),domain:'127.0.0.1',path:'/'});
+await js(`localStorage.setItem('musicata.browse-view','library'); history.replaceState(null,'')`);
 await send('Page.reload');
 if(!await wait(`document.querySelectorAll('.album-card').length === 6`))throw new Error('Fixture library did not load');
 check('Browse, Listen and Settings are separate activities',await js(`['browse','listen','settings'].every(area=>document.querySelector('[data-activity="'+area+'"]'))`));

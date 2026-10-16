@@ -12,6 +12,7 @@
 
   let { embedded = false }: { embedded?: boolean } = $props();
   let wasOpen = false;
+  let editing = $state(false);
   $effect(() => {
     if (embedded) return;
     const open = player.queueOpen;
@@ -49,6 +50,7 @@
     <header class="queue-head">
       <strong>Queue</strong>
       <div class="queue-head-actions">
+        <button class="ghost-button queue-edit" type="button" aria-pressed={editing} onclick={() => editing = !editing}>{editing ? "Done editing" : "Edit queue"}</button>
         <label class="autoplay-toggle" title="Keep playing similar tracks when the queue ends">
           <input
             type="checkbox"
@@ -88,11 +90,11 @@
               <span class="q-title">{item.title || "Unknown"}</span>
               <span class="q-sub">{[item.artist, item.album].filter(Boolean).join(" · ")}</span>
             </button>
-            <span class="q-actions">
+            <span class="q-actions" hidden={!editing}>
               <button
                 class="icon-button"
                 type="button"
-                title="Move up"
+                title="Move up" aria-label="Move up"
                 disabled={index === 0}
                 onclick={() => sendCommand(player.target, { command: "move_queue_item", from: index, to: index - 1 })}
                 >↑</button
@@ -100,7 +102,7 @@
               <button
                 class="icon-button"
                 type="button"
-                title="Move down"
+                title="Move down" aria-label="Move down"
                 disabled={index === player.queue.length - 1}
                 onclick={() => sendCommand(player.target, { command: "move_queue_item", from: index, to: index + 1 })}
                 >↓</button
@@ -108,7 +110,7 @@
               <button
                 class="icon-button"
                 type="button"
-                title="Remove"
+                title="Remove" aria-label="Remove"
                 onclick={() => sendCommand(player.target, { command: "remove_queue_item", index })}>×</button
               >
             </span>

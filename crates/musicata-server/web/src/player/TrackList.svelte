@@ -15,6 +15,14 @@
     playlistId?: string | null;
     onPlaylistChanged?: (detail: PlaylistDetail) => void;
   } = $props();
+  let openMenu: HTMLDetailsElement | null = null;
+  function closeMenu() {
+    if (!openMenu) return;
+    openMenu.open = false;
+    openMenu.querySelector<HTMLElement>("summary")?.focus();
+    openMenu = null;
+  }
+
   let playlists = $state<Playlist[]>([]);
   let playlistBusy = $state(false);
   let playlistError = $state<string | null>(null);
@@ -55,6 +63,7 @@
       const detail = await api.addToPlaylist(id, [track.id]);
       if (detail && id === playlistId) onPlaylistChanged(detail);
       select.value = "";
+      closeMenu();
     });
   }
 
@@ -83,6 +92,7 @@
   }
 </script>
 
+<svelte:window onresize={() => closeMenu()} onkeydown={(event) => { if (event.key === "Escape" && openMenu) { event.stopImmediatePropagation(); closeMenu(); } }} onclick={(event) => { if (openMenu?.contains(event.target as Node)) { if ((event.target as HTMLElement).closest('button')) closeMenu(); } else if (openMenu) { openMenu.open = false; openMenu = null; } }} />
 <div class="track-list">
   {#each tracks as track, index (`${track.id}-${index}`)}
     <div class="track" class:active={player.nowPlaying?.track_id === track.id}>
@@ -99,6 +109,7 @@
         tabindex="0"
         onclick={() => playTracks(tracks, index)}
         onkeydown={(e) => {
+          if (e.target !== e.currentTarget) return;
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
             playTracks(tracks, index);
@@ -106,7 +117,7 @@
         }}
       >
         <span class="track-titles">
-          <strong>{track.title}</strong>
+          <strong title={track.title}>{track.title}</strong>
           <button
             type="button"
             class="track-link"
@@ -120,6 +131,7 @@
         <button
           type="button"
           class="track-link track-album-cell"
+          title={track.album_title}
           disabled={!track.album_id}
           onclick={(e) => {
             e.stopPropagation();
@@ -128,39 +140,65 @@
         >
       </div>
       <span class="track-stat">{track.duration_seconds ? formatTime(track.duration_seconds) : ""}</span>
-      <span class="track-actions">
+      <div class="track-actions">
         <button
           class="icon-toggle heart"
           class:active={favorites.has(track.id)}
           type="button"
           title="Favorite"
+          aria-label="Favorite {track.title}"
           aria-pressed={favorites.has(track.id)}
           onclick={() => favorites.toggleTrack(track.id)}>{favorites.has(track.id) ? "♥" : "♡"}</button
         >
-        <button
-          class="icon-button track-audio-radio"
-          type="button"
-          title="Start audio radio — tracks that sound like this"
-          onclick={() => startAudioRadio(track.id)}>≈</button
-        >
-        <button class="icon-button track-play-next" type="button" title="Play next" onclick={() => playNext(track)}>↳</button>
-        <button class="icon-button track-add-queue" type="button" title="Add to queue" onclick={() => enqueueTracks([track])}>＋</button>
-        <select class="track-add-playlist" aria-label="Add {track.title} to playlist" value="" disabled={playlistBusy} onchange={(event) => addToPlaylist(event, track)}>
-          <option value="" disabled>Add to playlist</option>
-          {#each playlists as playlist (playlist.id)}<option value={playlist.id}>{playlist.name}</option>{/each}
-        </select>
-        {#if playlistId}
-          <button class="icon-button playlist-move-up" type="button" title="Move up" disabled={playlistBusy || index === 0} onclick={() => movePlaylistTrack(index, -1)}>↑</button>
-          <button class="icon-button playlist-move-down" type="button" title="Move down" disabled={playlistBusy || index === tracks.length - 1} onclick={() => movePlaylistTrack(index, 1)}>↓</button>
-          <button class="icon-button playlist-remove" type="button" title="Remove from playlist" disabled={playlistBusy} onclick={() => removePlaylistTrack(index)}>×</button>
-        {/if}
-        <button
-          class="icon-button track-meta"
-          type="button"
-          title="Edit metadata"
-          onclick={() => metadata.open(track.id)}>⋯</button
-        >
-      </span>
+        <details class="track-menu" ontoggle={(event) => {
+          const details = event.currentTarget;
+          const menu = details.querySelector<HTMLElement>('.track-menu-content')!;
+          if (details.open) {
+            if (openMenu && openMenu !== details) openMenu.open = false;
+            openMenu = details;
+            menu.style.removeProperty('top');
+            menu.style.removeProperty('left');
+            menu.showPopover();
+            if (matchMedia('(min-width: 1024px)').matches) {
+              const trigger = details.getBoundingClientRect();
+              menu.style.top = `${Math.max(8, Math.min(trigger.bottom + 4, innerHeight - 124 - menu.offsetHeight))}px`;
+              menu.style.left = `${Math.max(8, Math.min(trigger.right - menu.offsetWidth, innerWidth - menu.offsetWidth - 8))}px`;
+            }
+          } else {
+            menu.hidePopover();
+            if (openMenu === details) openMenu = null;
+          }
+        }}>
+          <summary class="track-menu-toggle" aria-label="Actions for {track.title}">⋯</summary>
+          <div class="track-menu-content" popover="manual" role="group" aria-label="Actions for {track.title}">
+            <p class="track-menu-heading">{track.title}<span>{track.artist_name} · {track.album_title}</span></p>
+            <button class="icon-button" type="button" aria-pressed={favorites.has(track.id)} onclick={() => favorites.toggleTrack(track.id)}>{favorites.has(track.id) ? "Remove favorite" : "Add favorite"}</button>
+            <button
+              class="icon-button track-audio-radio"
+              type="button"
+              title="Start audio radio — tracks that sound like this"
+              onclick={() => startAudioRadio(track.id)}>Start audio radio</button
+            >
+            <button class="icon-button track-play-next" type="button" title="Play next" onclick={() => playNext(track)}>Play next</button>
+            <button class="icon-button track-add-queue" type="button" title="Add to queue" onclick={() => enqueueTracks([track])}>Add to queue</button>
+            <select class="track-add-playlist" aria-label="Add {track.title} to playlist" value="" disabled={playlistBusy} onchange={(event) => addToPlaylist(event, track)}>
+              <option value="" disabled>Add to playlist</option>
+              {#each playlists as playlist (playlist.id)}<option value={playlist.id}>{playlist.name}</option>{/each}
+            </select>
+            {#if playlistId}
+              <button class="icon-button playlist-move-up" type="button" title="Move up" disabled={playlistBusy || index === 0} onclick={() => movePlaylistTrack(index, -1)}>Move up</button>
+              <button class="icon-button playlist-move-down" type="button" title="Move down" disabled={playlistBusy || index === tracks.length - 1} onclick={() => movePlaylistTrack(index, 1)}>Move down</button>
+              <button class="icon-button playlist-remove" type="button" title="Remove from playlist" disabled={playlistBusy} onclick={() => removePlaylistTrack(index)}>Remove from playlist</button>
+            {/if}
+            <button
+              class="icon-button track-meta"
+              type="button"
+              title="Edit metadata"
+              onclick={() => metadata.open(track.id)}>Edit metadata</button
+            >
+          </div>
+        </details>
+      </div>
     </div>
   {/each}
 </div>
