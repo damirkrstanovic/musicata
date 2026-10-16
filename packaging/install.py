@@ -50,6 +50,16 @@ CLOUDFLARE_VERSION = 'v0.2.4'
 XCADDY_VERSION = 'v0.4.7'
 CLOUDFLARE_IMAGE = f'ghcr.io/{REPO}-caddy:1.3.1'
 COMPONENTS = {'caddy', 'dsp', 'mpd', 'snapcast', 'airplay', 'spotify', 'discovery', 'ml'}
+LIBRESPOT = Path('/usr/local/bin/librespot')
+SNAPCAST_BIN = Path('/usr/local/bin')
+SNAPCAST_REVISION = 'f12373479243e93a97237592d6a3703539ec41d5'  # 0.35.0, GPL-3.0-or-later
+AUDIO_SERVICES = {
+    'mpd': ['mpd.service', 'mpd.socket'],
+    'snapserver': ['snapserver.service'],
+    'snapclient': ['snapclient.service'],
+    'snapcast': ['snapserver.service', 'snapclient.service', 'snapcast.service'],
+    'shairport-sync': ['shairport-sync.service'],
+}
 
 class InstallError(Exception):
     pass
@@ -166,17 +176,23 @@ def packages(family, cfg):
     base += ['systemd','util-linux',{'debian':'passwd','arch':'shadow','fedora':'shadow-utils'}[family]]
     if cfg['mode'] == 'docker': base += [{'debian':'docker.io','arch':'docker','fedora':'moby-engine'}[family]]
     components = cfg['components']
-    if 'mpd' in components: base += ['mpd','alsa-utils']
-    if 'discovery' in components:
-        base += {'debian':['avahi-daemon','avahi-utils','libnss-mdns'], 'arch':['avahi','nss-mdns'], 'fedora':['avahi','avahi-tools','nss-mdns']}[family]
+    base += ['mpd','alsa-utils','shairport-sync','smartmontools','nvme-cli','sysstat','pciutils']
+    base += ['lm-sensors'] if family == 'debian' else ['lm_sensors']
+    base += {'debian':['avahi-daemon','avahi-utils','libnss-mdns'], 'arch':['avahi','nss-mdns'], 'fedora':['avahi','avahi-tools','nss-mdns']}[family]
+    if family == 'debian':
+        base += ['snapserver','snapclient']
+    elif not all(shutil.which(binary) for binary in ('snapserver','snapclient')):
+        # No official Snapcast packages on these families: build pinned upstream source.
+        base += ['git','cmake','make','pkgconf']
+        base += {'arch':['gcc','boost','alsa-lib','flac','libvorbis','opus','openssl','libsoxr','expat'],
+                 'fedora':['gcc-c++','boost-devel','alsa-lib-devel','avahi-devel','flac-devel',
+                           'libvorbis-devel','opus-devel','openssl-devel','soxr-devel','expat-devel']}[family]
     # Managed Snapcast/cast-in binaries must live beside the Musicata process.
     if cfg['mode'] == 'native':
         if 'caddy' in components:
             base += ['caddy']
             if cfg['tls_dns']=='cloudflare': base += [{'debian':'golang-go','arch':'go','fedora':'golang'}[family]]
-        if 'snapcast' in components: base += ['snapcast'] if family == 'arch' else ['snapserver','snapclient']
-        if 'airplay' in components: base += ['shairport-sync']
-        if 'spotify' in components: base += ['librespot']
+    # Librespot is supplied by the verified release; distro repositories often lack it.
     return sorted(set(base))
 
 
@@ -201,6 +217,26 @@ def package_installed(family, package):
 def install_packages(family, names):
     if not names: return
     print('Installing dependencies:', ', '.join(names), flush=True)
+    # Package post-install scripts must not claim a DAC or start a second server.
+    # Existing units/masks belong to the user and are left alone.
+    services = [service for name in names for service in AUDIO_SERVICES.get(name, [])
+                if not succeeds(['systemctl','cat',service])
+                and not any((Path(root)/service).is_symlink()
+                            for root in ('/run/systemd/system','/etc/systemd/system'))]
+    if services: run(['systemctl','mask','--runtime',*services])
+    try:
+        install_distro_packages(family, names)
+    finally:
+        if services:
+            try:
+                # Packages can create boot enablement links even while runtime-masked.
+                try: run(['systemctl','disable',*services])
+                except InstallError as error: print('Audio service cleanup:', error, file=sys.stderr)
+            finally:
+                run(['systemctl','unmask','--runtime',*services])
+
+
+def install_distro_packages(family, names):
     if family == 'debian':
         run(['apt-get','update'])
         for name in names:
@@ -280,6 +316,47 @@ def atomic_write(path, text, mode=0o644):
     temporary.write_text(text)
     temporary.chmod(mode)
     os.replace(temporary,path)
+
+
+def install_librespot(artifact):
+    if shutil.which('librespot'): return
+    binary = artifact/'librespot'
+    notices = artifact/'LIBRESPOT-NOTICES.txt'
+    if not binary.is_file() or not notices.is_file():
+        raise InstallError('Release lacks bundled Librespot and its notices. Use Musicata 1.6.1 or newer, or install Librespot before retrying.')
+    run([binary,'--version'])
+    LIBRESPOT.parent.mkdir(parents=True,exist_ok=True)
+    temporary = LIBRESPOT.with_name('librespot.new')
+    shutil.copy2(binary,temporary)
+    temporary.chmod(0o755)
+    atomic_write(CURRENT.parent/'licenses'/'LIBRESPOT-NOTICES.txt',notices.read_text())
+    os.replace(temporary,LIBRESPOT)
+
+
+def install_snapcast(family, scratch):
+    missing = [name for name in ('snapserver','snapclient') if not shutil.which(name)]
+    if family == 'debian' or not missing: return
+    source = scratch/'snapcast'
+    run(['git','init',source])
+    run(['git','-C',source,'remote','add','origin','https://github.com/snapcast/snapcast.git'])
+    run(['git','-C',source,'fetch','--depth','1','origin',SNAPCAST_REVISION])
+    run(['git','-C',source,'checkout','--detach','FETCH_HEAD'])
+    if run(['git','-C',source,'rev-parse','HEAD']) != SNAPCAST_REVISION:
+        raise InstallError('Snapcast source revision mismatch.')
+    print('Building Snapcast 0.35.0 from pinned upstream source…',flush=True)
+    run(['cmake','-S',source,'-B',source/'build','-DCMAKE_BUILD_TYPE=Release'])
+    run(['cmake','--build',source/'build','--parallel','2'])
+    for name in missing: run([source/'bin'/name,'--version'])
+    licenses = CURRENT.parent/'licenses'
+    atomic_write(licenses/'SNAPCAST-LICENSE', (source/'LICENSE').read_text())
+    atomic_write(licenses/'SNAPCAST-SOURCE.txt',
+                 'https://github.com/snapcast/snapcast/tree/'+SNAPCAST_REVISION+'\n')
+    SNAPCAST_BIN.mkdir(parents=True,exist_ok=True)
+    for name in missing:
+        temporary = SNAPCAST_BIN/(name+'.new')
+        shutil.copy2(source/'bin'/name,temporary)
+        temporary.chmod(0o755)
+        os.replace(temporary,SNAPCAST_BIN/name)
 
 
 def unit_text(cfg, uid, gid):
@@ -544,18 +621,6 @@ def docker_images(cfg, scratch):
         except InstallError as error:
             raise InstallError(f'Cannot pull {image}. Check release availability/network access. If GHCR reports unauthorized, make the package public or run sudo docker login ghcr.io with a token granting read:packages. Existing Musicata services have not been stopped.\n{error}') from error
         images[component] = run(['docker','image','inspect','--format','{{.Id}}',image])
-    extra = []
-    if 'snapcast' in cfg['components']: extra += ['snapserver']
-    if 'airplay' in cfg['components']: extra += ['shairport-sync']
-    if 'spotify' in cfg['components']: extra += ['librespot']
-    if extra:
-        # The base image is Debian even when the host is Fedora or Arch.
-        dockerfile = scratch/'Dockerfile'
-        dockerfile.write_text('FROM '+images['server']+'\nUSER root\nRUN apt-get update && apt-get install -y --no-install-recommends '+ ' '.join(extra)+' && rm -rf /var/lib/apt/lists/*\nUSER musicata\n')
-        try: run(['docker','build','-t','musicata-installer:'+cfg['version'],scratch])
-        except InstallError as error:
-            raise InstallError('Optional audio packages could not be installed in the Debian server image. No running Musicata service was replaced. In particular librespot may be absent from configured repositories.\n'+str(error)) from error
-        images['server'] = run(['docker','image','inspect','--format','{{.Id}}','musicata-installer:'+cfg['version']])
     if 'caddy' in cfg['components']:
         image = CLOUDFLARE_IMAGE if cfg['tls_dns']=='cloudflare' else 'caddy:2-alpine'
         print('Pulling',image,flush=True)
@@ -583,7 +648,7 @@ def docker_command(cfg, uid, gid, component, image):
         argv += ['-v',cfg['library']+':/music:ro,z','-e',f'MUSICATA_ADDR={bind}:{cfg["port"]}']
         if 'ml' in cfg['components']: argv += ['-e','MUSICATA_ML_SERVICE_URL=http://127.0.0.1:3091']
         if 'mpd' in cfg['components']: argv += ['-e','MUSICATA_MPD=127.0.0.1:6600','-e',f'MUSICATA_PUBLIC_URL=http://127.0.0.1:{cfg["port"]}']
-        if 'airplay' in cfg['components']: argv += ['-v','/run/dbus:/run/dbus:ro']
+        argv += ['-v','/run/dbus:/run/dbus:ro']
     return argv + [image]
 
 
@@ -741,6 +806,9 @@ def deploy(cfg, saved, family, missing):
             run(['systemctl','enable','--now','docker.service'])
             cfg['images'] = docker_images(cfg,scratch)
         else: artifact = native_artifact(version,release,scratch)
+        if not shutil.which('librespot'):
+            install_librespot(artifact or native_artifact(version,release,scratch))
+        install_snapcast(family,scratch)
         if 'caddy' in cfg['components']: prepare_caddy(cfg,scratch)
         try: account = pwd.getpwnam(cfg['user'])
         except KeyError:
@@ -802,7 +870,7 @@ def deploy(cfg, saved, family, missing):
                 shutil.copytree(artifact,destination)
                 temp_link = CURRENT.with_name('current.new');temp_link.symlink_to(destination);os.replace(temp_link,CURRENT)
                 if not saved: atomic_write(UNIT,unit_text(cfg,uid,gid))
-            if 'discovery' in cfg['components']: configure_discovery(cfg)
+            configure_discovery(cfg)
             run(['systemctl','daemon-reload'])
             if 'dsp' in cfg['components']:
                 run(['systemd-analyze','verify',DSP_UNIT]);run(['systemctl','enable','--now','musicata-camilladsp.service'])
@@ -910,6 +978,10 @@ def main(argv=None):
     print('Components:', ', '.join(['server']+cfg['components']))
     print('Service user:',cfg['user'],'; library:',cfg['library'],'; port:',cfg['port'])
     print('Dependencies to install:',', '.join(missing) or 'none')
+    missing_librespot = not shutil.which('librespot')
+    print('Librespot:', 'install from verified release archive' if missing_librespot else 'existing executable retained')
+    missing_snapcast = not all(shutil.which(binary) for binary in ('snapserver','snapclient'))
+    if family != 'debian' and missing_snapcast: print('Snapcast: build pinned upstream 0.35.0 (two build jobs; no audio service activation)')
     if family == 'arch' and missing: print('Arch package installation includes a full system upgrade (pacman -Syu); partial upgrades are unsupported.')
     if cfg['mode']=='docker': print('Docker uses host networking for LAN audio/discovery. ML, if selected, binds localhost only.')
     if 'caddy' in cfg['components']:
@@ -922,7 +994,7 @@ def main(argv=None):
         if saved and 'caddy' not in saved['components']: print('Enabling HTTPS signs out existing browser sessions; sign in again at the HTTPS address.')
         print('Native audio endpoints currently lack HTTPS/WSS support; the loopback backend is not reachable directly from other devices.')
     for issue in issues: print('BLOCKER:',issue)
-    if cfg['check'] or cfg['dry_run']: return 1 if issues or (cfg['check'] and missing) else 0
+    if cfg['check'] or cfg['dry_run']: return 1 if issues or (cfg['check'] and (missing or missing_librespot or missing_snapcast)) else 0
     if issues: raise InstallError('Resolve the blockers above before installing.')
     if os.geteuid()!=0: raise InstallError('Run with sudo to install dependencies and system services. --check and --dry-run do not require root.')
     if not cfg['yes']:

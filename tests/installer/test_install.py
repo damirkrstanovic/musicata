@@ -11,6 +11,78 @@ sys.modules[spec.name] = m
 spec.loader.exec_module(m)
 
 class PlanningTests(unittest.TestCase):
+    def test_default_dependencies_do_not_activate_playback(self):
+        for mode in ('native', 'docker'):
+            cfg = m.options(['--mode', mode])
+            packages = set(m.packages('debian', cfg))
+            self.assertTrue({'mpd', 'alsa-utils', 'avahi-daemon', 'avahi-utils',
+                             'libnss-mdns', 'snapserver', 'snapclient', 'shairport-sync',
+                             'smartmontools', 'nvme-cli', 'lm-sensors', 'sysstat', 'pciutils'} <= packages)
+            self.assertNotIn('librespot', packages)  # Supplied by the verified release.
+            self.assertEqual(cfg['components'], [])
+            self.assertNotIn('MUSICATA_MPD=', m.unit_text(cfg, 1001, 1001))
+
+    def test_snapcast_fallback_preserves_existing_binary_and_checks_revision(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'snapcast'
+            (source/'bin').mkdir(parents=True)
+            (source/'bin/snapclient').write_text('built client')
+            (source/'LICENSE').write_text('GPL fixture')
+            destination = root/'installed'
+            destination.mkdir()
+            (destination/'snapserver').write_text('existing server')
+            def which(name):
+                return str(destination/name) if name == 'snapserver' else None
+            with patch.object(m.shutil, 'which', side_effect=which), patch.object(m, 'SNAPCAST_BIN', destination), patch.object(m, 'CURRENT', root/'current'), patch.object(m, 'run', return_value=m.SNAPCAST_REVISION) as run:
+                m.install_snapcast('fedora', root)
+                self.assertEqual((destination/'snapserver').read_text(), 'existing server')
+                self.assertEqual((destination/'snapclient').read_text(), 'built client')
+                self.assertTrue((destination/'snapclient').stat().st_mode & 0o111)
+                self.assertTrue((root/'licenses/SNAPCAST-LICENSE').is_file())
+                run.return_value = 'wrong revision'
+                with self.assertRaisesRegex(m.InstallError, 'revision mismatch'):
+                    m.install_snapcast('arch', root)
+
+    def test_docker_audio_uses_shipped_image_and_host_discovery(self):
+        from unittest.mock import patch
+        cfg = m.options(['--with', 'spotify,airplay'])
+        cfg['version'] = '1.6.1'
+        commands = []
+        def docker(argv):
+            commands.append(argv)
+            return 'sha256:fixture' if argv[:3] == ['docker', 'image', 'inspect'] else ''
+        with tempfile.TemporaryDirectory() as scratch, patch.object(m, 'run', side_effect=docker):
+            images = m.docker_images(cfg, Path(scratch))
+            self.assertEqual(images['server'], 'sha256:fixture')
+            self.assertEqual(list(Path(scratch).iterdir()), [])
+        self.assertFalse(any(c[:2] == ['docker', 'build'] for c in commands))
+        default = m.docker_command(m.options([]), 1001, 1001, 'server', 'image')
+        self.assertIn('/run/dbus:/run/dbus:ro', default)
+
+    def test_new_audio_services_stay_inactive_when_package_install_fails(self):
+        from unittest.mock import patch
+        commands = []
+        def run(argv, **kwargs):
+            commands.append(argv)
+            if argv[:2] == ['apt-get', 'install']:
+                raise m.InstallError('package download failed')
+            return ''
+        def succeeds(argv):
+            return argv[0] == 'apt-cache' or argv == ['systemctl', 'cat', 'snapclient.service']
+        with patch.object(m, 'run', side_effect=run), patch.object(m, 'succeeds', side_effect=succeeds):
+            with self.assertRaisesRegex(m.InstallError, 'package download failed'):
+                m.install_packages('debian', ['mpd', 'snapclient'])
+        masks = [c for c in commands if c[:3] == ['systemctl', 'mask', '--runtime']]
+        self.assertEqual(len(masks), 1)
+        mask = masks[0]
+        self.assertIn('mpd.service', mask)
+        self.assertIn('mpd.socket', mask)
+        self.assertNotIn('snapclient.service', mask)  # Existing service belongs to the user.
+        self.assertIn(['systemctl', 'disable', 'mpd.service', 'mpd.socket'], commands)
+        self.assertIn(['systemctl', 'unmask', '--runtime', 'mpd.service', 'mpd.socket'], commands)
+
     def test_cloudflare_docker_pulls_prebuilt_image_without_building(self):
         from unittest.mock import patch
         cfg=m.options(['--with','caddy','--tls-domain','music.example.org','--tls-dns','cloudflare','--tls-dns-token-file','/root/cloudflare-token'])
@@ -84,7 +156,13 @@ class PlanningTests(unittest.TestCase):
         for family, engine in [('debian','docker.io'),('arch','docker'),('fedora','moby-engine')]:
             self.assertIn(engine,m.packages(family,m.options([])))
             self.assertIn('mpd',m.packages(family,m.options(['--mode','native','--with','mpd'])))
-        self.assertIn('snapcast',m.packages('arch',m.options(['--mode','native','--with','snapcast'])))
+        from unittest.mock import patch
+        with patch.object(m.shutil, 'which', return_value=None):
+            self.assertIn('boost',m.packages('arch',m.options([])))
+            self.assertIn('boost-devel',m.packages('fedora',m.options([])))
+            self.assertNotIn('snapserver',m.packages('fedora',m.options([])))
+        with patch.object(m.shutil, 'which', return_value='/usr/local/bin/existing'):
+            self.assertNotIn('boost-devel',m.packages('fedora',m.options([])))
 
     def test_caddy_requires_a_public_hostname_and_safe_values(self):
         for args in [['--with','caddy'], ['--tls-domain','music.example.org'],
@@ -192,6 +270,11 @@ class DeploymentTests(unittest.TestCase):
         for name,leaf in [('CONFIG','etc/install.json'),('DATA','state'),('ML_DATA','ml'),('UNIT','etc/musicata.service'),('MPD_UNIT','etc/mpd.service'),('MPD_CONFIG','etc/mpd.conf'),('CURRENT','opt/current'),('BACKUPS','backups'),('NSS','etc/nsswitch.conf'),('AVAHI','etc/avahi.service'),('DSP_CONFIG','etc/camilladsp.json'),('DSP_UNIT','etc/camilladsp.service'),('DSP_MODULE','etc/modules-load.conf'),('CADDY_CONFIG','etc/caddy/Caddyfile'),('CADDY_UNIT','etc/caddy.service'),('CADDY_OVERRIDE','etc/musicata.service.d/caddy.conf'),('CADDY_ROOT','caddy-state'),('CADDY_ENV','etc/caddy/cloudflare.env'),('CADDY_BINARY','opt/caddy')]:
             self.stack.enter_context(patch.object(m,name,self.root/leaf))
         self.artifact=self.root/'artifact';self.artifact.mkdir();(self.artifact/'musicata-server').write_text('fixture binary')
+        (self.artifact/'librespot').write_text('fixture receiver')
+        (self.artifact/'LIBRESPOT-NOTICES.txt').write_text('fixture attribution')
+        self.stack.enter_context(patch.object(m, 'LIBRESPOT', self.root/'bin/librespot'))
+        self.stack.enter_context(patch.object(m, 'NSS', self.root/'nsswitch.conf'))
+        m.NSS.write_text('hosts: files dns\n')
         self.stack.enter_context(patch.object(m,'native_artifact',return_value=self.artifact))
         self.stack.enter_context(patch.object(m,'release_metadata',return_value=('1.0.10',{})))
         self.stack.enter_context(patch.object(m,'install_packages'))
@@ -204,6 +287,26 @@ class DeploymentTests(unittest.TestCase):
         self.stack.enter_context(patch.object(m,'verify_loopback_backend',create=True))
         self.tls_health=self.stack.enter_context(patch.object(m,'healthy_tls',create=True))
         self.cfg=m.options(['--mode','native','--library',str(self.root/'music')])
+
+    def test_bundled_receiver_installs_with_notices_without_starting_audio(self):
+        from unittest.mock import patch
+        with patch.object(m.shutil, 'which', return_value=None):
+            m.install_librespot(self.artifact)
+        self.assertEqual(m.LIBRESPOT.read_text(), 'fixture receiver')
+        self.assertEqual(m.LIBRESPOT.stat().st_mode & 0o777, 0o755)
+        self.assertEqual((m.CURRENT.parent/'licenses/LIBRESPOT-NOTICES.txt').read_text(), 'fixture attribution')
+        self.assertEqual(self.commands, [[str(self.artifact/'librespot'), '--version']])
+
+    def test_receiver_requires_notices_and_preserves_existing_executable(self):
+        from unittest.mock import patch
+        (self.artifact/'LIBRESPOT-NOTICES.txt').unlink()
+        with patch.object(m.shutil, 'which', return_value=None):
+            with self.assertRaisesRegex(m.InstallError, 'notices'):
+                m.install_librespot(self.artifact)
+        self.assertFalse(m.LIBRESPOT.exists())
+        with patch.object(m.shutil, 'which', return_value='/usr/bin/librespot'):
+            m.install_librespot(self.artifact)
+        self.assertFalse(m.LIBRESPOT.exists())
 
     def caddy_options(self, mode='native'):
         return m.options(['--mode',mode,'--with','caddy','--tls-domain','music.example.org','--library',str(self.root/'music')])

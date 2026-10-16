@@ -49,13 +49,23 @@ RUN --mount=type=cache,id=musicata-server-registry,target=/usr/local/cargo/regis
     cargo build --release -p musicata-server \
     && cp target/release/musicata-server /musicata-server
 
-# 3. Runtime.
+# Build the Spotify Connect pipe receiver separately from the Musicata workspace.
+FROM rust:1-bookworm AS librespot
+ENV RUSTFLAGS="-C target-cpu=x86-64-v2"
+COPY packaging/build-librespot.sh packaging/librespot-notices.py /build/
+RUN --mount=type=cache,id=musicata-librespot-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=musicata-librespot-target,target=/target \
+    CARGO_TARGET_DIR=/target bash /build/build-librespot.sh /out
+
+# 3. Runtime. Playback inputs are available immediately; Musicata activates them.
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates snapserver shairport-sync \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --uid 10001 musicata
 COPY --from=build /musicata-server /usr/local/bin/musicata-server
+COPY --from=librespot /out/librespot /usr/local/bin/librespot
+COPY --from=librespot /out/LIBRESPOT-NOTICES.txt /usr/share/doc/musicata/
 # The AGPL requires the license text to accompany the binary in object form too, and the
 # statically linked deps (plus the embedded web bundle) require their own attribution.
 COPY COPYING NOTICE THIRD-PARTY-NOTICES.md /usr/share/doc/musicata/
