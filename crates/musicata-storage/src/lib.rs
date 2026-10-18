@@ -15,6 +15,7 @@
 // program. If not, see <https://www.gnu.org/licenses/>.
 
 pub mod diagnostics;
+mod queue_cache;
 
 use anyhow::{Context, Result};
 use musicata_core::{
@@ -39,6 +40,7 @@ pub struct Database {
     // SQLite has one writer. Keep blocked writes off the foreground read pool.
     pool: SqlitePool,
     reads: SqlitePool,
+    queue_cache: queue_cache::QueueCache,
 }
 
 /// Register the sqlite-vec extension as a global SQLite auto-extension, once per process, so
@@ -88,9 +90,14 @@ impl Database {
         let reads = SqlitePoolOptions::new()
             .max_connections(5)
             .min_connections(1)
-            .connect_with(options.read_only(true).create_if_missing(false))
+            .connect_with(options.clone().read_only(true).create_if_missing(false))
             .await?;
-        let database = Self { pool, reads };
+        let queue_cache = queue_cache::QueueCache::connect(options).await?;
+        let database = Self {
+            pool,
+            reads,
+            queue_cache,
+        };
         database.migrate().await?;
 
         Ok(database)
@@ -648,6 +655,90 @@ impl Database {
         result?;
         conn.commit().await?;
         Ok(())
+    }
+
+    /// Background-only empty-result cache; successful/nonempty work is never cached.
+    async fn poll_empty<T>(
+        &self,
+        key: &'static str,
+        retry_before: i64,
+        query: impl std::future::Future<Output = Result<Vec<T>>>,
+    ) -> Result<Vec<T>> {
+        let Some(token) = self.queue_cache.begin(key, retry_before).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = query.await?;
+        if rows.is_empty() {
+            self.queue_cache.remember(key, token);
+        }
+        Ok(rows)
+    }
+    pub async fn poll_missing_fingerprints(
+        &self,
+        retry_before: i64,
+        limit: i64,
+    ) -> Result<Vec<TrackFingerprintTarget>> {
+        if limit <= 0 {
+            return self.tracks_missing_fingerprints(retry_before, limit).await;
+        }
+        self.poll_empty(
+            "fingerprint",
+            retry_before,
+            self.tracks_missing_fingerprints(retry_before, limit),
+        )
+        .await
+    }
+    pub async fn poll_missing_loudness(
+        &self,
+        after: Option<(&str, &str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<TrackFingerprintTarget>> {
+        // A page after a failed item can be empty while earlier items still need retries.
+        if after.is_some() || limit <= 0 {
+            return self.tracks_missing_loudness(after, limit).await;
+        }
+        self.poll_empty("loudness", 0, self.tracks_missing_loudness(None, limit))
+            .await
+    }
+    pub async fn poll_musicbrainz_search(&self, limit: i64) -> Result<Vec<TrackSearchTarget>> {
+        if limit <= 0 {
+            return self.tracks_for_musicbrainz_search(limit).await;
+        }
+        self.poll_empty(
+            "musicbrainz_search",
+            0,
+            self.tracks_for_musicbrainz_search(limit),
+        )
+        .await
+    }
+    pub async fn poll_missing_musicbrainz_metadata(
+        &self,
+        retry_before: i64,
+        limit: i64,
+    ) -> Result<Vec<MusicBrainzEnrichTarget>> {
+        if limit <= 0 {
+            return self
+                .tracks_missing_musicbrainz_metadata(retry_before, limit)
+                .await;
+        }
+        self.poll_empty(
+            "musicbrainz_enrich",
+            retry_before,
+            self.tracks_missing_musicbrainz_metadata(retry_before, limit),
+        )
+        .await
+    }
+    /// None means reuse the previous counts AND their original observation timestamp.
+    pub async fn poll_diagnostic_queues(
+        &self,
+        retry_before: i64,
+    ) -> Result<Option<Vec<(&'static str, usize, Option<usize>)>>> {
+        let Some(token) = self.queue_cache.begin("diagnostics", retry_before).await? else {
+            return Ok(None);
+        };
+        let queues = self.diagnostic_queues(retry_before).await?;
+        self.queue_cache.remember("diagnostics", token);
+        Ok(Some(queues))
     }
 
     /// Lightweight queue summaries for diagnostics; never materialize track metadata.
@@ -9825,6 +9916,183 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn empty_worker_polls_reuse_results_without_read_queries() {
+        let database = Database::connect(temp_db_path("empty-poll-cache"))
+            .await
+            .unwrap();
+        for pass in 0..2 {
+            if pass == 1 {
+                database.reads.close().await;
+            }
+            assert!(
+                database
+                    .poll_missing_fingerprints(1_000, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                database
+                    .poll_missing_loudness(None, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                database
+                    .poll_musicbrainz_search(10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                database
+                    .poll_missing_musicbrainz_metadata(1_000, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_cache_observes_new_work_and_never_caches_nonempty_results() {
+        let database = Database::connect(temp_db_path("poll-new-work"))
+            .await
+            .unwrap();
+        assert!(
+            database
+                .poll_missing_loudness(None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            database
+                .poll_diagnostic_queues(1000)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            database
+                .poll_diagnostic_queues(1000)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        database.save_library(&mut fixture_library()).await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                database
+                    .poll_missing_loudness(None, 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let queues = database
+            .poll_diagnostic_queues(1000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queues.iter().find(|q| q.0 == "loudness").unwrap().1, 1);
+        assert!(
+            database
+                .poll_diagnostic_queues(1000)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_limits_and_loudness_pages_do_not_hide_pending_work() {
+        let database = Database::connect(temp_db_path("poll-page")).await.unwrap();
+        database.save_library(&mut fixture_library()).await.unwrap();
+        assert!(
+            database
+                .poll_missing_loudness(None, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            database
+                .poll_missing_loudness(Some(("zzzz", "zzzz", "zzzz")), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .poll_missing_loudness(None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_negative_results_expire_without_database_writes() {
+        let database = Database::connect(temp_db_path("poll-retry")).await.unwrap();
+        let mut library = fixture_library();
+        for obs in &mut library.tracks[0].observed_metadata {
+            obs.musicbrainz_recording_id = None;
+            obs.musicbrainz_track_id = None;
+            obs.musicbrainz_release_id = None;
+            obs.musicbrainz_release_group_id = None;
+        }
+        database.save_library(&mut library).await.unwrap();
+        database
+            .upsert_track_fingerprint("track_1", "not_found", None, None, None, 1000)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .poll_missing_fingerprints(500, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            database
+                .poll_missing_fingerprints(500, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .poll_missing_fingerprints(2000, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_queue_queries_are_retried() {
+        let database = Database::connect(temp_db_path("poll-error")).await.unwrap();
+        assert!(
+            database
+                .poll_empty::<i32>("test", 0, async { anyhow::bail!("query failed") })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            database
+                .poll_empty("test", 0, async { Ok(vec![1]) })
+                .await
+                .unwrap(),
+            vec![1]
+        );
     }
 
     #[tokio::test]

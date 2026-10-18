@@ -557,9 +557,9 @@ pub fn start(runtime: Arc<Runtime>, database: Database, db_path: PathBuf) {
                 previous = cpu.map(|cpu| (now, cpu));
                 runtime.push_sample(s);
             }
-            if let Ok(Ok(queues)) = tokio::time::timeout(
+            if let Ok(Ok(Some(queues))) = tokio::time::timeout(
                 Duration::from_secs(2),
-                database.diagnostic_queues(super::now() as i64 - 7 * 24 * 60 * 60),
+                database.poll_diagnostic_queues(super::now() as i64 - 7 * 24 * 60 * 60),
             )
             .await
             {

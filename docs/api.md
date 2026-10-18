@@ -481,7 +481,10 @@ counters cover the current server session; scan counts are passes, analysis/meta
 are tracks, and artwork counts are covers. A completed item includes a durably cached
 negative lookup outcome. Retryable failures count attempts, not distinct pending items.
 Queue counts represent eligible unfinished work, even when its worker is disabled; their
-observation timestamp identifies stale measurements. Oldest queued time uses track discovery
+observation timestamp identifies stale measurements. Unchanged queue counts and empty worker
+queries are reused for at most five minutes; any library database commit invalidates them
+at the next poll. Time-based negative-result retries can consequently start up to five
+minutes later. Nonempty worker queues continue draining at their usual pace. Oldest queued time uses track discovery
 time, not the last retry time. Scan/prewarm queue counts and artwork queue ages are unknown.
 Worker starts/exits/panics/restarts are actual task lifecycle events, separate from item retries.
 Resource history correlates whole-process measurements with active worker kinds and backlog;
