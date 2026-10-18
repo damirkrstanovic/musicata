@@ -9,6 +9,7 @@
 //! Parsing is a pure function (canned-JSON tested); the base URL and client key are
 //! injectable for tests.
 
+#[cfg(test)]
 use std::io::Cursor;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -20,7 +21,7 @@ use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
@@ -42,42 +43,19 @@ const ACOUSTID_MIN_INTERVAL: Duration = Duration::from_millis(340);
 /// Compute the Chromaprint fingerprint (AcoustID's base64 form) for an audio file's
 /// bytes, plus its duration in whole seconds. Decodes up to [`FINGERPRINT_SECONDS`].
 /// `extension` (e.g. `flac`) hints the demuxer. Synchronous + CPU-heavy.
+#[cfg(test)]
 pub fn compute_fingerprint(audio: &[u8], extension: &str) -> Result<(String, u32), String> {
-    let (samples, sample_rate, channels, full_duration_seconds) = decode_samples(audio, extension)?;
-    if sample_rate == 0 || channels == 0 {
-        return Err("decoded audio had no sample rate / channels".to_string());
-    }
-    // AcoustID matches on the whole track's duration, so prefer the length read from the
-    // container metadata; only when that's unavailable fall back to the decoded-sample
-    // count (which is capped at the fingerprint window and would otherwise undercount).
-    let decoded_duration = (samples.len() as u32 / sample_rate.max(1) / channels.max(1)).max(1);
-    let duration = full_duration_seconds
-        .filter(|seconds| *seconds > 0)
-        .unwrap_or(decoded_duration);
-
-    let config = Configuration::preset_test2();
-    let mut printer = Fingerprinter::new(&config);
-    printer
-        .start(sample_rate, channels)
-        .map_err(|error| format!("fingerprinter start: {error:?}"))?;
-    printer.consume(&samples);
-    printer.finish();
-    let raw = printer.fingerprint();
-    if raw.is_empty() {
-        return Err("empty fingerprint".to_string());
-    }
-    let compressed = FingerprintCompressor::from(&config).compress(raw);
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(compressed);
-    Ok((encoded, duration))
+    compute_fingerprint_source(Box::new(Cursor::new(audio.to_vec())), extension)
 }
 
-/// Decode (up to [`FINGERPRINT_SECONDS`] of) an audio file's bytes into interleaved
-/// `i16` samples, returning them with the sample rate and channel count.
-fn decode_samples(
-    audio: &[u8],
+/// Decode from a seekable source and feed PCM directly into Chromaprint. Memory
+/// is independent of the file size and of the 120-second fingerprint window.
+pub fn compute_fingerprint_source(
+    source: Box<dyn MediaSource>,
     extension: &str,
-) -> Result<(Vec<i16>, u32, u32, Option<u32>), String> {
-    let source = Cursor::new(audio.to_vec());
+) -> Result<(String, u32), String> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let source = crate::analysis_source::DeadlineSource::new(source, deadline);
     let stream = MediaSourceStream::new(Box::new(source), Default::default());
     let mut hint = Hint::new();
     hint.with_extension(extension);
@@ -108,12 +86,17 @@ fn decode_samples(
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|error| format!("decoder: {error}"))?;
 
-    let mut samples: Vec<i16> = Vec::new();
+    let config = Configuration::preset_test2();
+    let mut printer = Fingerprinter::new(&config);
+    let mut sample_count = 0u64;
     let mut sample_rate = 0u32;
     let mut channels = 0u32;
     let mut sample_buf: Option<SampleBuffer<i16>> = None;
 
     loop {
+        if Instant::now() >= deadline {
+            return Err("fingerprint analysis budget exceeded".into());
+        }
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             // End of stream (or an unrecoverable read) — stop with what we have.
@@ -128,15 +111,23 @@ fn decode_samples(
                     let spec = *decoded.spec();
                     sample_rate = spec.rate;
                     channels = spec.channels.count() as u32;
+                    if sample_rate == 0 || channels == 0 {
+                        return Err("decoded audio had no sample rate / channels".into());
+                    }
+                    printer
+                        .start(sample_rate, channels)
+                        .map_err(|error| format!("fingerprinter start: {error:?}"))?;
                     sample_buf = Some(SampleBuffer::<i16>::new(decoded.capacity() as u64, spec));
                 }
                 if let Some(buf) = sample_buf.as_mut() {
                     buf.copy_interleaved_ref(decoded);
-                    samples.extend_from_slice(buf.samples());
+                    printer.consume(buf.samples());
+                    sample_count += buf.samples().len() as u64;
                 }
                 if sample_rate > 0
                     && channels > 0
-                    && samples.len() as u32 / sample_rate / channels >= FINGERPRINT_SECONDS
+                    && sample_count / u64::from(sample_rate) / u64::from(channels)
+                        >= u64::from(FINGERPRINT_SECONDS)
                 {
                     break;
                 }
@@ -147,10 +138,23 @@ fn decode_samples(
         }
     }
 
-    if samples.is_empty() {
+    if Instant::now() >= deadline {
+        return Err("fingerprint analysis budget exceeded".into());
+    }
+    if sample_count == 0 {
         return Err("no audio decoded".to_string());
     }
-    Ok((samples, sample_rate, channels, full_duration_seconds))
+    let duration = full_duration_seconds
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or((sample_count / u64::from(sample_rate) / u64::from(channels)).max(1) as u32);
+    printer.finish();
+    let raw = printer.fingerprint();
+    if raw.is_empty() {
+        return Err("empty fingerprint".to_string());
+    }
+    let compressed = FingerprintCompressor::from(&config).compress(raw);
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(compressed);
+    Ok((encoded, duration))
 }
 
 /// The MusicBrainz ids AcoustID resolved for a track.
@@ -359,6 +363,54 @@ mod tests {
         let (_fingerprint, duration) =
             compute_fingerprint(&silent_wav(200), "wav").expect("fingerprint");
         assert_eq!(duration, 200);
+    }
+
+    #[test]
+    fn fingerprints_large_source_without_reading_past_the_window() {
+        use std::io::{self, Read, Seek, SeekFrom};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use symphonia::core::io::MediaSource;
+        struct Counted {
+            bytes: Cursor<Vec<u8>>,
+            read: Arc<AtomicUsize>,
+        }
+        impl Read for Counted {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                let n = self.bytes.read(out)?;
+                self.read.fetch_add(n, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        impl Seek for Counted {
+            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+                self.bytes.seek(pos)
+            }
+        }
+        impl MediaSource for Counted {
+            fn is_seekable(&self) -> bool {
+                true
+            }
+            fn byte_len(&self) -> Option<u64> {
+                Some(self.bytes.get_ref().len() as u64)
+            }
+        }
+        let bytes = silent_wav(240);
+        assert!(bytes.len() > 32 * 1024 * 1024);
+        let read = Arc::new(AtomicUsize::new(0));
+        let source = Counted {
+            bytes: Cursor::new(bytes),
+            read: read.clone(),
+        };
+        let (fingerprint, duration) = compute_fingerprint_source(Box::new(source), "wav").unwrap();
+        assert_eq!(duration, 240);
+        assert!(!fingerprint.is_empty());
+        assert!(
+            read.load(Ordering::Relaxed) < 22 * 1024 * 1024,
+            "fingerprinting must stop after 120 seconds, not buffer the whole file"
+        );
     }
 
     #[test]
