@@ -47,7 +47,43 @@ pub async fn prepare(state: &AppState, request: ExportRequest) -> anyhow::Result
         "description":request.description.map(|text|sanitize_description(&text)),"problem_time_unix_seconds":request.problem_time_unix_seconds,
         "detection_limits":["No analogue or DAC-side glitch measurement","Stream headers do not establish completed playback","Offline reporters have bounded queues"]});
     let destination = path(&state.db_path);
-    tokio::task::spawn_blocking(move || write_archive(snapshot, context, &destination)).await??;
+    let mut attachments = vec![(
+        "runtime.json",
+        serde_json::to_vec(&state.diagnostics.runtime().snapshot(true))?,
+    )];
+    let profile_status = state.diagnostics.profiles().status();
+    let mut omitted_profiles = 0;
+    if request.include_profiles {
+        for (kind, ready) in [
+            (super::profiles::ProfileKind::Cpu, profile_status.cpu_ready),
+            (
+                super::profiles::ProfileKind::Heap,
+                profile_status.heap_ready,
+            ),
+        ] {
+            let profile_path = super::profiles::path(&state.db_path, kind);
+            if ready
+                && tokio::fs::metadata(&profile_path)
+                    .await
+                    .is_ok_and(|m| m.len() <= super::profiles::ARTIFACT_LIMIT as u64)
+            {
+                match tokio::fs::read(&profile_path).await {
+                    Ok(bytes) => attachments.push((kind.filename(), bytes)),
+                    Err(_) => omitted_profiles += 1,
+                }
+            } else {
+                omitted_profiles += 1;
+            }
+        }
+    }
+    let mut context = context;
+    context["profiles"] = serde_json::to_value(profile_status)?;
+    context["omitted_profiles"] = serde_json::json!(omitted_profiles);
+    context["resource_history_retention_hours"] = serde_json::json!(24);
+    tokio::task::spawn_blocking(move || {
+        write_archive(snapshot, context, &destination, attachments)
+    })
+    .await??;
     Ok(())
 }
 fn sanitize_description(text: &str) -> String {
@@ -134,6 +170,7 @@ fn write_archive(
     snapshot: DiagnosticSnapshot,
     context: serde_json::Value,
     destination: &Path,
+    attachments: Vec<(&str, Vec<u8>)>,
 ) -> anyhow::Result<()> {
     use std::io::Write;
     let mut temp = destination.as_os_str().to_os_string();
@@ -170,6 +207,21 @@ fn write_archive(
             zip.start_file(name, options)?;
             zip.write_all(&data)?;
         }
+        for (name, bytes) in attachments {
+            anyhow::ensure!(
+                matches!(
+                    name,
+                    "runtime.json" | "cpu-profile.svg" | "heap-profile.json"
+                ),
+                "unexpected diagnostic attachment"
+            );
+            anyhow::ensure!(
+                bytes.len() <= 4 * 1024 * 1024,
+                "diagnostic attachment exceeds limit"
+            );
+            zip.start_file(name, options)?;
+            zip.write_all(&bytes)?;
+        }
         zip.finish()?.0.sync_all()?;
         std::fs::rename(&temp, destination)?;
         Ok(())
@@ -183,6 +235,46 @@ fn write_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn runtime_and_profiles_are_allowlisted_and_bounded() {
+        let dir =
+            std::env::temp_dir().join(format!("musicata-bundle-bounds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("bundle.zip");
+        write_archive(
+            DiagnosticSnapshot::default(),
+            serde_json::json!({}),
+            &dest,
+            vec![
+                ("runtime.json", b"{}".to_vec()),
+                ("cpu-profile.svg", b"<svg/>".to_vec()),
+            ],
+        )
+        .unwrap();
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&dest).unwrap()).unwrap();
+        assert!(zip.by_name("runtime.json").is_ok());
+        assert!(zip.by_name("cpu-profile.svg").is_ok());
+        assert!(
+            write_archive(
+                DiagnosticSnapshot::default(),
+                serde_json::json!({}),
+                &dest,
+                vec![("private.db", vec![])]
+            )
+            .is_err()
+        );
+        assert!(
+            write_archive(
+                DiagnosticSnapshot::default(),
+                serde_json::json!({}),
+                &dest,
+                vec![("runtime.json", vec![0; 4 * 1024 * 1024 + 1])]
+            )
+            .is_err()
+        );
+        assert!(dest.exists()); // Failed exports preserve the last completed bundle.
+        let _ = std::fs::remove_dir_all(dir);
+    }
     #[test]
     fn descriptions_remove_recognizable_secret_and_path_variants() {
         let text = r#"Password=secret password:secret api_key=secret C:\Users\Alice\Music
@@ -207,6 +299,7 @@ mod tests {
             snapshot,
             serde_json::json!({"version":"test"}),
             &destination,
+            vec![],
         )
         .unwrap();
         let mut archive = zip::ZipArchive::new(std::fs::File::open(destination).unwrap()).unwrap();

@@ -1,6 +1,6 @@
 [package]
 name = "musicata-server"
-version = "1.8.1"
+version = "1.8.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -80,6 +80,18 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # Podcast RSS feed parsing (the `provider-podcast` feature). serde-based deserialization
 # of the small RSS subset we need. MIT (AGPL-compatible).
 quick-xml = { version = "0.37", features = ["serialize"], optional = true }
+
+# Profiling is local and opt-in. Apache-2.0 / MIT; jemalloc includes BSD-2-Clause.
+[target.'cfg(target_os = "linux")'.dependencies]
+pprof = { version = "0.15", default-features = false }
+tikv-jemallocator = { version = "0.7", features = ["stats"] }
+tikv-jemalloc-ctl = { version = "0.7", features = ["use_std", "stats"] }
+backtrace = "0.3"
+
+# The upstream libgcc heap unwinder can segfault on static musl (tikv/jemallocator#146).
+# The CPU unwinder also failed named-stack validation there; allocator statistics remain.
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["profiling"] }
 
 [dev-dependencies]
 sqlx.workspace = true

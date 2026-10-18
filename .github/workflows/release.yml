@@ -67,6 +67,11 @@ jobs:
           TARGET_CFLAGS: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
         run: cargo zigbuild --release -p musicata-server --target ${{ matrix.target }}
 
+      # Exercise unwinding in the optimized static binary; debug tests cannot prove it safe.
+      - name: Profile smoke (native architecture)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: python3 tests/diagnostics/profiles.py target/${{ matrix.target }}/release/musicata-server
+
       - name: Package
         run: |
           dist="${{ matrix.name }}"

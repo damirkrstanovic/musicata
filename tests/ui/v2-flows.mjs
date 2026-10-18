@@ -1058,6 +1058,25 @@ await waitUntil(`document.querySelector('[data-settings-category="system"]')`, 5
 await js(`document.querySelector('[data-settings-category="system"]')?.click()`);
 check("diagnostics: Settings panel appears", await waitUntil(`document.querySelector('[data-diagnostics]')`, 5000) < Infinity);
 check("diagnostics: controls finish loading",await waitUntil(`Array.from(document.querySelectorAll('[data-diagnostics] button')).some(button=>button.textContent.includes('Record more detail'))`,3000)<Infinity);
+const waitForDiagnostic = async (predicate, budgetMs = 15000) => {
+  const end = Date.now() + budgetMs;
+  while (Date.now() < end) {
+    if (predicate(await api('/api/diagnostics'))) return true;
+    await sleep(150);
+  }
+  return false;
+};
+check("diagnostics: resource and worker summary appears", await waitUntil(`document.querySelector('[data-runtime-health] tbody tr')`, 5000) < Infinity);
+await js(`document.querySelector('[data-diagnostics] input[type="checkbox"]').click()`);
+check("diagnostics: startup CPU choice persists", await waitForDiagnostic(s=>s.cpu_on_startup, 3000));
+await api('/api/diagnostics/profile/startup', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({cpu:false,heap:false})});
+await js(`(() => { const select = document.querySelector('[data-diagnostics] select'); select.value = '5'; select.dispatchEvent(new Event('change', {bubbles:true})); })()`);
+await waitUntil(`Array.from(document.querySelectorAll('[data-diagnostics] button')).some(b=>b.textContent.includes('Capture CPU for 5 seconds'))`, 2000);
+await clickText('[data-diagnostics] button', 'Capture CPU for 5 seconds');
+check("diagnostics: bounded CPU capture finishes", await waitForDiagnostic(s=>s.profiles.cpu_ready && !s.profiles.running));
+check("diagnostics: CPU download appears", await waitUntil(`document.querySelector('[data-diagnostics] a[download="cpu-profile.svg"]')`, 5000) < Infinity);
+const cpuDownload = await fetch(base+'/api/diagnostics/profile/cpu',{headers:{cookie:COOKIE}});
+check("diagnostics: CPU profile is SVG", cpuDownload.ok && (await cpuDownload.text()).includes('<svg'));
 await clickText('[data-diagnostics] button', 'Record more detail for 15 minutes');
 check("diagnostics: detailed recording starts", await waitUntil(`document.querySelector('[data-diagnostic-detail]')`, 3000) < Infinity);
 await clickText('[data-diagnostics] button', 'Stop detailed recording');

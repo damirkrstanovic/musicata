@@ -62,6 +62,8 @@ pub struct DiagnosticHealth {
 #[derive(Clone)]
 pub struct Diagnostics(Arc<Inner>);
 struct Inner {
+    runtime: Arc<super::runtime::Runtime>,
+    profiles: super::profiles::Profiles,
     tx: mpsc::Sender<Input>,
     dropped: AtomicU64,
     rejected: AtomicU64,
@@ -112,11 +114,19 @@ impl Operation {
     }
 }
 impl Diagnostics {
+    pub fn profiles(&self) -> super::profiles::Profiles {
+        self.0.profiles.clone()
+    }
+    pub fn runtime(&self) -> Arc<super::runtime::Runtime> {
+        self.0.runtime.clone()
+    }
     fn channel() -> (Self, mpsc::Receiver<Input>) {
         let (tx, rx) = mpsc::channel(512);
         let session = format!("{}-{}", now(), std::process::id());
         (
             Self(Arc::new(Inner {
+                runtime: Arc::new(super::runtime::Runtime::default()),
+                profiles: super::profiles::Profiles::default(),
                 tx,
                 dropped: AtomicU64::new(0),
                 rejected: AtomicU64::new(0),

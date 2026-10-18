@@ -469,6 +469,13 @@ export async function diagnosticStatus(): Promise<DiagnosticStatus> { return get
 export async function setDiagnosticDetail(enabled: boolean): Promise<DiagnosticStatus> {
   return (await sendJson<DiagnosticStatus>("/api/diagnostics/debug", "POST", { enabled }))!;
 }
-export async function prepareDiagnostics(description: string, problemTime: string): Promise<DiagnosticStatus["export"]> {
-  return (await sendJson<DiagnosticStatus["export"]>("/api/diagnostics/export", "POST", { description: description || null, problem_time_unix_seconds: problemTime ? Math.floor(new Date(problemTime).getTime() / 1000) : null }))!;
+export async function prepareDiagnostics(description: string, problemTime: string, includeProfiles = false): Promise<DiagnosticStatus["export"]> {
+  return (await sendJson<DiagnosticStatus["export"]>("/api/diagnostics/export", "POST", { include_profiles: includeProfiles, description: description || null, problem_time_unix_seconds: problemTime ? Math.floor(new Date(problemTime).getTime() / 1000) : null }))!;
+}
+
+export async function captureProfile(kind: "cpu" | "heap", seconds = 60): Promise<DiagnosticStatus> {
+  return (await sendJson<DiagnosticStatus>("/api/diagnostics/profile", "POST", {kind, seconds}))!;
+}
+export async function setStartupProfiles(cpu: boolean, heap: boolean): Promise<DiagnosticStatus> {
+  return (await sendJson<DiagnosticStatus>("/api/diagnostics/profile/startup", "POST", {cpu, heap}))!;
 }

@@ -91,12 +91,15 @@ pub async fn ml_loop(
     trigger: Arc<Notify>,
     mut ready: watch::Receiver<bool>,
 ) {
+    let _worker = crate::diagnostics::runtime::worker("ml");
     let _ = ready.wait_for(|&r| r).await;
     loop {
         let delay = if enabled(&database).await {
+            crate::diagnostics::runtime::state("ml", "waiting_for_schedule");
             let target = schedule_seconds(&database).await;
             Duration::from_secs(seconds_until(local_seconds_of_day(now_unix()), target) as u64)
         } else {
+            crate::diagnostics::runtime::state("ml", "disabled");
             DISABLED_POLL
         };
 
@@ -173,13 +176,15 @@ async fn ml_pass(
             let url = service_url.to_string();
             let target = target.clone();
             set.spawn(async move {
+                let mut health = crate::diagnostics::runtime::Job::new("ml");
                 // An unreadable file is skipped (not marked), so it's retried next run.
                 let context=musicata_core::diagnostics::DiagnosticContext {source_id:Some(target.provider_id.clone()),track_id:Some(target.track_id.clone()),..Default::default()};
                 let audio=match crate::open_track_analysis_source(&providers,&target).await {
                     Ok(audio)=>audio,
                     Err(error)=>{
                         crate::diagnostics::record_context("source.read","ml",musicata_core::diagnostics::DiagnosticAction::Failure,context,&error.to_string());
-                        return (target.track_id,None);
+                        health.fail(true, "source_read");
+                        return (target.track_id,None, health);
                     }
                 };
                 crate::diagnostics::record_context("source.read","ml",musicata_core::diagnostics::DiagnosticAction::Recovery,context.clone(),"");
@@ -190,19 +195,19 @@ async fn ml_pass(
                 match analysis {
                     Ok(analysis) => {
                         crate::diagnostics::record_context("ml.analysis","ml",musicata_core::diagnostics::DiagnosticAction::Recovery,context.clone(),"");
-                        (target.track_id, Some(analysis))
+                        (target.track_id, Some(analysis), health)
                     },
                     // Service down / track undecodable → skip (retried next run).
                     Err(error) => {
                         crate::diagnostics::record_context("ml.analysis","ml",musicata_core::diagnostics::DiagnosticAction::Failure,context,&error);
                         tracing::debug!(track = %target.track_id, %error, diagnostic_recorded=true, "ml: analyze failed");
-                        (target.track_id, None)
+                        { health.fail(true, "analysis_unavailable"); (target.track_id, None, health) }
                     }
                 }
             });
         }
         while let Some(joined) = set.join_next().await {
-            let Ok((track_id, analysis)) = joined else {
+            let Ok((track_id, analysis, mut health)) = joined else {
                 crate::diagnostics::failure("ml.worker", "ml", None, "worker panicked");
                 continue;
             };
@@ -221,9 +226,11 @@ async fn ml_pass(
                     )
                     .await
                 {
+                    health.fail(true, "persistence");
                     tracing::warn!(track = %track_id, %error, "ml: store failed");
                 } else {
                     stored += 1;
+                    health.success();
                 }
             }
             activity.update(task, format!("Audio analysis ({done}/{total})"));
