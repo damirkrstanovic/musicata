@@ -83,7 +83,7 @@ quick-xml = { version = "0.37", features = ["serialize"], optional = true }
 
 # Profiling is local and opt-in. Apache-2.0 / MIT; jemalloc includes BSD-2-Clause.
 [target.'cfg(target_os = "linux")'.dependencies]
-pprof = { version = "0.15", default-features = false, features = ["flamegraph"] }
+pprof = { version = "0.15", default-features = false }
 tikv-jemallocator = { version = "0.7", features = ["stats"] }
 tikv-jemalloc-ctl = { version = "0.7", features = ["use_std", "stats"] }
 backtrace = "0.3"

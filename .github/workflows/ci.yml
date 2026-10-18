@@ -56,6 +56,12 @@ jobs:
           MUSICATA_SKIP_WEB_BUILD: "1"
         run: cargo test
 
+      # Sampling is process-wide: unrelated parallel tests can receive all CPU samples.
+      - name: Isolated CPU and heap profiling
+        env:
+          MUSICATA_SKIP_WEB_BUILD: "1"
+        run: cargo test -p musicata-server actual_profiles_finish_and_resolve_application_stacks -- --ignored --test-threads=1
+
       # Dependency tests are not run by the workspace suite. These deterministic
       # iterator tests need no NAS and guard the locally patched SMB wake-up race.
       - name: SMB directory wake-up regression

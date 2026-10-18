@@ -134,9 +134,21 @@ fn capture(db: &Path, kind: ProfileKind, seconds: u64) -> anyhow::Result<()> {
                     })
                     .build()?;
                 drop(guard);
-                let mut writer = LimitedBytes(Vec::new());
-                report.flamegraph(&mut writer)?;
-                writer.0
+                let stacks = report
+                    .data
+                    .into_iter()
+                    .filter(|(_, count)| *count > 0)
+                    .map(|(frames, count)| {
+                        let names = frames
+                            .frames
+                            .iter()
+                            .rev()
+                            .flat_map(|symbols| symbols.iter().rev().map(|symbol| symbol.name()))
+                            .collect();
+                        (names, count as u64)
+                    })
+                    .collect();
+                render_flamegraph(stacks)?
             }
             ProfileKind::Heap => capture_heap(db, seconds)?,
         };
@@ -149,6 +161,81 @@ fn capture(db: &Path, kind: ProfileKind, seconds: u64) -> anyhow::Result<()> {
         anyhow::bail!("profiling unsupported")
     }
 }
+// A small static flamegraph: widths represent inclusive sample counts, root at bottom.
+// Function names are the only profiler metadata serialized; no filenames or thread IDs.
+fn render_flamegraph(stacks: Vec<(Vec<String>, u64)>) -> anyhow::Result<Vec<u8>> {
+    use std::{collections::BTreeMap, io::Write};
+    #[derive(Default)]
+    struct Node {
+        count: u64,
+        children: BTreeMap<String, Node>,
+    }
+    fn escape(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+    fn draw(
+        node: &Node,
+        name: &str,
+        x: f64,
+        width: f64,
+        depth: usize,
+        height: usize,
+        out: &mut LimitedBytes,
+    ) -> std::io::Result<()> {
+        let y = height - 20 * (depth + 1);
+        let title = escape(name);
+        let label: String = name.chars().take((width / 7.0).max(0.0) as usize).collect();
+        writeln!(
+            out,
+            "<g><title>{title} ({} samples)</title><rect x=\"{x:.2}\" y=\"{y}\" width=\"{width:.2}\" height=\"19\" fill=\"hsl({},75%,65%)\"/><text x=\"{:.2}\" y=\"{}\" font-size=\"12\">{}</text></g>",
+            node.count,
+            (depth * 17) % 60,
+            x + 2.0,
+            y + 14,
+            escape(&label)
+        )?;
+        let mut child_x = x;
+        for (name, child) in &node.children {
+            let child_width = width * child.count as f64 / node.count.max(1) as f64;
+            draw(child, name, child_x, child_width, depth + 1, height, out)?;
+            child_x += child_width;
+        }
+        Ok(())
+    }
+    let mut root = Node::default();
+    let mut nodes = 0;
+    let mut max_depth = 0;
+    for (frames, count) in stacks {
+        if count == 0 {
+            continue;
+        }
+        root.count += count;
+        max_depth = max_depth.max(frames.len().min(64));
+        let mut node = &mut root;
+        for frame in frames.into_iter().take(64) {
+            anyhow::ensure!(frame.len() <= 16384, "profile symbol exceeds size limit");
+            if !node.children.contains_key(&frame) {
+                nodes += 1;
+                anyhow::ensure!(nodes <= 8192, "profile exceeds stack limit");
+            }
+            node = node.children.entry(frame).or_default();
+            node.count += count;
+        }
+    }
+    let height = (max_depth + 1) * 20 + 30;
+    let mut out = LimitedBytes(Vec::new());
+    writeln!(
+        out,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"{height}\" viewBox=\"0 0 1200 {height}\"><rect width=\"100%\" height=\"100%\" fill=\"white\"/><text x=\"4\" y=\"18\" font-size=\"14\">CPU samples — hover for function and count</text>"
+    )?;
+    draw(&root, "all samples", 0.0, 1200.0, 0, height, &mut out)?;
+    out.write_all(b"</svg>")?;
+    Ok(out.0)
+}
+
 struct LimitedBytes(Vec<u8>);
 impl std::io::Write for LimitedBytes {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -318,6 +405,7 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "process-wide sampling must run alone; CI runs this explicitly"]
     async fn actual_profiles_finish_and_resolve_application_stacks() {
         let root =
             std::env::temp_dir().join(format!("musicata-profile-test-{}", super::super::now()));
@@ -411,6 +499,21 @@ mod tests {
         let json = serde_json::to_string(&stacks).unwrap();
         assert!(json.contains("function_16"));
         assert!(!json.contains("private"));
+    }
+    #[test]
+    fn flamegraph_merges_stacks_and_escapes_symbols() {
+        let svg = render_flamegraph(vec![
+            (vec!["root".into(), "a<&>".into()], 3),
+            (vec!["root".into(), "b".into()], 1),
+        ])
+        .unwrap();
+        let text = String::from_utf8(svg).unwrap();
+        assert!(text.contains("root (4 samples)"));
+        assert!(text.contains("a&lt;&amp;&gt; (3 samples)"));
+        assert!(text.contains("width=\"900.00\""));
+        assert!(!text.contains("a<&>"));
+        assert!(render_flamegraph(Vec::new()).is_ok());
+        assert!(render_flamegraph(vec![(vec!["x".repeat(ARTIFACT_LIMIT)], 1)]).is_err());
     }
     #[test]
     fn profile_output_is_bounded() {
