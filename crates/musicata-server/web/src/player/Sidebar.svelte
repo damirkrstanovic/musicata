@@ -1,6 +1,5 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
-  import { onDestroy } from "svelte";
   import { api, type Playlist, type SmartPlaylist } from "../lib/api";
   import { radio } from "../lib/radio.svelte";
   import { nav, activityFor } from "../lib/nav.svelte";
@@ -31,9 +30,6 @@
   }
   load();
 
-  // Query changes are debounced centrally so exiting search cancels pending input.
-  onDestroy(() => search.cancelPending());
-
   async function newPlaylist() {
     const name = await promptText({ title: "New playlist", label: "Name", confirmLabel: "Create" });
     if (!name) return;
@@ -48,17 +44,6 @@
     <div class="brand-text"><h1>Musicata</h1><p>Player</p></div>
     <button class="np-chevron" type="button" aria-label="Close navigation" onclick={onclose}>×</button>
   </div>
-
-  {#if activity === "browse"}
-  <form class="search" role="search" onsubmit={(event) => {
-    event.preventDefault();
-    const input = event.currentTarget.querySelector('input')!;
-    search.update(input.value);
-    onclose();
-  }}>
-    <input type="search" aria-label="Search library" autocomplete="off" placeholder="Search" bind:value={search.draft} oninput={(e) => search.schedule(e.currentTarget.value)} />
-  </form>
-  {/if}
 
   <nav class="library-nav" aria-label="Views">
     <button class="nav-link desktop-destination" data-activity="browse" class:is-active={activity === "browse"} type="button" onclick={() => search.clear()}>Browse</button>

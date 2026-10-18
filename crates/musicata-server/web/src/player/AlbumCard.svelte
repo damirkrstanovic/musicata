@@ -1,16 +1,20 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
   import type { Album } from "../types/Album";
-  import { api } from "../lib/api";
-  import { playTracks } from "../lib/playback";
+  import { playAlbum as playAlbumOnOutput } from "../lib/playback";
   import Cover from "./Cover.svelte";
 
-  let { album, onopen }: { album: Album; onopen: () => void } = $props();
+  let { album, onopen, displayTitle = album.title, displayArtistName = album.artist_name, firstStreamUrl }: {
+    album: Album;
+    onopen: () => void;
+    displayTitle?: string;
+    displayArtistName?: string;
+    firstStreamUrl?: string;
+  } = $props();
 
-  async function playAlbum(event: MouseEvent) {
+  function playAlbum(event: MouseEvent) {
     event.stopPropagation();
-    const { tracks } = await api.albumDetail(album.id);
-    playTracks(tracks, 0);
+    void playAlbumOnOutput(album.id, firstStreamUrl);
   }
 </script>
 
@@ -28,12 +32,12 @@
   }}
 >
   <div class="card-cover">
-    <Cover url={album.artwork_url} size={300} label={album.title} />
-    <button class="card-play" type="button" title="Play album" aria-label="Play album" onclick={playAlbum}>▶</button>
+    <Cover url={album.artwork_url} size={300} label={displayTitle} />
+    <button class="card-play" type="button" title="Play album" aria-label="Play album" disabled={!firstStreamUrl} onclick={playAlbum}>▶</button>
   </div>
   <div class="card-text">
-    <strong title={album.title}>{album.title}</strong>
-    <span title={album.artist_name}>{album.artist_name}{album.year ? ` · ${album.year}` : ""}</span>
-    {#if album.title.toLowerCase().startsWith("unknown album")}<span>{album.track_count} tracks · Open for details</span>{/if}
+    <strong title={album.title}>{displayTitle}</strong>
+    <span title={album.artist_name}>{displayArtistName}{album.year ? ` · ${album.year}` : ""}</span>
+    {#if displayTitle === "Unidentified album"}<span>{album.track_count} tracks · Open for details</span>{/if}
   </div>
 </div>

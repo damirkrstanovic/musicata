@@ -34,7 +34,7 @@ class Player {
   elapsed = $state(0);
   duration = $state(0);
   seekDragging = $state(false);
-  get queueOpen(): boolean { return nav.overlays.includes("queue"); }
+  get queueOpen(): boolean { return nav.overlays.at(-1) === "queue"; }
   set queueOpen(open: boolean) {
     if (open) nav.openOverlay("queue");
     else if (this.queueOpen) nav.closeOverlay();

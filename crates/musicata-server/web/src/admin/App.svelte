@@ -65,11 +65,12 @@
   {:else}
     <div id="settings-panel" role="tabpanel" aria-labelledby="settings-tab-{category}" data-settings-panel={category}>
       {#if category === "sources"}<SourcesPanel /><ImportExportPanel />
+      {:else if category === "library"}<StatusDashboard />
       {:else if category === "outputs"}<PlayersZonesPanel /><SnapcastPanel />
       {:else if category === "sound"}<EqPanel management />
       {:else if category === "metadata"}<SettingsPanel group="metadata" /><MergedArtistsPanel />
       {:else if category === "history"}<SettingsPanel group="history" />
-      {:else}<StatusDashboard /><DiagnosticsPanel /><UsersPanel /><AccountPanel /><SettingsPanel group="system" />{/if}
+      {:else}<DiagnosticsPanel /><UsersPanel /><AccountPanel /><SettingsPanel group="system" />{/if}
     </div>
   {/if}
 </div>

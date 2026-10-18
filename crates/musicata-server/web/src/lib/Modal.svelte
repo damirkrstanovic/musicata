@@ -10,7 +10,7 @@
   $effect(() => {
     if ($activeModal) {
       restoreFocus = document.activeElement as HTMLElement | null;
-      tick().then(() => formEl?.querySelector<HTMLElement>("input, .primary-button")?.focus());
+      tick().then(() => formEl?.querySelector<HTMLElement>($activeModal?.danger ? ".modal-actions .ghost-button" : "input, .primary-button")?.focus());
     }
   });
 
@@ -18,7 +18,7 @@
     const current = $activeModal;
     activeModal.set(null);
     current?.resolve(result);
-    restoreFocus?.focus();
+    void tick().then(() => restoreFocus?.isConnected && restoreFocus.focus());
   }
 
   function submit(event: Event) {
@@ -36,7 +36,14 @@
 
 <svelte:window
   onkeydown={(event) => {
-    if ($activeModal && event.key === "Escape") close(null);
+    if (!$activeModal) return;
+    if (event.key === "Escape") { event.preventDefault(); close(null); }
+    if (event.key === "Tab" && formEl) {
+      const controls = [...formEl.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]')];
+      const first = controls[0], last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    }
   }}
 />
 
@@ -48,9 +55,9 @@
       if (event.target === event.currentTarget) close(null);
     }}
   >
-    <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby={$activeModal.title ? "modal-title" : undefined}>
       <form bind:this={formEl} onsubmit={submit}>
-        {#if $activeModal.title}<h2 class="modal-title">{$activeModal.title}</h2>{/if}
+        {#if $activeModal.title}<h2 class="modal-title" id="modal-title">{$activeModal.title}</h2>{/if}
         {#if $activeModal.message}<p class="modal-message">{$activeModal.message}</p>{/if}
         {#if $activeModal.fields?.length}
           <div class="modal-fields">

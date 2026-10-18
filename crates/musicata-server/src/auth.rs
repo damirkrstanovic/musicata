@@ -212,6 +212,13 @@ fn is_admin_path(path: &str) -> bool {
         || path == "/api/history"
 }
 
+fn is_admin_mutation_path(path: &str, method: &axum::http::Method) -> bool {
+    !matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
+        && (path == "/api/snapcast/status"
+            || path.starts_with("/api/snapcast/rooms")
+            || path.starts_with("/api/snapcast/groups/"))
+}
+
 /// Always-open endpoints (the SPA must reach these before a session exists). `/api/about`
 /// is open by obligation, not convenience: AGPL section 13 owes the source offer to everyone
 /// who interacts with this instance over the network, including whoever is looking at the
@@ -367,6 +374,7 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
         return AppError::unauthorized("sign in to continue").into_response();
     };
     if (is_admin_path(&path)
+        || is_admin_mutation_path(&path, request.method())
         || (path.starts_with("/api/dsp/profiles")
             && !matches!(
                 *request.method(),
@@ -911,6 +919,22 @@ mod tests {
         assert!(!is_admin_path("/api/players/mpd/dsp"));
         assert!(!is_admin_path("/api/tracks"));
         assert!(!is_admin_path("/api/playlists"));
+        assert!(!is_admin_mutation_path(
+            "/api/snapcast/status",
+            &axum::http::Method::GET
+        ));
+        assert!(is_admin_mutation_path(
+            "/api/snapcast/status",
+            &axum::http::Method::PATCH
+        ));
+        assert!(is_admin_mutation_path(
+            "/api/snapcast/groups/living",
+            &axum::http::Method::PATCH
+        ));
+        assert!(!is_admin_mutation_path(
+            "/api/snapcast/clients/living/volume",
+            &axum::http::Method::POST
+        ));
         assert!(is_open_path("/api/auth/login"));
         assert!(!is_open_path("/api/auth/me"));
     }

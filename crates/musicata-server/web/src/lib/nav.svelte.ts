@@ -164,11 +164,11 @@ class Nav {
   }
 
   openOverlay(overlay: Overlay): void {
-    if (this.overlays.includes(overlay)) return;
+    if (this.overlays.at(-1) === overlay) return;
     this.save();
     const entry = this.snapshot();
     entry.index++;
-    entry.overlays.push(overlay);
+    entry.overlays = [...entry.overlays.filter(item => item !== overlay), overlay];
     history.pushState(entry, "");
     this.positions.set(entry.index, entry.scroll);
     this.apply(entry);

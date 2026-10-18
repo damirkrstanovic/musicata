@@ -6,6 +6,9 @@
 // Args: <port> <basePath> <mode=behavior|scale>. Assumes Chrome CDP on :9222. Exits
 // non-zero on any failed assertion.
 import { radioFlows } from "./radio-flows.mjs";
+import { stablePlayerFlows } from "./stable-player-flows.mjs";
+import { outputPickerFlows } from "./output-picker-flows.mjs";
+import { albumPlayFlows } from "./album-play-flows.mjs";
 import { uxFlows } from "./ux-flows.mjs";
 import { curationFlows } from "./curation-flows.mjs";
 
@@ -43,7 +46,8 @@ function check(name, ok, detail = "") {
   if (!ok) failures++;
 }
 
-// Behavior phase: pre-create a zone (holding the browser player) and a radio station via the
+let groupedPlayerId = null;
+// Behavior phase: pre-create a zone (holding a separate native speaker) and a radio station via the
 // API, so the page loads with them present.
 if (MODE === "behavior") {
   const saved = await api('/api/playlists', {
@@ -55,15 +59,18 @@ if (MODE === "behavior") {
     method: 'PATCH', headers: {'content-type': 'application/json'},
     body: JSON.stringify({add_track_ids: tracks.items.map(t => t.id)}),
   });
-  const players = (await api("/api/players")) || [];
-  const browser = players.find((p) => p.kind === "browser");
+  const grouped = await api("/api/players", {
+    method:"POST", headers:{"content-type":"application/json"},
+    body:JSON.stringify({kind:"native",address:"smoke-grouped",name:"Grouped speaker"}),
+  });
+  groupedPlayerId = grouped?.id;
   const zone = await api("/api/zones", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ name: "Smoke Zone" }),
   });
-  if (browser && zone) {
-    await api(`/api/players/${browser.id}`, {
+  if (grouped && zone) {
+    await api(`/api/players/${grouped.id}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ zone_id: zone.id }),
@@ -169,8 +176,21 @@ await send("Page.reload");
 await sleep(2500);
 
 console.log(`Svelte UI smoke (${PATH}, ${MODE}):`);
+if (MODE === "behavior") {
+  await outputPickerFlows({js, check, waitUntil, tap: tapMobile, groupedPlayerId});
+  await js(`document.querySelector('.output-trigger')?.click()`);
+  await js(`document.querySelector('[data-output="player:browser-local"]')?.click()`);
+  await sleep(400);
+  await albumPlayFlows({js, check, waitUntil, tap:tapMobile});
+}
 if (process.env.MUSICATA_RADIO_ONLY) {
   await radioFlows({js, api, check, waitUntil, clickText, screenshot: mobileScreenshot});
+  ws.close();
+  process.exit(failures ? 1 : 0);
+}
+
+if (process.env.MUSICATA_STABLE_ONLY) {
+  await stablePlayerFlows({js, send, check, waitUntil, tap: tapMobile, screenshot: mobileScreenshot});
   ws.close();
   process.exit(failures ? 1 : 0);
 }
@@ -206,15 +226,15 @@ if (MODE === "behavior") {
   check('Browse returns to preferred browsing view', await js(`document.querySelectorAll('.artist-card').length > 0`));
   await js(`document.querySelector('.now-title-button')?.click()`);
   await sleep(300);
-  check('desktop title opens Now Playing beside the library', await js(`document.querySelector('.shell').classList.contains('np-open') && !!document.querySelector('.right-rail .queue-drawer') && document.querySelector('.content').getBoundingClientRect().right <= document.querySelector('.right-rail').getBoundingClientRect().left + 1`));
-  check('desktop Now Playing does not offer a duplicate queue overlay', await js(`!document.querySelector('.queue-btn')?.getClientRects().length`));
+  check('desktop title opens details above the stable player', await js(`document.querySelector('.shell').classList.contains('np-open') && !!document.querySelector('.now-playing-panel .queue-drawer') && document.querySelector('.playback-panels').getBoundingClientRect().bottom <= document.querySelector('.player-bar').getBoundingClientRect().top`));
+  check('desktop Now Playing keeps transport visible', await js(`document.querySelector('.player-bar .transport')?.getBoundingClientRect().bottom <= innerHeight`));
   await mobileScreenshot('desktop-now-playing');
   await js('history.back()');
   await sleep(300);
   check('desktop Back closes Now Playing and preserves browsing', await js(`!document.querySelector('.shell').classList.contains('np-open') && document.querySelectorAll('.artist-card').length > 0`));
   await js('history.forward()');
   await sleep(300);
-  check('desktop Forward restores Now Playing', await js(`document.querySelector('.shell').classList.contains('np-open') && !!document.querySelector('.right-rail .queue-drawer')`));
+  check('desktop Forward restores Now Playing', await js(`document.querySelector('.shell').classList.contains('np-open') && !!document.querySelector('.now-playing-panel .queue-drawer')`));
   await js(`localStorage.setItem('musicata.browse-view', 'removed-view'); history.replaceState(null, '')`);
   await send('Page.reload');
   await sleep(1200);
@@ -387,6 +407,22 @@ check("queue reorder moves an item", (await js(`document.querySelector('.queue-r
 await js(`(()=>{const r=[...document.querySelectorAll('.queue-row')]; r.at(-1)?.querySelector('button[title="Remove"]')?.click();})()`);
 await sleep(500);
 check("queue remove drops a row", (await js(`document.querySelectorAll('.queue-row').length`)) < qLen, `len ${qLen}`);
+// Clearing requires confirmation; Undo restores order without replacing a newer queue.
+const beforeClear = await js(`Array.from(document.querySelectorAll('.queue-row .q-title')).map(e=>e.textContent)`);
+await js(`document.querySelector('.queue-options-toggle')?.click()`);
+await js(`document.querySelector('.clear-queue')?.click()`);
+await waitUntil(`document.querySelector('.modal')`, 1000);
+check("queue clear initially focuses Cancel", await js(`document.activeElement?.textContent.trim()==='Cancel'`));
+await clickText(".modal button", "Cancel");
+check("cancelling queue clear preserves its order", JSON.stringify(await js(`Array.from(document.querySelectorAll('.queue-row .q-title')).map(e=>e.textContent)`)) === JSON.stringify(beforeClear));
+await js(`document.querySelector('.clear-queue')?.click()`);
+await waitUntil(`document.querySelector('.modal')`,1000);
+await clickText(".modal button", "Clear queue");
+check("confirmed clear empties the queue", await waitUntil(`document.querySelectorAll('.queue-row').length===0`,2000)<Infinity);
+await js(`document.querySelector('.undo-clear')?.click()`);
+check("Undo restores the exact queue order", await waitUntil(`JSON.stringify(Array.from(document.querySelectorAll('.queue-row .q-title')).map(e=>e.textContent))===${JSON.stringify(JSON.stringify(beforeClear))}`,2000)<Infinity);
+await js(`document.querySelector('.queue-row .q-main')?.click()`);
+await waitUntil(`document.querySelector('.transport')?.dataset.status==='playing'`,2000);
 await clickText(".queue-head button", "Close");
 
 // Browse filter + search persistence
@@ -404,6 +440,7 @@ await js(`document.querySelector('.transport-buttons .control.play')?.click()`);
 await sleep(400);
 await js(`document.querySelector('.album-card .card-play')?.click()`);
 await sleep(2000);
+check("play album replaces queue without a modal", await js(`!document.querySelector('.modal')`));
 check("play album from the grid starts playback", (await js(`document.querySelector('.transport')?.dataset.status`)) === "playing");
 await js(`(()=>{const el=document.querySelector('.search input'); el.value='dar'; el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
 await sleep(900);
@@ -587,7 +624,7 @@ if (remoteOutput) {
   remoteSocket.send(JSON.stringify({type:"renderer"}));
   const remoteTrack = (await api("/api/tracks?limit=1")).items[0];
   await api(`/api/players/${remoteOutput.id}/commands`, {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({command:"play_tracks",track_ids:[remoteTrack.id]})});
-  await js(`(()=>{const s=document.querySelector('select[aria-label="Output"]');s.value='player:${remoteOutput.id}';s.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await js(`(()=>{document.querySelector('[data-output="player:${remoteOutput.id}"]')?.click();})()`);
   await sleep(500);
   await js(`[...document.querySelectorAll('.eq-btn')].find(b=>/equalizer/i.test(b.title))?.click()`);
   await sleep(100);
@@ -612,7 +649,7 @@ if (remoteOutput) {
   check("disconnected remote levels expire",
     await waitUntil('document.querySelector(".vu-drawer")?.dataset.available === "false"', 3000) < Infinity);
   await clickText(".vu-head button", "Close");
-  await js(`(()=>{const s=document.querySelector('select[aria-label="Output"]');s.value='player:browser-local';s.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await js(`(()=>{document.querySelector('[data-output="player:browser-local"]')?.click();})()`);
   await sleep(300);
 }
 
@@ -754,10 +791,10 @@ check(
 await js(`document.querySelector('.radio-btn')?.click()`);
 check("output-switch radio request is held", await waitUntil(`window.__radioPendingCount === 3`, 1000) < Infinity);
 const oldOutputQueueBeforeSwitch = (await api("/api/players/browser-local/state"))?.queue?.length ?? 0;
-await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>/smoke zone/i.test(o.textContent)); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
+await js(`(()=>{[...document.querySelectorAll('.output-option')].find(o=>/smoke zone/i.test(o.textContent))?.click();})()`);
 check(
   "output switch completes before stale response release",
-  await waitUntil(`/smoke zone/i.test(document.querySelector('.player-switch-btn option:checked')?.textContent || '')`, 3000) < Infinity,
+  await waitUntil(`/smoke zone/i.test(document.querySelector('.output-option[aria-pressed="true"]')?.textContent || '')`, 3000) < Infinity,
 );
 await js(`window.__releaseHeldRadio?.()`);
 check("switched-output held request finishes", await waitUntil(`window.__radioReleasedCount === 3`, 3000) < Infinity);
@@ -784,10 +821,15 @@ check("radio play sets now-playing", /smoke fm/i.test((await js(`document.queryS
 await radioFlows({js, api, check, waitUntil, clickText, screenshot: mobileScreenshot});
 if (MODE === "behavior") await curationFlows({js, api, check, waitUntil, clickText});
 
+// Temporarily join the browser for the real zone-audio check; it stays standalone elsewhere.
+const audioZone = (await api('/api/zones')).find(zone => zone.name === 'Smoke Zone');
+await api('/api/players/browser-local', {method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({zone_id:audioZone.id})});
+await send('Page.reload');
+await waitUntil(`document.querySelector('.output-option[data-output^="zone:"]')`,5000);
 // Zone: switch the output to the zone (which holds the browser player) and play.
-await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>/zone/i.test(o.textContent)); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
+await js(`(()=>{[...document.querySelectorAll('.output-option')].find(o=>o.dataset.output.startsWith('zone:'))?.click();})()`);
 await sleep(1200);
-check("switched output to a zone", /zone/i.test((await js(`document.querySelector('.player-switch-btn')?.value`)) || ""));
+check("switched output to a zone", /zone/i.test((await js(`document.querySelector('.output-option[aria-pressed="true"]')?.dataset.output`)) || ""));
 await clickText(".seg", "Tracks");
 await sleep(600);
 await js(`document.querySelector('.track-main')?.click()`);
@@ -800,10 +842,18 @@ check("zone plays (elapsed advances)", z1 !== z2, `${z1} -> ${z2}`);
 // Clear the queue → it empties (the Clear control, end-to-end on the active player).
 await js(`document.querySelector('.queue-btn')?.click()`);
 await sleep(500);
-await clickText(".queue-head button", "Clear");
+await js(`if (!document.querySelector('.clear-queue')) document.querySelector('.queue-options-toggle')?.click()`);
+await js(`document.querySelector('.clear-queue')?.click()`);
+await waitUntil(`document.querySelector('.modal')`, 1000);
+await js(`document.querySelector('.modal .primary-button')?.click()`);
 await sleep(800);
 check("clear empties the queue", (await js(`document.querySelectorAll('.queue-row').length`)) === 0);
 await clickText(".queue-head button", "Close");
+
+// Restore the independent browser target for subsequent browser audio checks.
+await api('/api/players/browser-local', {method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({zone_id:null})});
+await send('Page.reload');
+await waitUntil(`document.querySelector('.output-option[data-output="player:browser-local"]')`,5000);
 
 // ---- Latency: client-side responsiveness of the core paths, against the local testdata fixture
 // with deliberately GENEROUS budgets. These measure client + server-logic + WS-broadcast time —
@@ -811,7 +861,7 @@ await clickText(".queue-head button", "Close");
 // is to catch a gross regression (a path that got much slower or stopped responding), not to pin
 // a millisecond budget. Each playback check also asserts audio actually advances, so a fast-but-
 // silent "playing" still fails.
-await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>o.value==='player:browser-local'); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`); // output → the browser player
+await js(`(()=>{[...document.querySelectorAll('.output-option')].find(o=>o.dataset.output==='player:browser-local')?.click();})()`); // output → the browser player
 await sleep(700);
 await clickText(".seg", "Tracks");
 await sleep(500);
@@ -860,7 +910,7 @@ await sleep(400);
 // track, and the footer Play must actually play it on THIS tab. The bug — the footer sent a bare
 // `play` while the freshly-loaded tab had never claimed browser output, so `drive()` skipped it
 // and nothing played, even though picking a track from the library (which claims) worked.
-await js(`(()=>{const s=document.querySelector('.player-switch-btn'); const o=[...s.options].find(o=>o.value==='player:browser-local'); if(o){s.value=o.value; s.dispatchEvent(new Event('change',{bubbles:true}));}})()`); // output → the browser player itself, not the zone
+await js(`(()=>{[...document.querySelectorAll('.output-option')].find(o=>o.dataset.output==='player:browser-local')?.click();})()`); // output → the browser player itself, not the zone
 await sleep(800);
 await clickText(".seg", "Tracks");
 await sleep(600);
@@ -886,16 +936,14 @@ await js(`(() => {
   window.__outputReports = [];
   const send = WebSocket.prototype.send;
   WebSocket.prototype.send = function(data) { window.__outputReports.push(data); return send.call(this, data); };
-  const select = document.querySelector('.player-switch-btn');
-  select.value = [...select.options].find(o => o.textContent.includes('Z Remote output')).value;
-  select.dispatchEvent(new Event('change', {bubbles: true}));
+  [...document.querySelectorAll('.output-option')].find(o => o.textContent.includes('Z Remote output'))?.click();
 })()`);
 await sleep(1300);
 check("switching output pauses local audio", await js(`document.querySelector('audio').paused`));
 await js(`document.querySelector('audio').dispatchEvent(new Event('ended'))`);
 await sleep(200);
 check("old browser progress and ended do not reach remote output", await js(`window.__outputReports.every(data => !['progress', 'ended'].includes(JSON.parse(data).type))`));
-await js(`(() => { const s = document.querySelector('.player-switch-btn'); s.value = [...s.options].find(o => o.textContent === 'This Browser').value; s.dispatchEvent(new Event('change', {bubbles: true})); })()`);
+await js(`(() => { document.querySelector('[data-output="player:browser-local"]')?.click(); })()`);
 await sleep(600);
 
 check("no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
@@ -932,10 +980,10 @@ for (const [width, height] of [[360, 800], [800, 360], [320, 568]]) {
   await send("Emulation.setDeviceMetricsOverride", {width, height, deviceScaleFactor: 1, mobile: true});
   await sleep(350);
   await mobileScreenshot(`${width}x${height}-browse`);
-  check(`${label}: output is labelled on the main screen`, await js(`document.querySelector('.mobile-output')?.textContent.includes('Output:')`));
-  check(`${label}: output button opens selection`, await tapMobile('.mobile-output'));
-  check(`${label}: output selector receives focus`, await js(`document.activeElement?.classList.contains('player-switch-btn')`));
-  await tapMobile('[aria-label="Close Now Playing"]');
+  check(`${label}: output is labelled on the main screen`, await js(`document.querySelector('.output-trigger')?.textContent.includes('Playing on')`));
+  check(`${label}: output button opens selection`, await tapMobile('.output-trigger'));
+  check(`${label}: output selector receives focus`, await js(`document.activeElement?.classList.contains('output-option')`));
+  await tapMobile('[aria-label="Close output picker"]');
   const priorStatus = await js('document.querySelector(".transport")?.dataset.status');
   check(`${label}: playback control is reachable`, await tapMobile('.mini-controls .play'));
   check(`${label}: playback toggles`, await waitUntil(`document.querySelector('.transport')?.dataset.status !== ${JSON.stringify(priorStatus)}`, 2000) < Infinity);
@@ -953,15 +1001,15 @@ for (const [width, height] of [[360, 800], [800, 360], [320, 568]]) {
   check(`${label}: queue returns focus`, await js(`document.activeElement?.getAttribute('aria-label') === 'Queue'`));
   check(`${label}: now playing expands`, await tapMobile('.now-title-button'));
   await mobileScreenshot(`${width}x${height}-now-playing`);
-  check(`${label}: full playback controls work`, await tapMobile('.transport-buttons .play'));
-  check(`${label}: output selector is visible`, await js(`(() => {const el=document.querySelector('.player-switch-btn'); const r=el.getBoundingClientRect(); return r.width > 0 && r.top >= 0 && r.bottom <= innerHeight && el.contains(document.elementFromPoint(r.x+r.width/2, r.y+r.height/2));})()`));
-  check(`${label}: output preset is tappable`, await tapMobile('.output-btn:last-child', true));
+  check(`${label}: persistent playback controls work`, await tapMobile('.mini-controls .play'));
+  check(`${label}: output selector is visible`, await js(`(() => {const el=document.querySelector('.output-trigger'); const r=el.getBoundingClientRect(); return r.width > 0 && r.top >= 0 && r.bottom <= innerHeight && el.contains(document.elementFromPoint(r.x+r.width/2, r.y+r.height/2));})()`));
+  check(`${label}: output preset is tappable`, await tapMobile('.now-playing-panel .output-btn:last-child', true));
   check(`${label}: output preset applies volume`, await waitUntil(`Number(document.querySelector('.transport-aux input[aria-label="Volume"]')?.value) === 20`, 2000) < Infinity);
-  await tapMobile('.output-btn:first-child', true);
-  await js('document.querySelector(".right-rail").scrollTop = 0');
+  await tapMobile('.now-playing-panel .output-btn:first-child', true);
+  await js('document.querySelector(".now-playing-panel").scrollTop = 0');
   check(`${label}: now playing closes`, await tapMobile('[aria-label="Close Now Playing"]'));
   check(`${label}: navigation opens`, await tapMobile('[aria-label="Open navigation"]'));
-  check(`${label}: covered content cannot take focus`, await js(`document.querySelector('.content').inert && document.querySelector('.right-rail').inert`));
+  check(`${label}: covered content cannot take focus`, await js(`document.querySelector('.content').inert && document.querySelector('.player-bar').inert`));
   await js(`[...document.querySelectorAll('.playlist-list .nav-link')].find(button=>button.textContent.trim()==='Phone playlist')?.setAttribute('data-smoke-playlist','phone')`);
   check(`${label}: saved playlist is tappable`, await tapMobile('[data-smoke-playlist=phone]', true));
   check(`${label}: saved playlist opens and closes navigation`, await waitUntil(`document.querySelector('.hero-title')?.textContent === 'Phone playlist' && document.querySelector('.hero-sub')?.textContent === '2 tracks' && !document.querySelector('.shell').classList.contains('nav-open')`, 2000) < Infinity);
@@ -972,19 +1020,18 @@ for (const [width, height] of [[360, 800], [800, 360], [320, 568]]) {
 
 // A remote output choice survives reopening the controller; a removed output
 // falls back safely instead of attempting a WebSocket to a nonexistent target.
-await tapMobile('.mobile-output');
+await tapMobile('.output-trigger');
 const chosenOutput = await js(`(() => {
-  const select = document.querySelector('.player-switch-btn');
-  select.value = [...select.options].find(o => o.value.startsWith('zone:')).value;
-  select.dispatchEvent(new Event('change', {bubbles: true}));
-  return select.value;
+  const option = document.querySelector('.output-option[data-output^="zone:"]');
+  option.click();
+  return option.dataset.output;
 })()`);
 await send("Page.reload");
-check("mobile: chosen output survives reload", await waitUntil(`document.querySelector('.player-switch-btn')?.value === ${JSON.stringify(chosenOutput)}`, 5000) < Infinity);
-check("mobile: main screen names the chosen output", await js(`document.querySelector('.mobile-output strong')?.textContent === document.querySelector('.player-switch-btn option:checked')?.textContent.replace('Zone · ', '')`));
+check("mobile: chosen output survives reload", await waitUntil(`document.querySelector('.output-option[aria-pressed="true"]')?.dataset.output === ${JSON.stringify(chosenOutput)}`, 5000) < Infinity);
+check("mobile: main screen names the chosen output", await js(`document.querySelector('.output-trigger strong')?.textContent === document.querySelector('.output-option[aria-pressed="true"] strong')?.textContent`));
 await js(`localStorage.setItem('musicata.output', 'player:removed-output')`);
 await send("Page.reload");
-check("mobile: removed output falls back to browser", await waitUntil(`document.querySelector('.mobile-output strong')?.textContent === 'This Browser'`, 5000) < Infinity);
+check("mobile: removed output falls back to browser", await waitUntil(`document.querySelector('.output-trigger strong')?.textContent === 'This Browser'`, 5000) < Infinity);
 
 // Fresh phone entry and one coherent browser/visible Back history.
 await send("Emulation.setDeviceMetricsOverride", {width: 360, height: 800, deviceScaleFactor: 1, mobile: true});
@@ -1007,7 +1054,7 @@ check("Now Playing includes current queue", await js(`document.querySelector('.s
 const embeddedTitle = await js(`document.querySelector('.queue-drawer.embedded .q-title')?.textContent`);
 check("Now Playing queue track can be tapped", await tapMobile('.queue-drawer.embedded .q-main', true));
 check("Now Playing queue selection plays", !!embeddedTitle && await waitUntil(`document.querySelector('#now-title')?.textContent === ${JSON.stringify(embeddedTitle)}`, 1500) < Infinity);
-await js('document.querySelector(".right-rail").scrollTop = 0');
+await js('document.querySelector(".now-playing-panel").scrollTop = 0');
 await js('history.back()');
 await sleep(500);
 check("phone Back closes Now Playing before leaving album", await js(`!document.querySelector('.shell').classList.contains('np-open') && document.querySelector('.hero-title')?.textContent === ${JSON.stringify(historyAlbum)}`));
@@ -1095,6 +1142,7 @@ if (process.env.MUSICATA_UI_SCREENSHOTS) {
 }
 
 
+if (MODE === "behavior") await stablePlayerFlows({js, send, check, waitUntil, tap: tapMobile, screenshot: mobileScreenshot});
 if (MODE === "behavior") await uxFlows({js, send, check, waitUntil, tap: tapMobile, screenshot: mobileScreenshot});
 check("no CSP violations", cspViolations.length === 0, cspViolations.slice(0, 3).join(" | "));
 console.log(failures ? `\nFAILED: ${failures} check(s)` : `\nAll checks passed`);

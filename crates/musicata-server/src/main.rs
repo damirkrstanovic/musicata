@@ -75,9 +75,8 @@ use axum::{
 use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, Library, LibrarySummary, LocalDiskProvider,
     MetadataApprovalState, MetadataFieldValue, PlaybackState, Player, PlayerCommand, Playlist,
-    RadioStation, SearchResults, Track, TrackMetadataFieldObservation, Zone, album_artwork_url,
-    artwork_asset_id, find_album_artwork_candidates, merge_libraries,
-    regroup_library_with_overrides,
+    RadioStation, Track, TrackMetadataFieldObservation, Zone, album_artwork_url, artwork_asset_id,
+    find_album_artwork_candidates, merge_libraries, regroup_library_with_overrides,
 };
 use musicata_storage::{Database, ResolvedMusicBrainzMetadata};
 use musicbrainz::{
@@ -3602,7 +3601,7 @@ async fn artists(
 async fn albums(
     State(state): State<AppState>,
     Query(query): Query<TrackListQuery>,
-) -> Result<Json<Page<Album>>, AppError> {
+) -> Result<Json<Page<AlbumListItem>>, AppError> {
     let filter = BrowseFilter {
         genre: query.genre,
         year: query.year,
@@ -3634,7 +3633,39 @@ async fn albums(
             .await
     }
     .map_err(db_error)?;
+    let items = album_list_items(&state.database, items).await?;
     Ok(Json(page_envelope(items, total, &page)))
+}
+
+async fn album_list_items(
+    database: &Database,
+    albums: Vec<Album>,
+) -> Result<Vec<AlbumListItem>, AppError> {
+    let hints = database
+        .album_browse_hints(
+            &albums
+                .iter()
+                .map(|album| album.id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(db_error)?;
+    Ok(albums
+        .into_iter()
+        .map(|album| {
+            let display_hint = hints.get(&album.id).map(|hint| AlbumDisplayHint {
+                folder_name: hint.folder_name.clone(),
+                first_track: Some(AlbumFirstTrack {
+                    id: hint.first_track_id.clone(),
+                    stream_url: hint.first_stream_url.clone(),
+                }),
+            });
+            AlbumListItem {
+                album,
+                display_hint,
+            }
+        })
+        .collect())
 }
 
 /// Whether a browse filter narrows anything (ignoring empty-string params).
@@ -4199,7 +4230,7 @@ async fn handle_queue_frame<T: QueueOutput>(output: &T, text: &str) {
 #[derive(Debug, Serialize)]
 struct ArtistDetailResponse {
     artist: Artist,
-    albums: Vec<Album>,
+    albums: Vec<AlbumListItem>,
     tracks: Vec<Track>,
 }
 
@@ -4224,6 +4255,7 @@ async fn artist_detail(
         .await
         .map_err(db_error)?;
 
+    let albums = album_list_items(&state.database, albums).await?;
     Ok(Json(ArtistDetailResponse {
         artist,
         albums,
@@ -4426,6 +4458,56 @@ struct AlbumDetailResponse {
     album: Album,
     artist: Option<Artist>,
     tracks: Vec<Track>,
+    display_hint: AlbumDisplayHint,
+}
+
+/// An album list item preserves the generated `Album` JSON fields and adds a
+/// presentation-only source hint without changing the domain schema.
+#[derive(Debug, Serialize)]
+struct AlbumListItem {
+    #[serde(flatten)]
+    album: Album,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_hint: Option<AlbumDisplayHint>,
+}
+
+/// A non-canonical, presentation-only clue for clients when broken tags leave an
+/// album with a placeholder title or artist.  It deliberately exposes only the
+/// final directory name, never a filesystem path or a value written to a tag.
+#[derive(Debug, Default, Serialize)]
+struct AlbumDisplayHint {
+    folder_name: Option<String>,
+    first_track: Option<AlbumFirstTrack>,
+}
+
+#[derive(Debug, Serialize)]
+struct AlbumFirstTrack {
+    id: String,
+    stream_url: String,
+}
+
+fn album_display_hint(tracks: &[Track]) -> AlbumDisplayHint {
+    let folder_name = tracks
+        .iter()
+        .find_map(|track| folder_name_from_relative_path(&track.relative_path));
+    let first_track = tracks.first().map(|track| AlbumFirstTrack {
+        id: track.id.clone(),
+        stream_url: track.stream_url.clone(),
+    });
+    AlbumDisplayHint {
+        folder_name,
+        first_track,
+    }
+}
+
+fn folder_name_from_relative_path(relative_path: &str) -> Option<String> {
+    relative_path
+        .rsplit_once('/')
+        .map(|(folder, _)| folder)
+        .and_then(|folder| folder.rsplit('/').next())
+        .map(str::trim)
+        .filter(|folder| !folder.is_empty())
+        .map(str::to_owned)
 }
 
 async fn album_detail(
@@ -4453,6 +4535,7 @@ async fn album_detail(
     Ok(Json(AlbumDetailResponse {
         album,
         artist,
+        display_hint: album_display_hint(&tracks),
         tracks,
     }))
 }
@@ -4873,16 +4956,17 @@ async fn delete_playlist_route(
 #[derive(Debug, Serialize)]
 struct FavoritesResponse {
     tracks: Vec<Track>,
-    albums: Vec<Album>,
+    albums: Vec<AlbumListItem>,
     artists: Vec<Artist>,
 }
 
 async fn list_favorites(
     State(state): State<AppState>,
 ) -> Result<Json<FavoritesResponse>, AppError> {
+    let albums = state.database.starred_albums().await.map_err(db_error)?;
     Ok(Json(FavoritesResponse {
         tracks: state.database.starred_tracks().await.map_err(db_error)?,
-        albums: state.database.starred_albums().await.map_err(db_error)?,
+        albums: album_list_items(&state.database, albums).await?,
         artists: state.database.starred_artists().await.map_err(db_error)?,
     }))
 }
@@ -5306,6 +5390,10 @@ fn snapcast_routes() -> Router<AppState> {
             "/api/snapcast/clients/{id}/volume",
             post(snapcast_set_volume),
         )
+        .route(
+            "/api/snapcast/groups/{id}",
+            axum::routing::patch(snapcast_update_group),
+        )
 }
 
 #[cfg(not(feature = "snapcast"))]
@@ -5348,9 +5436,11 @@ struct SnapcastStatus {
     server_host: String,
     /// Connected snapclients (rooms), each a synchronized output.
     clients: Vec<snapcast::SnapClient>,
+    /// Real Snapserver groups. These are transport groups, not Musicata playback zones.
+    groups: Vec<snapcast::SnapGroup>,
     /// Streams snapserver currently has live (Musicata + any enabled inputs) with now-playing.
     inputs: Vec<snapcast::SnapStream>,
-    /// Which stream all rooms are currently playing (`Musicata`/`AirPlay`/`Spotify`).
+    /// The persisted default used by the explicit "route all groups" action.
     active_input: String,
     /// Cast-in input config (the toggles + whether the helper binary is installed).
     airplay_enabled: bool,
@@ -5369,12 +5459,16 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
     let active_input = snapcast_active_input(&state.database).await;
     let manager = state.players.snapcast_manager().await;
     let mut clients = Vec::new();
+    let mut groups = Vec::new();
     let mut inputs = Vec::new();
     if let Some(manager) = &manager {
         let control = snapcast::SnapControl::new(manager.control_addr());
-        // Point every room at the selected input so new/idle clients converge on it.
-        let _ = control.assign_all_to_stream(&active_input).await;
-        clients = control.clients().await.unwrap_or_default();
+        // Reading status must never alter per-group routing.
+        groups = control.groups().await.unwrap_or_default();
+        clients = groups
+            .iter()
+            .flat_map(|group| group.clients.clone())
+            .collect();
         inputs = control.streams().await.unwrap_or_default();
     }
     let setting = |key: &'static str| state.database.get_setting(key);
@@ -5406,6 +5500,7 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
         auth_enabled,
         server_host,
         clients,
+        groups,
         inputs,
         active_input,
         airplay_enabled,
@@ -5427,8 +5522,10 @@ struct SnapcastSettingsUpdate {
     /// the stream is declared in the regenerated snapserver config).
     airplay_enabled: Option<bool>,
     spotify_enabled: Option<bool>,
-    /// The stream all rooms play (`Musicata`/`AirPlay`/`Spotify`) — applied live.
+    /// Compatibility for callers that previously selected the stream for every room.
     active_input: Option<String>,
+    /// Explicitly route every existing Snapserver group to this stream.
+    route_all_input: Option<String>,
     /// Server-side EQ profile for the Snapcast stream (`""` clears it) — applied live.
     dsp_profile_id: Option<String>,
 }
@@ -5496,27 +5593,35 @@ async fn snapcast_update(
             .await
             .map_err(db_error)?;
     }
-    // Switch which input all rooms play — applied live via Group.SetStream (only among streams
-    // snapserver actually has; an input enabled but not yet restarted simply won't switch yet).
-    if let Some(input) = update.active_input {
+    // This is intentionally an explicit all-groups operation. Individual group routes are
+    // maintained by `snapcast_update_group`; status reads never converge them to this setting.
+    if let Some(input) = update.route_all_input.or(update.active_input) {
         let input = input.trim();
-        if [
-            snapcast::STREAM_NAME,
-            snapcast::AIRPLAY_STREAM_NAME,
-            snapcast::SPOTIFY_STREAM_NAME,
-        ]
-        .contains(&input)
-        {
-            state
-                .database
-                .set_setting("snapcast.active_input", input)
-                .await
-                .map_err(db_error)?;
-            if let Some(manager) = state.players.snapcast_manager().await {
-                let control = snapcast::SnapControl::new(manager.control_addr());
-                let _ = control.assign_all_to_stream(input).await;
-            }
+        let manager = state
+            .players
+            .snapcast_manager()
+            .await
+            .ok_or_else(|| AppError::bad_request("Snapcast is not enabled"))?;
+        if !manager.is_running() {
+            return Err(AppError::bad_request("Snapcast is not running"));
         }
+        let control = snapcast::SnapControl::new(manager.control_addr());
+        let streams = control
+            .streams()
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?;
+        validate_snapcast_route_all_input(input, &streams)?;
+        control
+            .assign_all_to_stream(input)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?;
+        // Persist only after every live group accepted the route. A failed request must not make
+        // the UI claim a route is active that Snapserver never applied.
+        state
+            .database
+            .set_setting("snapcast.active_input", input)
+            .await
+            .map_err(db_error)?;
     }
     // Server-side EQ correction for the Snapcast stream — persisted + applied live to the writer.
     if let Some(profile_id) = update.dsp_profile_id {
@@ -5574,6 +5679,117 @@ async fn snapcast_update(
             .map_err(|error| AppError::internal(error.to_string()))?;
     }
     snapcast_status(State(state)).await
+}
+
+#[cfg(feature = "snapcast")]
+fn validate_snapcast_route_all_input(
+    input: &str,
+    streams: &[snapcast::SnapStream],
+) -> Result<(), AppError> {
+    if ![
+        snapcast::STREAM_NAME,
+        snapcast::AIRPLAY_STREAM_NAME,
+        snapcast::SPOTIFY_STREAM_NAME,
+    ]
+    .contains(&input)
+    {
+        return Err(AppError::bad_request("unsupported Snapcast stream"));
+    }
+    if !streams.iter().any(|stream| stream.id == input) {
+        return Err(AppError::bad_request("Snapcast stream is not available"));
+    }
+    Ok(())
+}
+
+/// Change one real Snapserver group's transport membership and/or stream. This never touches a
+/// Musicata zone or queue: all groups routed to Musicata still hear the single shared player.
+#[cfg(feature = "snapcast")]
+#[derive(Debug, Deserialize)]
+struct SnapcastGroupUpdate {
+    client_ids: Option<Vec<String>>,
+    stream_id: Option<String>,
+}
+
+#[cfg(feature = "snapcast")]
+async fn snapcast_update_group(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(update): Json<SnapcastGroupUpdate>,
+) -> Result<Json<SnapcastStatus>, AppError> {
+    if update.client_ids.is_none() && update.stream_id.is_none() {
+        return Err(AppError::bad_request("choose speakers and/or a stream"));
+    }
+    let manager = state
+        .players
+        .snapcast_manager()
+        .await
+        .ok_or_else(|| AppError::not_found("snapcast is not enabled"))?;
+    let control = snapcast::SnapControl::new(manager.control_addr());
+    // Read the authoritative Snapserver state immediately before mutation. Group ids must never
+    // be treated as Musicata zone ids, and stale client/stream ids must fail rather than route an
+    // arbitrary Snapserver object.
+    let groups = control
+        .groups()
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+    let streams = if update.stream_id.is_some() {
+        control
+            .streams()
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?
+    } else {
+        Vec::new()
+    };
+    validate_snapcast_group_update(&id, &update, &groups, &streams)?;
+    if let Some(client_ids) = &update.client_ids {
+        control
+            .set_group_clients(&id, client_ids)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?;
+    }
+    if let Some(stream_id) = &update.stream_id {
+        control
+            .set_group_stream(&id, stream_id)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?;
+    }
+    snapcast_status(State(state)).await
+}
+
+#[cfg(feature = "snapcast")]
+fn validate_snapcast_group_update(
+    id: &str,
+    update: &SnapcastGroupUpdate,
+    groups: &[snapcast::SnapGroup],
+    streams: &[snapcast::SnapStream],
+) -> Result<(), AppError> {
+    if !groups.iter().any(|group| group.id == id) {
+        return Err(AppError::not_found("unknown Snapcast group"));
+    }
+    if let Some(client_ids) = &update.client_ids {
+        if client_ids.is_empty() {
+            return Err(AppError::bad_request("a group needs at least one speaker"));
+        }
+        let known: std::collections::HashSet<&str> = groups
+            .iter()
+            .flat_map(|group| group.clients.iter().map(|client| client.id.as_str()))
+            .collect();
+        let requested: std::collections::HashSet<&str> =
+            client_ids.iter().map(String::as_str).collect();
+        if requested.len() != client_ids.len()
+            || requested.iter().any(|client| !known.contains(*client))
+        {
+            return Err(AppError::bad_request(
+                "unknown or duplicate Snapcast speaker",
+            ));
+        }
+    }
+    if let Some(stream_id) = &update.stream_id
+        && !streams.iter().any(|stream| stream.id == *stream_id)
+    {
+        return Err(AppError::bad_request("unknown Snapcast stream"));
+    }
+    Ok(())
 }
 
 /// A provisioned room as shown in `/admin`: its name, the snapclient command (password
@@ -6632,7 +6848,7 @@ const DEFAULT_SEARCH_LIMIT: usize = 50;
 async fn search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
-) -> Result<Json<SearchResults>, AppError> {
+) -> Result<Json<SearchResponse>, AppError> {
     let q = query.q.unwrap_or_default();
     let limit = query.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
     let offset = query.offset.unwrap_or(0);
@@ -6641,7 +6857,21 @@ async fn search(
         .search(&q, limit, offset)
         .await
         .map_err(|error| AppError::internal(error.to_string()))?;
-    Ok(Json(results))
+    let albums = album_list_items(&state.database, results.albums).await?;
+    Ok(Json(SearchResponse {
+        query: results.query,
+        artists: results.artists,
+        albums,
+        tracks: results.tracks,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResponse {
+    query: String,
+    artists: Vec<Artist>,
+    albums: Vec<AlbumListItem>,
+    tracks: Vec<Track>,
 }
 
 async fn metadata_write_back_policy() -> impl IntoResponse {
@@ -8173,9 +8403,18 @@ mod tests {
     use super::{
         ARTWORK_CACHE_CONTROL, BOOL_SETTINGS, Config, DEFAULT_SOURCE_URL, PlayerManager,
         ProviderHandle, ProviderRegistry, acoustid_lookup_duration, app, artwork_etag,
-        bool_setting_default, normalize_size, parse_range, resize_to_jpeg,
-        schedule_autoplay_refills,
+        bool_setting_default, folder_name_from_relative_path, normalize_size, parse_range,
+        resize_to_jpeg, schedule_autoplay_refills,
     };
+
+    #[test]
+    fn album_display_hint_uses_only_the_final_relative_folder() {
+        assert_eq!(
+            folder_name_from_relative_path("Artist/Release/01 - Track.flac"),
+            Some("Release".to_string())
+        );
+        assert_eq!(folder_name_from_relative_path("Track.flac"), None);
+    }
 
     #[tokio::test]
     async fn profiling_controls_are_admin_only_and_validate_requests() {
@@ -8400,6 +8639,80 @@ mod tests {
         // welcome; bumping this number is the moment to confirm the default was chosen, and
         // that a network-touching feature is not being switched on for everyone by accident.
         assert_eq!(BOOL_SETTINGS.len(), 15);
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[test]
+    fn snapcast_group_update_rejects_unknown_and_duplicate_control_ids() {
+        let client = crate::snapcast::SnapClient {
+            id: "kitchen".into(),
+            name: "Kitchen".into(),
+            connected: true,
+            volume_percent: 40,
+            muted: false,
+        };
+        let groups = vec![crate::snapcast::SnapGroup {
+            id: "downstairs".into(),
+            name: "Downstairs".into(),
+            stream_id: "Musicata".into(),
+            clients: vec![client],
+        }];
+        let streams = vec![crate::snapcast::SnapStream {
+            id: "Musicata".into(),
+            status: "playing".into(),
+            now_playing: None,
+        }];
+        assert!(
+            super::validate_snapcast_group_update(
+                "downstairs",
+                &super::SnapcastGroupUpdate {
+                    client_ids: Some(vec!["kitchen".into(), "kitchen".into()]),
+                    stream_id: None
+                },
+                &groups,
+                &streams,
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_snapcast_group_update(
+                "downstairs",
+                &super::SnapcastGroupUpdate {
+                    client_ids: None,
+                    stream_id: Some("not-a-stream".into())
+                },
+                &groups,
+                &streams,
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_snapcast_group_update(
+                "unknown",
+                &super::SnapcastGroupUpdate {
+                    client_ids: Some(vec!["kitchen".into()]),
+                    stream_id: None
+                },
+                &groups,
+                &streams,
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_snapcast_group_update(
+                "downstairs",
+                &super::SnapcastGroupUpdate {
+                    client_ids: Some(vec!["kitchen".into()]),
+                    stream_id: Some("Musicata".into())
+                },
+                &groups,
+                &streams,
+            )
+            .is_ok()
+        );
+        assert!(super::validate_snapcast_route_all_input("AirPlay", &streams).is_err());
+        assert!(super::validate_snapcast_route_all_input("not-a-stream", &streams).is_err());
+        assert!(super::validate_snapcast_route_all_input("Musicata", &streams).is_ok());
     }
 
     /// The defaults themselves, pinned. These are the values every existing installation gets
@@ -8711,6 +9024,118 @@ mod tests {
                 .expect("tracks")
                 .iter()
                 .all(|track| track["album_id"] == album.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn album_list_adds_folder_hint_without_rewriting_album_metadata() {
+        let fixture = TestFixture::new("album-list-display-hint");
+        let mut library = fixture.library();
+        let album = library
+            .albums
+            .iter_mut()
+            .find(|album| album.title == "Paramparcad")
+            .expect("album");
+        let album_id = album.id.clone();
+        album.title = "Unknown Album (2/8/2003 …)".to_string();
+        album.artist_name = "\"".to_string();
+        let app = fixture.app_with_library(library).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/albums")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(response.into_body()).await;
+        let items = serde_json::from_str::<serde_json::Value>(&body).expect("album list json");
+        let item = items["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["id"] == album_id)
+            .expect("changed album");
+
+        assert_eq!(item["title"], "Unknown Album (2/8/2003 …)");
+        assert_eq!(item["artist_name"], "\"");
+        assert_eq!(item["display_hint"]["folder_name"], "1994 - Paramparcad");
+    }
+
+    #[tokio::test]
+    async fn album_list_first_track_matches_detail_order_without_a_folder() {
+        let fixture = TestFixture::new("album-list-first-track");
+        let mut library = fixture.library();
+        let album_id = library
+            .albums
+            .iter()
+            .find(|album| album.title == "Paramparcad")
+            .expect("album")
+            .id
+            .clone();
+        let first = library
+            .tracks
+            .iter_mut()
+            .filter(|track| track.album_id == album_id)
+            .min_by(|left, right| {
+                (left.disc_number, left.track_number, &left.title).cmp(&(
+                    right.disc_number,
+                    right.track_number,
+                    &right.title,
+                ))
+            })
+            .expect("first track");
+        first.relative_path = "first-track.mp3".to_string();
+        let app = fixture.app_with_library(library).await;
+
+        let detail: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/api/albums/{album_id}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body(),
+            )
+            .await,
+        )
+        .expect("album detail json");
+        let list: serde_json::Value = serde_json::from_str(
+            &body_text(
+                app.oneshot(
+                    Request::builder()
+                        .uri("/api/albums")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .into_body(),
+            )
+            .await,
+        )
+        .expect("album list json");
+        let item = list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["id"] == album_id)
+            .expect("album list item");
+
+        assert_eq!(item["display_hint"]["folder_name"], serde_json::Value::Null);
+        assert_eq!(
+            item["display_hint"]["first_track"]["id"],
+            detail["tracks"][0]["id"]
+        );
+        assert_eq!(
+            item["display_hint"]["first_track"]["stream_url"],
+            detail["tracks"][0]["stream_url"]
         );
     }
 
@@ -10212,6 +10637,52 @@ mod tests {
             .header("authorization", "Bearer listener-token").header("content-type", "application/json")
             .body(Body::from(r#"{"profile_id":null,"enabled":true,"correction_enabled":false,"listening_profile_id":"taste-techno-bass","listening_enabled":true}"#)).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
+    async fn listeners_can_change_snapcast_volume_but_not_group_configuration() {
+        let fixture = TestFixture::new("snapcast-listener-controls");
+        let (router, db) = fixture.app_with_library_db(fixture.library()).await;
+        db.create_user(&musicata_storage::UserRecord {
+            id: "listener".into(),
+            username: "listener".into(),
+            password_hash: "unused".into(),
+            role: "listener".into(),
+            api_token: "listener-token".into(),
+            created_at_unix_seconds: 1,
+        })
+        .await
+        .unwrap();
+        let volume = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/snapcast/clients/kitchen/volume")
+                    .header("authorization", "Bearer listener-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"percent":42}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // No Snapserver is configured in this fixture, so the handler reports 404. The
+        // important boundary is that middleware lets the listener reach that control route.
+        assert_eq!(volume.status(), StatusCode::NOT_FOUND);
+        let group = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/snapcast/groups/downstairs")
+                    .header("authorization", "Bearer listener-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"stream_id":"Musicata"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(group.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

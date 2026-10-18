@@ -9,7 +9,7 @@ binary via `rust-embed` from `web/dist/`. Components are `PascalCase.svelte`.
 - **Browse** — artists, albums, tracks, favorites, search and library filters.
 - **Listen** — queue, playlists, similarity mixes and internet radio stations.
 - **Settings** — administrator-only configuration inside the shared player shell:
-  Music sources, Outputs & groups, Sound profiles, Metadata & artwork,
+  Music sources, Library status, Outputs & groups, Sound profiles, Metadata & artwork,
   History & services, and System & accounts. Categories are tabs on desktop and a labeled select on compact screens; search indexes
   named destinations and keywords, never current values or credentials.
 
@@ -17,6 +17,9 @@ The `/` and compatible `/admin` entry points mount the same player component tre
 Internal Settings navigation must preserve the audio element, renderer, output,
 WebSocket and transport. `/admin` starts at Settings and remains administrator-gated.
 Keep the activity split clean: configuration and maintenance progress belong in Settings.
+Library status has no standalone navigation entry. Its coverage counts and worker state
+distinguish waiting, working, retrying and stale observations; missing work is not proof
+that a worker is currently processing it.
 Playback work initiated by the listener (creating a mix or finding the next song) shows
 its loading, empty, and error states in the player, where the action was taken.
 
@@ -42,19 +45,24 @@ A fresh visit on any screen starts with album covers. The last Albums, Artists o
 choice is remembered in this browser; Browse returns to that choice on desktop. Detail routes
 and temporary playback panels are restored by history, not saved as the browsing preference. Persistent bottom destinations are
 **Library · Playlists · Now Playing**, with the compact player above them. Artists and
-Tracks remain available in the browsing switcher. The top bar keeps the current output
-visible and exposes Back whenever there is an in-app history entry.
+Tracks remain available in the browsing switcher. The top bar exposes navigation, Settings,
+and Back whenever there is an in-app history entry.
 
-The compact player's title and artwork open Now Playing: controls followed directly by
-the active queue, with its current track highlighted. Saved playlists have a separate
-browse screen. Back closes the current playback/drawer view before returning through
-library navigation, and Forward restores that view. Desktop starts with a sidebar, a wide library, and a bottom transport bar. Expanding the
-player or opening queue, metadata, EQ, metering, or statistics adds a side rail. Browse,
-Listen and Settings remain primary sidebar destinations; playlists and radio have named
-sections. The compact layout applies below 1024 px, including landscape phones.
-Clicking its current song or Now Playing opens the queue alongside the transport, leaving
-the library available. Output selection and playback controls stay visible. The optional
-install prompt sits in the page flow on all screen sizes so it cannot cover browsing controls.
+The transport stays at the bottom on every destination. Its “Playing on” control opens
+one shared picker for players and zones, with the current choice clearly marked. Opening
+Queue, Now Playing, EQ, metering, metadata or statistics must not relocate or resize the
+transport or output picker. Desktop playback panels sit against the right edge above the bottom bar; compact
+screens use the space between the top navigation and player. The compact layout applies
+below 1024 px, including landscape phones. Playback and output selection remain reachable
+while these panels are open.
+
+The current song's title and artwork open Now Playing with the active queue visible
+immediately. Shuffle and Repeat stay above the scrolling queue; sound and playback tools
+remain visible below it. Album Play replaces the queue immediately. Explicit Clear queue
+asks for confirmation, initially focuses Cancel, and offers Undo for library tracks. Saved playlists have a separate browse screen.
+Back closes the current playback/drawer view before returning through library navigation,
+and Forward restores that view. Browse, Listen and Settings remain primary sidebar
+destinations. The optional install prompt sits in page flow so it cannot cover controls.
 
 Sound-profile creation, import, deletion, room-filter uploads and browser device bindings
 live in Settings → Sound profiles. Profile selection, bypass and volume leveling remain
@@ -69,7 +77,8 @@ so selecting one never requires a profile-management write.
 Settings imports classify profiles as headphone correction, speaker/room correction, or a
 listening adjustment. Room impulse responses belong only to equipment correction.
 
-Search results expose Clear search. Submitting search closes the navigation drawer;
+Search is a labeled field directly in Library, above the results on all screen sizes.
+The same field provides Clear while searching; it is never hidden inside navigation.
 Clear search and Library/Browse restore the pre-search browsing segment and scroll position.
 Switching Tracks/Albums/Artists within search retains the query.
 

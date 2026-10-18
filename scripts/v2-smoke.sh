@@ -51,7 +51,7 @@ run_phase() {
   done
   local rc=0
   MUSICATA_SMOKE_DB="$TMP/$mode.db" node tests/ui/v2-flows.mjs "$port" "$BASE_PATH" "$mode" || rc=$?
-  if [ "$mode" = behavior ] && [ -z "${MUSICATA_UX_ONLY:-}" ]; then
+  if [ "$mode" = behavior ] && [ -z "${MUSICATA_UX_ONLY:-}" ] && [ -z "${MUSICATA_STABLE_ONLY:-}" ]; then
     node tests/ui/activity-flows.mjs "$port" || rc=$?
   fi
   kill "$SRV" 2>/dev/null || true

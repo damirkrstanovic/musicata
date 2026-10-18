@@ -2,15 +2,30 @@
   // SPDX-License-Identifier: AGPL-3.0-or-later
   import { browse } from "../lib/browse.svelte";
 
+  let genreSearch = $state("");
+  const normalizedGenres = $derived(
+    (browse.index?.genres ?? []).map((genre) => ({
+      ...genre,
+      display: genre.value.trim().replace(/\s+/g, " "),
+    })),
+  );
+  const matchingGenres = $derived(
+    normalizedGenres.filter((genre) => genre.display.toLocaleLowerCase().includes(genreSearch.trim().toLocaleLowerCase())),
+  );
+
   // Lazy-load the facet index the first time the filters render.
   if (!browse.index) browse.load();
 </script>
 
 {#if browse.index}
   <div class="browse-filters">
+    <label>
+      <span class="sr-only">Search genres</span>
+      <input type="search" bind:value={genreSearch} placeholder="Search genres" aria-label="Search genres" />
+    </label>
     <select bind:value={browse.genre} aria-label="Genre">
       <option value="">All genres</option>
-      {#each browse.index.genres as g (g.value)}<option value={g.value}>{g.value}</option>{/each}
+      {#each matchingGenres as g (g.value)}<option value={g.value}>{g.display} ({g.track_count})</option>{/each}
     </select>
     <select
       value={browse.year ?? ""}
@@ -38,3 +53,9 @@
     {/if}
   </div>
 {/if}
+
+<style>
+  .sr-only { position:absolute; width:1px; height:1px; padding:0; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+  label { min-width:0; width:100%; }
+  input[type="search"] { width:100%; min-width:0; min-height:44px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; color:var(--text); background:var(--panel-strong); font-size:16px; }
+</style>

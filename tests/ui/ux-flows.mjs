@@ -18,7 +18,6 @@ export async function uxFlows({js, send, check, waitUntil, tap, screenshot}) {
       await js(`window.uxBrowseScroll={page:scrollY,content:document.querySelector('.content').scrollTop};document.querySelector('.track-album-cell')?.click()`);
       await waitUntil('document.querySelector(".hero-title")',3000);
     }
-    if (compact) await tap('[aria-label="Open navigation"]');
     await js(`(()=>{const input=document.querySelector('.search input'); input.value='Dar'; input.dispatchEvent(new Event('input',{bubbles:true})); input.form?.requestSubmit();})()`);
     await settle();
     check(`UX ${width}: search submission exposes results`, await js(`!document.querySelector('.shell').classList.contains('nav-open') && !!document.querySelector('[aria-label="Clear search"]')`));
@@ -45,7 +44,6 @@ export async function uxFlows({js, send, check, waitUntil, tap, screenshot}) {
       check(`UX ${width}: Escape closes actions`,await js(`!document.querySelector('.track-menu[open]')`));
     }
     // A just-typed debounce must not resurrect search after choosing Library/Browse.
-    if(compact) await tap('[aria-label="Open navigation"]');
     await js(`(()=>{const input=document.querySelector('.search input'); input.value='pending'; input.dispatchEvent(new Event('input',{bubbles:true})); document.querySelector(${JSON.stringify(compact ? '.mobile-tabs [data-tab="library"]' : '[data-activity="browse"]')})?.click();})()`);
     await settle();
     check(`UX ${width}: leaving search cancels pending input`,await js(`document.querySelector('.search input')?.value === '' && !document.querySelector('.clear-search')`));
@@ -63,10 +61,11 @@ export async function uxFlows({js, send, check, waitUntil, tap, screenshot}) {
     await screenshot(`ux-${width}-tracks`);
     await js(`document.querySelectorAll('.seg')[1]?.click()`);
     await waitUntil('document.querySelector(".album-card")',3000);
-    await tap('.album-card');
+    await tap('.album-card', true);
     await waitUntil('document.querySelector(".hero-title")',3000);
     check(`UX ${width}: album title appears once`,await js(`!!document.querySelector('.hero-title') && !document.querySelector('.content-title h2')`));
     if(compact) check(`UX ${width}: album tracks start near header`,await js(`document.querySelector('.track')?.getBoundingClientRect().top < 400`));
+    if(width<1024 && width>height) check('UX landscape: album heading fits above the persistent player',await js(`document.querySelector('.hero-title')?.getBoundingClientRect().bottom <= document.querySelector('.player-bar')?.getBoundingClientRect().top`));
     await screenshot(`ux-${width}-album`);
     if(compact) {
       await tap('[aria-label="Settings"]');

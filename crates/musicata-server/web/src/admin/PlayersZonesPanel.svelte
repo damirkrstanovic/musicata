@@ -77,8 +77,8 @@
   async function removePlayer(player: Player) {
     if (
       !(await confirmAction({
-        title: "Remove player",
-        message: `Remove the player “${player.name}”?`,
+        title: "Remove output",
+        message: `Remove the output “${player.name}”?`,
         confirmLabel: "Remove",
       }))
     )
@@ -127,8 +127,8 @@
 </script>
 
 <section class="admin-panel players-panel">
-  <div class="admin-panel-head"><h2>Players &amp; zones</h2></div>
-  <p class="admin-hint">MPD players you control, optionally grouped into zones.</p>
+  <div class="admin-panel-head"><h2>Outputs &amp; groups</h2></div>
+  <p class="admin-hint">MPD outputs you control, optionally grouped into zones.</p>
 
   <div class="admin-list">
     {#each players as player (player.id)}
@@ -161,13 +161,13 @@
   </div>
 
   <form class="field-form" onsubmit={addPlayer}>
-    <h3>Add an MPD player</h3>
+    <h3>Add an MPD output</h3>
     <div class="field-grid">
       <label class="field"><span>Address</span><input name="address" placeholder="127.0.0.1:6600" required /></label>
       <label class="field"><span>Name (optional)</span><input name="name" placeholder="Living room" /></label>
     </div>
     <div class="field-actions">
-      <button type="submit" class="primary-button" disabled={busy}>Add player</button>
+      <button type="submit" class="primary-button" disabled={busy}>Add output</button>
       <span class="form-status" class:error>{status}</span>
     </div>
   </form>

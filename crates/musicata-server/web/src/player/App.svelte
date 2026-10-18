@@ -23,8 +23,11 @@
   import type { Player } from "../types/Player";
   import type { Zone } from "../types/Zone";
   import Modal from "../lib/Modal.svelte";
+  import { activeModal } from "../lib/modal";
   import Sidebar from "./Sidebar.svelte";
   import Footer from "./Footer.svelte";
+  import OutputPicker from "./OutputPicker.svelte";
+  import NowPlaying from "./NowPlaying.svelte";
   import TracksView from "./TracksView.svelte";
   import LibraryGrid from "./LibraryGrid.svelte";
   import ArtistsGrid from "./ArtistsGrid.svelte";
@@ -51,8 +54,8 @@
   const navOpen = $derived(nav.overlays.includes("navigation"));
   const nowPlayingOpen = $derived(nav.overlays.includes("nowPlaying"));
   let mobile = $state(false);
-  let railExpanded = $state(false);
-  const railOpen = $derived(railExpanded || nowPlayingOpen || player.queueOpen || dsp.panelOpen || metadata.trackId !== null || meter.open || statsPanel.open);
+  const auxiliaryOpen = $derived(dsp.panelOpen || metadata.trackId !== null || meter.open || statsPanel.open);
+  const panelOpen = $derived(nowPlayingOpen || player.queueOpen || auxiliaryOpen);
 
   onMount(() => {
     const query = matchMedia("(max-width: 1023px)");
@@ -63,16 +66,24 @@
     return () => { query.removeEventListener("change", update); nav.stop(); };
   });
 
+  function closeAuxiliaryPanels() {
+    dsp.panelOpen = false;
+    metadata.close();
+    if (meter.open) meter.toggle();
+    statsPanel.open = false;
+  }
+
+  function toggleQueue() {
+    const open = !player.queueOpen || auxiliaryOpen;
+    closeAuxiliaryPanels();
+    player.queueOpen = open;
+  }
+
   async function setNowPlaying(open: boolean) {
-    if (open) nav.openOverlay("nowPlaying");
+    if (open) { closeAuxiliaryPanels(); nav.openOverlay("nowPlaying"); }
     else nav.closeOverlay();
     await tick();
     if (open) document.querySelector<HTMLButtonElement>('[aria-label="Close Now Playing"]')?.focus();
-  }
-
-  async function openOutput() {
-    await setNowPlaying(true);
-    document.querySelector<HTMLSelectElement>('.player-switch-btn')?.focus();
   }
 
   async function openNavigation() {
@@ -313,6 +324,7 @@
   }
 
   onDestroy(() => {
+    search.cancelPending();
     clearTimeout(connectRetry);
     ws?.close();
     renderer?.close();
@@ -329,36 +341,37 @@
   if (wasNowPlaying && !nowPlayingOpen) document.querySelector<HTMLButtonElement>('.now-title-button')?.focus({preventScroll: true});
   else if (wasNavigation && !navOpen) document.querySelector<HTMLButtonElement>('[aria-label="Open navigation"]')?.focus({preventScroll: true});
 }} onkeydown={(event) => {
+  if ($activeModal) return;
   if (event.key === "Escape") {
-    if (document.querySelector(".track-menu[open]")) return;
+    if (document.querySelector(".track-menu[open], .output-picker:popover-open")) return;
+    if (statsPanel.open) { statsPanel.open = false; return; }
+    if (meter.open) { meter.toggle(); return; }
+    if (dsp.panelOpen) { dsp.panelOpen = false; return; }
+    if (metadata.trackId) { metadata.close(); return; }
     if (player.queueOpen) player.queueOpen = false;
     else if (nowPlayingOpen) void setNowPlaying(false);
     else void closeNavigation();
   }
 }} />
 
-<main class="shell" class:nav-open={navOpen} class:np-open={nowPlayingOpen} class:rail-open={railOpen}>
-  <header class="mobile-bar" inert={mobile && (navOpen || nowPlayingOpen || player.queueOpen)}>
+<main inert={$activeModal !== null} class="shell" class:nav-open={navOpen} class:np-open={nowPlayingOpen}>
+  <header class="mobile-bar" inert={mobile && navOpen}>
     {#if nav.canGoBack}<button class="bar-icon mobile-back" type="button" aria-label="Back" onclick={() => nav.pop()}>‹</button>{/if}
     <button class="bar-icon" type="button" aria-label="Open navigation" aria-expanded={navOpen} onclick={openNavigation}>☰</button>
-    <button class="mobile-output" type="button" onclick={openOutput} aria-expanded={nowPlayingOpen}>
-      <span>Output:</span>
-      <strong>{(player.activeKind === "zone" ? zones : players).find(p => p.id === player.activeId)?.name ?? "Connecting…"}</strong>
-      <span aria-hidden="true">⌄</span>
-    </button>
+    <span class="mobile-brand">Musicata</span>
     {#if session.isAdmin}<button class="bar-icon" type="button" aria-label="Settings" onclick={() => nav.push({name: "settings", category: "sources"})}>⚙</button>{/if}
   </header>
   <button class="scrim" type="button" hidden={!navOpen} aria-label="Dismiss navigation" onclick={closeNavigation}></button>
   <Sidebar onclose={closeNavigation} inert={mobile && !navOpen} />
 
-  <section class="content" inert={mobile && (navOpen || nowPlayingOpen || player.queueOpen)}>
+  <section class="content" inert={mobile && (navOpen || panelOpen)}>
     {#if activity !== "settings"}<InstallPrompt inline />{/if}
+    <div class="browse-toolbar">
     <header class="content-header">
       {#if nav.canGoBack}
         <button class="back-btn" type="button" onclick={() => nav.pop()}>‹ Back</button>
       {/if}
       <div class="content-title">
-        <p class="eyebrow">{activity === "browse" ? "Browse" : activity === "listen" ? "Listen" : "Administration"}</p>
         {#if route.name !== "album" && route.name !== "artist"}<h2>{title}</h2>{/if}
       </div>
       {#if activity === "browse"}
@@ -385,14 +398,21 @@
         </div>
       </div>
       {/if}
-      {#if search.query.trim() && activity === "browse"}
-        <button class="ghost-button clear-search" type="button" aria-label="Clear search" onclick={async () => {
-          search.clear();
-          await tick();
-          document.querySelector<HTMLButtonElement>('.seg.is-active')?.focus({preventScroll: true});
-        }}>Clear search</button>
-      {/if}
     </header>
+
+    {#if activity === "browse"}
+      <form class="search library-search" role="search" onsubmit={event => { event.preventDefault(); search.update(search.draft); if (mobile) event.currentTarget.querySelector("input")?.blur(); }}>
+        <label for="library-search">Search library</label>
+        <div class="search-field">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/></svg>
+          <input id="library-search" type="search" aria-label="Search library" placeholder="Artists, albums, tracks…" autocomplete="off"
+            bind:value={search.draft} oninput={event => search.schedule(event.currentTarget.value)} />
+          {#if search.draft || search.query}<button class="ghost-button clear-search" type="button" aria-label="Clear search" onclick={async () => { search.clear(); await tick(); document.getElementById("library-search")?.focus({preventScroll:true}); }}>Clear</button>{/if}
+        </div>
+      </form>
+    {/if}
+
+    </div>
 
     {#if activity === "listen"}
       <nav class="listen-tabs" aria-label="Listening activities">
@@ -433,52 +453,21 @@
     {/if}
   </section>
 
-  <aside class="right-rail" class:overlay-open={player.queueOpen} inert={mobile && navOpen}>
-    <div class="rail-header" inert={mobile && player.queueOpen}>
-      <button class="rail-toggle ghost-button" type="button" aria-expanded={railOpen} onclick={() => {
-        railExpanded = !railOpen;
-        if (!railExpanded) { if (nowPlayingOpen) void setNowPlaying(false); player.queueOpen = false; dsp.panelOpen = false; metadata.close(); if (meter.open) meter.toggle(); statsPanel.open = false; }
-      }}>{railOpen ? "Collapse player" : "Expand player"}</button>
-      {#if nowPlayingOpen}<span class="desktop-now-heading">Now Playing</span>{/if}
-      <button class="np-chevron" type="button" aria-label="Close Now Playing" onclick={() => setNowPlaying(false)}>⌄</button>
-      <div class="player-switch">
-        <select
-          class="player-switch-btn"
-          aria-label="Output"
-          value={`${player.activeKind}:${player.activeId}`}
-          onchange={(e) => onTargetChange(e.currentTarget.value)}
-        >
-          {#each players as p (p.id)}
-            <option value={`player:${p.id}`}>{p.name}</option>
-          {/each}
-          {#each zones as z (z.id)}
-            <option value={`zone:${z.id}`}>Zone · {z.name}</option>
-          {/each}
-        </select>
-      </div>
-      {#if player.activeKind === "zone"}
-        <label>EQ and meter member
-          <select aria-label="EQ and meter member" value={zoneMemberId ?? ""} onchange={event => {
-            const output = players.find(p => p.id === event.currentTarget.value);
-            if (output) {zoneMemberId = output.id; dsp.bindOutput(output.id, output.name);}
-          }}>
-            {#each players.filter(p => p.zone_id === player.activeId) as member (member.id)}<option value={member.id}>{member.name}</option>{/each}
-          </select>
-        </label>
-      {/if}
-    </div>
-    <div class="rail-top">
-      <MetadataPanel />
-      {#if !mobile && nowPlayingOpen && !player.queueOpen}<QueueDrawer embedded />
-      {:else if !(mobile && nowPlayingOpen) || player.queueOpen}<QueueDrawer />{/if}
-      <EqPanel />
-      <VuMeter />
-      <StatsPanel />
-    </div>
-    <Footer onexpand={() => setNowPlaying(true)} inert={mobile && player.queueOpen} />
-    {#if mobile && nowPlayingOpen && !player.queueOpen}<QueueDrawer embedded />{/if}
+  <aside class="playback-panels" class:open={panelOpen} aria-label="Playback details" inert={mobile && navOpen}>
+    {#if nowPlayingOpen}<NowPlaying hidden={player.queueOpen || auxiliaryOpen} onclose={() => setNowPlaying(false)} />{/if}
+    <MetadataPanel />
+    <QueueDrawer />
+    <EqPanel />
+    <VuMeter />
+    <StatsPanel />
   </aside>
-  <nav class="mobile-tabs" aria-label="Main navigation" inert={navOpen || player.queueOpen}>
+  <div class="player-bar" inert={mobile && navOpen}>
+    <div class="player-destination">
+      <OutputPicker {players} {zones} memberId={zoneMemberId} onmemberchange={member => { zoneMemberId = member.id; dsp.bindOutput(member.id, member.name); }} onchange={onTargetChange} onrefresh={loadTargets} />
+    </div>
+    <Footer onexpand={() => setNowPlaying(true)} onqueue={toggleQueue} />
+  </div>
+  <nav class="mobile-tabs" aria-label="Main navigation" inert={navOpen}>
     <button type="button" data-tab="library" aria-current={!nowPlayingOpen && !["playlists", "playlist", "smart"].includes(route.name) ? "page" : undefined} class:active={!nowPlayingOpen && !["playlists", "playlist", "smart"].includes(route.name)} onclick={() => search.clear()}>Library</button>
     <button type="button" data-tab="playlists" aria-current={!nowPlayingOpen && ["playlists", "playlist", "smart"].includes(route.name) ? "page" : undefined} class:active={!nowPlayingOpen && ["playlists", "playlist", "smart"].includes(route.name)} onclick={() => nav.root({name: "playlists"})}>Playlists</button>
     <button type="button" data-tab="now-playing" aria-current={nowPlayingOpen ? "page" : undefined} class:active={nowPlayingOpen} onclick={() => setNowPlaying(true)}>Now Playing</button>

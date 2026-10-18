@@ -45,7 +45,7 @@
   {#if detail.albums.length}
     <div class="browse-grid">
       {#each detail.albums as album (album.id)}
-        <AlbumCard {album} onopen={() => nav.push({ name: "album", id: album.id, title: album.title })} />
+        <AlbumCard {album} firstStreamUrl={album.display_hint?.first_track?.stream_url} onopen={() => nav.push({ name: "album", id: album.id, title: album.title })} />
       {/each}
     </div>
   {/if}

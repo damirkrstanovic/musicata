@@ -6,13 +6,48 @@
   import { playQueueIndex } from "../lib/playback";
   import { api } from "../lib/api";
   import { nav } from "../lib/nav.svelte";
-  import { promptText } from "../lib/modal";
+  import { promptText, confirmAction } from "../lib/modal";
   import { initial } from "../lib/dom";
   import { tick } from "svelte";
 
   let { embedded = false }: { embedded?: boolean } = $props();
   let wasOpen = false;
   let editing = $state(false);
+  let optionsOpen = $state(false);
+  let busy = $state(false);
+  let message = $state("");
+  let cleared = $state<{ ids: string[]; epoch: number } | null>(null);
+
+  async function clearQueue() {
+    const target = player.target;
+    const epoch = player.targetEpoch;
+    if (!target || !player.queue.length || busy) return;
+    const canRestore = player.queue.every(item => item.track_id);
+    if (!await confirmAction({ title: "Clear this queue?", message: `Remove all ${player.queue.length} items and stop playback?${canRestore ? " You can undo this while the queue is empty." : " Live streams cannot be restored with Undo."}`, confirmLabel: "Clear queue" })) return;
+    if (player.targetEpoch !== epoch) return;
+    const ids = player.queue.flatMap(item => item.track_id ? [item.track_id] : []);
+    busy = true;
+    const success = await sendCommand(target, { command: "clear" });
+    if (player.targetEpoch === epoch) {
+      cleared = success && canRestore ? { ids, epoch } : null;
+      message = success ? "Queue cleared." : "Could not clear the queue. Try again.";
+    }
+    busy = false;
+  }
+
+  async function undoClear() {
+    const saved = cleared;
+    if (!saved || busy || player.queue.length || player.targetEpoch !== saved.epoch) return;
+    busy = true;
+    // Enqueue restores the saved order without starting audio outside a playback gesture.
+    const success = await sendCommand(player.target, { command: "enqueue", track_ids: saved.ids });
+    if (player.targetEpoch === saved.epoch) {
+      message = success ? "Queue restored. Choose a track to play." : "Could not restore the queue. Try again.";
+      if (success) cleared = null;
+    }
+    busy = false;
+  }
+
   $effect(() => {
     if (embedded) return;
     const open = player.queueOpen;
@@ -51,23 +86,22 @@
       <strong>Queue</strong>
       <div class="queue-head-actions">
         <button class="ghost-button queue-edit" type="button" aria-pressed={editing} onclick={() => editing = !editing}>{editing ? "Done editing" : "Edit queue"}</button>
-        <label class="autoplay-toggle" title="Keep playing similar tracks when the queue ends">
-          <input
-            type="checkbox"
-            checked={autoplay.enabled}
-            onchange={() => autoplay.toggle()}
-          />
-          <span>Autoplay</span>
-        </label>
-        <button class="ghost-button" type="button" onclick={() => sendCommand(player.target, { command: "clear" })}>
-          Clear
-        </button>
-        <button class="ghost-button save-queue-playlist" type="button" disabled={!player.queue.some((item) => item.track_id)} onclick={saveQueue}>
-          Save as playlist
-        </button>
+        <button class="ghost-button queue-options-toggle" type="button" aria-label="Queue options" aria-expanded={optionsOpen} onclick={() => optionsOpen = !optionsOpen}>•••</button>
         {#if !embedded}<button class="ghost-button" type="button" aria-label="Close queue" onclick={close}>Close</button>{/if}
       </div>
     </header>
+    {#if optionsOpen}
+      <div class="queue-options">
+        <button class="ghost-button save-queue-playlist" type="button" disabled={!player.queue.some(item => item.track_id)} onclick={saveQueue}>Save as playlist</button>
+        <button class="ghost-button clear-queue" type="button" disabled={busy || !player.queue.length} onclick={clearQueue}>Clear queue…</button>
+        <label class="autoplay-toggle" title="Keep playing similar tracks when the queue ends"><input type="checkbox" checked={autoplay.enabled} onchange={() => autoplay.toggle()} /><span>Autoplay</span></label>
+      </div>
+    {/if}
+    {#if message}
+      <div class="queue-feedback" role="status"><span>{message}</span>
+        {#if cleared && cleared.epoch === player.targetEpoch && !player.queue.length}<button class="ghost-button undo-clear" type="button" disabled={busy} onclick={undoClear}>Undo</button>{/if}
+      </div>
+    {/if}
     {#if player.queueActivity}
       <p class="queue-activity" role="status" aria-live="polite">{player.queueActivity}</p>
     {/if}
@@ -122,5 +156,10 @@
 {/if}
 
 <style>
+  .queue-head { flex-wrap:nowrap; }
+  .queue-head-actions { gap:4px; }
+  .queue-head-actions button { min-height:44px; padding:8px; }
+  .queue-options { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:0 16px 12px; }
+  .queue-feedback { display:flex; align-items:center; gap:8px; padding:8px 16px; color:var(--muted); font-size:.85rem; }
   .queue-activity { margin: 0.7rem 0; color: var(--muted); }
 </style>

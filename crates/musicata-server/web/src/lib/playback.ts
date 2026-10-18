@@ -42,6 +42,28 @@ export async function playTracks(
   });
 }
 
+/** Album cards load their tracks after the click; retain the selected output across that load. */
+export async function playAlbum(albumId: string, firstStreamUrl?: string): Promise<boolean> {
+  const target = player.target;
+  const epoch = player.targetEpoch;
+  if (!target) return false;
+  // Claim and start the known first stream while the user gesture is still active.
+  const primed = player.isBrowserOutput && !!firstStreamUrl;
+  if (player.isBrowserOutput) {
+    audio?.claim();
+    if (firstStreamUrl) audio?.primePlay(firstStreamUrl);
+  }
+  try {
+    const { tracks } = await api.albumDetail(albumId);
+    if (player.targetEpoch !== epoch) return false;
+    return playTracks(tracks, 0, target);
+  } catch (error) {
+    if (primed && player.targetEpoch === epoch) audio?.pause();
+    console.error("Could not play album", error);
+    return false;
+  }
+}
+
 /** Select a queue item while preserving the browser-output gesture required for audio playback. */
 export function playQueueIndex(index: number): void {
   const target = player.target;
