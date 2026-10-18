@@ -38,7 +38,7 @@
       server_host?: string;
       airplay_enabled?: boolean;
       spotify_enabled?: boolean;
-      active_input?: string;
+      route_all_input?: string;
       dsp_profile_id?: string;
     },
     note: string,
@@ -228,15 +228,14 @@
 
     {#if status.running && status.inputs.length > 1}
       <!-- Which input all rooms play. Applied live; only streams snapserver actually has appear. -->
-      <div class="admin-subhead">Playing in all rooms</div>
+      <div class="admin-subhead">Route all groups</div>
       <div class="input-picker">
         {#each status.inputs as input (input.id)}
           <button
             type="button"
             class="input-chip"
-            class:active={input.id === status.active_input}
             disabled={busy}
-            onclick={() => update({ active_input: input.id }, `Switched rooms to ${input.id}.`)}
+            onclick={() => update({ route_all_input: input.id }, `Routed all groups to ${input.id}.`)}
           >
             <span class="input-name">{input.id === "Musicata" ? "Library" : input.id}</span>
             {#if input.now_playing}<span class="input-now">{input.now_playing}</span>{/if}
@@ -419,10 +418,6 @@
     background: transparent;
     color: inherit;
     cursor: pointer;
-  }
-  .input-chip.active {
-    border-color: #d4af37;
-    background: rgba(212, 175, 55, 0.12);
   }
   .input-name {
     font-weight: 600;

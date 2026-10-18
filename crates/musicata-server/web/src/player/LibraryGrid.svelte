@@ -2,15 +2,16 @@
   // SPDX-License-Identifier: AGPL-3.0-or-later
   import { untrack, tick, onDestroy } from "svelte";
   import { api } from "../lib/api";
-  import type { Album } from "../types/Album";
+  import type { AlbumListItem } from "../lib/api";
   import { onVisible } from "../lib/dom";
   import { nav } from "../lib/nav.svelte";
   import { browse } from "../lib/browse.svelte";
   import { search } from "../lib/search.svelte";
+  import { albumTitleForDisplay, artistNameForDisplay } from "../lib/metadata-display";
   import AlbumCard from "./AlbumCard.svelte";
 
   const PAGE = 60;
-  let albums = $state<Album[]>([]);
+  let albums = $state<AlbumListItem[]>([]);
   let done = $state(false);
   let offset = 0;
   let loading = false;
@@ -73,7 +74,13 @@
 
 <div class="browse-grid">
   {#each albums as album (album.id)}
-    <AlbumCard {album} onopen={() => nav.push({ name: "album", id: album.id, title: album.title })} />
+    <AlbumCard
+      {album}
+      displayTitle={albumTitleForDisplay(album.title, album.display_hint)}
+      displayArtistName={artistNameForDisplay(album.artist_name)}
+      firstStreamUrl={album.display_hint?.first_track?.stream_url}
+      onopen={() => nav.push({ name: "album", id: album.id, title: album.title })}
+    />
   {/each}
 </div>
 {#if !done}<div class="scroll-sentinel" use:onVisible={loadMore}></div>{/if}

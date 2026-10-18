@@ -26,6 +26,17 @@ pub struct SnapClient {
     pub muted: bool,
 }
 
+/// A real Snapserver group: its member speakers hear its selected stream together. This is
+/// transport membership, deliberately separate from a Musicata playback zone and its queue.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct SnapGroup {
+    pub id: String,
+    pub name: String,
+    pub stream_id: String,
+    pub clients: Vec<SnapClient>,
+}
+
 /// A snapserver stream (the Musicata library stream, or an AirPlay/Spotify input).
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
@@ -87,16 +98,20 @@ impl SnapControl {
         }
     }
 
+    /// Every real Snapserver group, retaining the membership and route from its status record.
+    pub async fn groups(&self) -> Result<Vec<SnapGroup>> {
+        let status = self.call("Server.GetStatus", Value::Null).await?;
+        Ok(groups(&status).iter().map(parse_group).collect())
+    }
+
     /// Every client across all groups.
     pub async fn clients(&self) -> Result<Vec<SnapClient>> {
-        let status = self.call("Server.GetStatus", Value::Null).await?;
-        let mut clients = Vec::new();
-        for group in groups(&status) {
-            if let Some(array) = group.get("clients").and_then(|c| c.as_array()) {
-                clients.extend(array.iter().map(parse_client));
-            }
-        }
-        Ok(clients)
+        Ok(self
+            .groups()
+            .await?
+            .into_iter()
+            .flat_map(|group| group.clients)
+            .collect())
     }
 
     /// Set one client's output volume (0–100%), unmuting it.
@@ -124,18 +139,32 @@ impl SnapControl {
     /// Point every group at `stream` so all connected clients play it in sync. A no-op for a
     /// stream snapserver doesn't have (e.g. an input enabled but not yet live after a restart).
     pub async fn assign_all_to_stream(&self, stream: &str) -> Result<()> {
-        let status = self.call("Server.GetStatus", Value::Null).await?;
-        for group in groups(&status) {
-            let Some(id) = group.get("id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if group.get("stream_id").and_then(|v| v.as_str()) != Some(stream) {
-                let _ = self
-                    .call("Group.SetStream", json!({ "id": id, "stream_id": stream }))
-                    .await;
+        for group in self.groups().await? {
+            if group.stream_id != stream {
+                self.set_group_stream(&group.id, stream).await?;
             }
         }
         Ok(())
+    }
+
+    /// Replace the member list of one existing Snapserver group.
+    pub async fn set_group_clients(&self, group_id: &str, client_ids: &[String]) -> Result<()> {
+        self.call(
+            "Group.SetClients",
+            json!({ "id": group_id, "clients": client_ids }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Route one existing Snapserver group to one existing stream.
+    pub async fn set_group_stream(&self, group_id: &str, stream_id: &str) -> Result<()> {
+        self.call(
+            "Group.SetStream",
+            json!({ "id": group_id, "stream_id": stream_id }),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -209,5 +238,60 @@ fn parse_client(client: &Value) -> SnapClient {
             .pointer("/config/volume/muted")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+    }
+}
+
+fn parse_group(group: &Value) -> SnapGroup {
+    let id = group
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let name = group
+        .pointer("/config/name")
+        .and_then(|v| v.as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&id)
+        .to_string();
+    let clients = group
+        .get("clients")
+        .and_then(|clients| clients.as_array())
+        .map(|clients| clients.iter().map(parse_client).collect())
+        .unwrap_or_default();
+    SnapGroup {
+        id,
+        name,
+        stream_id: group
+            .get("stream_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        clients,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_group;
+    use serde_json::json;
+
+    #[test]
+    fn preserves_group_membership_and_stream_from_snapserver_status() {
+        let group = parse_group(&json!({
+            "id": "kitchen-group",
+            "config": { "name": "Kitchen" },
+            "stream_id": "AirPlay",
+            "clients": [{
+                "id": "kitchen-speaker",
+                "connected": true,
+                "config": { "name": "Kitchen speaker", "volume": { "percent": 42, "muted": false } }
+            }]
+        }));
+        assert_eq!(group.id, "kitchen-group");
+        assert_eq!(group.name, "Kitchen");
+        assert_eq!(group.stream_id, "AirPlay");
+        assert_eq!(group.clients.len(), 1);
+        assert_eq!(group.clients[0].id, "kitchen-speaker");
+        assert_eq!(group.clients[0].volume_percent, 42);
     }
 }

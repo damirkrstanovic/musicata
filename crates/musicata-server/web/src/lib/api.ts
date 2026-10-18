@@ -92,18 +92,26 @@ export interface AlbumDetail {
   album: Album;
   artist: Artist | null;
   tracks: TrackRow[];
+  display_hint: AlbumDisplayHint;
 }
+
+export type AlbumDisplayHint = {
+  folder_name: string | null;
+  first_track: { id: string; stream_url: string } | null;
+};
+
+export type AlbumListItem = Album & { display_hint?: AlbumDisplayHint };
 
 export interface ArtistDetail {
   artist: Artist;
-  albums: Album[];
+  albums: AlbumListItem[];
   tracks: TrackRow[];
 }
 
 export interface SearchResults {
   query: string;
   artists: Artist[];
-  albums: Album[];
+  albums: AlbumListItem[];
   tracks: TrackRow[];
 }
 
@@ -132,7 +140,7 @@ export interface SmartPlaylistDetail extends SmartPlaylist {
 
 export interface Favorites {
   tracks: TrackRow[];
-  albums: Album[];
+  albums: AlbumListItem[];
   artists: Artist[];
 }
 
@@ -271,7 +279,7 @@ export const api = {
   librarySummary: () => getJson<LibrarySummary>("/api/library/summary"),
   historyStats: () => getJson<HistoryStats>("/api/history/stats"),
   artists: (params?: ListParams) => getJson<Page<Artist>>("/api/artists", params),
-  albums: (params?: BrowseParams) => getJson<Page<Album>>("/api/albums", params),
+  albums: (params?: BrowseParams) => getJson<Page<AlbumListItem>>("/api/albums", params),
   tracks: (params?: BrowseParams) => getJson<Page<TrackRow>>("/api/tracks", params),
   browse: () => getJson<BrowseIndex>("/api/browse"),
 
@@ -329,8 +337,11 @@ export const api = {
     airplay_enabled?: boolean;
     spotify_enabled?: boolean;
     active_input?: string;
+    route_all_input?: string;
     dsp_profile_id?: string;
   }) => sendJson<SnapcastStatus>("/api/snapcast/status", "PATCH", update),
+  updateSnapcastGroup: (id: string, update: { client_ids?: string[]; stream_id?: string }) =>
+    sendJson<SnapcastStatus>(`/api/snapcast/groups/${encodeURIComponent(id)}`, "PATCH", update),
   snapcastRooms: () => getJson<SnapRoomView[]>("/api/snapcast/rooms"),
   addSnapcastRoom: (name: string) =>
     sendJson<SnapRoomView[]>("/api/snapcast/rooms", "POST", { name }),

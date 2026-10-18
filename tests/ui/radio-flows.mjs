@@ -65,16 +65,16 @@ export async function radioFlows({js, api, check, waitUntil, clickText, screensh
   check('directory retry recovers', await waitUntil(`!document.querySelector('.radio-directory [role="alert"]') && document.querySelector('.directory-station')`, 3000) < Infinity);
   await js(`window.__radioNextStation = true; document.querySelector('.radio-search').requestSubmit()`);
   await waitUntil(`document.querySelector('.directory-station')?.textContent.includes('Deferred FM')`, 3000);
-  const selected = await js(`document.querySelector('.player-switch-btn').value`);
+  const selected = await js(`document.querySelector('.output-option[aria-pressed="true"]').dataset.output`);
   const before = await js(`window.__radioPlaySends || 0`);
   await js(`window.__radioHoldSave = true`);
   await clickText('.directory-station button', 'Play');
   check('directory play awaits station save', await waitUntil(`window.__radioReleaseSave`, 3000) < Infinity);
-  await js(`(() => {const s=document.querySelector('.player-switch-btn'); const option=[...s.options].find(o=>o.value !== s.value); s.value=option.value; s.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await js(`(() => {document.querySelector('.output-option[aria-pressed="false"]')?.click();})()`);
   await js(`window.__radioReleaseSave?.()`);
   await waitUntil(`document.querySelector('.radio-saved')?.textContent.includes('Deferred FM')`, 3000);
   check('output switch cancels pending directory playback', await js(`(window.__radioPlaySends || 0) === ${before}`));
-  await js(`(() => {const s=document.querySelector('.player-switch-btn'); s.value=${JSON.stringify(selected)}; s.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await js(`(() => {[...document.querySelectorAll('.output-option')].find(o=>o.dataset.output === ${JSON.stringify(selected)})?.click();})()`);
   await screenshot('desktop-radio');
   await js(`window.__restoreDirectory()`);
 }

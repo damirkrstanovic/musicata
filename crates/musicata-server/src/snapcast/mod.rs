@@ -25,7 +25,7 @@ mod server;
 mod stream;
 mod writer;
 
-pub use control::{SnapClient, SnapControl, SnapStream};
+pub use control::{SnapClient, SnapControl, SnapGroup, SnapStream};
 pub use dsp::StereoEq;
 pub(crate) use library::{LibraryStream, stream_track as stream_library_track};
 pub use server::{

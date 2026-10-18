@@ -43,6 +43,15 @@ pub struct Database {
     queue_cache: queue_cache::QueueCache,
 }
 
+/// A single album card's safe display and playback preload data. Neither value
+/// changes the album's canonical metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlbumBrowseHint {
+    pub folder_name: Option<String>,
+    pub first_track_id: String,
+    pub first_stream_url: String,
+}
+
 /// Register the sqlite-vec extension as a global SQLite auto-extension, once per process, so
 /// every connection this process opens (sqlx shares the bundled SQLite) gets the `vec0` virtual
 /// table. Standard for all Musicata instances, not gated behind ML — the audio-embedding index
@@ -1328,6 +1337,53 @@ impl Database {
             albums.push(album_from_row(&row)?);
         }
         Ok((albums, total))
+    }
+
+    /// The final directory name for one track in each requested album.  This is a
+    /// presentation hint only; callers must not treat it as canonical metadata.
+    pub async fn album_browse_hints(
+        &self,
+        album_ids: &[String],
+    ) -> Result<BTreeMap<String, AlbumBrowseHint>> {
+        if album_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let placeholders = vec!["?"; album_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT album_id, relative_path, id, stream_url FROM (
+                SELECT album_id, relative_path, id, stream_url,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY album_id
+                           ORDER BY disc_number, track_number, title
+                       ) AS track_rank
+                FROM tracks WHERE album_id IN ({placeholders})
+             ) WHERE track_rank = 1"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in album_ids {
+            query = query.bind(id);
+        }
+        let rows = query.fetch_all(&self.reads).await?;
+        let mut hints = BTreeMap::new();
+        for row in rows {
+            let album_id: String = row.try_get("album_id")?;
+            let relative_path: String = row.try_get("relative_path")?;
+            let folder_name = relative_path
+                .rsplit_once('/')
+                .and_then(|(folder, _)| folder.rsplit('/').next())
+                .map(str::trim)
+                .filter(|folder| !folder.is_empty())
+                .map(str::to_owned);
+            hints.insert(
+                album_id,
+                AlbumBrowseHint {
+                    folder_name,
+                    first_track_id: row.try_get("id")?,
+                    first_stream_url: row.try_get("stream_url")?,
+                },
+            );
+        }
+        Ok(hints)
     }
 
     /// Albums ordered by how recently they were added — each album's most recent track

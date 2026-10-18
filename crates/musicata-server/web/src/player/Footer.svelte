@@ -9,8 +9,9 @@
   import { sendCommand, type PlayerCommand } from "../lib/commands";
   import type { RepeatMode } from "../types/RepeatMode";
   import SeekBar from "./SeekBar.svelte";
+  import PlaybackIcon from "./PlaybackIcon.svelte";
 
-  let { onexpand, inert = false }: { onexpand: () => void; inert?: boolean } = $props();
+  let { onexpand, onqueue, inert = false }: { onexpand: () => void; onqueue: () => void; inert?: boolean } = $props();
 
   const REPEAT_NEXT: Record<RepeatMode, RepeatMode> = { off: "all", all: "one", one: "off" };
 
@@ -37,7 +38,7 @@
       {/if}
     </button>
     <div class="now-text">
-      <button class="now-title-button" type="button" onclick={onexpand} aria-label="Show Now Playing and queue"><strong id="now-title"
+      <button class="now-title-button" type="button" onclick={onexpand} aria-label="Show Now Playing"><strong id="now-title"
         >{player.nowPlaying?.title ??
           (player.connection === "online"
             ? "Nothing playing"
@@ -61,10 +62,10 @@
   <div class="mini-controls">
     <button class="control play" type="button"
       aria-label={player.status === "playing" && !player.playBlocked ? "Pause" : "Play"}
-      onclick={() => togglePlayback()}>{player.status === "playing" && !player.playBlocked ? "❚❚" : "▶"}</button>
-    <button class="control" type="button" aria-label="Next" onclick={() => next()}>⏭</button>
+      onclick={() => togglePlayback()}><PlaybackIcon name={player.status === "playing" && !player.playBlocked ? "pause" : "play"} /></button>
+    <button class="control" type="button" aria-label="Next" onclick={() => next()}><PlaybackIcon name="next" /></button>
     <button class="control" type="button" aria-label="Queue" aria-expanded={player.queueOpen}
-      onclick={() => (player.queueOpen = !player.queueOpen)}>Queue</button>
+      onclick={onqueue}><PlaybackIcon name="queue" /></button>
   </div>
 
   <SeekBar />
@@ -75,27 +76,28 @@
         class="toggle"
         class:active={player.shuffle}
         type="button"
-        title="Shuffle"
+        title="Shuffle" aria-label="Shuffle"
         aria-pressed={player.shuffle}
-        onclick={() => send({ command: "set_shuffle", enabled: !player.shuffle })}>⤨</button
+        onclick={() => send({ command: "set_shuffle", enabled: !player.shuffle })}><PlaybackIcon name="shuffle" /></button
       >
-      <button class="control" type="button" title="Previous" onclick={() => previous()}>⏮</button>
+      <button class="control" type="button" title="Previous" aria-label="Previous" onclick={() => previous()}><PlaybackIcon name="previous" /></button>
       <button
         class="control play"
         class:needs-tap={player.playBlocked}
         type="button"
         title={player.status === "playing" && !player.playBlocked ? "Pause" : "Play"}
+        aria-label={player.status === "playing" && !player.playBlocked ? "Pause" : "Play"}
         onclick={() => togglePlayback()}
-        >{player.status === "playing" && !player.playBlocked ? "❚❚" : "▶"}</button
+        ><PlaybackIcon name={player.status === "playing" && !player.playBlocked ? "pause" : "play"} /></button
       >
-      <button class="control" type="button" title="Next" onclick={() => next()}>⏭</button>
+      <button class="control" type="button" title="Next" aria-label="Next" onclick={() => next()}><PlaybackIcon name="next" /></button>
       <button
         class="toggle"
         class:active={player.repeat !== "off"}
         type="button"
-        title="Repeat"
+        title="Repeat" aria-label={`Repeat: ${player.repeat}`}
         data-mode={player.repeat}
-        onclick={() => send({ command: "set_repeat", mode: REPEAT_NEXT[player.repeat] })}>↻</button
+        onclick={() => send({ command: "set_repeat", mode: REPEAT_NEXT[player.repeat] })}><PlaybackIcon name="repeat" /></button
       >
     </div>
   </div>
@@ -177,7 +179,7 @@
       title="Queue"
       aria-label="Queue"
       aria-pressed={player.queueOpen}
-      onclick={() => (player.queueOpen = !player.queueOpen)}
+      onclick={onqueue}
     >
       <span class="queue-glyph">Queue</span><span class="queue-count">{player.queue.length}</span>
     </button>

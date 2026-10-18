@@ -14,7 +14,10 @@ export async function curationFlows({ js, api, check, waitUntil, clickText }) {
   // mistake the prior queue for the local-track queue that this control must save.
   await js('if (!document.querySelector(".queue-drawer")) document.querySelector("[aria-label=Queue]")?.click()');
   await waitUntil('document.querySelector(".queue-drawer")', 1000);
-  await js('[...document.querySelectorAll(".queue-head button")].find(button => button.textContent.trim() === "Clear")?.click()');
+  await js('document.querySelector(".queue-options-toggle")?.click()');
+  await js('document.querySelector(".clear-queue")?.click()');
+  await waitUntil('document.querySelector(".modal")', 1000);
+  await js('document.querySelector(".modal .primary-button")?.click()');
   await waitUntil('document.querySelectorAll(".queue-row").length === 0', 2000);
   await closeQueue();
 
@@ -25,6 +28,7 @@ export async function curationFlows({ js, api, check, waitUntil, clickText }) {
   const queued = !!firstTitle && await waitUntil(`document.querySelectorAll('.queue-row')[0]?.querySelector('.q-title')?.textContent === ${JSON.stringify(firstTitle)}`, 3000) < Infinity;
   check('curation: track play creates a queue', queued);
   if (!queued) return closeQueue();
+  await js('if (!document.querySelector(".save-queue-playlist")) document.querySelector(".queue-options-toggle")?.click()');
   const saveState = await js(`(() => {
     const save = document.querySelector('.queue-drawer .save-queue-playlist');
     return save ? { disabled: save.disabled, queue: [...document.querySelectorAll('.queue-row .q-title')].map(row => row.textContent) } : null;

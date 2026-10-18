@@ -428,3 +428,12 @@ Snapcast source `../snapcast`: `doc/binary_protocol.md`, `doc/configuration.md`,
 `client/controller.cpp`, `server/etc/snapserver.conf`. Musicata: `crates/musicata-server/src/
 players.rs` (PlayerHandle, ZonePlayer), `main.rs` (stream_track, player WS),
 `fingerprint.rs` (symphonia decode pattern).
+
+## Group controls (1.8.4)
+
+The output picker displays Snapcast groups with their member speakers. Selecting an
+output only changes the controller target; administrators edit membership and stream
+routing separately. Status reads never change routing. Each group can select a live
+Musicata, AirPlay or Spotify stream; “Route all groups” is an explicit action that reports
+RPC failures before saving the selection. Musicata currently supplies one shared FIFO
+and playback queue, so these groups are not independent Musicata playback zones.
