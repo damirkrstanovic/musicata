@@ -134,20 +134,19 @@ fn capture(db: &Path, kind: ProfileKind, seconds: u64) -> anyhow::Result<()> {
                     })
                     .build()?;
                 drop(guard);
-                let stacks = report
-                    .data
-                    .into_iter()
-                    .filter(|(_, count)| *count > 0)
-                    .map(|(frames, count)| {
+                let stacks = report.data.into_iter().filter(|(_, count)| *count > 0).map(
+                    |(frames, count)| {
                         let names = frames
                             .frames
                             .iter()
                             .rev()
-                            .flat_map(|symbols| symbols.iter().rev().map(|symbol| symbol.name()))
+                            .flat_map(|symbols| symbols.iter().rev())
+                            .take(64)
+                            .map(|symbol| symbol.name())
                             .collect();
                         (names, count as u64)
-                    })
-                    .collect();
+                    },
+                );
                 render_flamegraph(stacks)?
             }
             ProfileKind::Heap => capture_heap(db, seconds)?,
@@ -163,7 +162,9 @@ fn capture(db: &Path, kind: ProfileKind, seconds: u64) -> anyhow::Result<()> {
 }
 // A small static flamegraph: widths represent inclusive sample counts, root at bottom.
 // Function names are the only profiler metadata serialized; no filenames or thread IDs.
-fn render_flamegraph(stacks: Vec<(Vec<String>, u64)>) -> anyhow::Result<Vec<u8>> {
+fn render_flamegraph(
+    stacks: impl IntoIterator<Item = (Vec<String>, u64)>,
+) -> anyhow::Result<Vec<u8>> {
     use std::{collections::BTreeMap, io::Write};
     #[derive(Default)]
     struct Node {
@@ -208,7 +209,9 @@ fn render_flamegraph(stacks: Vec<(Vec<String>, u64)>) -> anyhow::Result<Vec<u8>>
     let mut root = Node::default();
     let mut nodes = 0;
     let mut max_depth = 0;
-    for (frames, count) in stacks {
+    let mut input_bytes = 0usize;
+    for (stack_index, (frames, count)) in stacks.into_iter().enumerate() {
+        anyhow::ensure!(stack_index < 8192, "profile exceeds stack limit");
         if count == 0 {
             continue;
         }
@@ -217,6 +220,11 @@ fn render_flamegraph(stacks: Vec<(Vec<String>, u64)>) -> anyhow::Result<Vec<u8>>
         let mut node = &mut root;
         for frame in frames.into_iter().take(64) {
             anyhow::ensure!(frame.len() <= 16384, "profile symbol exceeds size limit");
+            input_bytes = input_bytes.saturating_add(frame.len());
+            anyhow::ensure!(
+                input_bytes <= ARTIFACT_LIMIT,
+                "profile input exceeds size limit"
+            );
             if !node.children.contains_key(&frame) {
                 nodes += 1;
                 anyhow::ensure!(nodes <= 8192, "profile exceeds stack limit");
@@ -514,6 +522,11 @@ mod tests {
         assert!(!text.contains("a<&>"));
         assert!(render_flamegraph(Vec::new()).is_ok());
         assert!(render_flamegraph(vec![(vec!["x".repeat(ARTIFACT_LIMIT)], 1)]).is_err());
+    }
+    #[test]
+    fn flamegraph_limits_repeated_input_before_rendering() {
+        let stacks = (0..3000).map(|_| (vec!["x".repeat(1024)], 1));
+        assert!(render_flamegraph(stacks).is_err());
     }
     #[test]
     fn profile_output_is_bounded() {
