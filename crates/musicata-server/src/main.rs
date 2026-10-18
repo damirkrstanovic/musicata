@@ -1380,10 +1380,7 @@ async fn loudness_pass(
     let after = after
         .as_ref()
         .map(|(artist, title, id)| (artist.as_str(), title.as_str(), id.as_str()));
-    let targets = match database
-        .tracks_missing_loudness(after, LOUDNESS_BATCH)
-        .await
-    {
+    let targets = match database.poll_missing_loudness(after, LOUDNESS_BATCH).await {
         Ok(targets) => targets,
         Err(error) => {
             tracing::warn!(%error, "loudness: failed to list tracks");
@@ -2164,7 +2161,7 @@ async fn fingerprint_pass(
 
     let retry_before = now_unix_seconds() - FINGERPRINT_RETRY_SECS;
     let targets = match database
-        .tracks_missing_fingerprints(retry_before, FINGERPRINT_BATCH)
+        .poll_missing_fingerprints(retry_before, FINGERPRINT_BATCH)
         .await
     {
         Ok(targets) => targets,
@@ -2540,10 +2537,7 @@ async fn musicbrainz_search_pass(
         return false;
     }
     diagnostics::runtime::state("musicbrainz", "idle");
-    let targets = match database
-        .tracks_for_musicbrainz_search(MB_SEARCH_BATCH)
-        .await
-    {
+    let targets = match database.poll_musicbrainz_search(MB_SEARCH_BATCH).await {
         Ok(targets) => targets,
         Err(error) => {
             tracing::warn!(%error, "musicbrainz search: failed to list targets");
@@ -2683,7 +2677,7 @@ async fn musicbrainz_enrich_pass(
 
     let retry_before = now_unix_seconds() - MB_ENRICH_RETRY_SECS;
     let targets = match database
-        .tracks_missing_musicbrainz_metadata(retry_before, MB_ENRICH_BATCH)
+        .poll_missing_musicbrainz_metadata(retry_before, MB_ENRICH_BATCH)
         .await
     {
         Ok(targets) => targets,
@@ -10557,6 +10551,29 @@ mod tests {
                 .count(),
             20
         );
+        // Ensure a checkpoint exists even when every concurrent deletion wins its race.
+        assert_eq!(
+            request(
+                router.clone(),
+                "PUT",
+                "/api/players/browser-local/dsp",
+                r#"{"profile_id":"profile-0","enabled":true}"#.into()
+            )
+            .await,
+            StatusCode::OK
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while database
+                .player_dsp("browser-local")
+                .await
+                .unwrap()
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial DSP checkpoint");
         for n in 0..20 {
             let path = format!("/api/dsp/profiles/profile-{n}");
             let selection = format!(r#"{{"profile_id":"profile-{n}","enabled":true}}"#);
@@ -10572,7 +10589,20 @@ mod tests {
             assert_eq!(deleted, StatusCode::NO_CONTENT);
             assert!(selected == StatusCode::OK || selected == StatusCode::BAD_REQUEST);
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while database
+                .player_dsp("browser-local")
+                .await
+                .unwrap()
+                .unwrap()
+                .profile_id
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deleted DSP selection checkpoint");
         let response = router
             .oneshot(
                 Request::builder()

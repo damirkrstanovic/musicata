@@ -609,8 +609,8 @@ if (remoteOutput) {
   await mobileScreenshot("desktop-remote-eq-vu");
   clearInterval(publish);
   remoteSocket.close();
-  await sleep(1200);
-  check("disconnected remote levels expire",await js('document.querySelector(".vu-drawer")?.dataset.available === "false"'));
+  check("disconnected remote levels expire",
+    await waitUntil('document.querySelector(".vu-drawer")?.dataset.available === "false"', 3000) < Infinity);
   await clickText(".vu-head button", "Close");
   await js(`(()=>{const s=document.querySelector('select[aria-label="Output"]');s.value='player:browser-local';s.dispatchEvent(new Event('change',{bubbles:true}));})()`);
   await sleep(300);

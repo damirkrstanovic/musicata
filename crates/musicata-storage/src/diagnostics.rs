@@ -113,6 +113,14 @@ impl DiagnosticStore {
         Ok(())
     }
     pub async fn write_batch(&self, batch: &DiagnosticBatch) -> Result<()> {
+        if batch.events.is_empty()
+            && batch.summaries.is_empty()
+            && batch.dropped == 0
+            && batch.storage_gaps == 0
+            && batch.reported_lost == 0
+        {
+            return Ok(());
+        }
         use musicata_core::diagnostics::DiagnosticAction;
         anyhow::ensure!(batch.events.len() <= 128, "diagnostic batch exceeds limit");
         self.ensure_wal_room().await?;
@@ -380,6 +388,39 @@ mod tests {
             ..Default::default()
         }
     }
+    #[tokio::test]
+    async fn loss_only_batches_are_persisted() {
+        let store = DiagnosticStore::open(&path()).await.unwrap();
+        store
+            .write_batch(&DiagnosticBatch {
+                dropped: 2,
+                storage_gaps: 3,
+                reported_lost: 4,
+                ..DiagnosticBatch::default()
+            })
+            .await
+            .unwrap();
+        let snapshot = store.snapshot(0).await.unwrap();
+        assert_eq!(
+            (
+                snapshot.dropped,
+                snapshot.storage_gaps,
+                snapshot.reported_lost
+            ),
+            (2, 3, 4)
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_batch_needs_no_database_connection() {
+        let store = DiagnosticStore::open(&path()).await.unwrap();
+        store.pool.close().await;
+        store
+            .write_batch(&DiagnosticBatch::default())
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn incidents_survive_restart_and_aggregate_with_recovery() {
         let path = path();
