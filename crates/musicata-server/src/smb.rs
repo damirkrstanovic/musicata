@@ -369,6 +369,44 @@ pub struct SmbProvider {
 }
 
 impl SmbProvider {
+    /// Open audio for a blocking decoder. One handle and one read-ahead block;
+    /// unlike artwork, audio has no whole-file size cap or whole-file allocation.
+    pub async fn open_audio(
+        &self,
+        item_id: &str,
+    ) -> anyhow::Result<Box<dyn symphonia::core::io::MediaSource>> {
+        let (slot, client) = self.pool.get().await?;
+        let unc = self.config.item_unc(item_id)?;
+        let opened = tokio::time::timeout(READ_TIMEOUT, async {
+            let Resource::File(file) = client.create_file(&unc, &open_read_args()).await? else {
+                anyhow::bail!("audio source is not a file");
+            };
+            let len = file.get_len().await?;
+            Ok::<_, anyhow::Error>((file, len))
+        })
+        .await;
+        let (file, len) = match opened {
+            Ok(Ok(opened)) => opened,
+            Ok(Err(error)) => {
+                self.pool.invalidate(slot).await;
+                return Err(error.context("open audio"));
+            }
+            Err(error) => {
+                self.pool.invalidate(slot).await;
+                return Err(anyhow!("open audio timed out: {error}"));
+            }
+        };
+        Ok(Box::new(CachingReader::new(
+            AudioReader {
+                file,
+                handle: Handle::current(),
+                pool: self.pool.clone(),
+                slot,
+            },
+            len,
+        )))
+    }
+
     pub fn from_record(record: &SourceRecord) -> anyhow::Result<Self> {
         let config = SmbConfig::from_record(record)?;
         Ok(Self {
@@ -891,6 +929,32 @@ trait BlockingReadAt {
     }
 }
 
+struct AudioReader {
+    file: File,
+    handle: Handle,
+    pool: Arc<SmbPool>,
+    slot: usize,
+}
+
+impl BlockingReadAt for AudioReader {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.handle.block_on(async {
+            let result =
+                match tokio::time::timeout(READ_TIMEOUT, self.file.read_at(buf, offset)).await {
+                    Ok(result) => result.map_err(smb_io_error),
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "SMB audio read timed out",
+                    )),
+                };
+            if result.is_err() {
+                self.pool.invalidate(self.slot).await;
+            }
+            result
+        })
+    }
+}
+
 /// Drives `smb::File::read_at` synchronously from a blocking thread.
 struct SmbFileReader {
     file: File,
@@ -941,21 +1005,40 @@ impl<R: BlockingReadAt> CachingReader<R> {
     fn fill_cache(&mut self) -> io::Result<()> {
         let start = self.pos;
         let want = READ_BLOCK_BYTES.min((self.len - start) as usize);
-        let mut block = vec![0u8; want];
+        self.cache.clear();
+        self.cache.resize(want, 0);
+        self.cache_start = start;
         let mut filled = 0usize;
         while filled < want {
             let read = self
                 .reader
-                .read_at(&mut block[filled..], start + filled as u64)?;
+                .read_at(&mut self.cache[filled..], start + filled as u64);
+            let read = match read {
+                Ok(read) => read,
+                Err(error) => {
+                    self.cache.clear();
+                    return Err(error);
+                }
+            };
             if read == 0 {
-                break;
+                self.cache.clear();
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SMB file ended before its reported length",
+                ));
             }
             filled += read;
         }
-        block.truncate(filled);
-        self.cache = block;
-        self.cache_start = start;
         Ok(())
+    }
+}
+
+impl<R: BlockingReadAt + Send + Sync> symphonia::core::io::MediaSource for CachingReader<R> {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.len)
     }
 }
 
@@ -1001,6 +1084,71 @@ impl<R: BlockingReadAt> Seek for CachingReader<R> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    /// Opt-in integration: a loopback Samba share named analysis-test containing
+    /// large.wav (>32 MiB), with test/test credentials. Never uses a real library.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires isolated loopback Samba fixture"]
+    async fn large_smb_audio_analysis_streams_to_completion() {
+        let provider = SmbProvider::from_record(&SourceRecord {
+            id: "test-smb".into(),
+            kind: "smb".into(),
+            display_name: "test".into(),
+            enabled: true,
+            host: Some("127.0.0.1".into()),
+            share: Some("analysis-test".into()),
+            base_path: None,
+            username: Some("test".into()),
+            password: Some("test".into()),
+            domain: None,
+            created_at_unix_seconds: 0,
+        })
+        .unwrap();
+        // Prove this fixture hits the old artwork limit, then use the audio path.
+        assert!(
+            provider
+                .read_file("large.wav")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("artwork limit")
+        );
+        for cycle in 0..3 {
+            let source = provider.open_audio("large.wav").await.unwrap();
+            assert!(source.byte_len().unwrap() > 32 * 1024 * 1024);
+            let (source, failed) = crate::analysis_source::TrackedSource::new(source);
+            let fingerprint = tokio::task::spawn_blocking(move || {
+                crate::fingerprint::compute_fingerprint_source(Box::new(source), "wav")
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(!fingerprint.0.is_empty());
+            assert!(!failed.load(Ordering::Relaxed));
+            let source = provider.open_audio("large.wav").await.unwrap();
+            let (source, failed) = crate::analysis_source::TrackedSource::new(source);
+            let (lufs, peak) = tokio::task::spawn_blocking(move || {
+                crate::loudness::analyze_loudness_source(
+                    Box::new(source),
+                    "wav",
+                    Duration::from_secs(120),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(lufs.is_finite() && peak.is_finite());
+            assert!(!failed.load(Ordering::Relaxed));
+            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+                for line in status
+                    .lines()
+                    .filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
+                {
+                    eprintln!("analysis cycle {cycle}: {line}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn joins_smb_paths() {
@@ -1105,5 +1253,42 @@ mod tests {
             reader.read_exact(&mut byte).unwrap();
         }
         assert_eq!(reader.reader.reads(), 1, "1000 small reads → 1 SMB read");
+    }
+
+    #[test]
+    fn truncated_source_is_an_error_not_successful_audio_eof() {
+        let mut reader = CachingReader::new(
+            FakeReader {
+                data: vec![1; 16],
+                reads: Cell::new(0),
+            },
+            32,
+        );
+        let error = reader.read(&mut [0; 32]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn large_audio_reads_use_a_bounded_cache() {
+        struct LargeFile;
+        impl BlockingReadAt for LargeFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                assert!(buf.len() <= 256 * 1024);
+                for (i, byte) in buf.iter_mut().enumerate() {
+                    *byte = (offset + i as u64) as u8;
+                }
+                Ok(buf.len())
+            }
+        }
+        let mut reader = CachingReader::new(LargeFile, 512 * 1024 * 1024);
+        reader.seek(SeekFrom::Start(40 * 1024 * 1024 + 7)).unwrap();
+        let mut bytes = [0; 4];
+        reader.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [7, 8, 9, 10]);
+        reader.seek(SeekFrom::End(-4)).unwrap();
+        reader.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [252, 253, 254, 255]);
+        assert_eq!(reader.read(&mut bytes).unwrap(), 0);
+        assert!(reader.cache.capacity() <= 256 * 1024);
     }
 }

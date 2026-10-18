@@ -3195,7 +3195,59 @@ impl Database {
         if unchanged {
             return Ok(0);
         }
+        // Multiple track overrides can spell the same album artist differently.
+        // Aggregation keeps one representative name, so comparing each override
+        // with that name never converges. Compare the resulting canonical state
+        // before writing, without cloning audio metadata/provenance for every track.
+        let canonical_state = |library: &Library| {
+            (
+                library
+                    .tracks
+                    .iter()
+                    .map(|t| {
+                        (
+                            t.id.clone(),
+                            (
+                                t.title.clone(),
+                                t.artist_id.clone(),
+                                t.artist_name.clone(),
+                                t.album_id.clone(),
+                                t.album_title.clone(),
+                                t.year,
+                                t.track_number,
+                                t.disc_number,
+                            ),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+                library
+                    .albums
+                    .iter()
+                    .map(|a| {
+                        (
+                            a.id.clone(),
+                            (
+                                a.title.clone(),
+                                a.artist_id.clone(),
+                                a.artist_name.clone(),
+                                a.year,
+                                a.track_count,
+                            ),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+                library
+                    .artists
+                    .iter()
+                    .map(|a| (a.id.clone(), (a.name.clone(), a.album_count, a.track_count)))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        };
+        let before = canonical_state(&library);
         let mut regrouped = regroup_library_with_overrides(library, &overrides, &aliases);
+        if canonical_state(&regrouped) == before {
+            return Ok(0);
+        }
         let applied = overrides.len() as u64;
         self.save_library(&mut regrouped).await?;
         Ok(applied)
@@ -10090,6 +10142,57 @@ mod tests {
         assert_eq!(rescanned.tracks[0].artist_name, "Canonical");
         assert_eq!(rescanned.albums[0].artist_name, "Canonical");
         database.pool.close().await;
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn canonical_album_artist_variants_do_not_rewrite_library_forever() {
+        let db_path = temp_db_path("album-artist-reapply");
+        let database = Database::connect(&db_path).await.unwrap();
+        let mut library = fixture_library();
+        let mut second = library.tracks[0].clone();
+        second.id = "track_2".into();
+        second.provider.item_id = "album/song2.mp3".into();
+        second.path = PathBuf::from("/music/album/song2.mp3");
+        second.relative_path = "album/song2.mp3".into();
+        library.tracks.push(second);
+        database.save_library(&mut library).await.unwrap();
+        for (id, artist) in [("track_1", "The Example"), ("track_2", "Example")] {
+            database
+                .upsert_track_musicbrainz_metadata(
+                    id,
+                    "resolved",
+                    &ResolvedMusicBrainzMetadata {
+                        album_artist_name: Some(artist.into()),
+                        ..Default::default()
+                    },
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+        database.reapply_canonical_grouping().await.unwrap();
+        let library = database.load_library().await.unwrap().unwrap();
+        assert_eq!(
+            library.albums.len(),
+            1,
+            "safe artist variants share one album"
+        );
+        let writer = database.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            database.reapply_canonical_grouping(),
+        )
+        .await;
+        writer.rollback().await.unwrap();
+        assert_eq!(
+            result
+                .expect("equivalent album-artist spellings triggered another rewrite")
+                .unwrap(),
+            0
+        );
+        database.pool.close().await;
+        database.reads.close().await;
         let _ = std::fs::remove_file(db_path);
     }
 

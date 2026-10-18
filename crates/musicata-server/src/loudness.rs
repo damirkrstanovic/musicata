@@ -5,9 +5,11 @@
 //! synchronous, CPU-heavy (a full decode per track) — the caller runs it on `spawn_blocking`
 //! from the `loudness_loop`, and the result is cached in `track_loudness` (analyzed once).
 
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
+#[cfg(test)]
+use std::io::Cursor;
 use std::time::{Duration, Instant};
 
+use crate::analysis_source::DeadlineSource;
 use ebur128::{EbuR128, Mode};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
@@ -16,43 +18,6 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-
-/// A `MediaSource` that stops serving bytes once a wall-clock deadline passes. Format probing
-/// (which can scan a whole malformed file before the decode loop even starts) and every
-/// `next_packet` read flow through this, so the deadline bounds *all* the decode work — not just
-/// the loop. After the deadline, reads return `TimedOut`, so `symphonia` aborts with an error.
-struct DeadlineSource {
-    inner: Cursor<Vec<u8>>,
-    deadline: Instant,
-}
-
-impl Read for DeadlineSource {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if Instant::now() >= self.deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "loudness analysis budget exceeded",
-            ));
-        }
-        self.inner.read(buf)
-    }
-}
-
-impl Seek for DeadlineSource {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.inner.seek(pos)
-    }
-}
-
-impl MediaSource for DeadlineSource {
-    fn is_seekable(&self) -> bool {
-        true
-    }
-
-    fn byte_len(&self) -> Option<u64> {
-        Some(self.inner.get_ref().len() as u64)
-    }
-}
 
 /// Floor for silent / below-gate tracks: `loudness_global` returns -inf when nothing crosses
 /// the absolute gate, which would produce an absurd leveling boost — clamp it.
@@ -66,16 +31,22 @@ const SILENCE_LUFS: f64 = -70.0;
 /// bytes — this runs in `spawn_blocking`, which can't be cancelled from outside, so the bound
 /// must be internal. Exceeding the budget returns `Err`; the caller marks the track
 /// un-measurable so it isn't retried, rather than the loudness loop spinning on it.
+#[cfg(test)]
 pub fn analyze_loudness(
     audio: &[u8],
     extension: &str,
     max_wall: Duration,
 ) -> Result<(f64, f64), String> {
+    analyze_loudness_source(Box::new(Cursor::new(audio.to_vec())), extension, max_wall)
+}
+
+pub fn analyze_loudness_source(
+    source: Box<dyn MediaSource>,
+    extension: &str,
+    max_wall: Duration,
+) -> Result<(f64, f64), String> {
     let deadline = Instant::now() + max_wall;
-    let source = DeadlineSource {
-        inner: Cursor::new(audio.to_vec()),
-        deadline,
-    };
+    let source = DeadlineSource::new(source, deadline);
     let stream = MediaSourceStream::new(Box::new(source), Default::default());
     let mut hint = Hint::new();
     hint.with_extension(extension);

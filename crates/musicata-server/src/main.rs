@@ -15,6 +15,7 @@
 // program. If not, see <https://www.gnu.org/licenses/>.
 
 mod activity;
+mod analysis_source;
 #[cfg(feature = "provider-archive")]
 mod archive_org;
 mod artwork;
@@ -1307,10 +1308,9 @@ async fn autoplay_candidates(
 const LOUDNESS_BATCH: i64 = 200;
 /// Concurrent decodes. Loudness analysis is pure-CPU (decode + R128), so a few across cores.
 const LOUDNESS_CONCURRENCY: usize = 4;
-/// Wall-clock budget for a single track's full decode. Generous enough for any real track (even
-/// a multi-hour mix decodes in seconds), so exceeding it means a malformed/pathological file —
-/// abandon it (marked un-measurable) rather than let it pin a core and spin the loudness loop.
-const LOUDNESS_MAX_WALL: Duration = Duration::from_secs(30);
+/// Wall-clock budget for decoding and streaming a track, including network reads.
+/// Allow large lossless tracks on slower shares while bounding pathological decodes.
+const LOUDNESS_MAX_WALL: Duration = Duration::from_secs(300);
 
 /// Analyze one batch of un-measured tracks, starting after `after` in `(artist, title, id)`
 /// order. Returns the cursor to continue from (the last track in the batch, whether or not it
@@ -1372,7 +1372,7 @@ async fn loudness_pass(
         workers.spawn(async move {
             let _permit = permit;
             // An unreadable file is skipped (not marked), so a transient failure is retried.
-            let audio = match read_track_source_file(&providers, &target).await {
+            let audio = match open_track_analysis_source(&providers, &target).await {
                 Ok(audio) => audio,
                 Err(error) => {
                     diagnostics::failure("source.read", "loudness", None, &error.to_string());
@@ -1381,12 +1381,18 @@ async fn loudness_pass(
                 }
             };
             diagnostics::recovery("source.read", "loudness", None);
+            let (audio, read_failed) = analysis_source::TrackedSource::new(audio);
             let extension = target.extension.clone();
             let result = tokio::task::spawn_blocking(move || {
-                loudness::analyze_loudness(&audio, &extension, LOUDNESS_MAX_WALL)
+                loudness::analyze_loudness_source(Box::new(audio), &extension, LOUDNESS_MAX_WALL)
             })
             .await
             .unwrap_or_else(|_| Err("analysis task panicked".to_string()));
+            if read_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                diagnostics::failure("source.read", "loudness", None, "audio source read failed during analysis");
+                done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return; // Do not cache an incomplete decode; retry a transient read failure.
+            }
             let now = now_unix_seconds();
             match result {
                 Ok((lufs, true_peak)) => {
@@ -2105,17 +2111,20 @@ async fn fingerprint_pass(
             let _permit = permit;
             // Read the audio (SMB or local); an unreadable file is skipped (not marked, so
             // a transient failure is retried).
-            let Ok(audio) = read_track_source_file(&providers, &target).await else {
+            let Ok(audio) = open_track_analysis_source(&providers, &target).await else {
                 done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return;
             };
+            let (audio, read_failed) = analysis_source::TrackedSource::new(audio);
             let extension = target.extension.clone();
             let real_duration = target.duration_seconds;
             let lookup_client = client.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                let Ok((fingerprint, window_duration)) =
-                    fingerprint::compute_fingerprint(&audio, &extension)
-                else {
+                let result = fingerprint::compute_fingerprint_source(Box::new(audio), &extension);
+                if read_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                    return FingerprintOutcome::Transient;
+                }
+                let Ok((fingerprint, window_duration)) = result else {
                     // Undecodable file → won't change on retry; negative-cache it.
                     return FingerprintOutcome::NoMatch;
                 };
@@ -2357,24 +2366,32 @@ async fn snapcast_rooms_from_db(database: &musicata_storage::Database) -> Vec<sn
 
 /// Read a track's audio bytes from its provider — SMB over the wire, else local disk.
 #[cfg_attr(not(feature = "provider-smb"), allow(unused_variables))]
-async fn read_track_source_file(
+async fn open_track_analysis_source(
     providers: &Arc<RwLock<ProviderRegistry>>,
     target: &musicata_storage::TrackFingerprintTarget,
-) -> Result<Vec<u8>, String> {
+) -> Result<Box<dyn symphonia::core::io::MediaSource>, String> {
     #[cfg(feature = "provider-smb")]
     {
-        if let Some(providers::ProviderHandle::Smb(smb)) =
-            providers.read().await.get(&target.provider_id)
-        {
+        let smb = {
+            let providers = providers.read().await;
+            match providers.get(&target.provider_id) {
+                Some(providers::ProviderHandle::Smb(smb)) => Some(smb.clone()),
+                _ => None,
+            }
+        };
+        if let Some(smb) = smb {
             return smb
-                .read_file(&target.provider_item_id)
+                .open_audio(&target.provider_item_id)
                 .await
                 .map_err(|error| error.to_string());
         }
     }
-    tokio::fs::read(&target.path)
+    #[cfg(not(feature = "provider-smb"))]
+    let _ = providers;
+    let file = tokio::fs::File::open(&target.path)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(Box::new(file.into_std().await))
 }
 
 /// Retry window for a fingerprinted recording MusicBrainz couldn't resolve.

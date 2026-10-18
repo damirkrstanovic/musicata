@@ -175,7 +175,7 @@ async fn ml_pass(
             set.spawn(async move {
                 // An unreadable file is skipped (not marked), so it's retried next run.
                 let context=musicata_core::diagnostics::DiagnosticContext {source_id:Some(target.provider_id.clone()),track_id:Some(target.track_id.clone()),..Default::default()};
-                let audio=match crate::read_track_source_file(&providers,&target).await {
+                let audio=match crate::open_track_analysis_source(&providers,&target).await {
                     Ok(audio)=>audio,
                     Err(error)=>{
                         crate::diagnostics::record_context("source.read","ml",musicata_core::diagnostics::DiagnosticAction::Failure,context,&error.to_string());
@@ -184,7 +184,7 @@ async fn ml_pass(
                 };
                 crate::diagnostics::record_context("source.read","ml",musicata_core::diagnostics::DiagnosticAction::Recovery,context.clone(),"");
                 let analysis =
-                    tokio::task::spawn_blocking(move || analyze_via_service(&url, &audio))
+                    tokio::task::spawn_blocking(move || analyze_via_service(&url, audio))
                         .await
                         .unwrap_or_else(|_| Err("analysis task panicked".to_string()));
                 match analysis {
@@ -238,27 +238,32 @@ async fn ml_pass(
 }
 
 /// POST the audio bytes to the service's `/analyze` and parse the embedding + tags.
-fn analyze_via_service(service_url: &str, audio: &[u8]) -> Result<ServiceAnalysis, String> {
+fn analyze_via_service(
+    service_url: &str,
+    audio: Box<dyn symphonia::core::io::MediaSource>,
+) -> Result<ServiceAnalysis, String> {
     let endpoint = format!("{}/analyze", service_url.trim_end_matches('/'));
     let agent = ureq::AgentBuilder::new().timeout(ANALYZE_TIMEOUT).build();
-    let response = agent
+    let mut request = agent
         .post(&endpoint)
-        .set("content-type", "application/octet-stream")
-        .send_bytes(audio)
-        .map_err(|error| match error {
-            ureq::Error::Status(_, response) => {
-                let mut body = String::new();
-                let _ = std::io::Read::read_to_string(
-                    &mut std::io::Read::take(response.into_reader(), 1024),
-                    &mut body,
-                );
-                match body.as_str() {
-                    "audio decode failed" | "model inference failed" | "worker failed" => body,
-                    _ => "analysis service failed".into(),
-                }
+        .set("content-type", "application/octet-stream");
+    if let Some(length) = audio.byte_len() {
+        request = request.set("content-length", &length.to_string());
+    }
+    let response = request.send(audio).map_err(|error| match error {
+        ureq::Error::Status(_, response) => {
+            let mut body = String::new();
+            let _ = std::io::Read::read_to_string(
+                &mut std::io::Read::take(response.into_reader(), 1024),
+                &mut body,
+            );
+            match body.as_str() {
+                "audio decode failed" | "model inference failed" | "worker failed" => body,
+                _ => "analysis service failed".into(),
             }
-            other => other.to_string(),
-        })?;
+        }
+        other => other.to_string(),
+    })?;
     response.into_json().map_err(|error| error.to_string())
 }
 
@@ -315,12 +320,27 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
             let mut bytes = [0; 4096];
-            let _ = socket.read(&mut bytes);
+            loop {
+                let n = socket.read(&mut bytes).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&bytes[..n]);
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    if request.len() >= header_end + 4 + 5 {
+                        assert_eq!(&request[header_end + 4..], b"audio");
+                        break;
+                    }
+                }
+            }
             let body = "model inference failed";
             write!(socket,"HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
         });
-        let error = analyze_via_service(&format!("http://{address}"), b"audio").unwrap_err();
+        let error = analyze_via_service(
+            &format!("http://{address}"),
+            Box::new(std::io::Cursor::new(b"audio".to_vec())),
+        )
+        .unwrap_err();
         server.join().unwrap();
         assert_eq!(error, "model inference failed");
     }
