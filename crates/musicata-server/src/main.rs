@@ -185,7 +185,34 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to open database {}", config.database.display()))?;
     if !config.scan_once && config.reset_admin.is_none() {
-        let _ = diagnostics::Diagnostics::start(diagnostics::data_path(&config.database));
+        let diagnostics = diagnostics::Diagnostics::start(diagnostics::data_path(&config.database));
+        diagnostics::runtime::start(
+            diagnostics.runtime(),
+            database.clone(),
+            config.database.clone(),
+        );
+        let db = database.clone();
+        let path = config.database.clone();
+        let profiles = diagnostics.profiles();
+        tokio::spawn(async move {
+            for (key, kind) in [
+                (
+                    diagnostics::profiles::CPU_STARTUP,
+                    diagnostics::profiles::ProfileKind::Cpu,
+                ),
+                (
+                    diagnostics::profiles::HEAP_STARTUP,
+                    diagnostics::profiles::ProfileKind::Heap,
+                ),
+            ] {
+                if bool_setting(&db, key).await {
+                    let _ = profiles.start(path.clone(), kind, 60);
+                    while profiles.status().running.is_some() {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
     }
 
     // `--reset-admin USERNAME` is the locked-out recovery path: set the password (read from
@@ -451,11 +478,6 @@ async fn main() -> Result<()> {
 /// a full directory walk over a network share is expensive, and re-walking the whole tree
 /// every minute was the cause of constant NAS load.
 const LIBRARY_RESCAN_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-/// How long a background worker (fingerprint/MusicBrainz/artwork) sleeps after finding its
-/// queue empty before polling again. Short, because polling is a single cheap indexed query;
-/// while there *is* work the worker loops back-to-back without sleeping.
-const BACKGROUND_IDLE_POLL: Duration = Duration::from_secs(20);
 
 /// Listening history is kept for this long; older listens are pruned.
 const LISTEN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -960,6 +982,7 @@ async fn library_discovery_loop(
     interval: Duration,
     ready: tokio::sync::watch::Sender<bool>,
 ) {
+    let _worker = diagnostics::runtime::worker("scan");
     run_startup_migrations(&database).await;
     let _ = ready.send(true); // migrations done — workers may start.
     // Apply already-acquired/local-cache covers (and grouping) up front, before the (slow)
@@ -1003,12 +1026,13 @@ async fn fingerprint_loop(
     activity: Arc<activity::ActivityLog>,
     mut ready: tokio::sync::watch::Receiver<bool>,
 ) {
+    let _worker = diagnostics::runtime::worker("fingerprint");
     let _ = ready.wait_for(|&r| r).await;
     loop {
         let durable = fingerprint_pass(&database, &providers, &activity).await;
         if durable == 0 {
             // Empty queue, or every track failed transiently (AcoustID down) — back off.
-            tokio::time::sleep(BACKGROUND_IDLE_POLL).await;
+            tokio::time::sleep(diagnostics::runtime::idle_delay("fingerprint")).await;
         }
     }
 }
@@ -1022,21 +1046,42 @@ async fn musicbrainz_loop(
     activity: Arc<activity::ActivityLog>,
     mut ready: tokio::sync::watch::Receiver<bool>,
 ) {
+    let _worker = diagnostics::runtime::worker("musicbrainz");
     let _ = ready.wait_for(|&r| r).await;
+    let mut grouping_pending = false;
     loop {
         let mut did = false;
         did |= musicbrainz_search_pass(&database, &activity).await;
         did |= musicbrainz_enrich_pass(&database, &activity).await;
         if did {
+            grouping_pending = true;
+            diagnostics::runtime::retry_if_failed("musicbrainz").await;
             continue; // more queue to drain before re-grouping / idling.
         }
-        // Queue drained: re-apply resolved enrichment AND user artist-merges over the
-        // grouping a rescan reset (unconditional, so merges apply even with enrichment off).
-        if let Err(error) = database.reapply_canonical_grouping().await {
+        // Only new enrichment needs regrouping here. Scans and explicit artist merges
+        // already apply grouping in their own mutation paths. An empty poll must not
+        // reload/sort the entire library and all its metadata observations.
+        if let Err(error) =
+            apply_pending_grouping(&mut grouping_pending, database.reapply_canonical_grouping())
+                .await
+        {
             tracing::warn!(%error, "reapply canonical grouping failed");
         }
-        tokio::time::sleep(BACKGROUND_IDLE_POLL).await;
+        tokio::time::sleep(diagnostics::runtime::idle_delay("musicbrainz")).await;
     }
+}
+
+// Kept separate so an unchanged pass can be tested without touching storage.
+async fn apply_pending_grouping(
+    pending: &mut bool,
+    apply: impl std::future::Future<Output = anyhow::Result<u64>>,
+) -> anyhow::Result<()> {
+    if !*pending {
+        return Ok(());
+    }
+    apply.await?;
+    *pending = false;
+    Ok(())
 }
 
 /// **Artwork** — fills missing album + artist covers, independently of everything else.
@@ -1048,13 +1093,16 @@ async fn artwork_loop(
     artwork_cache: Arc<artwork::ArtworkCache>,
     mut ready: tokio::sync::watch::Receiver<bool>,
 ) {
+    let _worker = diagnostics::runtime::worker("artwork");
     let _ = ready.wait_for(|&r| r).await;
     loop {
         let mut did = false;
         did |= artwork_fill_pass(&database, &activity, &artwork_cache).await;
         did |= artist_artwork_fill_pass(&database, &activity, &artwork_cache).await;
         if !did {
-            tokio::time::sleep(BACKGROUND_IDLE_POLL).await;
+            tokio::time::sleep(diagnostics::runtime::idle_delay("artwork")).await;
+        } else {
+            diagnostics::runtime::retry_if_failed("artwork").await;
         }
     }
 }
@@ -1069,6 +1117,7 @@ async fn loudness_loop(
     activity: Arc<activity::ActivityLog>,
     mut ready: tokio::sync::watch::Receiver<bool>,
 ) {
+    let _worker = diagnostics::runtime::worker("loudness");
     let _ = ready.wait_for(|&r| r).await;
     loop {
         // Sweep the whole backlog, paging with a keyset cursor so a cluster of tracks that keep
@@ -1078,7 +1127,7 @@ async fn loudness_loop(
         while let Some(next) = loudness_pass(&database, &providers, &activity, cursor).await {
             cursor = Some(next);
         }
-        tokio::time::sleep(BACKGROUND_IDLE_POLL).await;
+        tokio::time::sleep(diagnostics::runtime::idle_delay("loudness")).await;
     }
 }
 
@@ -1324,8 +1373,10 @@ async fn loudness_pass(
 ) -> Option<(String, String, String)> {
     let _timing = diagnostics::Timing::new(diagnostics::Operation::BackgroundJob);
     if !bool_setting(database, SETTING_LOUDNESS).await {
+        diagnostics::runtime::state("loudness", "disabled");
         return None;
     }
+    diagnostics::runtime::state("loudness", "idle");
     let after = after
         .as_ref()
         .map(|(artist, title, id)| (artist.as_str(), title.as_str(), id.as_str()));
@@ -1370,12 +1421,14 @@ async fn loudness_pass(
         let done = done.clone();
         let durable = durable.clone();
         workers.spawn(async move {
+            let mut health = diagnostics::runtime::Job::new("loudness");
             let _permit = permit;
             // An unreadable file is skipped (not marked), so a transient failure is retried.
             let audio = match open_track_analysis_source(&providers, &target).await {
                 Ok(audio) => audio,
                 Err(error) => {
                     diagnostics::failure("source.read", "loudness", None, &error.to_string());
+                    health.fail(true,"source_read");
                     done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
@@ -1386,27 +1439,36 @@ async fn loudness_pass(
             let result = tokio::task::spawn_blocking(move || {
                 loudness::analyze_loudness_source(Box::new(audio), &extension, LOUDNESS_MAX_WALL)
             })
-            .await
-            .unwrap_or_else(|_| Err("analysis task panicked".to_string()));
+            .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => { health.fail(true, "analysis_panicked"); return; }
+            };
             if read_failed.load(std::sync::atomic::Ordering::Relaxed) {
                 diagnostics::failure("source.read", "loudness", None, "audio source read failed during analysis");
                 done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                health.fail(true,"source_read");
                 return; // Do not cache an incomplete decode; retry a transient read failure.
             }
             let now = now_unix_seconds();
             match result {
                 Ok((lufs, true_peak)) => {
-                    let _ = diagnostics::background_result(database
+                    let stored = diagnostics::background_result(database
                         .upsert_track_loudness(&target.track_id, Some(lufs), Some(true_peak), now)
                         .await, "persistence.upsert_track_loudness");
+                    if stored.is_none() { health.fail(true,"persistence"); return; }
+                    health.success();
                 }
                 Err(error) => {
+
                     // Undecodable / un-measurable → mark analyzed (NULL) so it isn't retried.
                     diagnostics::failure("loudness.analysis", "loudness", None, &error);
                     tracing::debug!(track = %target.track_id, %error, diagnostic_recorded=true, "loudness analysis failed");
-                    let _ = diagnostics::background_result(database
+                    let stored = diagnostics::background_result(database
                         .upsert_track_loudness(&target.track_id, None, None, now)
                         .await, "persistence.upsert_track_loudness");
+                    if stored.is_none() { health.fail(true,"persistence"); return; }
+                    health.fail(false,"analysis_unmeasurable");
                 }
             }
             durable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1516,6 +1578,16 @@ pub(crate) struct BoolSetting {
 }
 
 pub(crate) const BOOL_SETTINGS: &[BoolSetting] = &[
+    BoolSetting {
+        key: diagnostics::profiles::CPU_STARTUP,
+        default: false,
+        doc: "CPU capture is opt-in and stops after 60 seconds.",
+    },
+    BoolSetting {
+        key: diagnostics::profiles::HEAP_STARTUP,
+        default: false,
+        doc: "Heap stack sampling is opt-in and stops after 60 seconds.",
+    },
     BoolSetting {
         key: SETTING_ARTWORK_FETCH,
         default: true,
@@ -1766,8 +1838,10 @@ async fn artwork_fill_pass(
 
     // Fetching new covers is a user setting (web UI), not a flag — read it live.
     if !artwork_fetch_enabled(database).await {
+        diagnostics::runtime::state("artwork", "disabled");
         return false;
     }
+    diagnostics::runtime::state("artwork", "idle");
     let fanart_tv_key = database
         .get_setting(SETTING_FANART_TV_KEY)
         .await
@@ -1799,6 +1873,7 @@ async fn artwork_fill_pass(
     let mut found = 0usize;
 
     for (index, target) in batch.into_iter().enumerate() {
+        let mut health = diagnostics::runtime::Job::new("artwork");
         activity.update(
             task,
             format!(
@@ -1835,7 +1910,7 @@ async fn artwork_fill_pass(
                 let cache_key =
                     artwork_providers::acquired_cache_key(&target.album_id, &cover.image_url);
                 artwork_cache.put(&cache_key, ext, &bytes).await;
-                let _ = diagnostics::background_result(
+                let stored = diagnostics::background_result(
                     database
                         .upsert_acquired_artwork(
                             &target.album_id,
@@ -1850,21 +1925,29 @@ async fn artwork_fill_pass(
                         .await,
                     "persistence.upsert_acquired_artwork",
                 );
+                if stored.is_none() {
+                    health.fail(true, "persistence");
+                    continue;
+                }
                 let url = format!(
                     "/api/albums/{}/artwork?asset={}",
                     target.album_id, cache_key
                 );
-                let _ = diagnostics::background_result(
+                let stored = diagnostics::background_result(
                     database
                         .set_album_artwork(&target.album_id, None, Some(&url))
                         .await,
                     "persistence.set_album_artwork",
                 );
+                if stored.is_none() {
+                    health.fail(true, "persistence");
+                    continue;
+                }
                 found += 1;
             }
             None => {
                 // Negative cache: don't re-query this album until the retry window.
-                let _ = diagnostics::background_result(
+                let stored = diagnostics::background_result(
                     database
                         .upsert_acquired_artwork(
                             &target.album_id,
@@ -1879,8 +1962,13 @@ async fn artwork_fill_pass(
                         .await,
                     "persistence.upsert_acquired_artwork",
                 );
+                if stored.is_none() {
+                    health.fail(true, "persistence");
+                    continue;
+                }
             }
         }
+        health.success();
     }
 
     if found > 0 {
@@ -1911,8 +1999,10 @@ async fn artist_artwork_fill_pass(
         tracing::warn!(%error, "artist artwork: failed to re-apply acquired images");
     }
     if !artwork_fetch_enabled(database).await {
+        diagnostics::runtime::state("artwork", "disabled");
         return false;
     }
+    diagnostics::runtime::state("artwork", "idle");
     let registry = Arc::new(artwork_providers::ArtworkProviderRegistry::new(vec![
         Box::new(artwork_providers::DeezerProvider::new()),
     ]));
@@ -1935,6 +2025,7 @@ async fn artist_artwork_fill_pass(
     let mut found = 0usize;
 
     for (index, target) in batch.into_iter().enumerate() {
+        let mut health = diagnostics::runtime::Job::new("artwork");
         activity.update(
             task,
             format!(
@@ -1962,7 +2053,7 @@ async fn artist_artwork_fill_pass(
                 let cache_key =
                     artwork_providers::acquired_cache_key(&target.artist_id, &image.image_url);
                 artwork_cache.put(&cache_key, ext, &bytes).await;
-                let _ = diagnostics::background_result(
+                let stored = diagnostics::background_result(
                     database
                         .upsert_acquired_artist_artwork(
                             &target.artist_id,
@@ -1977,10 +2068,14 @@ async fn artist_artwork_fill_pass(
                         .await,
                     "persistence.upsert_acquired_artist_artwork",
                 );
+                if stored.is_none() {
+                    health.fail(true, "persistence");
+                    continue;
+                }
                 found += 1;
             }
             None => {
-                let _ = diagnostics::background_result(
+                let stored = diagnostics::background_result(
                     database
                         .upsert_acquired_artist_artwork(
                             &target.artist_id,
@@ -1995,8 +2090,13 @@ async fn artist_artwork_fill_pass(
                         .await,
                     "persistence.upsert_acquired_artist_artwork",
                 );
+                if stored.is_none() {
+                    health.fail(true, "persistence");
+                    continue;
+                }
             }
         }
+        health.success();
     }
 
     // Publish artwork_url for the artists we just acquired images for.
@@ -2053,8 +2153,10 @@ async fn fingerprint_pass(
     activity: &Arc<activity::ActivityLog>,
 ) -> usize {
     if !bool_setting(database, SETTING_FINGERPRINT).await {
+        diagnostics::runtime::state("fingerprint", "disabled");
         return 0;
     }
+    diagnostics::runtime::state("fingerprint", "idle");
     // Until the project compiles in its AcoustID application key, the feature no-ops.
     if fingerprint::ACOUSTID_CLIENT_KEY.is_empty() {
         return 0;
@@ -2108,10 +2210,12 @@ async fn fingerprint_pass(
         let durable = durable.clone();
         let done = done.clone();
         workers.spawn(async move {
+            let mut health = diagnostics::runtime::Job::new("fingerprint");
             let _permit = permit;
             // Read the audio (SMB or local); an unreadable file is skipped (not marked, so
             // a transient failure is retried).
             let Ok(audio) = open_track_analysis_source(&providers, &target).await else {
+                health.fail(true, "source_read");
                 done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return;
             };
@@ -2146,7 +2250,7 @@ async fn fingerprint_pass(
             let now = now_unix_seconds();
             match outcome {
                 FingerprintOutcome::Resolved(found) => {
-                    let _ = diagnostics::background_result(
+                    let stored = diagnostics::background_result(
                         database
                             .upsert_track_fingerprint(
                                 &target.track_id,
@@ -2159,11 +2263,16 @@ async fn fingerprint_pass(
                             .await,
                         "persistence.upsert_track_fingerprint",
                     );
+                    if stored.is_none() {
+                        health.fail(true, "persistence");
+                        return;
+                    }
                     resolved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    health.success();
                     durable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 FingerprintOutcome::NoMatch => {
-                    let _ = diagnostics::background_result(
+                    let stored = diagnostics::background_result(
                         database
                             .upsert_track_fingerprint(
                                 &target.track_id,
@@ -2176,10 +2285,17 @@ async fn fingerprint_pass(
                             .await,
                         "persistence.upsert_track_fingerprint",
                     );
+                    if stored.is_none() {
+                        health.fail(true, "persistence");
+                        return;
+                    }
+                    health.success();
                     durable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 // Transient: leave it untouched so the next pass tries again.
-                FingerprintOutcome::Transient => {}
+                FingerprintOutcome::Transient => {
+                    health.fail(true, "source_or_lookup");
+                }
             }
             let count = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             activity.update(task, format!("Identifying tracks ({count}/{total})"));
@@ -2420,8 +2536,10 @@ async fn musicbrainz_search_pass(
     activity: &Arc<activity::ActivityLog>,
 ) -> bool {
     if !bool_setting(database, SETTING_MB_ENRICH).await {
+        diagnostics::runtime::state("musicbrainz", "disabled");
         return false;
     }
+    diagnostics::runtime::state("musicbrainz", "idle");
     let targets = match database
         .tracks_for_musicbrainz_search(MB_SEARCH_BATCH)
         .await
@@ -2441,6 +2559,7 @@ async fn musicbrainz_search_pass(
     let mut resolved = 0usize;
 
     for (index, target) in targets.into_iter().enumerate() {
+        let mut health = diagnostics::runtime::Job::new("musicbrainz");
         if index > 0 {
             tokio::time::sleep(MB_REQUEST_INTERVAL).await;
         }
@@ -2468,7 +2587,7 @@ async fn musicbrainz_search_pass(
         let now = now_unix_seconds();
         match outcome {
             Some(Ok(Some(found))) if mb_search_match_is_confident(&found, &target) => {
-                let _ = diagnostics::background_result(
+                let stored = diagnostics::background_result(
                     database
                         .upsert_track_fingerprint(
                             &target.track_id,
@@ -2481,11 +2600,15 @@ async fn musicbrainz_search_pass(
                         .await,
                     "persistence.upsert_track_fingerprint",
                 );
+                if stored.is_none() {
+                    health.fail(true, "persistence");
+                    continue;
+                }
                 resolved += 1;
             }
             Some(Ok(_)) => {
                 // Searched, no confident match → terminal marker (don't re-search).
-                let _ = diagnostics::background_result(
+                let stored = diagnostics::background_result(
                     database
                         .upsert_track_fingerprint(
                             &target.track_id,
@@ -2498,10 +2621,18 @@ async fn musicbrainz_search_pass(
                         .await,
                     "persistence.upsert_track_fingerprint",
                 );
+                if stored.is_none() {
+                    health.fail(true, "persistence");
+                    continue;
+                }
             }
             // Transport error / task panic → leave it `not_found` to retry next pass.
-            _ => {}
+            _ => {
+                health.fail(true, "lookup_unavailable");
+                continue;
+            }
         }
+        health.success();
     }
 
     if resolved > 0 {
@@ -2540,9 +2671,8 @@ fn loose_text_match(left: &str, right: &str) -> bool {
 /// and apply it to the canonical library (so an untagged track stops showing folder-derived
 /// junk). DB-only; never overwrites embedded tags (enforced in `reapply_canonical_grouping`).
 /// Gated by a Settings toggle. Mirrors `fingerprint_pass` (capped, paced, negative cache,
-/// activity). Returns whether it had targets; when it has none, `musicbrainz_loop` does the
-/// `reapply_canonical_grouping` that re-applies resolved enrichment over a rescan's reset
-/// grouping, so that correction still happens with no new track to fetch.
+/// activity). Returns whether it had targets. The worker regroups once this work drains;
+/// scan paths restore grouping themselves, so an unchanged idle poll stays cheap.
 async fn musicbrainz_enrich_pass(
     database: &Database,
     activity: &Arc<activity::ActivityLog>,
@@ -2572,6 +2702,7 @@ async fn musicbrainz_enrich_pass(
     let mut resolved = 0usize;
 
     for (index, target) in targets.into_iter().enumerate() {
+        let mut health = diagnostics::runtime::Job::new("musicbrainz");
         if index > 0 {
             tokio::time::sleep(MB_REQUEST_INTERVAL).await;
         }
@@ -2607,16 +2738,20 @@ async fn musicbrainz_enrich_pass(
                         .or_else(|| target.release_group_mbid.clone()),
                     artist_mbid: enrichment.artist_mbid,
                 };
-                let _ = diagnostics::background_result(
+                let stored = diagnostics::background_result(
                     database
                         .upsert_track_musicbrainz_metadata(&target.track_id, "resolved", &meta, now)
                         .await,
                     "persistence.upsert_track_musicbrainz_metadata",
                 );
+                if stored.is_none() {
+                    health.fail(true, "persistence");
+                    continue;
+                }
                 resolved += 1;
             }
-            _ => {
-                let _ = diagnostics::background_result(
+            Some(_) => {
+                let stored = diagnostics::background_result(
                     database
                         .upsert_track_musicbrainz_metadata(
                             &target.track_id,
@@ -2627,8 +2762,17 @@ async fn musicbrainz_enrich_pass(
                         .await,
                     "persistence.upsert_track_musicbrainz_metadata",
                 );
+                if stored.is_none() {
+                    health.fail(true, "persistence");
+                    continue;
+                }
+            }
+            None => {
+                health.fail(true, "lookup_unavailable");
+                continue;
             }
         }
+        health.success();
     }
 
     if resolved > 0 {
@@ -2698,6 +2842,18 @@ fn app(
     });
     Router::new()
         .route("/api/diagnostics", get(diagnostics::http::status))
+        .route(
+            "/api/diagnostics/profile",
+            post(diagnostics::http::capture_profile).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/diagnostics/profile/startup",
+            post(diagnostics::http::startup_profiles).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/diagnostics/profile/{kind}",
+            get(diagnostics::http::download_profile),
+        )
         .route(
             "/api/diagnostics/debug",
             post(diagnostics::http::detail).layer(DefaultBodyLimit::max(4096)),
@@ -6995,6 +7151,7 @@ async fn artwork_prewarm_loop(
     providers: Arc<RwLock<ProviderRegistry>>,
     artwork_cache: Arc<artwork::ArtworkCache>,
 ) {
+    let _worker = diagnostics::runtime::worker("prewarm");
     const WARM_CONCURRENCY: usize = 3;
     const IDLE_POLL: Duration = Duration::from_secs(300);
     let mut warmed: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -7023,7 +7180,13 @@ async fn artwork_prewarm_loop(
                 let artwork_cache = artwork_cache.clone();
                 let id = id.clone();
                 set.spawn(async move {
+                    let mut health = diagnostics::runtime::Job::new("prewarm");
                     let ok = warm_album_cover(&database, &providers, &artwork_cache, &id).await;
+                    if ok {
+                        health.success();
+                    } else {
+                        health.fail(true, "cover_unavailable");
+                    }
                     (id, ok)
                 });
             }
@@ -8021,6 +8184,120 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn profiling_controls_are_admin_only_and_validate_requests() {
+        use tower::ServiceExt;
+        let fixture = TestFixture::new("profile-auth");
+        let (app, db) = fixture.app_with_library_db(fixture.library()).await;
+        for (id, role) in [("admin", "admin"), ("listener", "listener")] {
+            db.create_user(&musicata_storage::UserRecord {
+                id: id.into(),
+                username: id.into(),
+                password_hash: "unused".into(),
+                role: role.into(),
+                api_token: format!("{id}-token"),
+                created_at_unix_seconds: 1,
+            })
+            .await
+            .unwrap();
+        }
+        for (token, path, body, expected) in [
+            (
+                "listener-token",
+                "/api/diagnostics/profile",
+                r#"{"kind":"cpu","seconds":1}"#,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "admin-token",
+                "/api/diagnostics/profile",
+                r#"{"kind":"cpu","seconds":61}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "listener-token",
+                "/api/diagnostics/profile/startup",
+                r#"{"cpu":true,"heap":true}"#,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "admin-token",
+                "/api/diagnostics/profile/startup",
+                r#"{"cpu":true,"heap":false}"#,
+                if cfg!(all(target_os = "linux", not(target_env = "musl"))) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+        assert_eq!(
+            super::bool_setting(&db, super::diagnostics::profiles::CPU_STARTUP).await,
+            cfg!(all(target_os = "linux", not(target_env = "musl")))
+        );
+        assert!(!super::bool_setting(&db, super::diagnostics::profiles::HEAP_STARTUP).await);
+        let queues = db.diagnostic_queues(0).await.unwrap();
+        assert!(
+            queues
+                .iter()
+                .any(|(kind, count, _)| *kind == "loudness" && *count > 0)
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/diagnostics/profile/heap")
+                    .header("authorization", "Bearer listener-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn unchanged_grouping_pass_does_not_poll_storage() {
+        let mut pending = false;
+        super::apply_pending_grouping(&mut pending, async {
+            anyhow::bail!("an unchanged pass must not access storage")
+        })
+        .await
+        .unwrap();
+        assert!(!pending);
+    }
+
+    #[tokio::test]
+    async fn grouping_failure_remains_pending_and_success_clears_it() {
+        let mut pending = true;
+        assert!(
+            super::apply_pending_grouping(&mut pending, async {
+                anyhow::bail!("temporary storage failure")
+            })
+            .await
+            .is_err()
+        );
+        assert!(pending);
+        super::apply_pending_grouping(&mut pending, async { Ok(0) })
+            .await
+            .unwrap();
+        assert!(!pending);
+    }
+
+    #[tokio::test]
     async fn http_logging_is_quiet_unless_debug_or_server_failure() {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
@@ -8128,7 +8405,7 @@ mod tests {
         // The ten toggles that existed when the string settings were retired. A new one is
         // welcome; bumping this number is the moment to confirm the default was chosen, and
         // that a network-touching feature is not being switched on for everyone by accident.
-        assert_eq!(BOOL_SETTINGS.len(), 13);
+        assert_eq!(BOOL_SETTINGS.len(), 15);
     }
 
     /// The defaults themselves, pinned. These are the values every existing installation gets
@@ -8150,6 +8427,8 @@ mod tests {
             ("snapcast.manage_server", true),
             ("snapcast.airplay_enabled", false),
             ("snapcast.spotify_enabled", false),
+            (crate::diagnostics::profiles::CPU_STARTUP, false),
+            (crate::diagnostics::profiles::HEAP_STARTUP, false),
         ] {
             assert_eq!(bool_setting_default(key), expected, "default for {key}");
         }

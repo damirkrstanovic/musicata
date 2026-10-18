@@ -21,6 +21,10 @@ pub struct DiagnosticExportStatus {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct DiagnosticStatus {
     pub health: DiagnosticHealth,
+    pub runtime: super::runtime::RuntimeSnapshot,
+    pub profiles: super::profiles::ProfileStatus,
+    pub cpu_on_startup: bool,
+    pub heap_on_startup: bool,
     pub export: DiagnosticExportStatus,
 }
 fn admin(user: Option<Extension<CurrentUser>>) -> Result<(), AppError> {
@@ -37,6 +41,10 @@ pub async fn status(
     admin(user)?;
     Ok(Json(DiagnosticStatus {
         health: state.diagnostics.health(),
+        runtime: state.diagnostics.runtime().snapshot(false),
+        profiles: state.diagnostics.profiles().status(),
+        cpu_on_startup: crate::bool_setting(&state.database, super::profiles::CPU_STARTUP).await,
+        heap_on_startup: crate::bool_setting(&state.database, super::profiles::HEAP_STARTUP).await,
         export: state
             .diagnostic_export
             .lock()
@@ -167,6 +175,8 @@ pub async fn native_report(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportRequest {
+    #[serde(default)]
+    pub include_profiles: bool,
     pub description: Option<String>,
     pub problem_time_unix_seconds: Option<i64>,
 }
@@ -284,4 +294,98 @@ mod tests {
         }
         assert!(!limits.allow("extra"));
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileRequest {
+    kind: super::profiles::ProfileKind,
+    seconds: u64,
+}
+pub async fn capture_profile(
+    State(state): State<AppState>,
+    user: Option<Extension<CurrentUser>>,
+    Json(request): Json<ProfileRequest>,
+) -> Result<Json<DiagnosticStatus>, AppError> {
+    admin(user.clone())?;
+    state
+        .diagnostics
+        .profiles()
+        .start(state.db_path.clone(), request.kind, request.seconds)
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    status(State(state), user).await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupProfiles {
+    cpu: bool,
+    heap: bool,
+}
+pub async fn startup_profiles(
+    State(state): State<AppState>,
+    user: Option<Extension<CurrentUser>>,
+    Json(request): Json<StartupProfiles>,
+) -> Result<Json<DiagnosticStatus>, AppError> {
+    admin(user.clone())?;
+    let capability = state.diagnostics.profiles().status();
+    if (request.cpu && !capability.supported) || (request.heap && !capability.heap_supported) {
+        return Err(AppError::bad_request(
+            "requested startup profiler is unavailable in this build",
+        ));
+    }
+    state
+        .database
+        .set_bool_setting(super::profiles::CPU_STARTUP, request.cpu)
+        .await?;
+    state
+        .database
+        .set_bool_setting(super::profiles::HEAP_STARTUP, request.heap)
+        .await?;
+    status(State(state), user).await
+}
+pub async fn download_profile(
+    State(state): State<AppState>,
+    user: Option<Extension<CurrentUser>>,
+    Path(kind): Path<String>,
+) -> Result<Response, AppError> {
+    admin(user)?;
+    let status = state.diagnostics.profiles().status();
+    let (kind, ready, mime) = match kind.as_str() {
+        "cpu" => (
+            super::profiles::ProfileKind::Cpu,
+            status.cpu_ready,
+            "image/svg+xml",
+        ),
+        "heap" => (
+            super::profiles::ProfileKind::Heap,
+            status.heap_ready,
+            "application/json",
+        ),
+        _ => return Err(AppError::not_found("unknown profile kind")),
+    };
+    if !ready {
+        return Err(AppError::not_found("capture a profile first"));
+    }
+    let path = super::profiles::path(&state.db_path, kind);
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| AppError::not_found("profile unavailable"))?;
+    if metadata.len() > super::profiles::ARTIFACT_LIMIT as u64 {
+        return Err(AppError::bad_request("profile exceeds download limit"));
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|_| AppError::not_found("profile unavailable"))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime.to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", kind.filename()),
+            ),
+            (header::CACHE_CONTROL, "no-store".into()),
+        ],
+        bytes,
+    )
+        .into_response())
 }

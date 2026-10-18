@@ -98,6 +98,9 @@ impl ActivityLog {
             finished_at_unix_seconds: None,
             message: None,
         };
+        if matches!(activity.kind.as_str(), "scan") {
+            crate::diagnostics::runtime::begin(&activity.kind);
+        }
         {
             let mut items = self.items.lock().expect("activity log poisoned");
             items.push_front(activity);
@@ -125,6 +128,9 @@ impl ActivityLog {
         {
             let mut items = self.items.lock().expect("activity log poisoned");
             if let Some(activity) = items.iter_mut().find(|activity| activity.id == id) {
+                if activity.status == "running" && matches!(activity.kind.as_str(), "scan") {
+                    crate::diagnostics::runtime::finish(&activity.kind, ok, !ok, "job_failed");
+                }
                 activity.status = if ok { "ok" } else { "error" }.to_string();
                 activity.finished_at_unix_seconds = Some(now());
                 activity.message = message;
@@ -137,6 +143,11 @@ impl ActivityLog {
     pub fn remove(&self, id: u64) {
         {
             let mut items = self.items.lock().expect("activity log poisoned");
+            if let Some(a) = items.iter().find(|a| a.id == id && a.status == "running") {
+                if matches!(a.kind.as_str(), "scan") {
+                    crate::diagnostics::runtime::finish(&a.kind, true, false, "");
+                }
+            }
             items.retain(|activity| activity.id != id);
         }
         self.bump();

@@ -650,6 +650,49 @@ impl Database {
         Ok(())
     }
 
+    /// Lightweight queue summaries for diagnostics; never materialize track metadata.
+    pub async fn diagnostic_queues(
+        &self,
+        retry_before: i64,
+    ) -> Result<Vec<(&'static str, usize, Option<usize>)>> {
+        let mut queues = Vec::new();
+        for (kind, query) in [
+            (
+                "fingerprint",
+                "SELECT COUNT(*) AS n, MIN(t.added_at_unix_seconds) AS oldest FROM tracks t LEFT JOIN track_fingerprint f ON f.track_id=t.id WHERE NOT EXISTS (SELECT 1 FROM track_metadata_observations o WHERE o.track_id=t.id AND (o.musicbrainz_recording_id IS NOT NULL OR o.musicbrainz_release_id IS NOT NULL OR o.musicbrainz_release_group_id IS NOT NULL)) AND (f.track_id IS NULL OR (f.status='not_found' AND f.fingerprinted_at_unix_seconds < ?1))",
+            ),
+            (
+                "loudness",
+                "SELECT COUNT(*) AS n, MIN(t.added_at_unix_seconds) AS oldest FROM tracks t LEFT JOIN track_loudness a ON a.track_id=t.id WHERE a.track_id IS NULL",
+            ),
+            (
+                "musicbrainz",
+                "SELECT COUNT(*) AS n, MIN(t.added_at_unix_seconds) AS oldest FROM tracks t JOIN track_fingerprint f ON f.track_id=t.id LEFT JOIN track_musicbrainz_metadata m ON m.track_id=t.id WHERE (f.status='resolved' AND f.musicbrainz_recording_id IS NOT NULL AND (m.track_id IS NULL OR (m.status='not_found' AND m.enriched_at_unix_seconds < ?1))) OR (f.status='not_found' AND NOT EXISTS (SELECT 1 FROM track_metadata_observations o WHERE o.track_id=t.id AND (o.musicbrainz_recording_id IS NOT NULL OR o.musicbrainz_release_id IS NOT NULL OR o.musicbrainz_release_group_id IS NOT NULL)))",
+            ),
+            (
+                "artwork",
+                "SELECT COUNT(*) AS n, NULL AS oldest FROM (SELECT a.id FROM albums a LEFT JOIN acquired_album_artwork c ON c.album_id=a.id WHERE a.artwork_url IS NULL AND (c.album_id IS NULL OR (c.status='not_found' AND c.acquired_at_unix_seconds < ?1)) UNION ALL SELECT a.id FROM artists a LEFT JOIN acquired_artist_artwork c ON c.artist_id=a.id WHERE a.artwork_url IS NULL AND (c.artist_id IS NULL OR (c.status='not_found' AND c.acquired_at_unix_seconds < ?1)))",
+            ),
+            (
+                "ml",
+                "SELECT COUNT(*) AS n, MIN(t.added_at_unix_seconds) AS oldest FROM tracks t LEFT JOIN track_features e ON e.track_id=t.id WHERE e.track_id IS NULL",
+            ),
+        ] {
+            let mut query = sqlx::query(query);
+            if matches!(kind, "fingerprint" | "musicbrainz" | "artwork") {
+                query = query.bind(retry_before);
+            }
+            let row = query.fetch_one(&self.reads).await?;
+            queues.push((
+                kind,
+                row.try_get::<i64, _>("n")?.max(0) as usize,
+                row.try_get::<Option<i64>, _>("oldest")?
+                    .map(|n| n.max(0) as usize),
+            ));
+        }
+        Ok(queues)
+    }
+
     pub async fn load_library(&self) -> Result<Option<Library>> {
         let Some(provider) =
             sqlx::query("SELECT id, source_root FROM providers ORDER BY id LIMIT 1")
@@ -9866,6 +9909,42 @@ mod tests {
                 .expect("missing")
                 .len(),
             1
+        );
+
+        // Diagnostics must count the same eligible work, including retry expiry.
+        for cutoff in [500, 2_000] {
+            let expected = database
+                .tracks_missing_fingerprints(cutoff, 10)
+                .await
+                .unwrap()
+                .len();
+            let queues = database.diagnostic_queues(cutoff).await.unwrap();
+            assert_eq!(
+                queues.iter().find(|q| q.0 == "fingerprint").unwrap().1,
+                expected
+            );
+            assert_eq!(
+                queues.iter().find(|q| q.0 == "musicbrainz").unwrap().1,
+                database
+                    .tracks_for_musicbrainz_search(10)
+                    .await
+                    .unwrap()
+                    .len()
+            );
+        }
+        // Embedded identification excludes a track even after its retry window.
+        library.tracks[0].observed_metadata[0].musicbrainz_recording_id = Some("tagged".into());
+        database.save_library(&mut library).await.unwrap();
+        assert_eq!(
+            database
+                .diagnostic_queues(2_000)
+                .await
+                .unwrap()
+                .iter()
+                .find(|q| q.0 == "fingerprint")
+                .unwrap()
+                .1,
+            0
         );
 
         let _ = std::fs::remove_file(db_path);

@@ -153,6 +153,19 @@ scans in the background.
 
 ---
 
+### Profiling shipped binaries (1.8.2)
+
+[tikv/jemallocator #146](https://github.com/tikv/jemallocator/issues/146) documents
+musl profiling crashes in the default heap unwinder; Musicata reproduced this with an
+optimized static binary under synthetic request traffic. Heap capture is therefore a
+reported capability: supported by the Linux glibc/Docker build, disabled on musl, while
+allocator totals remain available. CPU unwinding also failed named-stack validation in
+static musl, so both stack-capture capabilities are disabled there. Debug-build profiling tests are not
+sufficient: `tests/diagnostics/profiles.py` exercises the actual release executable and
+requires named application CPU stacks. The musl cross-linker also stripped its symbol
+table under debug-only stripping, so the server explicitly keeps symbols in its release
+profile. Raw heap mapping paths and dynamic thread labels are excluded from exports.
+
 ## 6. Metadata sourcing & conflict resolution
 
 **Problem:** values for the same field come from several places (embedded tags,

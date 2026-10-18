@@ -443,3 +443,55 @@ and `{rms_l,rms_r,peak_l,peak_r}`. Stale/unowned/unapplied generations are rejec
 Controllers send `{type:"meter_subscription",enabled:true}` and receive at most 20 snapshots/s;
 `levels:null` means unavailable/stale/paused. Native rendering requires its own endpoint token.
 Endpoint tokens cannot edit desired settings, processor bindings, or another output's channel.
+
+## Runtime diagnostics and profiling
+
+All diagnostics controls and downloads require an administrator session. In **Settings →
+System → Diagnostics**, resource measurements update every 30 seconds; CPU 100% is one
+core. Process RSS, swap, jemalloc live allocations/resident/retained bytes and cgroup v2
+memory are separate measurements. Container memory includes page cache and can exceed the
+Docker CLI's working-set display. Missing platform metrics are `null`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/diagnostics` | Recorder, resource, worker and profiling status. |
+| POST | `/api/diagnostics/profile` | `{kind:"cpu"\|"heap", seconds:1..60}`; one capture at a time, automatic stop. |
+| POST | `/api/diagnostics/profile/startup` | Persist `{cpu:bool, heap:bool}` for captures on the next server start. Both default off; when both are enabled CPU runs first, then heap. |
+| GET | `/api/diagnostics/profile/{kind}` | Download the completed CPU SVG or heap JSON from this server session. |
+| POST | `/api/diagnostics/export` | Existing description/time fields plus optional `include_profiles` (default false). |
+
+Linux builds retain function symbols. Linux glibc builds, including the Docker image,
+support pprof CPU sampling (99 Hz) and jemalloc allocation sampling (approximately one sample per MiB allocated). Heap captures contain
+before/after live allocation stacks **originating during that capture**, not all earlier
+allocations. They contain function names, never raw mapped-library paths or music metadata.
+Static musl downloads expose resource/worker history and allocator statistics but disable
+stack captures: CPU unwinding failed named-stack validation, and the heap unwinder can crash ([upstream issue](https://github.com/tikv/jemallocator/issues/146)).
+`profiles.supported` and `profiles.heap_supported` advertise these capabilities; unsupported startup settings are rejected.
+Profiles are at most 2 MiB each; an oversized capture fails rather than storing an unbounded
+artifact. The most recent capture of each kind replaces its previous file. Only captures
+completed during the current server session are offered for download. Captures add overhead;
+compare normal-operation samples with profiling disabled before drawing performance conclusions.
+The allocator uses eight arenas, disables allocator huge pages and purges freed pages in
+the background to bound idle overhead on hosts with large CPU counts. High RSS by itself
+is not evidence of a leak.
+
+Resource history retains at most 2,880 samples (about 24 hours), with a checkpoint at most
+4 MiB every five minutes. It survives restarts with session and build identity. Worker
+counters cover the current server session; scan counts are passes, analysis/metadata counts
+are tracks, and artwork counts are covers. A completed item includes a durably cached
+negative lookup outcome. Retryable failures count attempts, not distinct pending items.
+Queue counts represent eligible unfinished work, even when its worker is disabled; their
+observation timestamp identifies stale measurements. Oldest queued time uses track discovery
+time, not the last retry time. Scan/prewarm queue counts and artwork queue ages are unknown.
+Worker starts/exits/panics/restarts are actual task lifecycle events, separate from item retries.
+Resource history correlates whole-process measurements with active worker kinds and backlog;
+it does not claim exact CPU or memory attribution to an async task.
+
+Bundles always include `runtime.json` and up to 256 recent worker events, plus explicitly
+included completed profiles. Context records omitted profiles and capture status. The existing
+16 MiB archive cap still applies. Collection stays local and files use owner-only permissions.
+Runtime measurements and profile stack labels contain no track/source names or credentials.
+Tokio Console is not enabled: its unstable task instrumentation and continuous event collection
+would add release configuration and overhead to ordinary operation. Bounded CPU stacks,
+worker state/duration and progress are the first tools for investigating repeated wakeups;
+wall-clock operation duration must not be interpreted as CPU time.

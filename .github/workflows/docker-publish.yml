@@ -56,7 +56,9 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          push: true
+          # Keep the server local until the executable passes the profiling smoke.
+          push: ${{ matrix.image != 'server' }}
+          load: ${{ matrix.image == 'server' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # build.rs stamps this into the binary, so `--version` and the in-app AGPL section 13
@@ -68,3 +70,21 @@ jobs:
           # CI, so a source change recompiles from scratch — acceptable for a release workflow).
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+      - name: Verify profiling before publishing the server
+        if: matrix.image == 'server'
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}-server:sha-${GITHUB_SHA::7}"
+          docker create --name profile-image "$image"
+          docker cp profile-image:/usr/local/bin/musicata-server ./musicata-server-profile-check
+          docker rm profile-image
+          python3 tests/diagnostics/profiles.py ./musicata-server-profile-check
+
+      - name: Publish verified server image
+        if: matrix.image == 'server'
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r tag; do
+            [ -z "$tag" ] || docker push "$tag"
+          done <<< "$IMAGE_TAGS"

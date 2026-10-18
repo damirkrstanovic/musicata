@@ -29,7 +29,13 @@ smb = { path = "vendor/smb" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = true
+# Function symbols remain available to opt-in CPU/heap captures and external perf.
+strip = "debuginfo"
+
+# Zig's musl linker treats strip-debuginfo as stripping the symbol table too.
+# Keep the server symbol table so shipped CPU profiles contain function names.
+[profile.release.package.musicata-server]
+strip = "none"
 
 [workspace.package]
 edition = "2024"
