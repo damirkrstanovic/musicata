@@ -1072,7 +1072,8 @@ mod tests {
             generation: 12,
         })
         .unwrap();
-        tx.send(WriterMsg::SetPlaying(true)).unwrap();
+        // Start paused; briefly enabling playback races the following pause command
+        // and legitimately allows audio before the writer receives that command.
         tx.send(WriterMsg::SetPlaying(false)).unwrap();
         chunks_tx.send(Ok(vec![2000, -2000])).unwrap();
         std::thread::sleep(Duration::from_millis(50));

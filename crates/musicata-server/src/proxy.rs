@@ -216,15 +216,28 @@ mod tests {
                 .stream;
             while stream.next().await.is_some() {}
         }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let rows = d
-            .store()
-            .await
-            .unwrap()
-            .snapshot(0)
-            .await
-            .unwrap()
-            .incidents;
+        // The marker follows both stream events in the recorder queue. Wait for its
+        // durable write instead of assuming database startup/flush takes under 300 ms.
+        d.record(crate::diagnostics::event(
+            "source.stream",
+            "source",
+            musicata_core::diagnostics::DiagnosticAction::Transition,
+            None,
+            "",
+        ));
+        let rows = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(store) = d.store().await {
+                    let snapshot = store.snapshot(0).await.unwrap();
+                    if !snapshot.transitions.is_empty() {
+                        break snapshot.incidents;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("diagnostic stream events were not persisted");
         assert_eq!(rows.len(), 1);
         assert!(rows[0]["recovered_at"].is_null());
         assert_eq!(
