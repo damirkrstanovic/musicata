@@ -96,3 +96,8 @@ tikv-jemallocator = { version = "0.7", features = ["profiling"] }
 [dev-dependencies]
 sqlx.workspace = true
 tower.workspace = true
+
+# Apply the same bounded arenas, background purging and heap accounting to native
+# SQLite/C allocations. Other targets keep their existing allocator configuration.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["override_allocator_on_supported_platforms"] }

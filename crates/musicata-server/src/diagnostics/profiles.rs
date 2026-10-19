@@ -16,7 +16,8 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // Enable the capability before allocator initialization; stack sampling itself is off.
 // No user environment configuration is needed to activate a bounded session later.
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-#[unsafe(export_name = "_rjem_malloc_conf")]
+#[cfg_attr(target_env = "gnu", unsafe(export_name = "malloc_conf"))]
+#[cfg_attr(not(target_env = "gnu"), unsafe(export_name = "_rjem_malloc_conf"))]
 pub static mut MALLOC_CONF: *const libc::c_char =
     c"prof:true,prof_active:false,lg_prof_sample:20,narenas:8,thp:never,metadata_thp:disabled,background_thread:true".as_ptr();
 // Bound allocator arenas independently of the host CPU count (containers may see many
@@ -402,6 +403,161 @@ fn heap_snapshot(_db: &Path) -> anyhow::Result<Vec<AllocationStack>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    #[ignore = "128 MiB process-wide reclamation test; run alone"]
+    fn native_freed_pages_are_reclaimed_while_workers_idle() {
+        const CHILD: &str = "MUSICATA_NATIVE_RECLAMATION_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "diagnostics::profiles::tests::native_freed_pages_are_reclaimed_while_workers_idle", "--ignored", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            eprintln!(
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(
+                result.status.success(),
+                "isolated allocator regression failed"
+            );
+            return;
+        }
+        fn rss() -> usize {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("VmRSS:").map(|value| {
+                        value
+                            .split_whitespace()
+                            .next()
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap()
+                            * 1024
+                    })
+                })
+                .unwrap()
+        }
+        let before = rss();
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    // Keep a final allocation and each worker alive after freeing the
+                    // bulk. Idle async/SQL workers cannot rely on thread exit to reclaim.
+                    let pointers: Vec<_> = (0..4096)
+                        .map(|_| unsafe {
+                            let p = libc::malloc(8192);
+                            assert!(!p.is_null());
+                            std::ptr::write_bytes(p.cast::<u8>(), 42, 8192);
+                            p
+                        })
+                        .collect();
+                    barrier.wait();
+                    barrier.wait();
+                    for p in &pointers[..4095] {
+                        unsafe { libc::free(*p) };
+                    }
+                    barrier.wait();
+                    barrier.wait();
+                    unsafe { libc::free(pointers[4095]) };
+                })
+            })
+            .collect();
+        barrier.wait();
+        let peak = rss();
+        barrier.wait();
+        barrier.wait();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut after = rss();
+        while after > before + 48 * 1024 * 1024 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+            after = rss();
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        eprintln!("native reclamation RSS: before={before}, peak={peak}, idle={after}");
+        assert!(
+            peak > before + 96 * 1024 * 1024,
+            "workload must touch native pages"
+        );
+        assert!(
+            after <= before + 48 * 1024 * 1024,
+            "idle native free pages stayed resident"
+        );
+    }
+    // Isolate allocator counters from other tests. This catches native C allocations
+    // bypassing the allocator whose statistics and purge policy we expose.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn native_allocations_are_accounted_for() {
+        const CHILD: &str = "MUSICATA_NATIVE_ALLOCATOR_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "diagnostics::profiles::tests::native_allocations_are_accounted_for",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            eprintln!(
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(
+                result.status.success(),
+                "isolated allocator regression failed"
+            );
+            return;
+        }
+        fn allocated() -> usize {
+            tikv_jemalloc_ctl::epoch::advance().unwrap();
+            tikv_jemalloc_ctl::stats::allocated::read().unwrap()
+        }
+        let before = allocated();
+        const BYTES: usize = 16 * 1024 * 1024;
+        // SAFETY: malloc/calloc results are checked, accessed only within their
+        // allocation, and freed through the matching C API, including realloc failure.
+        let (during, resized, after) = unsafe {
+            let pointer = libc::calloc(1, BYTES);
+            assert!(!pointer.is_null());
+            std::ptr::write_bytes(pointer.cast::<u8>(), 42, BYTES);
+            let during = allocated();
+            let larger = libc::realloc(pointer, BYTES * 2);
+            if larger.is_null() {
+                libc::free(pointer);
+                panic!("native realloc failed");
+            }
+            assert_eq!(*larger.cast::<u8>(), 42);
+            std::ptr::write_bytes(larger.cast::<u8>().add(BYTES), 43, BYTES);
+            let resized = allocated();
+            libc::free(larger);
+            (during, resized, allocated())
+        };
+        // Allocator bookkeeping may free small startup buffers between snapshots.
+        assert!(
+            during + 256 * 1024 >= before + BYTES,
+            "native allocation missing: before={before}, during={during}"
+        );
+        assert!(
+            resized + 256 * 1024 >= before + BYTES * 2,
+            "native realloc missing: {resized}"
+        );
+        assert!(
+            after < before + BYTES / 2,
+            "freed native allocation still live: {after}"
+        );
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn allocator_policy_bounds_arenas_and_purges_while_idle() {

@@ -4,6 +4,13 @@ Musicata is a local-first music server + web controller. Rust workspace, milesto
 (see `docs/roadmap.md`). **This is the single source of truth for human and AI contributors;
 `CLAUDE.md` includes this file.**
 
+## Planning and task tracking
+
+Use **GitHub Issues** for planning and task descriptions. Keep task scope, acceptance
+criteria, implementation plans and progress in the relevant issue rather than separate
+repository task-plan files. Link related issues from pull requests; repository design
+documentation can provide supporting technical detail.
+
 ## Prior art — read before solving a hard problem
 
 **`docs/prior-art.md`** captures how Roon, Jellyfin, Navidrome, beets, Picard, Music
@@ -139,6 +146,56 @@ explicitly. See `docs/native-endpoint.md` and `docs/musicata-ml.md`.
   passes). See `*_loop` fns in `main.rs`. The trade-off — eventual consistency instead of
   strict ordering — is the point; don't re-entangle them for ordering.
 - AGPL-3.0; check a new dependency's license before adding it.
+
+## Runtime performance lessons
+
+The 1.8.5 investigation ([#59](https://github.com/damirkrstanovic/musicata/issues/59),
+[#63](https://github.com/damirkrstanovic/musicata/pull/63)) found native heap retention,
+unnecessary library rewrites, and repeated failed artwork decoding. Apply these lessons when
+changing background work or investigating CPU/RAM usage:
+
+- **Separate memory measurements and processes.** Record server RSS/PSS, allocator live and
+  resident bytes, and container memory/cache separately. Allocator `retained` is reserved
+  virtual address space, not resident RAM; raw cgroup memory also includes filesystem cache.
+  Measure Snapserver and other companion binaries separately. High RSS alone does not prove
+  a leak, and low Rust allocation counts do not account for every native allocation.
+- **Verify allocator coverage for the actual build.** Native SQLite/C allocations previously
+  used glibc while Rust used jemalloc; glibc retained about 1 GiB of already-freed pages.
+  GNU/Linux now uses jemalloc's supported native allocator override, with matching
+  `malloc_conf` configuration and background reclamation. Musl keeps its separate existing
+  configuration. Preserve these target distinctions; check native allocation accounting and
+  idle page reclamation rather than assuming a Rust global allocator covers C code.
+- **Measure complete background cycles on unchanged data.** For idle-memory regressions,
+  capture at least an hour before changing the process, then measure after deployment through
+  the next periodic scan and artwork retries. A low reading immediately after restart is
+  insufficient. Record version/revision, PID/session, enabled queues, worker attempts,
+  completions/retries/restarts, CPU, RSS, allocator statistics and I/O. Keep problematic inputs
+  for the comparison. Include peak RSS/high-water marks and recovery time; periodic samples
+  can miss short peaks. Distinguish bounded observations from proof that no leak exists.
+- **Account for profiler overhead.** Continuous CPU sampling identifies executing functions;
+  it does not measure heap ownership. Native malloc/free uprobes can impose substantial CPU
+  overhead even when allocation records are sampled. Compare CPU against an untraced baseline
+  or equivalent instrumentation, and stop temporary allocation tracing after capture. Verify
+  real uploaded profiles and resolved Rust symbols, not just collector readiness. Keep raw
+  captures and host configuration private; publish anonymized findings in the issue.
+- **Unchanged scans must avoid unnecessary persistence.** A backfill requires a newly learned
+  value for the *same entity*. "Some stored track lacks a duration" plus "some scanned track
+  has one" incorrectly forced full-library rewrites every hour. Reuse the existing snapshot
+  and test actual database writes across repeated unchanged scans with mixed known/unknown
+  metadata, as well as a genuine same-track backfill.
+- **Bound artwork before expensive work and back off failures.** Limit downloaded bytes and
+  decoded image allocations independently: a small compressed image can expand enormously.
+  Read up to the byte limit plus one and reject overflow; silently truncating at the limit can
+  cache a corrupt image forever. Bound embedded-artwork source reads and concurrency too.
+  Failed warming needs bounded retry backoff and invalidation when artwork/source content
+  changes; distinguish durable absence from transient errors. Release temporary album lists
+  before idle sleeps. Automatic repair of old truncated cache entries and complete embedded
+  read/content-invalidation coverage remain follow-ups in #59.
+- **Test allocator and profiling behavior in isolation and in shipped builds.** Process-wide
+  allocator/profiler tests need isolated processes. Exercise native allocation/free while
+  worker threads remain alive, so thread exit cannot hide retention. Run the profiling smoke
+  against optimized executables on supported GNU/Linux and native-architecture musl targets;
+  debug-only tests cannot establish release unwinding or platform capability behavior.
 
 ## Coding Style & Naming
 

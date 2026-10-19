@@ -166,6 +166,27 @@ requires named application CPU stacks. The musl cross-linker also stripped its s
 table under debug-only stripping, so the server explicitly keeps symbols in its release
 profile. Raw heap mapping paths and dynamic thread labels are excluded from exports.
 
+### Native allocation ownership and idle reclamation (1.8.5)
+
+[Issue #59](https://github.com/damirkrstanovic/musicata/issues/59) found a large
+free-but-resident native glibc heap while Rust jemalloc live allocations stayed small.
+A C allocation/free workload with persistent worker threads reproduced the retention.
+The [supported jemallocator native override](https://docs.rs/tikv-jemalloc-sys/latest/tikv_jemalloc_sys/)
+lets Linux GNU builds use the existing bounded/purging allocator for linked C libraries
+too. This also closes the native-allocation blind spot in heap captures. Keep the
+matching `malloc_conf` symbol and test native calloc/realloc/free accounting, idle
+reclamation, and optimized profiling; do not infer success from a restart's low RSS.
+
+The same investigation found an oversized PNG silently truncated by the download
+limit, then repeatedly decoded for missing thumbnails. Artwork downloads now detect
+one byte beyond the limit and reject partial results; thumbnail decoding has a
+64 MiB allocation budget. Failed prewarming backs off from five minutes to six hours,
+retries immediately when the artwork reference changes, and prunes removed albums.
+The hourly scan also incorrectly treated a mix of known and unknown durations as
+backfill work, rewriting the whole library on every unchanged pass. Backfill now
+requires a newly learned duration for the same track and reuses the prior snapshot;
+a database-trigger regression verifies that repeated unchanged scans write no tracks.
+
 ## 6. Metadata sourcing & conflict resolution
 
 **Problem:** values for the same field come from several places (embedded tags,

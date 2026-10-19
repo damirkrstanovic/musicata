@@ -473,7 +473,12 @@ completed during the current server session are offered for download. Captures a
 compare normal-operation samples with profiling disabled before drawing performance conclusions.
 The allocator uses eight arenas, disables allocator huge pages and purges freed pages in
 the background to bound idle overhead on hosts with large CPU counts. High RSS by itself
-is not evidence of a leak.
+is not evidence of a leak. On Linux GNU builds (including Docker), native C/SQLite
+allocations share this allocator and therefore appear in its statistics and heap captures.
+Earlier releases used a separate glibc heap for native allocations, outside these totals.
+Musl retains its existing Rust-only allocator configuration. Allocator `retained` is
+reserved virtual address space, not resident RAM; it must not be added to RSS. Child
+processes such as Snapserver have separate heaps and are not included in server statistics.
 
 Resource history retains at most 2,880 samples (about 24 hours), with a checkpoint at most
 4 MiB every five minutes. It survives restarts with session and build identity. Worker
