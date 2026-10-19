@@ -17,6 +17,42 @@ use tokio::fs;
 /// temp path (different extensions of the same key, or two writers of the same entry).
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Retry unavailable/undecodable covers less often without permanently hiding
+/// newly acquired artwork. Entries are pruned against the current album list.
+#[derive(Default)]
+pub struct PrewarmRetries {
+    entries: std::collections::HashMap<String, (String, u32, std::time::Instant)>,
+}
+impl PrewarmRetries {
+    pub fn ready(&self, id: &str, revision: &str, now: std::time::Instant) -> bool {
+        self.entries
+            .get(id)
+            .is_none_or(|(old, _, next)| old != revision || now >= *next)
+    }
+    pub fn failed(&mut self, id: &str, revision: &str, now: std::time::Instant) {
+        let count = self
+            .entries
+            .get(id)
+            .filter(|(old, _, _)| old == revision)
+            .map_or(0, |(_, count, _)| count.saturating_add(1));
+        let delay = (300 * (1u64 << count.min(7))).min(6 * 60 * 60);
+        self.entries.insert(
+            id.into(),
+            (
+                revision.into(),
+                count,
+                now + std::time::Duration::from_secs(delay),
+            ),
+        );
+    }
+    pub fn succeeded(&mut self, id: &str) {
+        self.entries.remove(id);
+    }
+    pub fn retain(&mut self, albums: &std::collections::HashSet<&str>) {
+        self.entries.retain(|id, _| albums.contains(id.as_str()));
+    }
+}
+
 /// A flat, sharded directory of cached artwork files.
 #[derive(Clone)]
 pub struct ArtworkCache {
@@ -91,6 +127,54 @@ mod tests {
             .expect("clock after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("musicata-artcache-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn failed_prewarming_backs_off_and_changed_artwork_retries_immediately() {
+        let mut retries = PrewarmRetries::default();
+        let now = std::time::Instant::now();
+        assert!(retries.ready("album", "old-cover", now));
+        retries.failed("album", "old-cover", now);
+        assert!(!retries.ready(
+            "album",
+            "old-cover",
+            now + std::time::Duration::from_secs(299)
+        ));
+        let next = now + std::time::Duration::from_secs(300);
+        assert!(retries.ready("album", "old-cover", next));
+        retries.failed("album", "old-cover", next);
+        assert!(!retries.ready(
+            "album",
+            "old-cover",
+            next + std::time::Duration::from_secs(599)
+        ));
+        assert!(retries.ready(
+            "album",
+            "old-cover",
+            next + std::time::Duration::from_secs(600)
+        ));
+        assert!(retries.ready("album", "new-cover", next));
+        retries.failed("album", "new-cover", next);
+        assert!(retries.ready(
+            "album",
+            "new-cover",
+            next + std::time::Duration::from_secs(300)
+        ));
+        retries.succeeded("album");
+        assert!(retries.ready("album", "new-cover", next));
+        for _ in 0..100 {
+            retries.failed("album", "new-cover", now);
+        }
+        assert!(!retries.ready(
+            "album",
+            "new-cover",
+            now + std::time::Duration::from_secs(21599)
+        ));
+        assert!(retries.ready(
+            "album",
+            "new-cover",
+            now + std::time::Duration::from_secs(21600)
+        ));
     }
 
     #[tokio::test]

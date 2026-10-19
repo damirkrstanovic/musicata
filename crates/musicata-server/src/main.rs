@@ -541,6 +541,21 @@ async fn register_persisted_sources(
     Ok(())
 }
 
+/// Backfill only when a previously missing duration was learned for that track.
+/// Mixed known/unknown durations alone are normal and must not force idle writes.
+fn has_new_durations(prior: &Library, scanned: &Library) -> bool {
+    let missing: std::collections::HashSet<_> = prior
+        .tracks
+        .iter()
+        .filter(|track| track.duration_seconds.is_none())
+        .map(|track| track.id.as_str())
+        .collect();
+    scanned
+        .tracks
+        .iter()
+        .any(|track| track.duration_seconds.is_some() && missing.contains(track.id.as_str()))
+}
+
 /// Scan every source once and persist any changes. Runs in the background so a
 /// slow or unreachable source (an SMB share on a flaky network) never blocks the
 /// web server. Each source's progress and any failure (with its root cause) are
@@ -638,15 +653,9 @@ async fn scan_and_persist(
     // fresh scan now carries durations the stored rows lack, persist it even though
     // no file changed — a one-time cost after upgrading.
     let needs_backfill = !changes.has_changes()
-        && database
-            .load_library()
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|stored| {
-                stored.tracks.iter().any(|t| t.duration_seconds.is_none())
-                    && scanned.tracks.iter().any(|t| t.duration_seconds.is_some())
-            });
+        && prior
+            .as_ref()
+            .is_some_and(|stored| has_new_durations(stored, &scanned));
 
     // A few sample skipped-file reasons (unreadable tags, etc.) so failures are
     // visible, not just counted.
@@ -7378,7 +7387,8 @@ async fn artwork_prewarm_loop(
     let _worker = diagnostics::runtime::worker("prewarm");
     const WARM_CONCURRENCY: usize = 3;
     const IDLE_POLL: Duration = Duration::from_secs(300);
-    let mut warmed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut warmed = std::collections::HashMap::<String, String>::new();
+    let mut retries = artwork::PrewarmRetries::default();
     loop {
         let albums = match database.list_albums(None, i64::MAX, 0).await {
             Ok((albums, _)) => albums,
@@ -7388,17 +7398,31 @@ async fn artwork_prewarm_loop(
                 continue;
             }
         };
-        let todo: Vec<String> = albums
+        let present: std::collections::HashSet<_> =
+            albums.iter().map(|album| album.id.as_str()).collect();
+        warmed.retain(|id, _| present.contains(id.as_str()));
+        retries.retain(&present);
+        drop(present);
+        let now = std::time::Instant::now();
+        let todo: Vec<_> = albums
             .into_iter()
-            .map(|album| album.id)
-            .filter(|id| !warmed.contains(id))
+            .map(|album| {
+                (
+                    album.id,
+                    format!("{:?}|{:?}", album.artwork_path, album.artwork_url),
+                )
+            })
+            .filter(|(id, revision)| {
+                warmed.get(id) != Some(revision) && retries.ready(id, revision, now)
+            })
             .collect();
         let mut newly = 0usize;
         // Bounded concurrency (chunks of WARM_CONCURRENCY) so warming leaves SMB headroom for
         // live streams rather than saturating the pool.
         for chunk in todo.chunks(WARM_CONCURRENCY) {
             let mut set = tokio::task::JoinSet::new();
-            for id in chunk {
+            for (id, revision) in chunk {
+                let revision = revision.clone();
                 let database = database.clone();
                 let providers = providers.clone();
                 let artwork_cache = artwork_cache.clone();
@@ -7411,15 +7435,18 @@ async fn artwork_prewarm_loop(
                     } else {
                         health.fail(true, "cover_unavailable");
                     }
-                    (id, ok)
+                    (id, revision, ok)
                 });
             }
             while let Some(joined) = set.join_next().await {
-                if let Ok((id, ok)) = joined
-                    && ok
-                    && warmed.insert(id)
-                {
-                    newly += 1;
+                if let Ok((id, revision, ok)) = joined {
+                    if ok {
+                        retries.succeeded(&id);
+                        warmed.insert(id, revision);
+                        newly += 1;
+                    } else {
+                        retries.failed(&id, &revision, std::time::Instant::now());
+                    }
                 }
             }
             // Periodic progress so a long first pass over a large library is visible.
@@ -7734,9 +7761,13 @@ fn artwork_etag(key: &str, size: Option<u32>) -> String {
 /// and re-encode as JPEG. `None` if the bytes can't be decoded — the caller then serves
 /// the original untouched. Synchronous + CPU-bound: call inside `spawn_blocking`.
 fn resize_to_jpeg(original: &[u8], size: u32) -> Option<Vec<u8>> {
-    let thumbnail = image::load_from_memory(original)
-        .ok()?
-        .thumbnail(size, size);
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(original))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let thumbnail = reader.decode().ok()?.thumbnail(size, size);
     let mut buffer = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, 82)
         .encode_image(&thumbnail.to_rgb8())
@@ -11962,6 +11993,73 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
     }
 
+    #[test]
+    fn duration_backfill_requires_a_new_duration_for_the_same_track() {
+        let fixture = TestFixture::new("duration-backfill");
+        let mut prior = fixture.library();
+        let mut scanned = prior.clone();
+        scanned.tracks[0].duration_seconds = Some(123.0);
+        assert!(super::has_new_durations(&prior, &scanned));
+        prior.tracks[0].duration_seconds = Some(123.0);
+        assert!(!super::has_new_durations(&prior, &scanned));
+        prior.tracks[0].duration_seconds = None;
+        scanned.tracks[0].id = "different-track".into();
+        assert!(!super::has_new_durations(&prior, &scanned));
+    }
+
+    #[tokio::test]
+    async fn unchanged_scan_with_mixed_durations_does_not_rewrite_tracks() {
+        let fixture = TestFixture::new("unchanged-durations");
+        let mut library = fixture.library();
+        library.tracks[0].duration_seconds = Some(123.0);
+        assert!(
+            library
+                .tracks
+                .iter()
+                .any(|track| track.duration_seconds.is_none())
+        );
+        let path = fixture.root.join("musicata.db");
+        let database = Database::connect(&path).await.unwrap();
+        database.save_library(&mut library).await.unwrap();
+        let audit = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE test_scan_writes (id INTEGER)")
+            .execute(&audit)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER test_scan_insert AFTER INSERT ON tracks BEGIN INSERT INTO test_scan_writes VALUES (1); END")
+            .execute(&audit).await.unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.push(ProviderHandle::local(LocalDiskProvider::new(&fixture.root)));
+        let providers = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let activity = std::sync::Arc::new(crate::activity::ActivityLog::default());
+        for _ in 0..2 {
+            super::scan_and_persist(&database, &providers, &lock, &activity, "unchanged", true)
+                .await;
+        }
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM test_scan_writes")
+            .fetch_one(&audit)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "an unrelated track with a duration must not trigger backfill"
+        );
+        let stored = database.load_library().await.unwrap().unwrap();
+        assert_eq!(stored.tracks.len(), library.tracks.len());
+        assert_eq!(
+            stored
+                .tracks
+                .iter()
+                .filter(|track| track.duration_seconds.is_some())
+                .count(),
+            1
+        );
+        audit.close().await;
+    }
+
     #[tokio::test]
     async fn warm_promotes_local_cover_and_survives_rescan() {
         // A folder cover, once warmed, must be recorded as a local-cache `acquired` row so a
@@ -12073,6 +12171,21 @@ mod tests {
     fn artwork_etag_is_size_aware() {
         assert_eq!(artwork_etag("abc", None), "\"abc\"");
         assert_eq!(artwork_etag("abc", Some(300)), "\"abc-300\"");
+    }
+
+    #[test]
+    fn thumbnail_decode_rejects_images_over_the_pixel_budget() {
+        // A compressed image can be tiny on disk but require over 64 MiB to decode.
+        // This valid RGB image exercises the decoder, not a malformed-header rejection.
+        let source = image::RgbImage::from_pixel(5000, 5000, image::Rgb([120, 130, 140]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(source)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert!(
+            resize_to_jpeg(&png, 128).is_none(),
+            "thumbnail decoding must respect its memory budget"
+        );
     }
 
     #[test]
