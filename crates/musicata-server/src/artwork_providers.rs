@@ -45,9 +45,12 @@ pub fn download_image(url: &str) -> Result<(Vec<u8>, &'static str), String> {
     let mut bytes = Vec::new();
     response
         .into_reader()
-        .take(MAX_BYTES)
+        .take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err("image response exceeds the 16 MiB artwork limit".to_string());
+    }
     if bytes.is_empty() {
         return Err("empty image response".to_string());
     }
@@ -609,6 +612,35 @@ mod tests {
         assert_eq!(result.provider, "itunes");
         assert_eq!(result.image_url, "https://is/y/600x600bb.jpg");
         assert_eq!(result.width, Some(600));
+    }
+
+    #[test]
+    fn oversized_download_is_rejected_instead_of_cached_truncated() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/cover.png", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).unwrap();
+            // No Content-Length: enforce the byte limit while reading, not only headers.
+            stream
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Type: image/png\r\n\r\n")
+                .unwrap();
+            stream.write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+            let block = [0; 65536];
+            for _ in 0..256 {
+                if stream.write_all(&block).is_err() {
+                    break;
+                }
+            }
+        });
+        let result = download_image(&url);
+        server.join().unwrap();
+        assert!(
+            result.is_err(),
+            "oversized download must not become a truncated cache entry"
+        );
     }
 
     #[test]
