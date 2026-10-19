@@ -354,17 +354,22 @@
   }
 }} />
 
-<main inert={$activeModal !== null} class="shell" class:nav-open={navOpen} class:np-open={nowPlayingOpen}>
-  <header class="mobile-bar" inert={mobile && navOpen}>
+<main inert={$activeModal !== null} class="shell listening-shell" class:nav-open={navOpen} class:np-open={nowPlayingOpen}>
+  <header class="mobile-bar" inert={navOpen}>
     {#if nav.canGoBack}<button class="bar-icon mobile-back" type="button" aria-label="Back" onclick={() => nav.pop()}>‹</button>{/if}
-    <button class="bar-icon" type="button" aria-label="Open navigation" aria-expanded={navOpen} onclick={openNavigation}>☰</button>
+    <button class="bar-icon" type="button" aria-label="Open navigation" aria-expanded={navOpen} onclick={openNavigation}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
     <span class="mobile-brand">Musicata</span>
-    {#if session.isAdmin}<button class="bar-icon" type="button" aria-label="Settings" onclick={() => nav.push({name: "settings", category: "sources"})}>⚙</button>{/if}
+    <nav class="desktop-navigation" aria-label="Main navigation">
+      <button type="button" data-activity="browse" aria-current={!nowPlayingOpen && activity === "browse" ? "page" : undefined} onclick={() => search.clear()}>Library</button>
+      <button type="button" aria-current={nowPlayingOpen ? "page" : undefined} onclick={() => setNowPlaying(true)}>Now Playing</button>
+      <button type="button" aria-current={!nowPlayingOpen && ["playlists", "playlist", "smart"].includes(route.name) ? "page" : undefined} onclick={() => nav.root({name: "playlists"})}>Playlists</button>
+    </nav>
+    {#if session.isAdmin}<button class="bar-icon" type="button" aria-label="Settings" data-activity="settings" onclick={() => nav.push({name: "settings", category: "sources"})}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 3-1 3-3 1 1 3-2 2 2 2-1 3 3 1 1 3h6l1-3 3-1-1-3 2-2-2-2 1-3-3-1-1-3Z"/><circle cx="12" cy="12" r="3"/></svg></button>{/if}
   </header>
   <button class="scrim" type="button" hidden={!navOpen} aria-label="Dismiss navigation" onclick={closeNavigation}></button>
-  <Sidebar onclose={closeNavigation} inert={mobile && !navOpen} />
+  <Sidebar onclose={closeNavigation} inert={!navOpen} />
 
-  <section class="content" inert={mobile && (navOpen || panelOpen)}>
+  <section class="content" inert={navOpen || (nowPlayingOpen && !auxiliaryOpen && !player.queueOpen) || (mobile && panelOpen)}>
     {#if activity !== "settings"}<InstallPrompt inline />{/if}
     <div class="browse-toolbar">
     <header class="content-header">
@@ -453,7 +458,7 @@
     {/if}
   </section>
 
-  <aside class="playback-panels" class:open={panelOpen} aria-label="Playback details" inert={mobile && navOpen}>
+  <aside class="playback-panels" class:open={panelOpen} class:listening={nowPlayingOpen && !auxiliaryOpen && !player.queueOpen} aria-label="Playback details" inert={navOpen}>
     {#if nowPlayingOpen}<NowPlaying hidden={player.queueOpen || auxiliaryOpen} onclose={() => setNowPlaying(false)} />{/if}
     <MetadataPanel />
     <QueueDrawer />
@@ -461,7 +466,7 @@
     <VuMeter />
     <StatsPanel />
   </aside>
-  <div class="player-bar" inert={mobile && navOpen}>
+  <div class="player-bar" inert={navOpen}>
     <div class="player-destination">
       <OutputPicker {players} {zones} memberId={zoneMemberId} onmemberchange={member => { zoneMemberId = member.id; dsp.bindOutput(member.id, member.name); }} onchange={onTargetChange} onrefresh={loadTargets} />
     </div>

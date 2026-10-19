@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import "../styles.css";
+import "./listening-room.css";
 import { mount } from "svelte";
 import App from "./App.svelte";
 import AuthGate from "../lib/AuthGate.svelte";

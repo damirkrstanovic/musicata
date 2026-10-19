@@ -8,9 +8,9 @@
   import { nav } from "../lib/nav.svelte";
   import { promptText, confirmAction } from "../lib/modal";
   import { initial } from "../lib/dom";
-  import { tick } from "svelte";
+  import { tick, type Snippet } from "svelte";
 
-  let { embedded = false }: { embedded?: boolean } = $props();
+  let { embedded = false, listening = false, controls }: { embedded?: boolean; listening?: boolean; controls?: Snippet } = $props();
   let wasOpen = false;
   let editing = $state(false);
   let optionsOpen = $state(false);
@@ -80,15 +80,20 @@
   }
 </script>
 
-{#if embedded || player.queueOpen}
-  <section class="queue-drawer" class:embedded aria-label="Play queue">
-    <header class="queue-head">
-      <strong>Queue</strong>
+{#snippet actions()}
       <div class="queue-head-actions">
         <button class="ghost-button queue-edit" type="button" aria-pressed={editing} onclick={() => editing = !editing}>{editing ? "Done editing" : "Edit queue"}</button>
         <button class="ghost-button queue-options-toggle" type="button" aria-label="Queue options" aria-expanded={optionsOpen} onclick={() => optionsOpen = !optionsOpen}>•••</button>
         {#if !embedded}<button class="ghost-button" type="button" aria-label="Close queue" onclick={close}>Close</button>{/if}
       </div>
+{/snippet}
+
+{#if embedded || player.queueOpen}
+  <section class="queue-drawer" class:embedded aria-label="Play queue">
+    <header class="queue-head">
+      <strong>Queue</strong>
+      {#if controls}{@render controls()}{/if}
+      {#if !listening}{@render actions()}{/if}
     </header>
     {#if optionsOpen}
       <div class="queue-options">
@@ -152,6 +157,7 @@
         {/each}
       </div>
     {/if}
+    {#if listening}<footer class="queue-footer">{@render actions()}</footer>{/if}
   </section>
 {/if}
 

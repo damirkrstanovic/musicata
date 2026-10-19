@@ -60,6 +60,7 @@
   </div>
 
   <div class="mini-controls">
+    <button class="control mini-previous" type="button" aria-label="Previous" onclick={() => previous()}><PlaybackIcon name="previous" /></button>
     <button class="control play" type="button"
       aria-label={player.status === "playing" && !player.playBlocked ? "Pause" : "Play"}
       onclick={() => togglePlayback()}><PlaybackIcon name={player.status === "playing" && !player.playBlocked ? "pause" : "play"} /></button>

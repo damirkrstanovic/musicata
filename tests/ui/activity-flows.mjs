@@ -144,4 +144,8 @@ check('direct admin entry denies listeners',await wait(`document.body.textConten
 await send('Network.setCookie',{name:'musicata_session',value:cookie.slice(cookie.indexOf('=')+1),domain:'127.0.0.1',path:'/'});
 await send('Page.navigate',{url:base+'/'});
 check('administrator login completes the preserved legacy profile import',await wait(`document.querySelector('[data-activity="settings"]') && !JSON.parse(localStorage.getItem('musicata-dsp')).custom?.length`) && (await api('/api/dsp/profiles')).some(profile=>profile.id===legacyProfile.id));
+await send('Page.navigate',{url:base+'/admin'});
+check('direct Settings entry loads',await wait(`document.querySelector('.settings-workspace')`));
+check('direct Settings entry uses the shared listening shell',await js(`getComputedStyle(document.querySelector('.mobile-bar')).display==='flex' && document.querySelector('.library-panel').getBoundingClientRect().right<=1 && document.querySelector('.content').getBoundingClientRect().top>=52`));
+await screenshot('direct-settings-entry');
 socket.close();process.exit(failures?1:0);

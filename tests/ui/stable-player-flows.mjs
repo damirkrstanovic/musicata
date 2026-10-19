@@ -1,3 +1,4 @@
+import { listeningRoomFlows } from "./listening-room-flows.mjs";
 // #51/#53: navigation must not move the playback/output controls away from the listener.
 export async function stablePlayerFlows({js, send, check, waitUntil, tap, screenshot}) {
   const settle = () => new Promise(r => setTimeout(r, 400));
@@ -8,6 +9,10 @@ export async function stablePlayerFlows({js, send, check, waitUntil, tap, screen
     await waitUntil('document.querySelector(".album-card")',5000);
     await settle();
     await js(`document.querySelector('.install-x')?.click()`);
+    await js(`document.querySelector('.content')?.scrollTo(0,100000);window.scrollTo(0,100000)`);
+    await settle();
+    check(`Listening room ${width}: last library card clears the fixed player`,await js(`(()=>{const e=[...document.querySelectorAll('.album-card')].at(-1);if(!e)return false;const r=e.getBoundingClientRect(),bar=document.querySelector('.player-bar').getBoundingClientRect();return r.bottom<=bar.top && e.contains(document.elementFromPoint(r.x+r.width/2,r.bottom-4))})()`));
+    await js(`document.querySelector('.content')?.scrollTo(0,0);window.scrollTo(0,0)`);
     check(`Stable ${width}: search is directly reachable in Library`,await tap('[aria-label="Search library"]'));
     await js(`window.stableBounds=Object.fromEntries(['.transport','.output-trigger'].map(s=>[s,document.querySelector(s)?.getBoundingClientRect().toJSON()]));`);
     const stable = () => js(`['.transport','.output-trigger'].every(s=>{const a=window.stableBounds[s],b=document.querySelector(s)?.getBoundingClientRect();return a&&b&&['x','y','width','height'].every(k=>Math.abs(a[k]-b[k])<2)})`);
@@ -36,6 +41,8 @@ export async function stablePlayerFlows({js, send, check, waitUntil, tap, screen
     await js(`window.modeTop=document.querySelector('.playback-modes')?.getBoundingClientRect().top;document.querySelector('.now-playing-panel').scrollTop=500`);
     check(`Stable ${width}: playback modes stay fixed while queue scrolls`,await js(`Math.abs(document.querySelector('.playback-modes')?.getBoundingClientRect().top-window.modeTop)<2`));
     await js(`document.querySelector('.now-playing-panel').scrollTop=0`);
+    check('Listening room '+width+': artwork and queue use the full listening surface',await js('(()=>{const panel=document.querySelector(".now-playing-panel"),art=panel?.querySelector(".playing-cover"),queue=panel?.querySelector(".queue-drawer");if(!panel||!art||!queue)return false;const a=art.getBoundingClientRect(),q=queue.getBoundingClientRect(),p=panel.getBoundingClientRect();return innerWidth>=1024?a.width>=280&&q.x>a.right&&p.width>=innerWidth-4:q.height>=Math.min(120,innerHeight*.2)})()'));
+    check(`Listening room ${width}: a queued track has room to remain readable`,await js(`(()=>{const list=document.querySelector('.now-playing-panel .queue-list');return !list || list.getBoundingClientRect().height>=58})()`));
     await screenshot(`stable-${width}-now`);
     if(width<1024) {
       await tap('[aria-label="Open navigation"]');
@@ -84,4 +91,5 @@ export async function stablePlayerFlows({js, send, check, waitUntil, tap, screen
     check(`Stable ${width}: Settings keeps output in place`,await stable());
     check(`Stable ${width}: page fits viewport`,await js(`document.documentElement.scrollWidth<=document.documentElement.clientWidth`));
   }
+  await listeningRoomFlows({js, send, check, waitUntil, tap, screenshot});
 }
