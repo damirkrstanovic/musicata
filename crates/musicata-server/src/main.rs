@@ -22,6 +22,8 @@ mod artwork;
 #[cfg(test)]
 mod artwork_cancellation_tests;
 mod artwork_providers;
+mod audio_identity;
+mod audio_identity_worker;
 mod auth;
 mod autoeq;
 mod backup;
@@ -78,7 +80,7 @@ use musicata_core::{
     Album, Artist, BrowseFilter, BrowseIndex, Library, LibrarySummary, LocalDiskProvider,
     MetadataApprovalState, MetadataFieldValue, PlaybackState, Player, PlayerCommand, Playlist,
     RadioStation, Track, TrackMetadataFieldObservation, Zone, album_artwork_url, artwork_asset_id,
-    find_album_artwork_candidates, merge_libraries, regroup_library_with_overrides,
+    find_album_artwork_candidates, merge_libraries,
 };
 use musicata_storage::{Database, ResolvedMusicBrainzMetadata};
 use musicbrainz::{
@@ -258,13 +260,18 @@ async fn main() -> Result<()> {
     if config.scan_once {
         migrate_identity(&database).await;
         let registry = providers.read().await.clone();
+        let revision = database.library_revision().await?;
         let prior = database.load_library().await?.map(Arc::new);
         let mut scanned = registry
             .scan_all(prior)
             .await
             .context("library scan failed")?;
-        database.save_library(&mut scanned).await?;
-        database.refresh_source_artwork(&scanned).await?;
+        database
+            .save_library_at_revision(&mut scanned, revision)
+            .await?;
+        database
+            .refresh_source_artwork_at_revision(&scanned, revision + 1)
+            .await?;
         restore_after_scan(&database).await;
         tracing::info!(
             artists = scanned.artists.len(),
@@ -362,6 +369,11 @@ async fn main() -> Result<()> {
                 activity.clone(),
                 LIBRARY_RESCAN_INTERVAL,
                 ready_tx,
+            ));
+            tokio::spawn(audio_identity_loop(
+                database.clone(),
+                providers.clone(),
+                ready_rx.clone(),
             ));
             tokio::spawn(fingerprint_loop(
                 database.clone(),
@@ -589,7 +601,20 @@ async fn scan_and_persist(
     // The stored library is the "prior" for an incremental scan: unchanged files
     // (same size + mtime) reuse their parsed metadata, so only new/changed files are
     // re-read — cheap in steady state, especially over the network.
-    let prior = database.load_library().await.ok().flatten().map(Arc::new);
+    let revision = match database.library_revision().await {
+        Ok(revision) => revision,
+        Err(error) => {
+            activity.finish(task, false, Some(error.to_string()));
+            return;
+        }
+    };
+    let prior = match database.load_library().await {
+        Ok(prior) => prior.map(Arc::new),
+        Err(error) => {
+            activity.finish(task, false, Some(error.to_string()));
+            return;
+        }
+    };
 
     // Scan each source in turn. The progress callback updates the activity label
     // live (finding files → N/M processed); per-source results and any failure with
@@ -643,10 +668,26 @@ async fn scan_and_persist(
                 ));
                 libraries.push(library);
             }
-            Err(error) => errors.push(format!("{id}: {error}")),
+            Err(error) => {
+                errors.push(format!("{id}: {error}"));
+                if let Some(retained) = prior
+                    .as_deref()
+                    .and_then(|p| providers::prior_source_library(p, &id))
+                {
+                    libraries.push(retained);
+                }
+            }
         }
     }
     let mut scanned = merge_libraries(libraries);
+    if let Err(error) = database.reconcile_library_identity(&mut scanned).await {
+        activity.finish(
+            task,
+            false,
+            Some(format!("identity reconciliation failed: {error}")),
+        );
+        return;
+    }
 
     let changes = match database.detect_library_changes(&scanned).await {
         Ok(changes) => changes,
@@ -678,12 +719,24 @@ async fn scan_and_persist(
         .collect();
 
     if changes.has_changes() || needs_backfill {
-        if let Err(error) = database.save_library(&mut scanned).await {
-            errors.push(format!("failed to save library: {error}"));
+        if let Err(error) = database
+            .save_library_at_revision(&mut scanned, revision)
+            .await
+        {
+            activity.finish(
+                task,
+                false,
+                Some(format!("failed to save library: {error}")),
+            );
+            return;
         }
     }
 
-    if let Err(error) = database.refresh_source_artwork(&scanned).await {
+    let committed_revision = revision + i64::from(changes.has_changes() || needs_backfill);
+    if let Err(error) = database
+        .refresh_source_artwork_at_revision(&scanned, committed_revision)
+        .await
+    {
         errors.push(format!("failed to update source artwork: {error}"));
     }
 
@@ -1036,6 +1089,31 @@ async fn library_discovery_loop(
         )
         .await;
         restore_after_scan(&database).await;
+    }
+}
+
+/// Exact encoded-audio verification has its own serial queue, independent of scans.
+async fn audio_identity_loop(
+    database: Database,
+    providers: Arc<RwLock<ProviderRegistry>>,
+    mut ready: tokio::sync::watch::Receiver<bool>,
+) {
+    let _worker = diagnostics::runtime::worker("audio_identity");
+    let _ = ready.wait_for(|&r| r).await;
+    loop {
+        let count = match audio_identity_worker::audio_identity_pass(&database, &providers).await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "audio identity verification failed");
+                0
+            }
+        };
+        if count == 0 {
+            diagnostics::runtime::state("audio_identity", "idle");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        } else {
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -1750,36 +1828,9 @@ async fn migrate_identity(database: &Database) {
     if stored >= IDENTITY_VERSION {
         return;
     }
-    // Move favorites/acquired_* from old ids to new (reads the current, old-id rows) —
-    // must precede the re-derive+save that rewrites the artist/album rows.
-    match database.remap_identity_references().await {
-        Ok(moved) if moved > 0 => {
-            tracing::info!(moved, "identity: remapped favorite/artwork references")
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(%error, "identity: reference remap failed; skipping re-derive");
-            return;
-        }
-    }
-    // Re-derive ids by regrouping the cached library and saving (empty overrides → only
-    // recomputes ids via the new derivation + any aliases), then regenerate artwork urls.
-    if let Ok(Some(library)) = database.load_library().await {
-        let aliases = database.artist_alias_map().await.unwrap_or_default();
-        let mut regrouped =
-            regroup_library_with_overrides(library, &std::collections::BTreeMap::new(), &aliases);
-        if let Err(error) = database.save_library(&mut regrouped).await {
-            tracing::warn!(%error, "identity: re-derive save failed");
-            return;
-        }
-        let _ = diagnostics::background_result(
-            database.reapply_acquired_artwork().await,
-            "persistence.reapply_acquired_artwork",
-        );
-        let _ = diagnostics::background_result(
-            database.reapply_acquired_artist_artwork().await,
-            "persistence.reapply_acquired_artist_artwork",
-        );
+    if let Err(error) = database.reapply_canonical_grouping().await {
+        tracing::warn!(%error, "identity: regroup failed");
+        return;
     }
     if let Err(error) = database
         .set_setting(SETTING_IDENTITY_VERSION, &IDENTITY_VERSION.to_string())
@@ -3408,11 +3459,16 @@ async fn rescan_library(
     let _guard = state.rescan_lock.lock().await;
     let forced = query.force.unwrap_or(false);
     let registry = state.providers.read().await.clone();
+    let revision = state.database.library_revision().await?;
     let prior = state.database.load_library().await?.map(Arc::new);
     let mut scanned = registry
         .scan_all(prior)
         .await
         .map_err(|error| AppError::internal(error.to_string()))?;
+    state
+        .database
+        .reconcile_library_identity(&mut scanned)
+        .await?;
     let changes = state.database.detect_library_changes(&scanned).await?;
     let changed = changes.has_changes();
     let mut updated = forced || changed;
@@ -3421,9 +3477,16 @@ async fn rescan_library(
     // stored library's, so this summary is correct whether or not we save.
     let summary = scanned.summary();
     if updated {
-        state.database.save_library(&mut scanned).await?;
+        state
+            .database
+            .save_library_at_revision(&mut scanned, revision)
+            .await?;
     }
-    let artwork_updated = state.database.refresh_source_artwork(&scanned).await? > 0;
+    let artwork_updated = state
+        .database
+        .refresh_source_artwork_at_revision(&scanned, revision + i64::from(updated))
+        .await?
+        > 0;
     if updated {
         // save_library rewrote albums/artists to folder-derived rows, clearing acquired
         // artwork + grouping; republish them immediately (as the discovery loop does).
@@ -4351,10 +4414,6 @@ struct MergeArtistsRequest {
 /// synchronously; the library view reflects it once the regroup completes.
 fn spawn_apply_aliases(database: Database) {
     tokio::spawn(async move {
-        let _ = diagnostics::background_result(
-            database.remap_identity_references().await,
-            "persistence.remap_identity_references",
-        );
         if let Err(error) = database.reapply_canonical_grouping().await {
             tracing::warn!(%error, "merge: reapply canonical grouping failed");
         }
@@ -6668,6 +6727,7 @@ async fn update_track_metadata_field_review(
     Path(id): Path<String>,
     Json(update): Json<MetadataFieldReviewUpdate>,
 ) -> Result<Json<TrackMetadataReviewResponse>, AppError> {
+    let revision = state.database.library_revision().await?;
     let mut updated_library = state
         .database
         .load_library()
@@ -6682,7 +6742,10 @@ async fn update_track_metadata_field_review(
     update_metadata_field_approval(track, &update)?;
     let response = metadata_review_response(track);
 
-    state.database.save_library(&mut updated_library).await?;
+    state
+        .database
+        .save_library_at_revision(&mut updated_library, revision)
+        .await?;
     // save_library cleared acquired artwork + grouping; republish them immediately.
     restore_after_scan(&state.database).await;
 

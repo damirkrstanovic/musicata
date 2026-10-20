@@ -373,3 +373,32 @@ For Musicata, the best first implementation is **safe enrichment, not retagging*
 - keep a revision trail.
 
 This is the best fit for a Roon-like server because playback, browsing, and recommendations can use enriched metadata immediately without forcing destructive changes onto the user's music files.
+
+## Selected versions and source revisions
+
+A saved track selection identifies a particular playable version, not a reusable file
+path. Schema 38 retains version snapshots separately from the current library, with
+explicitly unknown recording/release-track links until evidence establishes them.
+Names, MusicBrainz claims and approximate fingerprints do not prove that two versions
+are interchangeable. Existing selected IDs are preserved during migration.
+
+Source items identify provider locations. Their revisions describe observed file
+attributes and full-file hashes when available. An independent serial worker streams
+encoded audio packets, including codec parameters and timing, to establish exact
+same-source equivalence across tag or timestamp changes. It validates source attributes
+before and after reading and commits with a revision guard. Incomplete, unsupported or
+changing inputs back off instead of being treated as equal. This is not a guarantee
+against changes that preserve all observable source attributes.
+
+Changing audio at the same location creates a new selected version. Favorites, playlist
+entries and queued selections do not transfer to it. Removed selections retain their
+own metadata for display but cannot play until that selected version is available;
+replacement is an explicit listener choice. Listening events keep their recorded
+metadata and source context rather than joining mutable current tags.
+
+Verification begins after upgrading. If old bytes disappear before their audio evidence
+has been recorded, equivalence cannot be reconstructed; old references stay unresolved.
+No cross-source substitution or guessed repair of historical orphaned references is
+performed. Artist/album grouping remains a reversible projection of source observations,
+accepted overrides and aliases, with saved-reference provenance tied to actual members
+and contributor roles.

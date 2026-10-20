@@ -409,7 +409,7 @@ pub struct Playlist {
     pub updated_at_unix_seconds: i64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Track {
     pub id: String,
     pub provider: ProviderMapping,
@@ -445,13 +445,13 @@ pub struct ScanIssue {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderMapping {
     pub provider_id: String,
     pub item_id: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TrackMetadataObservation {
     pub source: String,
     pub confidence: f32,
@@ -481,7 +481,7 @@ pub struct TrackMetadataObservation {
     pub embedded_artwork_count: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct TrackMetadataFieldObservation {
     pub source: String,
@@ -1029,13 +1029,6 @@ pub fn build_track(
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let identity = build_track_identity(
-        &metadata,
-        &extension,
-        file.file_size_bytes,
-        file.modified_at_unix_seconds,
-        file.content_hash.as_deref(),
-    );
     let track = Track {
         id: String::new(), // assigned (deduped) in assemble_library
         provider: ProviderMapping {
@@ -1062,6 +1055,10 @@ pub fn build_track(
         path,
     };
 
+    let identity = selected_version_identity(
+        &source_item_identity(provider_id, &track.provider.item_id),
+        &source_revision(&track),
+    );
     let prior_artwork = prior
         .albums
         .get(&track.album_id)
@@ -1169,11 +1166,21 @@ pub fn assemble_library(
     let mut album_builders: BTreeMap<String, AlbumBuilder> = BTreeMap::new();
     let mut artist_builders: BTreeMap<String, ArtistBuilder> = BTreeMap::new();
     let mut track_id_counts = BTreeMap::new();
+    // Reserve reused identities before assigning any new entry, including copies
+    // that sort before their original source path.
+    let mut reserved_ids: BTreeSet<String> = built
+        .iter()
+        .filter(|item| item.identity.is_none())
+        .map(|item| item.track.id.clone())
+        .collect();
 
     for mut item in built {
         scan_errors.append(&mut item.issues);
         if let Some(identity) = item.identity {
-            let id = unique_track_id(&identity, &mut track_id_counts);
+            let mut id = identity.clone();
+            while !reserved_ids.insert(id.clone()) {
+                id = unique_track_id(&identity, &mut track_id_counts);
+            }
             item.track.stream_url = format!("/api/tracks/{id}/stream");
             item.track.id = id;
         }
@@ -1313,7 +1320,9 @@ impl TrackCanonicalOverride {
 ///
 /// Album artwork is carried over from the pre-regroup albums (by their old `album_id`),
 /// so regrouping doesn't drop covers. Track ids, stream urls, provenance, and
-/// `added_at` are preserved untouched.
+/// `added_at` are preserved untouched. The track display fields are first restored from
+/// their provider observations: a prior alias must not become the source value when that
+/// alias is later removed.
 pub fn regroup_library_with_overrides(
     library: Library,
     overrides: &BTreeMap<String, TrackCanonicalOverride>,
@@ -1322,8 +1331,7 @@ pub fn regroup_library_with_overrides(
     // canonical name before its id is derived, so the variants group as one artist.
     aliases: &BTreeMap<String, String>,
 ) -> Library {
-    // Carry over each old album's artwork + its album-artist (used for tracks whose
-    // album-artist isn't being overridden), keyed by the pre-regroup album_id.
+    // Carry over each old album's artwork, keyed by the pre-regroup album_id.
     let artwork_providers: BTreeMap<_, _> = library
         .albums
         .iter()
@@ -1360,6 +1368,7 @@ pub fn regroup_library_with_overrides(
 
     for track in &mut tracks {
         let old_album_id = track.album_id.clone();
+        restore_observed_grouping_fields(track);
         let override_for = overrides.get(&track.id);
         if let Some(over) = override_for {
             if let Some(title) = &over.title {
@@ -1382,11 +1391,25 @@ pub fn regroup_library_with_overrides(
             }
         }
 
-        // Album artist: the override wins; else keep the old album's artist; else the
-        // track artist (matching the scanner's fallback in `build_track`).
+        // Album artist: the override wins; otherwise use its original observation, with
+        // the track artist as the scanner's fallback. Do not use the old album row here:
+        // it may itself be the result of an alias that has since been removed.
         let album_artist_name = override_for
             .and_then(|over| over.album_artist_name.clone())
-            .or_else(|| album_artist_by_old_album.get(&old_album_id).cloned())
+            .or_else(|| observed_album_artist_name(&track.observed_metadata))
+            // Legacy snapshots may predate raw album-artist observations. Preserve
+            // their known grouping rather than guessing from a featured track artist.
+            .or_else(|| {
+                if track
+                    .observed_metadata
+                    .iter()
+                    .any(|o| matches!(o.source.as_str(), "embedded_tag" | "folder_path"))
+                {
+                    Some(track.artist_name.clone())
+                } else {
+                    album_artist_by_old_album.get(&old_album_id).cloned()
+                }
+            })
             .unwrap_or_else(|| track.artist_name.clone());
 
         // Apply user-curated artist merges: rewrite a variant name to its canonical so the
@@ -1444,6 +1467,59 @@ pub fn regroup_library_with_overrides(
         artist_builders,
         scan_errors,
     )
+}
+
+/// Restore the grouping-relevant canonical fields from immutable source observations.
+/// The scanner gives embedded tags precedence over folder-path inference; keep that rule
+/// here so regrouping is reversible and cannot drift from an initial scan. Older rows may
+/// lack observations, in which case their current values are the only available evidence.
+fn restore_observed_grouping_fields(track: &mut Track) {
+    let embedded = track
+        .observed_metadata
+        .iter()
+        .find(|observation| observation.source == "embedded_tag");
+    let folder = track
+        .observed_metadata
+        .iter()
+        .find(|observation| observation.source == "folder_path");
+
+    track.title = embedded
+        .and_then(|observation| observation.title.clone())
+        .or_else(|| folder.and_then(|observation| observation.title.clone()))
+        .unwrap_or_else(|| track.title.clone());
+    track.artist_name = embedded
+        .and_then(|observation| observation.artist_name.clone())
+        .or_else(|| folder.and_then(|observation| observation.artist_name.clone()))
+        .unwrap_or_else(|| track.artist_name.clone());
+    track.album_title = embedded
+        .and_then(|observation| observation.album_title.clone())
+        .or_else(|| folder.and_then(|observation| observation.album_title.clone()))
+        .unwrap_or_else(|| track.album_title.clone());
+    track.year = embedded
+        .and_then(|observation| observation.year)
+        .or_else(|| folder.and_then(|observation| observation.year))
+        .or(track.year);
+    track.track_number = embedded
+        .and_then(|observation| observation.track_number)
+        .or_else(|| folder.and_then(|observation| observation.track_number))
+        .or(track.track_number);
+    track.disc_number = embedded
+        .and_then(|observation| observation.disc_number)
+        .or_else(|| folder.and_then(|observation| observation.disc_number))
+        .or(track.disc_number);
+}
+
+fn observed_album_artist_name(observations: &[TrackMetadataObservation]) -> Option<String> {
+    observations
+        .iter()
+        .find(|observation| observation.source == "embedded_tag")
+        .and_then(|observation| observation.album_artist_name.clone())
+        .or_else(|| {
+            observations
+                .iter()
+                .find(|observation| observation.source == "folder_path")
+                .and_then(|observation| observation.album_artist_name.clone())
+        })
 }
 
 /// Fold one track into the album/artist aggregates: count it against its own
@@ -1514,7 +1590,12 @@ fn aggregate_track(
 /// `provider_id`, so per-source attribution survives). Album and artist rows are
 /// unioned by id — disjoint sources keep their aggregates exactly, and the rare
 /// same-id collision (a duplicate album across two sources) sums its counts.
-pub fn merge_libraries(libraries: Vec<Library>) -> Library {
+pub fn merge_libraries(mut libraries: Vec<Library>) -> Library {
+    libraries.sort_by(|a, b| {
+        a.provider_id
+            .cmp(&b.provider_id)
+            .then_with(|| a.source_root.cmp(&b.source_root))
+    });
     if libraries.len() == 1 {
         return libraries.into_iter().next().expect("len checked");
     }
@@ -2032,7 +2113,7 @@ fn hash_file_contents_if_small(
     file_size_bytes: Option<u64>,
 ) -> Result<Option<String>, std::io::Error> {
     // Only fingerprint files whose size is known and small; unknown or large
-    // files fall back to size/mtime identity (see `build_track_identity`).
+    // files fall back to size/mtime identity (see `source_revision`).
     match file_size_bytes {
         Some(size) if size <= INLINE_CONTENT_HASH_LIMIT_BYTES => {}
         _ => return Ok(None),
@@ -2474,45 +2555,6 @@ fn relative_display_path(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn build_track_identity(
-    metadata: &TrackMetadata,
-    extension: &str,
-    file_size_bytes: Option<u64>,
-    modified_at_unix_seconds: Option<i64>,
-    content_hash: Option<&str>,
-) -> String {
-    let source_identity = content_hash
-        .map(|hash| format!("sha256:{hash}"))
-        .unwrap_or_else(|| {
-            format!(
-                "unhashed:size={}:modified={}",
-                file_size_bytes
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                modified_at_unix_seconds
-                    .map(|value| value.to_string())
-                    .unwrap_or_default()
-            )
-        });
-
-    format!(
-        "{}::artist={}::album={}::title={}::year={}::track={}::extension={}",
-        source_identity,
-        metadata.artist_name.to_ascii_lowercase(),
-        metadata.album_title.to_ascii_lowercase(),
-        metadata.title.to_ascii_lowercase(),
-        metadata
-            .year
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        metadata
-            .track_number
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        extension
-    )
-}
-
 fn unique_track_id(identity: &str, counts: &mut BTreeMap<String, usize>) -> String {
     let count = counts.entry(identity.to_string()).or_default();
     let id = if *count == 0 {
@@ -2574,6 +2616,29 @@ fn track_composers(track: &Track) -> BTreeSet<String> {
         .filter(|value| !value.trim().is_empty())
         .cloned()
         .collect()
+}
+
+/// Stable source-location identity, independent of musical metadata and content.
+pub fn source_item_identity(provider_id: &str, item_id: &str) -> String {
+    stable_id("source-item", &format!("{provider_id:?}|{item_id:?}"))
+}
+
+/// Observable revision, not evidence that two revisions contain the same recording.
+pub fn source_revision(track: &Track) -> String {
+    stable_id(
+        "revision",
+        &format!(
+            "{:?}|{:?}|{:?}|{:?}",
+            track.file_size_bytes,
+            track.modified_at_unix_seconds,
+            track.content_hash,
+            track.extension
+        ),
+    )
+}
+
+pub fn selected_version_identity(slot: &str, revision: &str) -> String {
+    stable_id("version", &format!("{slot:?}|{revision:?}"))
 }
 
 fn stable_id(prefix: &str, value: &str) -> String {
@@ -3147,6 +3212,31 @@ mod tests {
     }
 
     #[test]
+    fn source_collision_ownership_is_independent_of_input_order() {
+        let fs = FakeFs::new(vec![(
+            PathBuf::from("/Album/Artist - Song.mp3"),
+            b"audio".to_vec(),
+        )]);
+        let mut a = scan_source(&fs, "source-a").unwrap();
+        let mut b = scan_source(&fs, "source-b").unwrap();
+        assert_ne!(a.tracks[0].id, b.tracks[0].id);
+        // Exercise legacy colliding ids as well as fresh source-scoped ids.
+        a.tracks[0].id = "legacy".into();
+        b.tracks[0].id = "legacy".into();
+        let ids = |library: Library| {
+            library
+                .tracks
+                .into_iter()
+                .map(|t| (t.provider.provider_id, t.id))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            ids(merge_libraries(vec![a.clone(), b.clone()])),
+            ids(merge_libraries(vec![b, a]))
+        );
+    }
+
+    #[test]
     fn merge_does_not_double_count_album_count_for_a_shared_album() {
         // BUG-07: the same album present in two sources (a local copy + a NAS copy)
         // dedups to one album row, but the artist's album_count summed 1+1=2.
@@ -3171,6 +3261,49 @@ mod tests {
             .find(|a| a.name == "ArtistX")
             .expect("ArtistX present");
         assert_eq!(artist.album_count, 1);
+    }
+
+    #[test]
+    fn incremental_identical_copy_never_reuses_a_retained_id() {
+        for added_parent in ["a", "z"] {
+            let original = PathBuf::from("/m/Album/01 - Artist - Song.mp3");
+            let mut fs = FakeFs::new(vec![(original.clone(), b"same audio".to_vec())]);
+            let first = scan_source(&fs, "source").unwrap();
+            let original_id = first.tracks[0].id.clone();
+            fs.files.push((
+                PathBuf::from(format!("/{added_parent}/Album/01 - Artist - Song.mp3")),
+                b"same audio".to_vec(),
+            ));
+            let second = scan_source_incremental(&fs, "source", Some(&first), &mut |_| {}).unwrap();
+            assert_eq!(second.tracks.len(), 2);
+            assert_eq!(
+                second
+                    .tracks
+                    .iter()
+                    .map(|t| &t.id)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                second
+                    .tracks
+                    .iter()
+                    .find(|t| t.path == original)
+                    .unwrap()
+                    .id,
+                original_id
+            );
+            let third = scan_source_incremental(&fs, "source", Some(&second), &mut |_| {}).unwrap();
+            let ids = |library: &Library| {
+                library
+                    .tracks
+                    .iter()
+                    .map(|t| (t.provider.item_id.clone(), t.id.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            assert_eq!(ids(&second), ids(&third));
+        }
     }
 
     #[test]
@@ -3324,6 +3457,47 @@ mod tests {
         );
         assert_eq!(merged.artists.len(), 1);
         assert_eq!(merged.artists[0].name, "Fela Kuti");
+    }
+
+    #[test]
+    fn regroup_restores_observed_names_after_the_last_alias_is_removed() {
+        let files = vec![
+            (
+                PathBuf::from("/A/01 - Fela Kuti - Zombie.mp3"),
+                vec![1u8; 1_200_000],
+            ),
+            (
+                PathBuf::from("/A/02 - Fela Anikulapo Kuti - Water.mp3"),
+                vec![2u8; 1_200_000],
+            ),
+        ];
+        let fs = FakeFs::new(files);
+        let library = scan_source(&fs, "src").expect("scan");
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            normalize_artist_key("Fela Anikulapo Kuti"),
+            "Fela Kuti".to_string(),
+        );
+
+        let original_albums: BTreeSet<_> = library.albums.iter().map(|a| a.id.clone()).collect();
+        let merged = regroup_library_with_overrides(library, &BTreeMap::new(), &aliases);
+        let unmerged = regroup_library_with_overrides(merged, &BTreeMap::new(), &BTreeMap::new());
+
+        let names: BTreeSet<_> = unmerged
+            .tracks
+            .iter()
+            .map(|track| track.artist_name.as_str())
+            .collect();
+        assert_eq!(names, BTreeSet::from(["Fela Kuti", "Fela Anikulapo Kuti"]));
+        assert_eq!(unmerged.artists.len(), 2);
+        assert_eq!(
+            unmerged
+                .albums
+                .iter()
+                .map(|a| a.id.clone())
+                .collect::<BTreeSet<_>>(),
+            original_albums
+        );
     }
 
     #[test]

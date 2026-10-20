@@ -7,13 +7,59 @@
 //! advertises [`ProviderCapabilities`] so callers can skip work a source can't do
 //! (e.g. an internet-radio source can stream but never scans).
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use musicata_core::{
     BrowseEntry, Library, LocalDiskProvider, MusicProvider, ProviderCapabilities, ScanProgress,
     StreamSpec, merge_libraries, scan_local_library_incremental,
 };
 use musicata_storage::{Database, SourceRecord};
+
+/// Extract one source's last successful snapshot without re-deriving any display
+/// fields. A failed source must retain its observations and selected artwork; a
+/// successful empty scan is represented by that provider returning an empty library
+/// and therefore intentionally does not use this helper.
+pub(crate) fn prior_source_library(prior: &Library, provider_id: &str) -> Option<Library> {
+    let tracks: Vec<_> = prior
+        .tracks
+        .iter()
+        .filter(|track| track.provider.provider_id == provider_id)
+        .cloned()
+        .collect();
+    if tracks.is_empty() {
+        return None;
+    }
+    let album_ids: BTreeSet<_> = tracks.iter().map(|track| track.album_id.as_str()).collect();
+    let albums: Vec<_> = prior
+        .albums
+        .iter()
+        .filter(|album| album_ids.contains(album.id.as_str()))
+        .cloned()
+        .collect();
+    let artist_ids: BTreeSet<_> = tracks
+        .iter()
+        .map(|track| track.artist_id.as_str())
+        .chain(albums.iter().map(|album| album.artist_id.as_str()))
+        .collect();
+    Some(Library {
+        provider_id: provider_id.to_string(),
+        source_root: prior.source_root.clone(),
+        artists: prior
+            .artists
+            .iter()
+            .filter(|artist| artist_ids.contains(artist.id.as_str()))
+            .cloned()
+            .collect(),
+        albums,
+        tracks,
+        scan_errors: prior
+            .scan_errors
+            .iter()
+            .filter(|issue| issue.path.contains(provider_id))
+            .cloned()
+            .collect(),
+    })
+}
 
 #[cfg(feature = "provider-archive")]
 use crate::archive_org::ArchiveProvider;
@@ -368,7 +414,14 @@ impl ProviderRegistry {
                 continue;
             }
             let scanned = match &prior {
-                Some(_) => provider.scan_with_progress(prior.clone(), |_| {}).await,
+                Some(prior) => {
+                    provider
+                        .scan_with_progress(
+                            prior_source_library(prior, &provider.provider_id()).map(Arc::new),
+                            |_| {},
+                        )
+                        .await
+                }
                 None => provider.scan().await,
             };
             match scanned {
@@ -379,9 +432,45 @@ impl ProviderRegistry {
                         %error,
                         "source scan failed; skipping it for this pass"
                     );
+                    if let Some(prior) = prior
+                        .as_deref()
+                        .and_then(|prior| prior_source_library(prior, &provider.provider_id()))
+                    {
+                        libraries.push(prior);
+                    }
                 }
             }
         }
         Ok(merge_libraries(libraries))
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_source_retains_snapshot_but_successful_empty_scan_removes_it() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("musicata-source-retention-{unique}"));
+        std::fs::create_dir_all(root.join("Album")).unwrap();
+        std::fs::write(root.join("Album/Artist - Song.mp3"), b"fixture").unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.push(ProviderHandle::local(LocalDiskProvider::new(&root)));
+        let initial = registry.scan_all(None).await.unwrap();
+        assert_eq!(initial.tracks.len(), 1);
+        let id = initial.tracks[0].id.clone();
+        let unavailable = root.with_extension("offline");
+        std::fs::rename(&root, &unavailable).unwrap();
+        let retained = registry.scan_all(Some(Arc::new(initial))).await.unwrap();
+        assert_eq!(retained.tracks[0].id, id);
+        std::fs::create_dir(&root).unwrap();
+        let empty = registry.scan_all(Some(Arc::new(retained))).await.unwrap();
+        assert!(empty.tracks.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(unavailable).unwrap();
     }
 }

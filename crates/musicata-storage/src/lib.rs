@@ -15,6 +15,8 @@
 // program. If not, see <https://www.gnu.org/licenses/>.
 
 pub mod diagnostics;
+mod grouping;
+mod identity;
 mod queue_cache;
 
 use anyhow::{Context, Result};
@@ -23,7 +25,7 @@ use musicata_core::{
     LibrarySummary, MetadataApprovalState, MetadataFieldValue, PlaybackStatus, Playlist,
     ProviderMapping, QueueItem, RadioStation, RepeatMode, ScanIssue, SearchResults, Track,
     TrackCanonicalOverride, TrackMetadataFieldObservation, TrackMetadataObservation, Zone,
-    album_identity, artist_identity, normalize_artist_key, regroup_library_with_overrides,
+    regroup_library_with_overrides,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -489,15 +491,56 @@ impl Database {
             set_user_version(&self.pool, 37).await?;
         }
 
+        if version < 38 {
+            identity::migrate_identity_schema(&self.pool).await?;
+            grouping::migrate_grouping_provenance(&self.pool).await?;
+            ensure_column(
+                &self.pool,
+                "listens",
+                "snapshot_json",
+                "ALTER TABLE listens ADD COLUMN snapshot_json TEXT",
+            )
+            .await?;
+            // Only extant versions can be backfilled. Missing legacy selections
+            // remain explicitly unknown rather than borrowing another song's tags.
+            for row in sqlx::query("SELECT * FROM tracks WHERE id IN (SELECT track_id FROM listens WHERE snapshot_json IS NULL)")
+                .fetch_all(&self.pool).await? {
+                let track = track_from_row(&row)?;
+                sqlx::query("UPDATE listens SET snapshot_json = ?1 WHERE track_id = ?2 AND snapshot_json IS NULL")
+                    .bind(serde_json::to_string(&track)?).bind(&track.id).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 38).await?;
+        }
         Ok(())
     }
 
     pub async fn save_library(&self, library: &mut Library) -> Result<()> {
+        let revision = self.library_revision().await?;
+        self.save_library_at_revision(library, revision).await
+    }
+
+    /// Commit only if the library from which this work began is still current.
+    pub async fn save_library_at_revision(
+        &self,
+        library: &mut Library,
+        revision: i64,
+    ) -> Result<()> {
+        let before = self.load_library().await?;
+
         // SQLx must own the transaction so cancellation rolls it back before the
         // connection returns to the pool. Raw BEGIN/COMMIT leaks locks on drop.
         let mut conn = self.pool.begin().await?;
 
         let result = async {
+            let changed = sqlx::query("UPDATE library_identity_state SET revision = revision + 1 WHERE singleton = 1 AND revision = ?1")
+                .bind(revision).execute(&mut *conn).await?;
+            anyhow::ensure!(changed.rows_affected() == 1, "library changed while preparing update; retry against the current snapshot");
+            identity::prepare_identity_save(&mut conn, library).await?;
+            if let Some(before) = &before {
+                grouping::preserve_grouping_favorites(&mut conn, before, library).await?;
+                grouping::preserve_grouping_artwork(&mut conn, before, library).await?;
+                grouping::preserve_artist_artwork(&mut conn, before, library).await?;
+            }
             // Acquire the write reservation before reading timestamps, avoiding a
             // deferred read-to-write upgrade racing another SQLite writer. Use a
             // normal managed BEGIN: SQLx 0.8's custom BEGIN checks the handle after
@@ -1710,7 +1753,38 @@ impl Database {
             .bind(id)
             .fetch_optional(&self.reads)
             .await?;
+        if let Some(row) = row {
+            return Ok(Some(track_from_row(&row)?));
+        }
+        // Live queues can still hold a provisional id after the verifier proves
+        // it is the original selected version. Resolve only that recorded proof,
+        // never another item at the same path or an unverified replacement.
+        let sql = format!("SELECT {} FROM music_versions v
+            JOIN source_revisions r ON r.source_item_id=v.source_item_id AND r.id=v.first_revision_id
+            JOIN tracks t ON t.id=r.version_id WHERE v.id=?1", track_columns("t"));
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .fetch_optional(&self.reads)
+            .await?;
         row.map(|row| track_from_row(&row)).transpose()
+    }
+
+    /// Resolve a listener-selected version for display. Active tracks win; a removed version
+    /// falls back only to its own immutable identity snapshot. This is intentionally separate
+    /// from [`Self::track`], which backs streaming and must reject unavailable sources.
+    pub async fn selected_track(&self, id: &str) -> Result<Option<Track>> {
+        if let Some(track) = self.track(id).await? {
+            return Ok(Some(track));
+        }
+        let row = sqlx::query("SELECT snapshot_json FROM music_versions WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.reads)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let snapshot: String = row.try_get("snapshot_json")?;
+        Ok(Some(serde_json::from_str(&snapshot)?))
     }
 
     /// Resolve track ids to their rows, preserving the input order and dropping any unknown ids.
@@ -1911,10 +1985,15 @@ impl Database {
         ext: &str,
         candidate: Option<&str>,
     ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        // A new explicit selection supersedes any retained choice origins for this
+        // current card; otherwise a later regroup could resurrect the old cover.
+        grouping::clear_artwork_origins(&mut tx, id).await?;
         sqlx::query("INSERT INTO album_artwork_choices (album_id,cache_key,ext,candidate_id)
             SELECT id,?2,?3,?4 FROM albums WHERE id=?1
             ON CONFLICT(album_id) DO UPDATE SET cache_key=excluded.cache_key,ext=excluded.ext,candidate_id=excluded.candidate_id")
-            .bind(id).bind(key).bind(ext).bind(candidate).execute(&self.pool).await?;
+            .bind(id).bind(key).bind(ext).bind(candidate).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1939,10 +2018,13 @@ impl Database {
     }
 
     pub async fn clear_artwork_choice(&self, id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        grouping::clear_artwork_origins(&mut tx, id).await?;
         sqlx::query("DELETE FROM album_artwork_choices WHERE album_id=?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2007,6 +2089,23 @@ impl Database {
     /// Apply source-only artwork changes without rewriting tracks or the full library.
     /// External acquisitions (including user-selected remote covers) keep precedence.
     pub async fn refresh_source_artwork(&self, scanned: &Library) -> Result<u64> {
+        self.refresh_source_artwork_guarded(scanned, None).await
+    }
+
+    pub async fn refresh_source_artwork_at_revision(
+        &self,
+        scanned: &Library,
+        revision: i64,
+    ) -> Result<u64> {
+        self.refresh_source_artwork_guarded(scanned, Some(revision))
+            .await
+    }
+
+    async fn refresh_source_artwork_guarded(
+        &self,
+        scanned: &Library,
+        revision: Option<i64>,
+    ) -> Result<u64> {
         let rows = sqlx::query(
             "SELECT a.id, a.artwork_path, a.artwork_url, a.artwork_provider_id, q.provider, q.cache_key, q.status
              FROM albums a LEFT JOIN acquired_album_artwork q ON q.album_id=a.id",
@@ -2057,8 +2156,19 @@ impl Database {
             return Ok(0);
         }
         let mut tx = self.pool.begin().await?;
+        if let Some(revision) = revision {
+            let result = sqlx::query("UPDATE library_identity_state SET revision=revision WHERE singleton=1 AND revision=?1")
+                .bind(revision).execute(&mut *tx).await?;
+            anyhow::ensure!(
+                result.rows_affected() == 1,
+                "library changed before artwork refresh; retry scan"
+            );
+        }
         let mut changed = 0;
         for (album, path, key) in pending {
+            sqlx::query("DELETE FROM grouping_album_artwork_origins WHERE role='acquired' AND provider='local-cache' AND cache_key IS NOT ?2 AND
+                (source_album_id=?1 OR track_id IN (SELECT id FROM tracks WHERE album_id=?1))")
+                .bind(&album.id).bind(key).execute(&mut *tx).await?;
             changed += sqlx::query(
                 "DELETE FROM acquired_album_artwork WHERE album_id=?1
                  AND provider='local-cache' AND cache_key IS NOT ?2",
@@ -2361,114 +2471,9 @@ impl Database {
         Ok(result.rows_affected())
     }
 
-    /// Re-point id-referencing rows after the artist/album id derivation changed (e.g. the
-    /// normalization rollout, or a merge). `artist_id`/`album_id` are derived from names,
-    /// so changing the derivation orphans `favorites` and `acquired_*` rows that hold the
-    /// old id (track ids are unaffected). This recomputes old→new from the current
-    /// artist/album rows (name-keyed) and moves those references, collapsing duplicates
-    /// (two old ids → one new merges the stars). Run it BEFORE the regroup+save that
-    /// rewrites the artist/album rows with the new ids. Returns rows moved.
+    /// Recompute grouping and reference projections from actual source memberships.
     pub async fn remap_identity_references(&self) -> Result<u64> {
-        // Resolve names through user artist-merges so a merge moves the member's stars/art
-        // onto the canonical id (matching the regroup's id derivation).
-        let aliases = self.artist_alias_map().await?;
-        let resolve = |name: &str| -> String {
-            aliases
-                .get(&musicata_core::normalize_artist_key(name))
-                .cloned()
-                .unwrap_or_else(|| name.to_string())
-        };
-        // old artist id -> new artist id (only where it actually changes).
-        let artist_rows = sqlx::query("SELECT id, name FROM artists")
-            .fetch_all(&self.reads)
-            .await?;
-        let mut artist_map: Vec<(String, String)> = Vec::new();
-        for row in &artist_rows {
-            let old: String = row.try_get("id")?;
-            let name: String = row.try_get("name")?;
-            let new = artist_identity(&resolve(&name), None);
-            if new != old {
-                artist_map.push((old, new));
-            }
-        }
-        let album_rows = sqlx::query("SELECT id, artist_name, title FROM albums")
-            .fetch_all(&self.reads)
-            .await?;
-        let mut album_map: Vec<(String, String)> = Vec::new();
-        for row in &album_rows {
-            let old: String = row.try_get("id")?;
-            let artist_name: String = row.try_get("artist_name")?;
-            let title: String = row.try_get("title")?;
-            let new = album_identity(&resolve(&artist_name), &title, None);
-            if new != old {
-                album_map.push((old, new));
-            }
-        }
-        if artist_map.is_empty() && album_map.is_empty() {
-            return Ok(0);
-        }
-
-        let mut tx = self.pool.begin().await?;
-        let mut moved = 0u64;
-        // For each old→new: move the reference if the destination is free (UPDATE OR
-        // IGNORE), then delete any leftover old row (the move was blocked by a duplicate —
-        // the star/cover collapses onto the existing new one).
-        for (kind, map) in [("artist", &artist_map), ("album", &album_map)] {
-            let acquired_table = if kind == "artist" {
-                "acquired_artist_artwork"
-            } else {
-                "acquired_album_artwork"
-            };
-            let acquired_col = if kind == "artist" {
-                "artist_id"
-            } else {
-                "album_id"
-            };
-            for (old, new) in map {
-                let fav = sqlx::query(
-                    "UPDATE OR IGNORE favorites SET item_id = ?1
-                     WHERE item_type = ?2 AND item_id = ?3",
-                )
-                .bind(new)
-                .bind(kind)
-                .bind(old)
-                .execute(&mut *tx)
-                .await?;
-                moved += fav.rows_affected();
-                sqlx::query("DELETE FROM favorites WHERE item_type = ?1 AND item_id = ?2")
-                    .bind(kind)
-                    .bind(old)
-                    .execute(&mut *tx)
-                    .await?;
-                let sql = format!(
-                    "UPDATE OR IGNORE {acquired_table} SET {acquired_col} = ?1 WHERE {acquired_col} = ?2"
-                );
-                sqlx::query(&sql)
-                    .bind(new)
-                    .bind(old)
-                    .execute(&mut *tx)
-                    .await?;
-                let del = format!("DELETE FROM {acquired_table} WHERE {acquired_col} = ?1");
-                sqlx::query(&del).bind(old).execute(&mut *tx).await?;
-                if kind == "album" {
-                    for table in ["album_artwork_choices", "artwork_refresh_versions"] {
-                        sqlx::query(&format!(
-                            "UPDATE OR IGNORE {table} SET album_id=?1 WHERE album_id=?2"
-                        ))
-                        .bind(new)
-                        .bind(old)
-                        .execute(&mut *tx)
-                        .await?;
-                        sqlx::query(&format!("DELETE FROM {table} WHERE album_id=?1"))
-                            .bind(old)
-                            .execute(&mut *tx)
-                            .await?;
-                    }
-                }
-            }
-        }
-        tx.commit().await?;
-        Ok(moved)
+        self.reapply_canonical_grouping().await
     }
 
     // ---- Artist aliases (user-curated merges) --------------------------------
@@ -2529,16 +2534,28 @@ impl Database {
         .bind(alias_key)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE library_identity_state SET revision = revision + 1 WHERE singleton = 1",
+        )
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
 
     /// Remove a single alias (unmerge one member).
     pub async fn remove_artist_alias(&self, alias_key: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM artist_aliases WHERE alias_key = ?1")
             .bind(alias_key)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query(
+            "UPDATE library_identity_state SET revision = revision + 1 WHERE singleton = 1",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3567,6 +3584,7 @@ impl Database {
     /// [`Database::reapply_acquired_artwork`]. Cheap no-op when there's neither enrichment
     /// nor any alias.
     pub async fn reapply_canonical_grouping(&self) -> Result<u64> {
+        let revision = self.library_revision().await?;
         let resolved = sqlx::query(
             "SELECT track_id, title, artist_name, album_title, album_artist_name,
                     track_number, disc_number, year
@@ -3575,9 +3593,6 @@ impl Database {
         .fetch_all(&self.reads)
         .await?;
         let aliases = self.artist_alias_map().await?;
-        if resolved.is_empty() && aliases.is_empty() {
-            return Ok(0);
-        }
 
         // Fields the file already owns via embedded tags — never overwrite these.
         let embedded_rows = sqlx::query(
@@ -3616,56 +3631,12 @@ impl Database {
                 overrides.insert(track_id, over);
             }
         }
-        if overrides.is_empty() && aliases.is_empty() {
-            return Ok(0);
-        }
-
         let Some(library) = self.load_library().await? else {
             return Ok(0);
         };
         // The worker revisits resolved metadata while idle. Only regroup when a
         // canonical value changes; otherwise a full-library rewrite repeatedly
         // takes SQLite's sole writer away from login and playback persistence.
-        let album_artists: BTreeMap<_, _> = library
-            .albums
-            .iter()
-            .map(|album| (album.id.as_str(), album.artist_name.as_str()))
-            .collect();
-        let canonical_artist = |name: &str| {
-            aliases
-                .get(&normalize_artist_key(name))
-                .cloned()
-                .unwrap_or_else(|| name.to_owned())
-        };
-        let unchanged = library.tracks.iter().all(|track| {
-            let empty = TrackCanonicalOverride::default();
-            let over = overrides.get(&track.id).unwrap_or(&empty);
-            let album_artist = album_artists
-                .get(track.album_id.as_str())
-                .copied()
-                .unwrap_or(&track.artist_name);
-            over.title
-                .as_ref()
-                .is_none_or(|value| value == &track.title)
-                && over
-                    .album_title
-                    .as_ref()
-                    .is_none_or(|value| value == &track.album_title)
-                && over.year.is_none_or(|value| Some(value) == track.year)
-                && over
-                    .track_number
-                    .is_none_or(|value| Some(value) == track.track_number)
-                && over
-                    .disc_number
-                    .is_none_or(|value| Some(value) == track.disc_number)
-                && canonical_artist(over.artist_name.as_deref().unwrap_or(&track.artist_name))
-                    == track.artist_name
-                && canonical_artist(over.album_artist_name.as_deref().unwrap_or(album_artist))
-                    == album_artist
-        });
-        if unchanged {
-            return Ok(0);
-        }
         // Multiple track overrides can spell the same album artist differently.
         // Aggregation keeps one representative name, so comparing each override
         // with that name never converges. Compare the resulting canonical state
@@ -3720,7 +3691,8 @@ impl Database {
             return Ok(0);
         }
         let applied = overrides.len() as u64;
-        self.save_library(&mut regrouped).await?;
+        self.save_library_at_revision(&mut regrouped, revision)
+            .await?;
         Ok(applied)
     }
 
@@ -4510,38 +4482,42 @@ impl Database {
         listened_at: i64,
         kind: ListenKind,
     ) -> Result<()> {
+        let snapshot = self
+            .track(track_id)
+            .await?
+            .map(|track| serde_json::to_string(&track))
+            .transpose()?;
         sqlx::query(
-            "INSERT INTO listens (track_id, player_id, listened_at_unix_seconds, event_kind)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO listens (track_id, player_id, listened_at_unix_seconds, event_kind, snapshot_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(track_id)
         .bind(player_id)
         .bind(listened_at)
         .bind(kind.as_str())
+        .bind(snapshot)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Distinct tracks paired with their most recent listen time (Unix seconds),
-    /// newest first. Listens for tracks no longer in the library are skipped by the
-    /// join. This is a cheap indexed query, safe to call often.
+    /// Listening history retains the selected version's context even after removal.
+    /// Legacy events without a recoverable snapshot remain in the event log.
     pub async fn recently_played(&self, limit: usize) -> Result<Vec<(Track, i64)>> {
-        let columns = track_columns("t");
-        let sql = format!(
-            "SELECT {columns}, MAX(l.listened_at_unix_seconds) AS last_listen
-             FROM listens l JOIN tracks t ON t.id = l.track_id
-             WHERE l.event_kind = 'played'
-             GROUP BY l.track_id
-             ORDER BY last_listen DESC, t.id
-             LIMIT ?1"
-        );
-        let rows = sqlx::query(&sql)
-            .bind(limit as i64)
-            .fetch_all(&self.reads)
-            .await?;
+        let rows = sqlx::query(
+            "SELECT snapshot_json, listened_at_unix_seconds FROM (
+                SELECT snapshot_json, listened_at_unix_seconds, track_id,
+                ROW_NUMBER() OVER (PARTITION BY track_id ORDER BY listened_at_unix_seconds DESC, id DESC) AS rank
+                FROM listens WHERE event_kind = 'played' AND snapshot_json IS NOT NULL
+             ) WHERE rank = 1 ORDER BY listened_at_unix_seconds DESC, track_id LIMIT ?1")
+            .bind(limit as i64).fetch_all(&self.reads).await?;
         rows.iter()
-            .map(|row| Ok((track_from_row(row)?, row.try_get("last_listen")?)))
+            .map(|row| {
+                Ok((
+                    serde_json::from_str(row.try_get::<&str, _>("snapshot_json")?)?,
+                    row.try_get("listened_at_unix_seconds")?,
+                ))
+            })
             .collect()
     }
 
@@ -4843,15 +4819,17 @@ impl Database {
         row.as_ref().map(playlist_from_row).transpose()
     }
 
-    /// The playlist's tracks in order. Tracks no longer in the library are skipped.
+    /// The playlist's selected versions in order. Removed versions retain their own snapshot;
+    /// unknown legacy ids are skipped without substituting any current track.
     pub async fn playlist_tracks(&self, id: &str) -> Result<Vec<Track>> {
-        let columns = track_columns("t");
-        let sql = format!(
-            "SELECT {columns} FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
-             WHERE pt.playlist_id = ?1 ORDER BY pt.position"
-        );
-        let rows = sqlx::query(&sql).bind(id).fetch_all(&self.reads).await?;
-        rows.iter().map(track_from_row).collect()
+        let ids = self.playlist_track_ids(id).await?;
+        let mut tracks = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(track) = self.selected_track(&id).await? {
+                tracks.push(track);
+            }
+        }
+        Ok(tracks)
     }
 
     /// The raw ordered track ids (including any that no longer resolve to a track).
@@ -5004,6 +4982,19 @@ impl Database {
     // ---- Favorites (starred tracks / albums / artists) ----
 
     pub async fn set_favorite(&self, item_type: &str, item_id: &str, now: i64) -> Result<()> {
+        let revision = self.library_revision().await?;
+        let library = self.load_grouping_library().await?;
+        let mut tx = self.pool.begin().await?;
+        let reserved = sqlx::query(
+            "UPDATE library_identity_state SET revision=revision WHERE singleton=1 AND revision=?1",
+        )
+        .bind(revision)
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            reserved.rows_affected() == 1,
+            "library changed while preparing favorite; retry against the current snapshot"
+        );
         sqlx::query(
             "INSERT INTO favorites (item_type, item_id, created_at_unix_seconds) VALUES (?1, ?2, ?3)
              ON CONFLICT(item_type, item_id) DO NOTHING",
@@ -5011,18 +5002,76 @@ impl Database {
         .bind(item_type)
         .bind(item_id)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if let Some(library) = library.as_ref() {
+            grouping::capture_favorite_origins(&mut tx, library, item_type, item_id, now).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn clear_favorite(&self, item_type: &str, item_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM favorites WHERE item_type = ?1 AND item_id = ?2")
-            .bind(item_type)
-            .bind(item_id)
-            .execute(&self.pool)
-            .await?;
+        let revision = self.library_revision().await?;
+        let library = self.load_grouping_library().await?;
+        let mut tx = self.pool.begin().await?;
+        let reserved = sqlx::query(
+            "UPDATE library_identity_state SET revision=revision WHERE singleton=1 AND revision=?1",
+        )
+        .bind(revision)
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            reserved.rows_affected() == 1,
+            "library changed while preparing favorite; retry against the current snapshot"
+        );
+        if let Some(library) = library.as_ref() {
+            grouping::clear_favorite_origins(&mut tx, library, item_type, item_id).await?;
+        } else {
+            sqlx::query("DELETE FROM favorites WHERE item_type = ?1 AND item_id = ?2")
+                .bind(item_type)
+                .bind(item_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
+    }
+
+    /// Minimal snapshot for favorite provenance. Group membership only depends on
+    /// tracks and albums, so avoid loading every metadata observation for a simple
+    /// star/unstar action on a large library.
+    async fn load_grouping_library(&self) -> Result<Option<Library>> {
+        let Some(provider) =
+            sqlx::query("SELECT id, source_root FROM providers ORDER BY id LIMIT 1")
+                .fetch_optional(&self.reads)
+                .await?
+        else {
+            return Ok(None);
+        };
+        let albums = sqlx::query(
+            "SELECT id, title, artist_id, artist_name, year, track_count, artwork_url, artwork_path, artwork_provider_id FROM albums",
+        )
+        .fetch_all(&self.reads)
+        .await?
+        .iter()
+        .map(album_from_row)
+        .collect::<Result<Vec<_>>>()?;
+        let columns = track_columns("t");
+        let tracks = sqlx::query(&format!("SELECT {columns} FROM tracks t"))
+            .fetch_all(&self.reads)
+            .await?
+            .iter()
+            .map(track_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(Library {
+            provider_id: provider.try_get("id")?,
+            source_root: provider.try_get("source_root")?,
+            artists: Vec::new(),
+            albums,
+            tracks,
+            scan_errors: Vec::new(),
+        }))
     }
 
     /// All favorited ids of a given type (for marking entities as starred).
@@ -5035,13 +5084,20 @@ impl Database {
     }
 
     pub async fn starred_tracks(&self) -> Result<Vec<Track>> {
-        let columns = track_columns("t");
-        let sql = format!(
-            "SELECT {columns} FROM favorites f JOIN tracks t ON t.id = f.item_id
-             WHERE f.item_type = 'track' ORDER BY f.created_at_unix_seconds DESC"
-        );
-        let rows = sqlx::query(&sql).fetch_all(&self.reads).await?;
-        rows.iter().map(track_from_row).collect()
+        let rows = sqlx::query(
+            "SELECT item_id FROM favorites WHERE item_type = 'track'
+             ORDER BY created_at_unix_seconds DESC",
+        )
+        .fetch_all(&self.reads)
+        .await?;
+        let mut tracks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("item_id")?;
+            if let Some(track) = self.selected_track(&id).await? {
+                tracks.push(track);
+            }
+        }
+        Ok(tracks)
     }
 
     pub async fn starred_albums(&self) -> Result<Vec<Album>> {
@@ -7857,6 +7913,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_versions_keep_playlist_and_favorite_metadata_after_source_replacement() {
+        let db_path = temp_db_path("selected-version-display");
+        let database = Database::connect(&db_path).await.expect("connect database");
+        let mut original = fixture_library();
+        database
+            .save_library(&mut original)
+            .await
+            .expect("save original library");
+        let old_id = original.tracks[0].id.clone();
+
+        let playlist = database
+            .create_playlist("Saved", None, std::slice::from_ref(&old_id), 1)
+            .await
+            .expect("create playlist");
+        database
+            .set_favorite("track", &old_id, 2)
+            .await
+            .expect("star selected version");
+
+        // The same source path now contains another encoded payload. It receives a
+        // new version id and title, so the retained display row must not substitute it.
+        let mut replacement = original.clone();
+        replacement.tracks[0].content_hash = Some("replacement-payload".to_string());
+        replacement.tracks[0].title = "Replacement".to_string();
+        database
+            .save_library(&mut replacement)
+            .await
+            .expect("save replacement library");
+        assert_ne!(replacement.tracks[0].id, old_id);
+        assert!(database.track(&old_id).await.unwrap().is_none());
+
+        let playlist_tracks = database.playlist_tracks(&playlist).await.unwrap();
+        assert_eq!(playlist_tracks.len(), 1);
+        assert_eq!(playlist_tracks[0].id, old_id);
+        assert_eq!(playlist_tracks[0].title, "Song");
+
+        let favorites = database.starred_tracks().await.unwrap();
+        assert_eq!(favorites.len(), 1);
+        assert_eq!(favorites[0].id, old_id);
+        assert_eq!(favorites[0].title, "Song");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn set_playlist_tracks_is_atomic_on_mid_batch_failure() {
         // BUG-09: replacing a playlist's tracks was DELETE + INSERTs with no transaction,
         // so a failure mid-batch (or a concurrent reader) could observe a half-written or
@@ -9950,12 +10051,14 @@ mod tests {
             .unwrap();
         database.refresh_artwork("album_1").await.unwrap();
         database.remap_identity_references().await.unwrap();
-        let id = musicata_core::album_identity("Artist", "Album", None);
+        let id = database.track("track_1").await.unwrap().unwrap().album_id;
+        assert_ne!(id, "album_1");
         assert_eq!(
             database.artwork_choice(&id).await.unwrap().unwrap().0,
             "chosen"
         );
-        assert!(database.artwork_choice("album_1").await.unwrap().is_none());
+        // Retain the original choice provenance so a later split can restore it.
+        assert!(database.artwork_choice("album_1").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -10396,7 +10499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remap_identity_moves_favorites_and_artwork() {
+    async fn remap_identity_does_not_guess_orphaned_artist_membership() {
         let db_path = temp_db_path("remap-identity");
         let database = Database::connect(&db_path).await.expect("connect");
 
@@ -10438,23 +10541,19 @@ mod tests {
             .await
             .unwrap();
 
-        let moved = database.remap_identity_references().await.expect("remap");
-        assert!(moved >= 1);
-
-        // Both stars collapsed onto the single new id (no duplicate, no orphan).
-        let fav_ids = database.favorite_ids("artist").await.unwrap();
-        assert_eq!(fav_ids, vec![new_id.clone()]);
-        // The acquired image moved to the new id.
+        assert_eq!(database.remap_identity_references().await.unwrap(), 0);
+        let ids = database.favorite_ids("artist").await.unwrap();
+        assert_eq!(ids, vec!["artist_old1", "artist_old2"]);
         assert!(
             database
-                .acquired_artist_artwork(&new_id)
+                .acquired_artist_artwork("artist_old1")
                 .await
                 .unwrap()
                 .is_some()
         );
         assert!(
             database
-                .acquired_artist_artwork("artist_old1")
+                .acquired_artist_artwork(&new_id)
                 .await
                 .unwrap()
                 .is_none()
@@ -10989,6 +11088,11 @@ mod tests {
         // An untagged track: only a folder-derived observation (source "folder_path").
         let mut library = fixture_library();
         database.save_library(&mut library).await.expect("save");
+        let source_artist_id = library.artists[0].id.clone();
+        database
+            .set_favorite("artist", &source_artist_id, 1)
+            .await
+            .expect("star source artist");
 
         // Fingerprint resolved it; only resolved-fingerprint tracks are enrich targets.
         database
@@ -11054,6 +11158,16 @@ mod tests {
             .expect("regrouped album");
         assert_eq!(track.album_id, album.id);
         assert!(lib.artists.iter().all(|a| a.name != "Artist"));
+        assert_eq!(
+            database
+                .favorite_ids("artist")
+                .await
+                .expect("favorites")
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([artist.id.clone(), album.artist_id.clone()]),
+            "the original card represented both contributor roles; preserve their distinct MBIDs"
+        );
 
         // An idle enrichment pass must not rewrite the entire library. Even with
         // another writer active, an already-applied pass should finish using reads.
@@ -11100,7 +11214,10 @@ mod tests {
         database.reapply_canonical_grouping().await.unwrap();
         let library = database.load_library().await.unwrap().unwrap();
         assert_eq!(library.tracks[0].artist_name, "Canonical");
-        assert_eq!(library.albums[0].artist_name, "Canonical");
+        assert_eq!(
+            library.albums[0].artist_name, "Album Artist",
+            "an alias for the track-artist role must not rewrite a distinct observed album artist"
+        );
         let writer = database.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -11118,7 +11235,7 @@ mod tests {
         database.reapply_canonical_grouping().await.unwrap();
         let rescanned = database.load_library().await.unwrap().unwrap();
         assert_eq!(rescanned.tracks[0].artist_name, "Canonical");
-        assert_eq!(rescanned.albums[0].artist_name, "Canonical");
+        assert_eq!(rescanned.albums[0].artist_name, "Album Artist");
         database.pool.close().await;
         let _ = std::fs::remove_file(db_path);
     }

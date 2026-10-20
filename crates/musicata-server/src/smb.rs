@@ -369,6 +369,47 @@ pub struct SmbProvider {
 }
 
 impl SmbProvider {
+    /// Return the scanner-visible revision attributes for one source item. Audio identity uses
+    /// this before and after streaming so a file changed mid-digest is never accepted.
+    pub async fn audio_stat(&self, item_id: &str) -> anyhow::Result<(u64, SystemTime)> {
+        let path = Path::new(item_id);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("SMB item has no file name"))?;
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let unc = self.config.item_unc(&parent.to_string_lossy())?;
+        let (slot, client) = self.pool.get().await?;
+        let result = tokio::time::timeout(READ_TIMEOUT, async {
+            let Resource::Directory(directory) =
+                client.create_file(&unc, &open_read_args()).await?
+            else {
+                anyhow::bail!("SMB item parent is not a directory");
+            };
+            let directory = Arc::new(directory);
+            let mut entries = Directory::query::<FileDirectoryInformation>(&directory, "*").await?;
+            while let Some(entry) = entries.next().await {
+                let entry = entry?;
+                if entry.file_name.to_string() == name {
+                    return Ok((entry.end_of_file, SystemTime::from(entry.last_write_time)));
+                }
+            }
+            anyhow::bail!("SMB item disappeared")
+        })
+        .await;
+        match result {
+            Ok(Ok(state)) => Ok(state),
+            Ok(Err(error)) => {
+                self.pool.invalidate(slot).await;
+                Err(error.context("stat audio"))
+            }
+            Err(error) => {
+                self.pool.invalidate(slot).await;
+                Err(anyhow!("stat audio timed out: {error}"))
+            }
+        }
+    }
+
     /// Open audio for a blocking decoder. One handle and one read-ahead block;
     /// unlike artwork, audio has no whole-file size cap or whole-file allocation.
     pub async fn open_audio(
