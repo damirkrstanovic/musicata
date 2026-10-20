@@ -527,6 +527,7 @@ fn song_to_built(
         album_artist_id,
         album_artist_name,
         artwork_path: None, // filled later by the artwork-acquisition pass, keyed on album_id
+        artwork_revision: None,
         issues: Vec::new(),
         io_error: false,
     }
@@ -682,6 +683,7 @@ impl OpenSubsonicProvider {
                             album_artist_id: track.artist_id.clone(),
                             album_artist_name: album_artist,
                             artwork_path: None,
+                            artwork_revision: None,
                             issues: Vec::new(),
                             io_error: false,
                         });
@@ -722,6 +724,7 @@ impl OpenSubsonicProvider {
                 std::path::Path::new(&source_root),
                 built,
                 scan_errors,
+                prior.as_deref(),
             ))
         })
         .await??;

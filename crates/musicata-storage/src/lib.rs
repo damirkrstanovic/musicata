@@ -462,6 +462,33 @@ impl Database {
             set_user_version(&self.pool, 36).await?;
         }
 
+        if version < 37 {
+            ensure_column(
+                &self.pool,
+                "albums",
+                "artwork_provider_id",
+                "ALTER TABLE albums ADD COLUMN artwork_provider_id TEXT",
+            )
+            .await?;
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS album_artwork_choices (
+                album_id TEXT PRIMARY KEY, cache_key TEXT NOT NULL, ext TEXT NOT NULL,
+                candidate_id TEXT)",
+            )
+            .execute(&self.pool)
+            .await?;
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS artwork_attempts (
+                album_id TEXT PRIMARY KEY, revision TEXT NOT NULL, absent INTEGER NOT NULL,
+                failures INTEGER NOT NULL, next_attempt INTEGER NOT NULL)",
+            )
+            .execute(&self.pool)
+            .await?;
+            sqlx::query("CREATE TABLE IF NOT EXISTS artwork_refresh_versions (album_id TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
+                .execute(&self.pool).await?;
+            set_user_version(&self.pool, 37).await?;
+        }
+
         Ok(())
     }
 
@@ -541,7 +568,7 @@ impl Database {
 
             for album in &library.albums {
                 sqlx::query(
-                    "INSERT INTO albums (id, title, artist_id, artist_name, year, track_count, artwork_url, artwork_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO albums (id, title, artist_id, artist_name, year, track_count, artwork_url, artwork_path, artwork_provider_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 )
                 .bind(&album.id)
                 .bind(&album.title)
@@ -551,6 +578,7 @@ impl Database {
                 .bind(album.track_count as i64)
                 .bind(&album.artwork_url)
                 .bind(album.artwork_path.as_ref().map(path_to_string))
+                .bind(&album.artwork_provider_id)
                 .execute(&mut *conn)
                 .await?;
             }
@@ -810,7 +838,7 @@ impl Database {
                 .fetch_all(&self.reads)
                 .await?;
         let album_rows = sqlx::query(
-            "SELECT id, title, artist_id, artist_name, year, track_count, artwork_url, artwork_path FROM albums ORDER BY artist_name, year, title",
+            "SELECT id, title, artist_id, artist_name, year, track_count, artwork_url, artwork_path, artwork_provider_id FROM albums ORDER BY artist_name, year, title",
         )
         .fetch_all(&self.reads)
         .await?;
@@ -867,6 +895,7 @@ impl Database {
                 artwork_path: row
                     .try_get::<Option<String>, _>("artwork_path")?
                     .map(PathBuf::from),
+                artwork_provider_id: row.try_get("artwork_provider_id")?,
             });
         }
 
@@ -1177,7 +1206,7 @@ impl Database {
         }
 
         let album_rows = sqlx::query(
-            "SELECT a.id, a.title, a.artist_id, a.artist_name, a.year, a.track_count, a.artwork_url, a.artwork_path
+            "SELECT a.id, a.title, a.artist_id, a.artist_name, a.year, a.track_count, a.artwork_url, a.artwork_path, a.artwork_provider_id
              FROM albums_fts f JOIN albums a ON a.rowid = f.rowid
              WHERE albums_fts MATCH ?1 ORDER BY rank LIMIT ?2 OFFSET ?3",
         )
@@ -1199,6 +1228,7 @@ impl Database {
                 artwork_path: row
                     .try_get::<Option<String>, _>("artwork_path")?
                     .map(PathBuf::from),
+                artwork_provider_id: row.try_get("artwork_provider_id")?,
             });
         }
 
@@ -1634,7 +1664,8 @@ impl Database {
 
     /// The artwork URL for an album, if any.
     pub async fn album_artwork_url(&self, album_id: &str) -> Result<Option<String>> {
-        let row = sqlx::query("SELECT artwork_url FROM albums WHERE id = ?1")
+        let row = sqlx::query("SELECT COALESCE((SELECT '/api/albums/' || album_id || '/artwork?asset=' || cache_key FROM album_artwork_choices WHERE album_id=id),
+     CASE WHEN artwork_url IS NULL THEN NULL ELSE artwork_url || COALESCE((SELECT '&refresh=' || generation FROM artwork_refresh_versions WHERE album_id=id),'') END) AS artwork_url FROM albums WHERE id = ?1")
             .bind(album_id)
             .fetch_optional(&self.reads)
             .await?;
@@ -1750,12 +1781,12 @@ impl Database {
     /// Used to decide how to serve the album's cover art (local disk vs. a network
     /// source like SMB). Returns `None` for an unknown/empty album.
     pub async fn album_provider_id(&self, album_id: &str) -> Result<Option<String>> {
-        let row = sqlx::query("SELECT provider_id FROM tracks WHERE album_id = ?1 LIMIT 1")
+        let row = sqlx::query("SELECT COALESCE(artwork_provider_id,(SELECT provider_id FROM tracks WHERE album_id=?1 LIMIT 1)) AS provider_id FROM albums WHERE id=?1")
             .bind(album_id)
             .fetch_optional(&self.reads)
             .await?;
         match row {
-            Some(row) => Ok(Some(row.try_get("provider_id")?)),
+            Some(row) => Ok(row.try_get("provider_id")?),
             None => Ok(None),
         }
     }
@@ -1849,6 +1880,241 @@ impl Database {
             });
         }
         Ok(facets)
+    }
+
+    pub async fn refresh_artwork(&self, id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO artwork_refresh_versions (album_id,generation) VALUES (?1,1)
+            ON CONFLICT(album_id) DO UPDATE SET generation=generation+1",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM artwork_attempts WHERE album_id=?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM acquired_album_artwork WHERE album_id=?1 AND status!='acquired'")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Explicit choices are independent of scanner state and disposable cache entries.
+    pub async fn set_artwork_choice(
+        &self,
+        id: &str,
+        key: &str,
+        ext: &str,
+        candidate: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO album_artwork_choices (album_id,cache_key,ext,candidate_id)
+            SELECT id,?2,?3,?4 FROM albums WHERE id=?1
+            ON CONFLICT(album_id) DO UPDATE SET cache_key=excluded.cache_key,ext=excluded.ext,candidate_id=excluded.candidate_id")
+            .bind(id).bind(key).bind(ext).bind(candidate).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn artwork_choice(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, String, Option<String>)>> {
+        let row = sqlx::query(
+            "SELECT cache_key,ext,candidate_id FROM album_artwork_choices WHERE album_id=?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.reads)
+        .await?;
+        row.map(|r| {
+            Ok((
+                r.try_get("cache_key")?,
+                r.try_get("ext")?,
+                r.try_get("candidate_id")?,
+            ))
+        })
+        .transpose()
+    }
+
+    pub async fn clear_artwork_choice(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM album_artwork_choices WHERE album_id=?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn artwork_pin_keys(&self) -> Result<std::collections::HashSet<String>> {
+        // Keep choices for temporarily unavailable sources: library rebuilds can remove albums.
+        let rows = sqlx::query("SELECT DISTINCT cache_key FROM album_artwork_choices")
+            .fetch_all(&self.reads)
+            .await?;
+        rows.into_iter()
+            .map(|r| Ok(r.try_get("cache_key")?))
+            .collect()
+    }
+
+    /// Raw automatic state for acquisition/scanning; browse queries overlay manual choices.
+    pub async fn source_album(&self, id: &str) -> Result<Option<Album>> {
+        let row = sqlx::query("SELECT id,title,artist_id,artist_name,year,track_count,artwork_url,artwork_path,artwork_provider_id FROM albums WHERE id=?1")
+            .bind(id).fetch_optional(&self.reads).await?;
+        row.map(|r| album_from_row(&r)).transpose()
+    }
+
+    pub async fn artwork_attempt_ready(&self, id: &str, revision: &str, now: i64) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT revision,absent,next_attempt FROM artwork_attempts WHERE album_id=?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.reads)
+        .await?;
+        Ok(match row {
+            None => true,
+            Some(r) => {
+                r.try_get::<String, _>("revision")? != revision
+                    || (r.try_get::<i64, _>("absent")? == 0
+                        && r.try_get::<i64, _>("next_attempt")? <= now)
+            }
+        })
+    }
+
+    pub async fn record_artwork_attempt(
+        &self,
+        id: &str,
+        revision: &str,
+        absent: bool,
+        now: i64,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO artwork_attempts (album_id,revision,absent,failures,next_attempt)
+            VALUES (?1,?2,?3,0,?4+300)
+            ON CONFLICT(album_id) DO UPDATE SET revision=excluded.revision,absent=excluded.absent,
+            failures=CASE WHEN revision=excluded.revision THEN min(failures+1,7) ELSE 0 END,
+            next_attempt=?4+min(21600,300*(1 << CASE WHEN revision=excluded.revision THEN min(failures+1,7) ELSE 0 END))")
+            .bind(id).bind(revision).bind(absent).bind(now).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn clear_artwork_attempt(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM artwork_attempts WHERE album_id=?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Apply source-only artwork changes without rewriting tracks or the full library.
+    /// External acquisitions (including user-selected remote covers) keep precedence.
+    pub async fn refresh_source_artwork(&self, scanned: &Library) -> Result<u64> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.artwork_path, a.artwork_url, a.artwork_provider_id, q.provider, q.cache_key, q.status
+             FROM albums a LEFT JOIN acquired_album_artwork q ON q.album_id=a.id",
+        )
+        .fetch_all(&self.reads)
+        .await?;
+        let stored: BTreeMap<String, _> = rows
+            .into_iter()
+            .map(|row| {
+                let id: String = row.try_get("id")?;
+                Ok((
+                    id,
+                    (
+                        row.try_get::<Option<String>, _>("artwork_path")?,
+                        row.try_get::<Option<String>, _>("artwork_url")?,
+                        row.try_get::<Option<String>, _>("provider")?,
+                        row.try_get::<Option<String>, _>("cache_key")?,
+                        row.try_get::<Option<String>, _>("status")?,
+                        row.try_get::<Option<String>, _>("artwork_provider_id")?,
+                    ),
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let mut pending = Vec::new();
+        for album in &scanned.albums {
+            let Some((path, url, provider, key, status, source_provider)) = stored.get(&album.id)
+            else {
+                continue;
+            };
+            if status.as_deref() == Some("acquired") && provider.as_deref() != Some("local-cache") {
+                continue;
+            }
+            let source_key = album
+                .artwork_url
+                .as_deref()
+                .and_then(|url| url.split_once("?asset=").map(|(_, key)| key));
+            let stale = provider.as_deref() == Some("local-cache") && key.as_deref() != source_key;
+            let new_path = album.artwork_path.as_ref().map(|path| path_to_string(path));
+            if stale
+                || path != &new_path
+                || url != &album.artwork_url
+                || source_provider != &album.artwork_provider_id
+            {
+                pending.push((album, new_path, source_key));
+            }
+        }
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut changed = 0;
+        for (album, path, key) in pending {
+            changed += sqlx::query(
+                "DELETE FROM acquired_album_artwork WHERE album_id=?1
+                 AND provider='local-cache' AND cache_key IS NOT ?2",
+            )
+            .bind(&album.id)
+            .bind(key)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            changed += sqlx::query(
+                "UPDATE albums SET artwork_path=?2, artwork_url=?3, artwork_provider_id=?4 WHERE id=?1
+                 AND (artwork_path IS NOT ?2 OR artwork_url IS NOT ?3 OR artwork_provider_id IS NOT ?4)
+                 AND NOT EXISTS (SELECT 1 FROM acquired_album_artwork q WHERE q.album_id=albums.id
+                                 AND q.status='acquired' AND q.provider!='local-cache')",
+            )
+            .bind(&album.id)
+            .bind(path)
+            .bind(&album.artwork_url)
+            .bind(&album.artwork_provider_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    /// Promote only the source revision that is still current. A late warmer must
+    /// not restore old provenance after a scan or overwrite an external selection.
+    pub async fn promote_local_artwork(
+        &self,
+        album_id: &str,
+        key: &str,
+        ext: &str,
+        now: i64,
+    ) -> Result<bool> {
+        let url = format!("/api/albums/{album_id}/artwork?asset={key}");
+        let result = sqlx::query(
+            "INSERT INTO acquired_album_artwork
+                (album_id, provider, cache_key, ext, status, acquired_at_unix_seconds)
+             SELECT id, 'local-cache', ?2, ?3, 'acquired', ?4 FROM albums
+             WHERE id=?1 AND artwork_url=?5
+               AND NOT EXISTS (SELECT 1 FROM acquired_album_artwork q WHERE q.album_id=?1
+                               AND q.status='acquired' AND q.provider!='local-cache')
+             ON CONFLICT(album_id) DO UPDATE SET provider='local-cache', remote_url=NULL,
+                cache_key=excluded.cache_key, ext=excluded.ext, width=NULL,
+                status='acquired', acquired_at_unix_seconds=excluded.acquired_at_unix_seconds",
+        )
+        .bind(album_id)
+        .bind(key)
+        .bind(ext)
+        .bind(now)
+        .bind(url)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Update an album's selected artwork without rewriting the whole library.
@@ -2184,6 +2450,21 @@ impl Database {
                     .await?;
                 let del = format!("DELETE FROM {acquired_table} WHERE {acquired_col} = ?1");
                 sqlx::query(&del).bind(old).execute(&mut *tx).await?;
+                if kind == "album" {
+                    for table in ["album_artwork_choices", "artwork_refresh_versions"] {
+                        sqlx::query(&format!(
+                            "UPDATE OR IGNORE {table} SET album_id=?1 WHERE album_id=?2"
+                        ))
+                        .bind(new)
+                        .bind(old)
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query(&format!("DELETE FROM {table} WHERE album_id=?1"))
+                            .bind(old)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                }
             }
         }
         tx.commit().await?;
@@ -5443,7 +5724,10 @@ fn repeat_mode_from_str(value: &str) -> RepeatMode {
 }
 
 const ALBUM_COLUMNS: &str =
-    "id, title, artist_id, artist_name, year, track_count, artwork_url, artwork_path";
+    "id, title, artist_id, artist_name, year, track_count,
+     COALESCE((SELECT '/api/albums/' || album_id || '/artwork?asset=' || cache_key
+               FROM album_artwork_choices WHERE album_id=id),
+     CASE WHEN artwork_url IS NULL THEN NULL ELSE artwork_url || COALESCE((SELECT '&refresh=' || generation FROM artwork_refresh_versions WHERE album_id=id),'') END) AS artwork_url, artwork_path, artwork_provider_id";
 
 /// The track column list, prefixed with a table alias, matching `track_from_row`.
 fn track_columns(alias: &str) -> String {
@@ -5574,6 +5858,7 @@ fn album_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Album> {
         artwork_path: row
             .try_get::<Option<String>, _>("artwork_path")?
             .map(PathBuf::from),
+        artwork_provider_id: row.try_get("artwork_provider_id")?,
     })
 }
 
@@ -9260,6 +9545,7 @@ mod tests {
                 track_count: 1,
                 artwork_url: Some("/api/albums/album_1/artwork".to_string()),
                 artwork_path: Some(PathBuf::from("/music/album/cover.jpg")),
+                artwork_provider_id: None,
             }],
             tracks: vec![Track {
                 id: "track_1".to_string(),
@@ -9649,6 +9935,295 @@ mod tests {
             .expect("rollback");
         drop(writer);
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn artwork_manual_choice_follows_album_identity_remap() {
+        let database = Database::connect(temp_db_path("manual-art-remap"))
+            .await
+            .unwrap();
+        let mut library = fixture_library();
+        database.save_library(&mut library).await.unwrap();
+        database
+            .set_artwork_choice("album_1", "chosen", "png", None)
+            .await
+            .unwrap();
+        database.refresh_artwork("album_1").await.unwrap();
+        database.remap_identity_references().await.unwrap();
+        let id = musicata_core::album_identity("Artist", "Album", None);
+        assert_eq!(
+            database.artwork_choice(&id).await.unwrap().unwrap().0,
+            "chosen"
+        );
+        assert!(database.artwork_choice("album_1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn artwork_routes_to_selected_provider_in_merged_album() {
+        let database = Database::connect(temp_db_path("artwork-provider"))
+            .await
+            .unwrap();
+        let mut library = fixture_library();
+        library.albums[0].artwork_provider_id = Some("second-provider".into());
+        database.save_library(&mut library).await.unwrap();
+        assert_eq!(
+            database
+                .album_provider_id("album_1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("second-provider")
+        );
+        let loaded = database.load_library().await.unwrap().unwrap();
+        assert_eq!(
+            loaded.albums[0].artwork_provider_id.as_deref(),
+            Some("second-provider")
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_artwork_survives_scan_restart_and_clear_restores_current_automatic() {
+        let path = temp_db_path("artwork-choice");
+        let database = Database::connect(&path).await.unwrap();
+        let mut library = fixture_library();
+        library.albums[0].artwork_url = Some("/api/albums/album_1/artwork?asset=old".into());
+        database.save_library(&mut library).await.unwrap();
+        database
+            .set_artwork_choice("album_1", "manual", "png", Some("candidate"))
+            .await
+            .unwrap();
+        library.albums[0].artwork_url = Some("/api/albums/album_1/artwork?asset=new".into());
+        database.refresh_source_artwork(&library).await.unwrap();
+        database.save_library(&mut library).await.unwrap();
+        let reopened = Database::connect(&path).await.unwrap();
+        assert!(
+            reopened
+                .album("album_1")
+                .await
+                .unwrap()
+                .unwrap()
+                .artwork_url
+                .unwrap()
+                .contains("manual")
+        );
+        assert!(
+            reopened.load_library().await.unwrap().unwrap().albums[0]
+                .artwork_url
+                .as_deref()
+                .unwrap()
+                .contains("new")
+        );
+        assert!(
+            reopened
+                .artwork_pin_keys()
+                .await
+                .unwrap()
+                .contains("manual")
+        );
+        reopened.clear_artwork_choice("album_1").await.unwrap();
+        assert!(
+            reopened
+                .album("album_1")
+                .await
+                .unwrap()
+                .unwrap()
+                .artwork_url
+                .unwrap()
+                .contains("new")
+        );
+        assert!(reopened.artwork_pin_keys().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn artwork_absence_and_backoff_are_revision_scoped_and_restart_durable() {
+        let path = temp_db_path("artwork-attempts");
+        let database = Database::connect(&path).await.unwrap();
+        assert!(
+            database
+                .artwork_attempt_ready("a", "r1", 100)
+                .await
+                .unwrap()
+        );
+        database
+            .record_artwork_attempt("a", "r1", true, 100)
+            .await
+            .unwrap();
+        let reopened = Database::connect(&path).await.unwrap();
+        assert!(
+            !reopened
+                .artwork_attempt_ready("a", "r1", 1000000)
+                .await
+                .unwrap()
+        );
+        assert!(
+            reopened
+                .artwork_attempt_ready("a", "r2", 101)
+                .await
+                .unwrap()
+        );
+        reopened
+            .record_artwork_attempt("a", "r2", false, 101)
+            .await
+            .unwrap();
+        assert!(
+            !reopened
+                .artwork_attempt_ready("a", "r2", 400)
+                .await
+                .unwrap()
+        );
+        assert!(
+            reopened
+                .artwork_attempt_ready("a", "r2", 401)
+                .await
+                .unwrap()
+        );
+        reopened
+            .record_artwork_attempt("a", "r2", false, 401)
+            .await
+            .unwrap();
+        assert!(
+            !reopened
+                .artwork_attempt_ready("a", "r2", 1000)
+                .await
+                .unwrap()
+        );
+        assert!(
+            reopened
+                .artwork_attempt_ready("a", "r2", 1001)
+                .await
+                .unwrap()
+        );
+        reopened.clear_artwork_attempt("a").await.unwrap();
+        assert!(
+            reopened
+                .artwork_attempt_ready("a", "r2", 402)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn source_artwork_refresh_rejects_late_warm_and_preserves_external_selection() {
+        let path = temp_db_path("source-artwork-refresh");
+        let database = Database::connect(&path).await.unwrap();
+        let mut library = fixture_library();
+        library.albums[0].artwork_url = Some("/api/albums/album_1/artwork?asset=old".into());
+        database.save_library(&mut library).await.unwrap();
+        assert!(
+            database
+                .promote_local_artwork("album_1", "old", "jpg", 1)
+                .await
+                .unwrap()
+        );
+        library.albums[0].artwork_url = Some("/api/albums/album_1/artwork?asset=new".into());
+        assert!(database.refresh_source_artwork(&library).await.unwrap() > 0);
+        assert!(
+            database
+                .acquired_artwork("album_1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !database
+                .promote_local_artwork("album_1", "old", "jpg", 2)
+                .await
+                .unwrap(),
+            "a warmer finishing after invalidation must not restore old provenance"
+        );
+        assert!(
+            database
+                .promote_local_artwork("album_1", "new", "jpg", 3)
+                .await
+                .unwrap()
+        );
+        assert_eq!(database.refresh_source_artwork(&library).await.unwrap(), 0);
+        database
+            .upsert_acquired_artwork(
+                "album_1",
+                "cover-art-archive",
+                Some("https://example.invalid/selected.jpg"),
+                Some("selected"),
+                Some("jpg"),
+                None,
+                "acquired",
+                4,
+            )
+            .await
+            .unwrap();
+        database
+            .set_album_artwork_url("album_1", "/api/albums/album_1/artwork?asset=selected")
+            .await
+            .unwrap();
+        library.albums[0].artwork_url =
+            Some("/api/albums/album_1/artwork?asset=another-source".into());
+        assert_eq!(database.refresh_source_artwork(&library).await.unwrap(), 0);
+        assert!(
+            !database
+                .promote_local_artwork("album_1", "selected", "jpg", 5)
+                .await
+                .unwrap(),
+            "an external selection must not become automatic provenance"
+        );
+        let reopened = Database::connect(&path).await.unwrap();
+        assert_eq!(
+            reopened
+                .acquired_artwork("album_1")
+                .await
+                .unwrap()
+                .unwrap()
+                .cache_key
+                .as_deref(),
+            Some("selected")
+        );
+        assert!(
+            reopened
+                .album_artwork_url("album_1")
+                .await
+                .unwrap()
+                .unwrap()
+                .ends_with("asset=selected")
+        );
+    }
+
+    #[tokio::test]
+    async fn source_artwork_refresh_removes_only_automatic_artwork_when_source_disappears() {
+        let database = Database::connect(temp_db_path("source-artwork-removed"))
+            .await
+            .unwrap();
+        let mut library = fixture_library();
+        library.albums[0].artwork_url = Some("/api/albums/album_1/artwork?asset=old".into());
+        database.save_library(&mut library).await.unwrap();
+        assert!(
+            database
+                .promote_local_artwork("album_1", "old", "jpg", 1)
+                .await
+                .unwrap()
+        );
+        library.albums[0].artwork_url = None;
+        library.albums[0].artwork_path = None;
+        assert!(database.refresh_source_artwork(&library).await.unwrap() > 0);
+        assert!(
+            database
+                .acquired_artwork("album_1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            database
+                .album_artwork_url("album_1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !database
+                .promote_local_artwork("album_1", "old", "jpg", 2)
+                .await
+                .unwrap()
+        );
+        assert_eq!(database.refresh_source_artwork(&library).await.unwrap(), 0);
     }
 
     #[tokio::test]

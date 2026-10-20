@@ -1,13 +1,16 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
   import { api, type AlbumDetail } from "../lib/api";
+  import { session } from "../lib/session.svelte";
   import Cover from "./Cover.svelte";
   import { playTracks } from "../lib/playback";
   import { albumTitleForDisplay, artistNameForDisplay, folderIdentityForDisplay } from "../lib/metadata-display";
+  import ArtworkEditor from "./ArtworkEditor.svelte";
   import TrackList from "./TrackList.svelte";
 
   let { id }: { id: string } = $props();
   let detail = $state<AlbumDetail | null>(null);
+  let artworkExpanded = $state(false);
   let failed = $state(false);
   let showOriginalMetadata = $state(false);
 
@@ -16,6 +19,7 @@
     const albumId = id;
     let alive = true;
     detail = null;
+    artworkExpanded = false;
     failed = false;
     showOriginalMetadata = false;
     api
@@ -67,12 +71,30 @@
         <button class="primary-button" type="button" onclick={() => detail && playTracks(detail.tracks, 0)}>
           Play
         </button>
+        {#if session.isAdmin}
+          <button class="ghost-button artwork-disclosure" type="button"
+            aria-expanded={artworkExpanded} aria-controls={`artwork-editor-${detail.album.id}`}
+            onclick={() => (artworkExpanded = !artworkExpanded)}>Change artwork</button>
+        {/if}
       </div>
     </div>
   </section>
+      {#key id}
+        <ArtworkEditor
+          albumId={detail.album.id}
+          expanded={artworkExpanded}
+          onupdated={(artworkUrl) => {
+            if (detail) detail.album.artwork_url = artworkUrl;
+          }}
+        />
+      {/key}
   <TrackList tracks={detail.tracks} />
 {:else if failed}
   <p class="admin-hint">Couldn't load this album. Try again.</p>
 {:else}
   <p class="admin-hint">Loading…</p>
 {/if}
+
+<style>
+  .artwork-disclosure { min-height: 44px; }
+</style>

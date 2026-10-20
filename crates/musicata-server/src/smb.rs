@@ -533,7 +533,7 @@ impl SmbProvider {
 
         let provider_id = self.provider_id.clone();
         let library = tokio::task::spawn_blocking(move || {
-            assemble_library(&provider_id, &root, built, walk_errors)
+            assemble_library(&provider_id, &root, built, walk_errors, prior.as_deref())
         })
         .await?;
         Ok(library)

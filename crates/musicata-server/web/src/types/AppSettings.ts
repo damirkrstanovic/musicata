@@ -5,49 +5,49 @@
  * network sources (SMB shares).
  * User-editable app settings (the `/admin` Settings panel; persisted in the DB).
  */
-export type AppSettings = { 
+export type AppSettings = {
 /**
  * Automatically fetch missing album covers from external providers.
  */
-artwork_fetch: boolean, 
+artwork_fetch: boolean, artwork_cache_mib: number,
 /**
  * Optional fanart.tv personal API key (empty = unset).
  */
-fanart_tv_key: string, 
+fanart_tv_key: string,
 /**
  * Identify untagged tracks by audio fingerprint (AcoustID) to resolve MusicBrainz
  * ids, which the id-exact artwork providers then use.
  */
-fingerprint_enabled: boolean, 
+fingerprint_enabled: boolean,
 /**
  * Apply real MusicBrainz metadata (title/artist/album/track number) to fingerprinted
  * tracks, without overwriting embedded tags. DB-only; files are never modified.
  */
-musicbrainz_enrich_enabled: boolean, 
+musicbrainz_enrich_enabled: boolean,
 /**
  * Audio-ML analysis (embeddings + tags via the `musicata-ml` service). Off by default.
  */
-ml_enabled: boolean, 
+ml_enabled: boolean,
 /**
  * Base URL of the `musicata-ml` service (empty = unset).
  */
-ml_service_url: string, 
+ml_service_url: string,
 /**
  * Daily local run time for ML analysis, "HH:MM" (default 02:00).
  */
-ml_schedule: string, 
+ml_schedule: string,
 /**
  * Record listening history (plays/skips). Default on; off stops new recording.
  */
-history_enabled: boolean, 
+history_enabled: boolean,
 /**
  * Submit confirmed listens to ListenBrainz. Off by default; needs a token.
  */
-scrobble_enabled: boolean, 
+scrobble_enabled: boolean,
 /**
  * ListenBrainz user token for scrobbling (empty = unset).
  */
-listenbrainz_token: string, 
+listenbrainz_token: string,
 /**
  * Source URL offered to users under AGPL section 13 (effective value: setting, else
  * upstream) — repoint it at your fork when you run modified code.

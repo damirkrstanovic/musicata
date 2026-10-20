@@ -3986,6 +3986,7 @@ mod tests {
             track_count: count,
             artwork_url: None,
             artwork_path: None,
+            artwork_provider_id: None,
         };
         let tracks = (1..=count)
             .map(|i| Track {

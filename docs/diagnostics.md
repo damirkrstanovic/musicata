@@ -70,3 +70,16 @@ categories into fixed pending failure/recovery state and spaces requests to resp
 ingestion limits. Undelivered current recovery remains eligible for retry. Both
 report known losses after reconnecting; a process killed abruptly can lose uncommitted evidence. Physical
 output validation and sustained listening complement the automated checks.
+
+## Background-work retry status
+
+Artwork prewarming reports the number of albums awaiting another attempt and the
+earliest retry timestamp. This pending count differs from the cumulative retry-attempt
+counter: one album can fail many times. A known future retry is waiting work, rather
+than a stalled worker. Disabled analysis queues likewise remain distinct from stalls.
+
+CPU, RSS and allocator statistics describe the shared process; they do not attribute
+memory or CPU precisely to one worker. CPU profiles identify sampled execution, not
+heap ownership. The optional ML service receives audio from the server through a
+stream; large-upload regressions exercise slow receivers and interrupted sources
+without enabling ML or sending music to an external service.

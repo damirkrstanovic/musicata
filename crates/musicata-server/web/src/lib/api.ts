@@ -10,6 +10,8 @@ import type { DirectoryStation } from "../types/DirectoryStation";
 import type { RadioStation } from "../types/RadioStation";
 import type { Player } from "../types/Player";
 import type { SourceView } from "../types/SourceView";
+import type { AlbumArtworkReviewResponse as AlbumArtworkReview } from "../types/AlbumArtworkReviewResponse";
+export type { AlbumArtworkReview };
 import type { AppSettings } from "../types/AppSettings";
 import type { About } from "../types/About";
 import type { SnapcastStatus } from "../types/SnapcastStatus";
@@ -371,6 +373,20 @@ export const api = {
   autoplay: () => getJson<{ enabled: boolean }>("/api/autoplay"),
   setAutoplay: (enabled: boolean) => sendJson("/api/autoplay", "PUT", { enabled }),
 
+  albumArtworkReview: (id: string) => getJson<AlbumArtworkReview>(`/api/albums/${encodeURIComponent(id)}/artwork/review`),
+  selectAlbumArtwork: (id: string, artwork_id: string) => sendJson<AlbumArtworkReview>(`/api/albums/${encodeURIComponent(id)}/artwork`, "PATCH", {artwork_id}),
+  clearAlbumArtwork: (id: string) => sendJson<AlbumArtworkReview>(`/api/albums/${encodeURIComponent(id)}/artwork`, "DELETE"),
+  refreshAlbumArtwork: (id: string) => sendJson<AlbumArtworkReview>(`/api/albums/${encodeURIComponent(id)}/artwork/refresh`, "POST"),
+  uploadAlbumArtwork: async (id: string, file: File): Promise<AlbumArtworkReview> => {
+    const response = await fetch(`/api/albums/${encodeURIComponent(id)}/artwork`, {method: "POST", headers: {"content-type": file.type}, body: file});
+    if (!response.ok) {
+      signalIfUnauthorized(response.status);
+      let message = "Artwork could not be saved. Try again.";
+      try { message = (await response.json())?.error?.message || message; } catch { /* use fallback */ }
+      throw new ApiError(response.status, message);
+    }
+    return response.json();
+  },
   albumDetail: (id: string) => getJson<AlbumDetail>(`/api/albums/${encodeURIComponent(id)}`),
   artistDetail: (id: string) => getJson<ArtistDetail>(`/api/artists/${encodeURIComponent(id)}`),
   metadataReview: (trackId: string) =>

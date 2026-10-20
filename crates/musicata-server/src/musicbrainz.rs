@@ -1653,6 +1653,7 @@ mod tests {
             track_count: 1,
             artwork_url: None,
             artwork_path: None,
+            artwork_provider_id: None,
         }
     }
 

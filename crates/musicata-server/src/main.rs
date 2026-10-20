@@ -19,6 +19,8 @@ mod analysis_source;
 #[cfg(feature = "provider-archive")]
 mod archive_org;
 mod artwork;
+#[cfg(test)]
+mod artwork_cancellation_tests;
 mod artwork_providers;
 mod auth;
 mod autoeq;
@@ -256,8 +258,14 @@ async fn main() -> Result<()> {
     if config.scan_once {
         migrate_identity(&database).await;
         let registry = providers.read().await.clone();
-        let mut scanned = registry.scan_all().await.context("library scan failed")?;
+        let prior = database.load_library().await?.map(Arc::new);
+        let mut scanned = registry
+            .scan_all(prior)
+            .await
+            .context("library scan failed")?;
         database.save_library(&mut scanned).await?;
+        database.refresh_source_artwork(&scanned).await?;
+        restore_after_scan(&database).await;
         tracing::info!(
             artists = scanned.artists.len(),
             albums = scanned.albums.len(),
@@ -375,6 +383,10 @@ async fn main() -> Result<()> {
             // Pre-warm existing covers (fetch + pre-resize) so the grid is a disk-cache hit on
             // first view instead of a burst of cold SMB reads. Its own task, draining its own
             // work via the cache — independent of the external-art fetch above.
+            tokio::spawn(artwork_cache_maintenance_loop(
+                database.clone(),
+                artwork_cache.clone(),
+            ));
             tokio::spawn(artwork_prewarm_loop(
                 database.clone(),
                 providers.clone(),
@@ -634,7 +646,7 @@ async fn scan_and_persist(
             Err(error) => errors.push(format!("{id}: {error}")),
         }
     }
-    let scanned = merge_libraries(libraries);
+    let mut scanned = merge_libraries(libraries);
 
     let changes = match database.detect_library_changes(&scanned).await {
         Ok(changes) => changes,
@@ -666,10 +678,13 @@ async fn scan_and_persist(
         .collect();
 
     if changes.has_changes() || needs_backfill {
-        let mut scanned = scanned;
         if let Err(error) = database.save_library(&mut scanned).await {
             errors.push(format!("failed to save library: {error}"));
         }
+    }
+
+    if let Err(error) = database.refresh_source_artwork(&scanned).await {
+        errors.push(format!("failed to update source artwork: {error}"));
     }
 
     let mut detail = summaries.join("\n");
@@ -1900,9 +1915,11 @@ async fn artwork_fill_pass(
 
         // Provider search + image download are synchronous (ureq) → off the runtime.
         let registry = registry.clone();
-        let fetched = tokio::task::spawn_blocking(move || {
+        let processing = artwork_cache.processing_permit().await;
+        let fetched = artwork_blocking(processing, move || {
             let cover = registry.find_cover(&query)?;
             let (bytes, ext) = artwork_providers::download_image(&cover.image_url).ok()?;
+            resize_to_jpeg(&bytes, 1)?;
             Some((cover, bytes, ext))
         })
         .await
@@ -2992,7 +3009,15 @@ fn app(
         )
         .route(
             "/api/albums/{id}/artwork",
-            get(album_artwork).patch(update_album_artwork),
+            get(album_artwork)
+                .patch(update_album_artwork)
+                .delete(clear_album_artwork)
+                .post(upload_album_artwork)
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/api/albums/{id}/artwork/refresh",
+            post(refresh_album_artwork),
         )
         .route("/api/tracks", get(tracks))
         .route("/api/search", get(search))
@@ -3383,24 +3408,29 @@ async fn rescan_library(
     let _guard = state.rescan_lock.lock().await;
     let forced = query.force.unwrap_or(false);
     let registry = state.providers.read().await.clone();
+    let prior = state.database.load_library().await?.map(Arc::new);
     let mut scanned = registry
-        .scan_all()
+        .scan_all(prior)
         .await
         .map_err(|error| AppError::internal(error.to_string()))?;
     let changes = state.database.detect_library_changes(&scanned).await?;
     let changed = changes.has_changes();
-    let updated = forced || changed;
+    let mut updated = forced || changed;
 
     // The scan reflects the current files; when unchanged its counts equal the
     // stored library's, so this summary is correct whether or not we save.
     let summary = scanned.summary();
     if updated {
         state.database.save_library(&mut scanned).await?;
+    }
+    let artwork_updated = state.database.refresh_source_artwork(&scanned).await? > 0;
+    if updated {
         // save_library rewrote albums/artists to folder-derived rows, clearing acquired
         // artwork + grouping; republish them immediately (as the discovery loop does).
         restore_after_scan(&state.database).await;
     }
 
+    updated |= artwork_updated;
     Ok(Json(RescanResponse {
         changed,
         updated,
@@ -5170,6 +5200,7 @@ async fn activity_ws_loop(mut socket: WebSocket, activity: Arc<activity::Activit
 struct AppSettings {
     /// Automatically fetch missing album covers from external providers.
     artwork_fetch: bool,
+    artwork_cache_mib: u32,
     /// Optional fanart.tv personal API key (empty = unset).
     fanart_tv_key: String,
     /// Identify untagged tracks by audio fingerprint (AcoustID) to resolve MusicBrainz
@@ -5226,6 +5257,7 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
         .unwrap_or_default();
     Ok(Json(AppSettings {
         artwork_fetch,
+        artwork_cache_mib: artwork_cache_mib(&state.database).await,
         fanart_tv_key,
         fingerprint_enabled,
         musicbrainz_enrich_enabled,
@@ -5242,6 +5274,7 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<AppSettings>
 #[derive(Debug, Deserialize)]
 struct SettingsUpdate {
     artwork_fetch: Option<bool>,
+    artwork_cache_mib: Option<u32>,
     fanart_tv_key: Option<String>,
     fingerprint_enabled: Option<bool>,
     musicbrainz_enrich_enabled: Option<bool>,
@@ -5258,6 +5291,17 @@ async fn update_settings(
     State(state): State<AppState>,
     Json(update): Json<SettingsUpdate>,
 ) -> Result<Json<AppSettings>, AppError> {
+    if let Some(limit) = update.artwork_cache_mib {
+        if !(16..=65536).contains(&limit) {
+            return Err(AppError::bad_request(
+                "Artwork cache must be between 16 and 65536 MiB.",
+            ));
+        }
+        state
+            .database
+            .set_setting("artwork_cache_mib", &limit.to_string())
+            .await?;
+    }
     if let Some(enabled) = update.artwork_fetch {
         state
             .database
@@ -6565,7 +6609,9 @@ struct AlbumArtworkCandidate {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct AlbumArtworkReviewResponse {
+    manual: bool,
     album_id: String,
     selected_artwork_id: Option<String>,
     selected_artwork_url: Option<String>,
@@ -6573,6 +6619,7 @@ struct AlbumArtworkReviewResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct AlbumArtworkCandidateResponse {
     id: String,
     source: &'static str,
@@ -7062,16 +7109,139 @@ fn now_unix_seconds() -> i64 {
         .unwrap_or_default()
 }
 
+async fn artwork_blocking<T: Send + 'static>(
+    permit: artwork::ProcessingPermit,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+}
+
 async fn album_artwork_review(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<AlbumArtworkReviewResponse>, AppError> {
-    let library = state
-        .database
+    let database = state.database.clone();
+    // Local candidate discovery can touch a slow mounted filesystem; keep it off runtime threads.
+    let library = database
         .load_library()
         .await?
-        .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
-    Ok(Json(album_artwork_review_response(&library, &id)?))
+        .ok_or_else(|| AppError::not_found("no library"))?;
+    let source = library
+        .album(&id)
+        .ok_or_else(|| AppError::not_found("unknown album"))?
+        .clone();
+    let review_id = id.clone();
+    let mut review =
+        tokio::task::spawn_blocking(move || album_artwork_review_response(&library, &review_id))
+            .await
+            .map_err(|_| AppError::not_found("artwork review unavailable"))??;
+    // Provider-relative paths must never be read as desktop paths. Network and embedded
+    // sources offer their current automatic cover, resolved through the normal provider route.
+    if source
+        .artwork_provider_id
+        .as_deref()
+        .is_some_and(|p| p != "local-disk")
+    {
+        review.candidates.clear();
+    }
+    if source.artwork_url.is_some() {
+        review.candidates.push(AlbumArtworkCandidateResponse {
+            id: "automatic".into(),
+            source: "automatic",
+            file_name: "Automatic artwork".into(),
+            mime_type: "image/*".into(),
+            file_size_bytes: None,
+            modified_at_unix_seconds: None,
+            selected: false,
+            preview_url: format!(
+                "/api/albums/{id}/artwork/candidates/automatic?asset={}",
+                source
+                    .artwork_url
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split_once("?asset=")
+                    .map(|(_, k)| k)
+                    .unwrap_or("source")
+            ),
+        });
+    }
+    if let Some((key, _, candidate)) = database.artwork_choice(&id).await? {
+        review.manual = true;
+        review.selected_artwork_id = candidate.clone();
+        review.selected_artwork_url = Some(format!("/api/albums/{id}/artwork?asset={key}"));
+        for item in &mut review.candidates {
+            item.selected = candidate.as_deref() == Some(&item.id);
+        }
+    } else {
+        review.selected_artwork_url = database.album_artwork_url(&id).await?;
+    }
+    Ok(Json(review))
+}
+
+async fn store_manual_artwork(
+    state: &AppState,
+    id: &str,
+    bytes: Vec<u8>,
+    candidate: Option<&str>,
+) -> Result<(), AppError> {
+    use sha2::{Digest, Sha256};
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(AppError::bad_request(
+            "Choose an image smaller than 16 MiB.",
+        ));
+    }
+    if state.database.source_album(id).await?.is_none() {
+        return Err(AppError::not_found("unknown album"));
+    }
+    let format = image::guess_format(&bytes)
+        .map_err(|_| AppError::bad_request("Choose a JPEG, PNG, GIF or WebP image."))?;
+    let ext = match format {
+        image::ImageFormat::Jpeg => "jpg",
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Gif => "gif",
+        image::ImageFormat::WebP => "webp",
+        _ => {
+            return Err(AppError::bad_request(
+                "Choose a JPEG, PNG, GIF or WebP image.",
+            ));
+        }
+    };
+    let key = format!("{:x}", Sha256::digest(&bytes));
+    let processing = state.artwork_cache.processing_permit().await;
+    let bytes = artwork_blocking(processing, move || resize_to_jpeg(&bytes, 1).map(|_| bytes))
+        .await
+        .map_err(|_| AppError::bad_request("Image validation failed. Try again."))?
+        .ok_or_else(|| {
+            AppError::bad_request("Image is damaged or too large to decode. Choose another image.")
+        })?;
+    let _choice = state.artwork_cache.source_lock(id).await;
+    state
+        .artwork_cache
+        .put_pinned(&key, ext, &bytes)
+        .await
+        .map_err(|_| {
+            AppError::bad_request(
+                "Could not save artwork. Check available disk space and try again.",
+            )
+        })?;
+    state
+        .database
+        .set_artwork_choice(id, &key, ext, candidate)
+        .await?;
+    Ok(())
+}
+
+async fn upload_album_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    bytes: axum::body::Bytes,
+) -> Result<Json<AlbumArtworkReviewResponse>, AppError> {
+    store_manual_artwork(&state, &id, bytes.to_vec(), None).await?;
+    album_artwork_review(State(state), Path(id)).await
 }
 
 async fn update_album_artwork(
@@ -7079,45 +7249,77 @@ async fn update_album_artwork(
     Path(id): Path<String>,
     Json(update): Json<AlbumArtworkSelectionUpdate>,
 ) -> Result<Json<AlbumArtworkReviewResponse>, AppError> {
-    let mut library = state
+    if update.artwork_id == "automatic" {
+        let _source = state.artwork_cache.source_lock(&id).await;
+        let cover = resolve_automatic_album_cover(
+            &state.database,
+            &state.providers,
+            &state.artwork_cache,
+            &id,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::not_found(
+                "automatic artwork is unavailable; upload an image or try again later",
+            )
+        })?;
+        drop(_source);
+        store_manual_artwork(&state, &id, cover.bytes, Some("automatic")).await?;
+        return album_artwork_review(State(state), Path(id)).await;
+    }
+    let library = state
         .database
         .load_library()
         .await?
-        .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
-    let candidate = album_artwork_candidates(&library, &id)?
-        .into_iter()
-        .find(|candidate| candidate.id == update.artwork_id)
-        .ok_or_else(|| {
-            AppError::not_found(format!(
-                "unknown artwork candidate for album {id}: {}",
-                update.artwork_id
-            ))
-        })?;
-    let album = library
-        .albums
-        .iter_mut()
-        .find(|album| album.id == id)
-        .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
-
-    album.artwork_path = Some(candidate.path);
-    album.artwork_url = Some(album_artwork_url(
-        &album.id,
-        album.artwork_path.as_ref().unwrap(),
-    ));
-
-    // Persist just the album's artwork columns rather than rewriting the library.
-    state
-        .database
-        .set_album_artwork(
-            &id,
-            album.artwork_path.as_deref(),
-            album.artwork_url.as_deref(),
-        )
+        .ok_or_else(|| AppError::not_found("no library"))?;
+    let album_id = id.clone();
+    let candidate = tokio::task::spawn_blocking(move || {
+        album_artwork_candidates(&library, &album_id)?
+            .into_iter()
+            .find(|c| c.id == update.artwork_id)
+            .ok_or_else(|| AppError::not_found("unknown artwork candidate"))
+    })
+    .await
+    .map_err(|_| AppError::not_found("candidate unavailable"))??;
+    let bytes = artwork::read_image_file(&candidate.path)
         .await
-        .map_err(db_error)?;
+        .map_err(|_| AppError::not_found("candidate unavailable"))?;
+    store_manual_artwork(&state, &id, bytes, Some(&candidate.id)).await?;
+    album_artwork_review(State(state), Path(id)).await
+}
 
-    let response = album_artwork_review_response(&library, &id)?;
-    Ok(Json(response))
+async fn clear_album_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<AlbumArtworkReviewResponse>, AppError> {
+    let _choice = state.artwork_cache.source_lock(&id).await;
+    state.database.clear_artwork_choice(&id).await?;
+    drop(_choice);
+    album_artwork_review(State(state), Path(id)).await
+}
+
+async fn refresh_album_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<AlbumArtworkReviewResponse>, AppError> {
+    let _source = state.artwork_cache.source_lock(&id).await;
+    let album = state
+        .database
+        .source_album(&id)
+        .await?
+        .ok_or_else(|| AppError::not_found("unknown album"))?;
+    if let Some(key) = album_source_artwork_key(&album) {
+        let _ = state.artwork_cache.invalidate(&key).await;
+    }
+    if let Some(acquired) = state.database.acquired_artwork(&id).await? {
+        if let Some(key) = acquired.cache_key {
+            let _ = state.artwork_cache.invalidate(&key).await;
+        }
+    }
+    state.database.refresh_artwork(&id).await?;
+    drop(_source);
+    // Fetch on the next request; no network work is coupled to this mutation.
+    album_artwork_review(State(state), Path(id)).await
 }
 
 /// An album cover's original bytes plus the cache key + content type they're stored under. The
@@ -7134,6 +7336,150 @@ struct AlbumCover {
     /// already survives rescans). `false` for a freshly-resolved folder/embedded/local cover,
     /// which the pre-warm worker then records so it survives too.
     persisted: bool,
+    processing: Option<artwork::ProcessingPermit>,
+}
+
+fn album_source_artwork_key(album: &Album) -> Option<String> {
+    let path = album.artwork_path.as_deref()?;
+    Some(
+        album
+            .artwork_url
+            .as_deref()
+            .and_then(|url| url.split_once("?asset="))
+            .map(|(_, key)| key.to_owned())
+            .unwrap_or_else(|| artwork_asset_id(path)),
+    )
+}
+
+/// Cache hits must remain independent of slow source reads occupying the processing limit.
+async fn artwork_revision(database: &Database, id: &str) -> Result<String, AppError> {
+    let album = database
+        .source_album(id)
+        .await?
+        .ok_or_else(|| AppError::not_found("unknown album"))?;
+    let acquired = database.acquired_artwork(id).await?;
+    Ok(format!(
+        "{:?}|{:?}|{:?}",
+        album.artwork_path,
+        album.artwork_url,
+        acquired.map(|a| (a.provider, a.cache_key, a.remote_url))
+    ))
+}
+
+async fn resolve_album_cover(
+    database: &Database,
+    providers: &Arc<RwLock<ProviderRegistry>>,
+    artwork_cache: &Arc<artwork::ArtworkCache>,
+    id: &str,
+) -> Result<Option<AlbumCover>, AppError> {
+    if let Some((key, ext, _)) = database.artwork_choice(id).await? {
+        // User assets are never silently replaced by automatic art, even if damaged/unavailable.
+        return Ok(artwork_cache
+            .get_pinned(&key, &ext)
+            .await
+            .map(|bytes| AlbumCover {
+                content_type: sniff_image_content_type(&bytes),
+                key,
+                cache_ext: ext,
+                bytes,
+                persisted: true,
+                processing: None,
+            }));
+    }
+    let _source = artwork_cache.source_lock(id).await;
+    // Recheck after waiting: a concurrent selection may have won the lock.
+    if let Some((key, ext, _)) = database.artwork_choice(id).await? {
+        return Ok(artwork_cache
+            .get_pinned(&key, &ext)
+            .await
+            .map(|bytes| AlbumCover {
+                content_type: sniff_image_content_type(&bytes),
+                key,
+                cache_ext: ext,
+                bytes,
+                persisted: true,
+                processing: None,
+            }));
+    }
+    resolve_automatic_album_cover(database, providers, artwork_cache, id).await
+}
+
+async fn resolve_automatic_album_cover(
+    database: &Database,
+    providers: &Arc<RwLock<ProviderRegistry>>,
+    artwork_cache: &Arc<artwork::ArtworkCache>,
+    id: &str,
+) -> Result<Option<AlbumCover>, AppError> {
+    if let Ok(Some(acquired)) = database.acquired_artwork(id).await
+        && acquired.status == "acquired"
+        && let Some(key) = acquired.cache_key
+    {
+        let ext = acquired.ext.unwrap_or_else(|| "jpg".into());
+        if let Some(bytes) = artwork_cache.get(&key, &ext).await {
+            return Ok(Some(AlbumCover {
+                key,
+                cache_ext: ext,
+                content_type: sniff_image_content_type(&bytes),
+                bytes,
+                persisted: true,
+                processing: None,
+            }));
+        }
+    }
+    let album = database
+        .source_album(id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
+    let key = album_source_artwork_key(&album);
+    if let Some(path) = album.artwork_path {
+        let key = key.expect("artwork path has a source key");
+        let ext = if is_embedded_artwork(&path) {
+            "embedded"
+        } else {
+            artwork_extension(&path)
+        };
+        if let Some(bytes) = artwork_cache.get(&key, ext).await {
+            return Ok(Some(AlbumCover {
+                key,
+                cache_ext: ext.into(),
+                content_type: sniff_image_content_type(&bytes),
+                bytes,
+                persisted: false,
+                processing: None,
+            }));
+        }
+    }
+    let revision = artwork_revision(database, id).await?;
+    if !database
+        .artwork_attempt_ready(id, &revision, now_unix_seconds())
+        .await?
+    {
+        return Ok(None);
+    }
+    let permit = artwork_cache.processing_permit().await;
+    let mut cover = match read_album_cover(database, providers, artwork_cache, id, &permit).await {
+        Ok(cover) => cover,
+        Err(error) => {
+            database
+                .record_artwork_attempt(id, &revision, false, now_unix_seconds())
+                .await?;
+            return Err(error);
+        }
+    };
+    if cover.is_none() {
+        // Only a successfully parsed absent embedded picture / no source is durable.
+        // I/O failures below are errors, never negative results.
+        database
+            .record_artwork_attempt(id, &revision, true, now_unix_seconds())
+            .await?;
+    } else {
+        database.clear_artwork_attempt(id).await?;
+    }
+    if let Some(cover) = &mut cover {
+        cover.processing = Some(permit);
+    }
+    Ok(cover)
 }
 
 /// Resolve an album's cover to its original bytes, fetching from the source and caching the
@@ -7141,11 +7487,32 @@ struct AlbumCover {
 /// or a local file. `Ok(None)` means the album has no usable cover (the caller 404s → the UI
 /// shows its monogram). Shared by `album_artwork` (HTTP hot path) and `warm_album_cover` (the
 /// background pre-warm worker), so both populate the cache identically.
-async fn resolve_album_cover(
+async fn cache_source_image(
+    cache: &artwork::ArtworkCache,
+    key: &str,
+    ext: &str,
+    bytes: &[u8],
+    permit: &artwork::ProcessingPermit,
+) -> Result<(), AppError> {
+    let source = bytes.to_vec();
+    if !artwork_blocking(permit.clone(), move || resize_to_jpeg(&source, 1).is_some())
+        .await
+        .unwrap_or(false)
+    {
+        return Err(AppError::not_found(
+            "artwork source image is damaged or exceeds decode limits",
+        ));
+    }
+    cache.put(key, ext, bytes).await;
+    Ok(())
+}
+
+async fn read_album_cover(
     database: &Database,
     providers: &Arc<RwLock<ProviderRegistry>>,
     artwork_cache: &Arc<artwork::ArtworkCache>,
     id: &str,
+    permit: &artwork::ProcessingPermit,
 ) -> Result<Option<AlbumCover>, AppError> {
     // An externally-acquired cover (iTunes/Deezer/Cover Art Archive) takes precedence — its
     // bytes live in the artwork cache, keyed by the stored cache_key.
@@ -7164,18 +7531,22 @@ async fn resolve_album_cover(
                 content_type,
                 bytes,
                 persisted: true,
+                processing: None,
             }));
         }
         // Cache miss (cleared/evicted) but we recorded the source — re-fetch once. Only an
         // external cover has a `remote_url`; a local-cache row falls through to re-read the source.
         if let Some(url) = acquired.remote_url.clone() {
-            let downloaded =
-                tokio::task::spawn_blocking(move || artwork_providers::download_image(&url))
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
+            let processing = permit.clone();
+            let downloaded = tokio::task::spawn_blocking(move || {
+                let _permit = processing;
+                artwork_providers::download_image(&url)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok);
             if let Some((bytes, _)) = downloaded {
-                artwork_cache.put(&key, &ext, &bytes).await;
+                cache_source_image(artwork_cache, &key, &ext, &bytes, permit).await?;
                 let content_type = sniff_image_content_type(&bytes);
                 return Ok(Some(AlbumCover {
                     key,
@@ -7183,27 +7554,32 @@ async fn resolve_album_cover(
                     content_type,
                     bytes,
                     persisted: true,
+                    processing: None,
                 }));
             }
         }
-        // Couldn't produce it — fall through to the embedded/folder logic.
+        if acquired.remote_url.is_some() {
+            return Err(AppError::not_found("artwork provider unavailable"));
+        }
+        // No remote source: re-read current local source.
     }
 
     let album = database
-        .album(id)
+        .source_album(id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| AppError::not_found(format!("unknown album: {id}")))?;
+    let key = album_source_artwork_key(&album);
     let Some(path) = album.artwork_path else {
         return Ok(None);
     };
+    let key = key.expect("artwork path has a source key");
 
     // An album with no folder cover falls back to a track's *embedded* artwork — in that case
     // `artwork_path` points at the audio file, so extract the picture (once) and cache it,
     // rather than trying to serve the audio file as an image.
     if is_embedded_artwork(&path) {
         const EMBEDDED_CACHE_EXT: &str = "embedded";
-        let key = artwork_asset_id(&path);
         if let Some(bytes) = artwork_cache.get(&key, EMBEDDED_CACHE_EXT).await {
             let content_type = sniff_image_content_type(&bytes);
             return Ok(Some(AlbumCover {
@@ -7212,17 +7588,16 @@ async fn resolve_album_cover(
                 content_type,
                 bytes,
                 persisted: false,
+                processing: None,
             }));
         }
-        // Read the audio file (over the source provider or local disk) once, extract its
-        // embedded cover, and cache the image so the network stays off the hot path.
-        let Ok(audio) = read_album_source_file(database, providers, id, &path).await else {
+        // Read only metadata through a bounded seekable source, then cache the image.
+        let Some(image) =
+            read_album_embedded_cover(database, providers, id, &path, permit.clone()).await?
+        else {
             return Ok(None);
         };
-        let Some(image) = musicata_core::extract_embedded_cover(&audio, &path) else {
-            return Ok(None);
-        };
-        artwork_cache.put(&key, EMBEDDED_CACHE_EXT, &image).await;
+        cache_source_image(artwork_cache, &key, EMBEDDED_CACHE_EXT, &image, permit).await?;
         let content_type = sniff_image_content_type(&image);
         return Ok(Some(AlbumCover {
             key,
@@ -7230,6 +7605,7 @@ async fn resolve_album_cover(
             content_type,
             bytes: image,
             persisted: false,
+            processing: None,
         }));
     }
 
@@ -7239,11 +7615,16 @@ async fn resolve_album_cover(
     #[cfg(feature = "provider-smb")]
     {
         let provider_id = database.album_provider_id(id).await.map_err(db_error)?;
-        if let Some(provider_id) = provider_id
-            && let Some(providers::ProviderHandle::Smb(smb)) =
-                providers.read().await.get(&provider_id)
+        let smb = if let Some(provider_id) = provider_id.as_deref().filter(|id| *id != "local-disk")
         {
-            let key = artwork_asset_id(&path);
+            match providers.read().await.get(provider_id) {
+                Some(providers::ProviderHandle::Smb(smb)) => Some(smb.clone()),
+                _ => return Err(AppError::not_found("artwork source is unavailable")),
+            }
+        } else {
+            None
+        };
+        if let Some(smb) = smb {
             let extension = artwork_extension(&path);
             let content_type = image_content_type(extension);
             // Serve the cached copy if we've fetched this cover before; otherwise fetch it over
@@ -7256,38 +7637,50 @@ async fn resolve_album_cover(
                     content_type,
                     bytes,
                     persisted: false,
+                    processing: None,
                 }));
             }
             // A missing/unreadable cover on the share is "no artwork" (→ the UI shows its
             // monogram fallback), never a 500.
             let item_id = path.to_string_lossy().into_owned();
-            let Ok(bytes) = smb.read_file(&item_id).await else {
-                return Ok(None);
-            };
-            artwork_cache.put(&key, extension, &bytes).await;
+            let bytes = smb
+                .read_file(&item_id)
+                .await
+                .map_err(|_| AppError::not_found("artwork source unavailable"))?;
+            cache_source_image(artwork_cache, &key, extension, &bytes, permit).await?;
             return Ok(Some(AlbumCover {
                 key,
                 cache_ext: extension.to_string(),
                 content_type,
                 bytes,
                 persisted: false,
+                processing: None,
             }));
         }
     }
 
+    if database
+        .album_provider_id(id)
+        .await?
+        .as_deref()
+        .is_some_and(|id| id != "local-disk")
+    {
+        return Err(AppError::not_found("artwork source is unavailable"));
+    }
     // Local file on disk.
-    let key = artwork_asset_id(&path);
     let extension = artwork_extension(&path);
     let content_type = image_content_type(extension);
-    let Ok(bytes) = tokio::fs::read(&path).await else {
-        return Ok(None);
-    };
+    let bytes = artwork::read_image_file(&path)
+        .await
+        .map_err(|_| AppError::not_found("artwork source unavailable"))?;
+    cache_source_image(artwork_cache, &key, extension, &bytes, permit).await?;
     Ok(Some(AlbumCover {
         key,
         cache_ext: extension.to_string(),
         content_type,
         bytes,
         persisted: false,
+        processing: None,
     }))
 }
 
@@ -7301,7 +7694,7 @@ async fn album_artwork(
     let cover = resolve_album_cover(&state.database, &state.providers, &state.artwork_cache, &id)
         .await?
         .ok_or_else(|| AppError::not_found(format!("album has no artwork: {id}")))?;
-    let etag = artwork_etag(&cover.key, size);
+    let etag = artwork_etag(&artwork_content_key(&cover.bytes), size);
     if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
         return artwork_not_modified(&etag);
     }
@@ -7312,6 +7705,7 @@ async fn album_artwork(
         cover.bytes,
         size,
         etag,
+        cover.processing,
     )
     .await
 }
@@ -7329,45 +7723,43 @@ async fn warm_album_cover(
     let Ok(Some(cover)) = resolve_album_cover(database, providers, artwork_cache, id).await else {
         return false;
     };
+    let content_key = artwork_content_key(&cover.bytes);
     let mut all_cached = true;
     for size in ARTWORK_SIZES {
         let variant_ext = format!("{size}.jpg");
-        if artwork_cache.get(&cover.key, &variant_ext).await.is_some() {
+        if artwork_cache
+            .get(&content_key, &variant_ext)
+            .await
+            .is_some()
+        {
             continue;
         }
         let source = cover.bytes.clone();
-        match tokio::task::spawn_blocking(move || resize_to_jpeg(&source, size)).await {
-            Ok(Some(resized)) => artwork_cache.put(&cover.key, &variant_ext, &resized).await,
+        let processing = match &cover.processing {
+            Some(permit) => permit.clone(),
+            None => artwork_cache.processing_permit().await,
+        };
+        match artwork_blocking(processing, move || resize_to_jpeg(&source, size)).await {
+            Ok(Some(resized)) => {
+                artwork_cache
+                    .put(&content_key, &variant_ext, &resized)
+                    .await
+            }
             _ => all_cached = false,
         }
     }
     // Promote a freshly-cached folder/embedded/local cover to a persisted `acquired` row so it
     // survives rescans: `reapply_acquired_artwork` (run after every scan) restores its
     // `artwork_url`, and `resolve_album_cover` then serves it from the local cache — never
-    // touching SMB again, even if a later scan fails to re-find the folder cover. Covers already
-    // backed by an acquired row (external art) are skipped so their provider/remote_url survive.
+    // touching SMB on cached requests. A later scan confirming changed source artwork
+    // invalidates only automatic provenance; acquired external choices keep precedence.
+    // Promotion is conditional so late work cannot restore an obsolete source revision.
     if all_cached && !cover.persisted {
         let _ = diagnostics::background_result(
             database
-                .upsert_acquired_artwork(
-                    id,
-                    "local-cache",
-                    None,
-                    Some(&cover.key),
-                    Some(&cover.cache_ext),
-                    None,
-                    "acquired",
-                    now_unix_seconds(),
-                )
+                .promote_local_artwork(id, &cover.key, &cover.cache_ext, now_unix_seconds())
                 .await,
-            "persistence.upsert_acquired_artwork",
-        );
-        // Apply the cover URL now so it shows immediately, rather than waiting for the next
-        // post-scan `reapply_acquired_artwork` (the periodic scan is only an hourly safety net).
-        let url = format!("/api/albums/{id}/artwork?asset={}", cover.key);
-        let _ = diagnostics::background_result(
-            database.set_album_artwork_url(id, &url).await,
-            "persistence.set_album_artwork_url",
+            "persistence.promote_local_artwork",
         );
     }
     all_cached
@@ -7379,6 +7771,30 @@ async fn warm_album_cover(
 /// ~17 ms warm). Its own task draining its own work, coordinating with the HTTP path only through
 /// the cache — a slow cover never blocks playback. Bounded concurrency leaves SMB headroom for
 /// live streams; warmed albums are remembered so steady-state passes only pick up new/failed ones.
+const DEFAULT_ARTWORK_CACHE_MIB: u32 = 512;
+async fn artwork_cache_mib(database: &Database) -> u32 {
+    database
+        .get_setting("artwork_cache_mib")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| (16..=65536).contains(v))
+        .unwrap_or(DEFAULT_ARTWORK_CACHE_MIB)
+}
+
+async fn artwork_cache_maintenance_loop(database: Database, cache: Arc<artwork::ArtworkCache>) {
+    loop {
+        if let Ok(pins) = database.artwork_pin_keys().await {
+            let limit = u64::from(artwork_cache_mib(&database).await) * 1024 * 1024;
+            if let Err(error) = cache.maintain(limit, &pins).await {
+                tracing::warn!(%error,"artwork cache maintenance failed");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
 async fn artwork_prewarm_loop(
     database: Database,
     providers: Arc<RwLock<ProviderRegistry>>,
@@ -7464,6 +7880,14 @@ async fn artwork_prewarm_loop(
                 "artwork prewarm: warmed album covers"
             );
         }
+        let (pending, next) = retries.pending();
+        let next = next.map(|deadline| {
+            now_unix_seconds() as usize
+                + deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs() as usize
+        });
+        diagnostics::runtime::pending_retry("prewarm", pending, next);
         // All resolvable covers cached → idle; re-list periodically so covers added by a later
         // scan (and any that failed transiently) get another pass.
         tokio::time::sleep(IDLE_POLL).await;
@@ -7498,16 +7922,21 @@ async fn artist_artwork(
                 bytes,
                 size,
                 etag,
+                None,
             )
             .await;
         }
         // Cache miss but we recorded the source — re-fetch once.
         if let Some(url) = acquired.remote_url.clone() {
-            let downloaded =
-                tokio::task::spawn_blocking(move || artwork_providers::download_image(&url))
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
+            let permit = state.artwork_cache.processing_permit().await;
+            let processing = permit.clone();
+            let downloaded = tokio::task::spawn_blocking(move || {
+                let _permit = processing;
+                artwork_providers::download_image(&url)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok);
             if let Some((bytes, _)) = downloaded {
                 state.artwork_cache.put(&key, &ext, &bytes).await;
                 return serve_sized_artwork(
@@ -7517,6 +7946,7 @@ async fn artist_artwork(
                     bytes,
                     size,
                     etag,
+                    Some(permit),
                 )
                 .await;
             }
@@ -7530,6 +7960,22 @@ async fn album_artwork_candidate(
     Path((id, artwork_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    if artwork_id == "automatic" {
+        let _source = state.artwork_cache.source_lock(&id).await;
+        let cover = resolve_automatic_album_cover(
+            &state.database,
+            &state.providers,
+            &state.artwork_cache,
+            &id,
+        )
+        .await?
+        .ok_or_else(|| AppError::not_found("automatic artwork is unavailable"))?;
+        let etag = artwork_etag(&artwork_content_key(&cover.bytes), None);
+        if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
+            return artwork_not_modified(&etag);
+        }
+        return artwork_response_typed(cover.bytes, cover.content_type, etag);
+    }
     let path = {
         let library = state
             .database
@@ -7561,6 +8007,7 @@ fn album_artwork_review_response(
     let candidates = album_artwork_candidates(library, album_id)?;
 
     Ok(AlbumArtworkReviewResponse {
+        manual: false,
         album_id: album_id.to_string(),
         selected_artwork_id: album
             .artwork_path
@@ -7596,6 +8043,14 @@ fn album_artwork_candidates(
     let album = library
         .album(album_id)
         .ok_or_else(|| AppError::not_found(format!("unknown album: {album_id}")))?;
+    if album
+        .artwork_provider_id
+        .as_deref()
+        .is_some_and(|p| p != "local-disk")
+    {
+        return Ok(Vec::new());
+    }
+
     let selected_id = album
         .artwork_path
         .as_ref()
@@ -7684,14 +8139,21 @@ async fn serve_artwork(
         return artwork_not_modified(&etag);
     }
 
+    if let Some(size) = size
+        && let Some(bytes) = cache.get(&key, &format!("{size}.jpg")).await
+    {
+        return artwork_response_typed(bytes, "image/jpeg", etag);
+    }
+    let permit = cache.processing_permit().await;
+
     // A cover that can't be read (missing file, stale path, permissions) is "no
     // artwork" — return 404 so the client falls back to its monogram, never a 500.
-    let bytes = tokio::fs::read(&path)
+    let bytes = artwork::read_image_file(&path)
         .await
         .map_err(|error| AppError::not_found(format!("album artwork unavailable: {error}")))?;
 
     let content_type = image_content_type(artwork_extension(&path));
-    serve_sized_artwork(cache, &key, content_type, bytes, size, etag).await
+    serve_sized_artwork(cache, &key, content_type, bytes, size, etag, Some(permit)).await
 }
 
 fn artwork_extension(path: &std::path::Path) -> &str {
@@ -7750,6 +8212,11 @@ fn normalize_size(requested: Option<u32>) -> Option<u32> {
 
 /// A size-aware ETag so a client can't reuse a thumbnail body for the full cover (or vice
 /// versa); the unsized form matches the original-bytes etag used elsewhere.
+fn artwork_content_key(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 fn artwork_etag(key: &str, size: Option<u32>) -> String {
     match size {
         Some(size) => format!("\"{key}-{size}\""),
@@ -7780,27 +8247,34 @@ fn resize_to_jpeg(original: &[u8], size: u32) -> Option<Vec<u8>> {
 /// artwork cache). A decode/resize failure falls back to the original — never a 500.
 async fn serve_sized_artwork(
     cache: &artwork::ArtworkCache,
-    key: &str,
+    _key: &str,
     original_content_type: &'static str,
     original: Vec<u8>,
     size: Option<u32>,
     etag: String,
+    permit: Option<artwork::ProcessingPermit>,
 ) -> Result<Response, AppError> {
     let Some(size) = size else {
         return artwork_response_typed(original, original_content_type, etag);
     };
+    // Content identity fences late pre-refresh resizing and deduplicates thumbnails too.
+    let key = artwork_content_key(&original);
     let variant_ext = format!("{size}.jpg");
-    if let Some(bytes) = cache.get(key, &variant_ext).await {
+    if let Some(bytes) = cache.get(&key, &variant_ext).await {
         return artwork_response_typed(bytes, "image/jpeg", etag);
     }
+    let permit = match permit {
+        Some(permit) => permit,
+        None => cache.processing_permit().await,
+    };
     let source = original.clone();
-    let resized = tokio::task::spawn_blocking(move || resize_to_jpeg(&source, size))
+    let resized = artwork_blocking(permit, move || resize_to_jpeg(&source, size))
         .await
         .ok()
         .flatten();
     match resized {
         Some(bytes) => {
-            cache.put(key, &variant_ext, &bytes).await;
+            cache.put(&key, &variant_ext, &bytes).await;
             artwork_response_typed(bytes, "image/jpeg", etag)
         }
         // Undecodable bytes: serve the original (unscaled) rather than failing.
@@ -7834,35 +8308,69 @@ fn sniff_image_content_type(bytes: &[u8]) -> &'static str {
     }
 }
 
-/// Read an album's source file (the cover image or, for embedded art, the audio file)
-/// from its provider — over SMB for a network album, else from local disk.
+/// Extract embedded artwork without buffering the local/SMB audio payload.
 #[cfg_attr(not(feature = "provider-smb"), allow(unused_variables))]
-#[cfg_attr(not(feature = "provider-smb"), allow(unused_variables))]
-async fn read_album_source_file(
+async fn read_album_embedded_cover(
     database: &Database,
     providers: &Arc<RwLock<ProviderRegistry>>,
     album_id: &str,
     path: &std::path::Path,
-) -> Result<Vec<u8>, AppError> {
+    permit: artwork::ProcessingPermit,
+) -> Result<Option<Vec<u8>>, AppError> {
     #[cfg(feature = "provider-smb")]
-    {
+    let source = {
         let provider_id = database
             .album_provider_id(album_id)
             .await
             .map_err(db_error)?;
-        if let Some(provider_id) = provider_id
-            && let Some(providers::ProviderHandle::Smb(smb)) =
-                providers.read().await.get(&provider_id)
-        {
+        // Clone before awaiting I/O, so registry updates do not wait for SMB.
+        let smb = if let Some(provider_id) = provider_id.filter(|id| id != "local-disk") {
+            match providers.read().await.get(&provider_id) {
+                Some(providers::ProviderHandle::Smb(smb)) => Some(smb.clone()),
+                _ => return Err(AppError::not_found("artwork source is unavailable")),
+            }
+        } else {
+            None
+        };
+        if let Some(smb) = smb {
             let item_id = path.to_string_lossy().into_owned();
-            return smb.read_file(&item_id).await.map_err(|error| {
+            Some(smb.open_audio(&item_id).await.map_err(|error| {
                 AppError::not_found(format!("artwork source unavailable: {error}"))
-            });
+            })?)
+        } else {
+            None
         }
+    };
+    #[cfg(not(feature = "provider-smb"))]
+    if database
+        .album_provider_id(album_id)
+        .await?
+        .as_deref()
+        .is_some_and(|id| id != "local-disk")
+    {
+        return Err(AppError::not_found("artwork source is unavailable"));
     }
-    tokio::fs::read(path)
-        .await
-        .map_err(|error| AppError::not_found(format!("artwork source unavailable: {error}")))
+    #[cfg(not(feature = "provider-smb"))]
+    let source: Option<Box<dyn symphonia::core::io::MediaSource>> = None;
+    let source = match source {
+        Some(source) => source,
+        None => Box::new(
+            tokio::fs::File::open(path)
+                .await
+                .map_err(|error| {
+                    AppError::not_found(format!("artwork source unavailable: {error}"))
+                })?
+                .into_std()
+                .await,
+        ) as Box<dyn symphonia::core::io::MediaSource>,
+    };
+    let path = path.to_path_buf();
+    artwork_blocking(permit, move || {
+        musicata_core::extract_embedded_cover_from(source, &path)
+    })
+    .await
+    .map_err(|_| AppError::not_found("artwork reader failed"))?
+    .map_err(|error| AppError::not_found(format!("embedded artwork unavailable: {error}")))
 }
 
 fn etag_matches(value: Option<&axum::http::HeaderValue>, etag: &str) -> bool {
@@ -8437,6 +8945,8 @@ mod tests {
         bool_setting_default, folder_name_from_relative_path, normalize_size, parse_range,
         resize_to_jpeg, schedule_autoplay_refills,
     };
+    use crate::{artwork, now_unix_seconds};
+    use std::sync::Arc;
 
     #[test]
     fn album_display_hint_uses_only_the_final_relative_folder() {
@@ -11858,6 +12368,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_artwork_does_not_wait_for_source_processing_permits() {
+        let fixture = TestFixture::new("cached-artwork-permits");
+        let mut library = fixture.library();
+        let album_id = library.albums[0].id.clone();
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .unwrap();
+        database.save_library(&mut library).await.unwrap();
+        database
+            .upsert_acquired_artwork(
+                &album_id,
+                "local-cache",
+                None,
+                Some("abcdef"),
+                Some("jpg"),
+                None,
+                "acquired",
+                now_unix_seconds(),
+            )
+            .await
+            .unwrap();
+        let cache = Arc::new(artwork::ArtworkCache::new(fixture.root.join("artwork")));
+        cache.put("abcdef", "jpg", b"original cover").await;
+        cache
+            .put(
+                &super::artwork_content_key(b"original cover"),
+                "300.jpg",
+                b"cached thumbnail",
+            )
+            .await;
+        let (app, _) = fixture
+            .app_with_database_cache(database, cache.clone())
+            .await;
+        let permits = [
+            cache.processing_permit().await,
+            cache.processing_permit().await,
+            cache.processing_permit().await,
+        ];
+        let request = || Request::builder().uri(format!("/api/albums/{album_id}/artwork?size=300"));
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.clone().oneshot(request().body(Body::empty()).unwrap()),
+        )
+        .await
+        .expect("cached artwork must not wait for source jobs")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response.headers().get("etag").unwrap().clone();
+        assert_eq!(body_text(response.into_body()).await, "cached thumbnail");
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(
+                request()
+                    .header(IF_NONE_MATCH, etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("cached 304 must not wait for source jobs")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        drop(permits);
+    }
+
+    #[tokio::test]
     async fn serves_track_stream_ranges() {
         let fixture = TestFixture::new("stream");
         let library = fixture.library();
@@ -12057,6 +12633,228 @@ mod tests {
                 .count(),
             1
         );
+        audit.close().await;
+    }
+
+    #[tokio::test]
+    async fn source_artwork_manual_rescan_invalidates_cached_cover_with_and_without_force() {
+        for forced in [false, true] {
+            let fixture = TestFixture::new("manual-artwork-rescan");
+            let mut library = fixture.library();
+            let album = library
+                .albums
+                .iter()
+                .find(|a| a.artwork_path.is_some())
+                .unwrap()
+                .clone();
+            let id = album.id.clone();
+            let key = album
+                .artwork_url
+                .as_deref()
+                .unwrap()
+                .split_once("?asset=")
+                .unwrap()
+                .1;
+            let database = Database::connect(fixture.root.join("musicata.db"))
+                .await
+                .unwrap();
+            database.save_library(&mut library).await.unwrap();
+            database
+                .upsert_acquired_artwork(
+                    &id,
+                    "local-cache",
+                    None,
+                    Some(key),
+                    Some("jpg"),
+                    None,
+                    "acquired",
+                    1,
+                )
+                .await
+                .unwrap();
+            let cache = Arc::new(artwork::ArtworkCache::new(fixture.root.join("artwork")));
+            cache.put(key, "jpg", b"old cached cover").await;
+            let (app, _) = fixture
+                .app_with_database_cache(database.clone(), cache)
+                .await;
+            let mut replacement = Vec::new();
+            image::DynamicImage::new_rgb8(24, 24)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut replacement),
+                    image::ImageFormat::Jpeg,
+                )
+                .unwrap();
+            fs::write(album.artwork_path.unwrap(), &replacement).unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/library/rescan?force={forced}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let result: serde_json::Value =
+                serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+            assert!(
+                database.acquired_artwork(&id).await.unwrap().is_none(),
+                "manual rescan must invalidate stale automatic provenance, force={forced}"
+            );
+            assert_eq!(result["changed"], false, "audio tracks did not change");
+            assert_eq!(
+                result["updated"], true,
+                "artwork changed even when audio did not"
+            );
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/albums/{id}/artwork"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+                replacement
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_artwork_scan_invalidates_promoted_cover_without_track_rewrites() {
+        let fixture = TestFixture::new("source-artwork-scan");
+        let path = fixture.root.join("1994 - Paramparcad/cover.jpg");
+        let mut original = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([120, 130, 140]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut original),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+        fs::write(&path, &original).unwrap();
+        let mut library = fixture.library();
+        let id = library
+            .albums
+            .iter()
+            .find(|a| a.artwork_path.as_ref() == Some(&path))
+            .unwrap()
+            .id
+            .clone();
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .unwrap();
+        database.save_library(&mut library).await.unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.push(ProviderHandle::local(LocalDiskProvider::new(&fixture.root)));
+        let providers = Arc::new(tokio::sync::RwLock::new(registry));
+        let cache = Arc::new(crate::artwork::ArtworkCache::new(
+            fixture.root.join("artwork"),
+        ));
+        assert!(super::warm_album_cover(&database, &providers, &cache, &id).await);
+        let old = super::resolve_album_cover(&database, &providers, &cache, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.bytes, original);
+        let mut replacement = Vec::new();
+        image::DynamicImage::new_rgb8(128, 128)
+            .write_to(
+                &mut std::io::Cursor::new(&mut replacement),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        assert_ne!(original.len(), replacement.len());
+        fs::write(&path, &replacement).unwrap();
+        let audit = sqlx::SqlitePool::connect(&format!(
+            "sqlite:{}",
+            fixture.root.join("musicata.db").display()
+        ))
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE test_artwork_writes (kind TEXT)")
+            .execute(&audit)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER test_artwork_tracks AFTER INSERT ON tracks BEGIN INSERT INTO test_artwork_writes VALUES ('track'); END").execute(&audit).await.unwrap();
+        sqlx::query("CREATE TRIGGER test_artwork_albums AFTER UPDATE ON albums BEGIN INSERT INTO test_artwork_writes VALUES ('album'); END").execute(&audit).await.unwrap();
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let activity = Arc::new(crate::activity::ActivityLog::default());
+        super::scan_and_persist(
+            &database,
+            &providers,
+            &lock,
+            &activity,
+            "changed cover",
+            true,
+        )
+        .await;
+        assert!(
+            database.acquired_artwork(&id).await.unwrap().is_none(),
+            "stale automatic provenance must be invalidated"
+        );
+        let new = super::resolve_album_cover(&database, &providers, &cache, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            new.bytes, replacement,
+            "a promoted source cover must not conceal its replacement"
+        );
+        assert_ne!(old.key, new.key);
+        assert_eq!(new.content_type, "image/jpeg");
+        drop(new);
+        drop(old);
+        let track_writes: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM test_artwork_writes WHERE kind='track'")
+                .fetch_one(&audit)
+                .await
+                .unwrap();
+        assert_eq!(
+            track_writes, 0,
+            "artwork-only changes must not rewrite tracks"
+        );
+        assert!(super::warm_album_cover(&database, &providers, &cache, &id).await);
+        sqlx::query("DELETE FROM test_artwork_writes")
+            .execute(&audit)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            super::scan_and_persist(&database, &providers, &lock, &activity, "unchanged", true)
+                .await;
+        }
+        let writes: i64 = sqlx::query_scalar("SELECT count(*) FROM test_artwork_writes")
+            .fetch_one(&audit)
+            .await
+            .unwrap();
+        assert_eq!(
+            writes, 0,
+            "unchanged art must not cause album or track writes"
+        );
+        // Cached covers remain available with the source offline and all source slots busy.
+        fs::remove_file(&path).unwrap();
+        let mut permits = Vec::new();
+        for _ in 0..3 {
+            permits.push(cache.processing_permit().await);
+        }
+        let offline = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::resolve_album_cover(&database, &providers, &cache, &id),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(offline.bytes, replacement);
+        drop(permits);
         audit.close().await;
     }
 
@@ -12306,6 +13104,301 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refreshed_artwork_cannot_reuse_late_old_content_thumbnail() {
+        let fixture = TestFixture::new("late-thumbnail");
+        let cache = artwork::ArtworkCache::new(fixture.root.join("cache"));
+        let image = |color| {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgb8(image::ImageBuffer::from_pixel(
+                16,
+                16,
+                image::Rgb(color),
+            ))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+            bytes
+        };
+        let old = image([255, 0, 0]);
+        let new = image([0, 255, 0]);
+        // Model old resize completing after Refresh: both old source-key and content-key
+        // thumbnails exist. Neither may be used for the new bytes at that same source key.
+        let old_thumbnail = resize_to_jpeg(&old, 300).unwrap();
+        cache.put("same-source", "300.jpg", &old_thumbnail).await;
+        cache
+            .put(&super::artwork_content_key(&old), "300.jpg", &old_thumbnail)
+            .await;
+        let expected = resize_to_jpeg(&new, 300).unwrap();
+        let response = super::serve_sized_artwork(
+            &cache,
+            "same-source",
+            "image/png",
+            new,
+            Some(300),
+            "etag".into(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_candidate_uses_cached_remote_source_and_pins_offline() {
+        let fixture = TestFixture::new("remote-art-choice");
+        let mut library = fixture.library();
+        let album = library
+            .albums
+            .iter_mut()
+            .find(|a| a.artwork_path.is_some())
+            .unwrap();
+        let id = album.id.clone();
+        album.artwork_provider_id = Some("offline-nas".into());
+        album.artwork_path = Some(PathBuf::from("share/album/cover.jpg"));
+        let (app, db) = fixture.app_with_library_db(library).await;
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_rgb8(8, 8)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let cache = artwork::ArtworkCache::new(fixture.root.join("artwork"));
+        cache.put("remote", "png", &bytes).await;
+        db.upsert_acquired_artwork(
+            &id,
+            "local-cache",
+            None,
+            Some("remote"),
+            Some("png"),
+            None,
+            "acquired",
+            1,
+        )
+        .await
+        .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/albums/{id}/artwork/review"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let review: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(review["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(review["candidates"][0]["id"], "automatic");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/albums/{id}/artwork/candidates/automatic"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            bytes
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/albums/{id}/artwork"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"artwork_id":"automatic"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (key, ext, _) = db.artwork_choice(&id).await.unwrap().unwrap();
+        cache
+            .maintain(0, &db.artwork_pin_keys().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(cache.get_pinned(&key, &ext).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn corrupt_source_backoff_survives_restart_until_explicit_refresh() {
+        let fixture = TestFixture::new("artwork-backoff");
+        let library = fixture.library();
+        let album = library
+            .albums
+            .iter()
+            .find(|a| a.artwork_path.is_some())
+            .unwrap()
+            .clone();
+        let id = album.id.clone();
+        let path = album.artwork_path.unwrap();
+        let valid = fs::read(&path).unwrap();
+        fs::write(&path, b"truncated image").unwrap();
+        let (app, db) = fixture.app_with_library_db(library).await;
+        let request = || {
+            Request::builder()
+                .uri(format!("/api/albums/{id}/artwork"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        fs::write(&path, &valid).unwrap();
+        let (restarted, _) = fixture.app_with_database(db).await;
+        let response = restarted.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let refreshed = restarted
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/albums/{id}/artwork/refresh"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        let review: serde_json::Value =
+            serde_json::from_slice(&to_bytes(refreshed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(
+            review["selected_artwork_url"]
+                .as_str()
+                .unwrap()
+                .contains("&refresh=1")
+        );
+        let response = restarted.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            valid
+        );
+    }
+
+    #[tokio::test]
+    async fn artwork_upload_clear_refresh_and_invalid_upload() {
+        let fixture = TestFixture::new("artwork-actions");
+        let library = fixture.library();
+        let id = library
+            .albums
+            .iter()
+            .find(|a| a.artwork_path.is_some())
+            .unwrap()
+            .id
+            .clone();
+        let mut original = Vec::new();
+        image::DynamicImage::new_rgb8(12, 12)
+            .write_to(
+                &mut std::io::Cursor::new(&mut original),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        fs::write(
+            library.album(&id).unwrap().artwork_path.as_ref().unwrap(),
+            &original,
+        )
+        .unwrap();
+        let app = fixture.app_with_library(library).await;
+        for (bytes, expected) in [
+            (b"not an image".to_vec(), StatusCode::BAD_REQUEST),
+            (original.clone(), StatusCode::OK),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/albums/{id}/artwork"))
+                        .header(CONTENT_TYPE, "image/png")
+                        .body(Body::from(bytes))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/albums/{id}/artwork/review"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let review: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(review["manual"], true);
+        let chosen = review["selected_artwork_url"].as_str().unwrap().to_owned();
+        for action in ["refresh", "clear"] {
+            let (method, url) = if action == "refresh" {
+                ("POST", format!("/api/albums/{id}/artwork/refresh"))
+            } else {
+                ("DELETE", format!("/api/albums/{id}/artwork"))
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(url)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let review: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(review["manual"], action == "refresh");
+            if action == "refresh" {
+                assert_eq!(review["selected_artwork_url"], chosen);
+            }
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/albums/{id}/artwork"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            original.as_slice()
+        );
+    }
+
+    #[tokio::test]
     async fn reviews_and_selects_album_artwork() {
         let fixture = TestFixture::new("artwork-selection");
         let library = fixture.library();
@@ -12363,8 +13456,9 @@ mod tests {
             review["selected_artwork_url"]
                 .as_str()
                 .unwrap_or_default()
-                .contains(&front_id)
+                .contains("?asset=")
         );
+        assert_eq!(review["manual"], true);
 
         let response = app
             .oneshot(
@@ -13677,6 +14771,18 @@ mod tests {
             &self,
             database: Database,
         ) -> (axum::Router, std::sync::Arc<PlayerManager>) {
+            self.app_with_database_cache(
+                database,
+                Arc::new(artwork::ArtworkCache::new(self.root.join("artwork"))),
+            )
+            .await
+        }
+
+        async fn app_with_database_cache(
+            &self,
+            database: Database,
+            artwork_cache: Arc<artwork::ArtworkCache>,
+        ) -> (axum::Router, std::sync::Arc<PlayerManager>) {
             let mut registry = ProviderRegistry::new();
             registry.push(ProviderHandle::local(LocalDiskProvider::new(&self.root)));
             registry.push(ProviderHandle::radio(crate::providers::RadioProvider::new(
@@ -13700,7 +14806,7 @@ mod tests {
                     user: "u".to_string(),
                     password: Some("p".to_string()),
                 },
-                std::sync::Arc::new(crate::artwork::ArtworkCache::new(self.root.join("artwork"))),
+                artwork_cache,
                 self.root.join("musicata.db"),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
             );
@@ -13710,8 +14816,20 @@ mod tests {
         fn write(&self, relative_path: &str) {
             let path = self.root.join(relative_path);
             fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture dir");
-            fs::write(path, b"fixture audio bytes used for route range tests")
-                .expect("write fixture file");
+            if let Some(format) = match path.extension().and_then(|e| e.to_str()) {
+                Some("jpg") => Some(image::ImageFormat::Jpeg),
+                Some("png") => Some(image::ImageFormat::Png),
+                _ => None,
+            } {
+                let mut bytes = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::new_rgb8(8, 8)
+                    .write_to(&mut bytes, format)
+                    .unwrap();
+                fs::write(path, bytes.into_inner()).unwrap();
+            } else {
+                fs::write(path, b"fixture audio bytes used for route range tests")
+                    .expect("write fixture file");
+            }
         }
     }
 

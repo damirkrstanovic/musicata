@@ -320,6 +320,170 @@ fn parse_schedule(raw: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// Generates a recording without allocating its body, and rejects eager buffering
+    /// more than 16 MiB ahead of the receiving service.
+    struct UploadSource {
+        position: u64,
+        fail_at: Option<u64>,
+        consumed: Arc<AtomicU64>,
+        dropped: Arc<AtomicBool>,
+    }
+    const UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
+    impl Read for UploadSource {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail_at.is_some_and(|end| self.position >= end) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "audio source interrupted",
+                ));
+            }
+            if self.position > self.consumed.load(Ordering::Relaxed) + 16 * 1024 * 1024 {
+                return Err(std::io::Error::other(
+                    "upload buffered ahead of the consumer",
+                ));
+            }
+            let end = self.fail_at.unwrap_or(UPLOAD_BYTES).min(UPLOAD_BYTES);
+            let len = bytes.len().min((end - self.position) as usize);
+            bytes[..len].fill(0x5a);
+            self.position += len as u64;
+            Ok(len)
+        }
+    }
+    impl Seek for UploadSource {
+        fn seek(&mut self, seek: SeekFrom) -> std::io::Result<u64> {
+            let position = match seek {
+                SeekFrom::Start(n) => n as i128,
+                SeekFrom::Current(n) => self.position as i128 + n as i128,
+                SeekFrom::End(n) => UPLOAD_BYTES as i128 + n as i128,
+            };
+            if !(0..=UPLOAD_BYTES as i128).contains(&position) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid audio seek",
+                ));
+            }
+            self.position = position as u64;
+            Ok(self.position)
+        }
+    }
+    impl symphonia::core::io::MediaSource for UploadSource {
+        fn is_seekable(&self) -> bool {
+            true
+        }
+        fn byte_len(&self) -> Option<u64> {
+            Some(UPLOAD_BYTES)
+        }
+    }
+    impl Drop for UploadSource {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn upload_receiver(
+        listener: std::net::TcpListener,
+        consumed: Arc<AtomicU64>,
+        close_after: Option<u64>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let mut socket = (0..500)
+                .find_map(|_| match listener.accept() {
+                    Ok((socket, _)) => Some(socket),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        None
+                    }
+                    Err(error) => panic!("accept upload: {error}"),
+                })
+                .expect("analysis client connects within five seconds");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                assert!(headers.len() < 16 * 1024);
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+            assert!(headers.starts_with("post /analyze http/1.1\r\n"));
+            assert!(headers.contains("content-length: 67108864\r\n"));
+            let mut bytes = [0; 64 * 1024];
+            while consumed.load(Ordering::Relaxed) < UPLOAD_BYTES {
+                let read = socket.read(&mut bytes).unwrap();
+                if read == 0 {
+                    return;
+                }
+                assert!(bytes[..read].iter().all(|&byte| byte == 0x5a));
+                let received = consumed.fetch_add(read as u64, Ordering::Relaxed) + read as u64;
+                if close_after.is_some_and(|limit| received >= limit) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let body = r#"{"embedding":[0.25],"tags":[]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        })
+    }
+
+    #[test]
+    fn repeated_large_ml_uploads_stream_to_a_slow_service_and_release_sources() {
+        for _ in 0..3 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let consumed = Arc::new(AtomicU64::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let receiver = upload_receiver(listener, consumed.clone(), None);
+            let source = UploadSource {
+                position: 0,
+                fail_at: None,
+                consumed: consumed.clone(),
+                dropped: dropped.clone(),
+            };
+            let result =
+                analyze_via_service(&format!("http://{address}"), Box::new(source)).unwrap();
+            receiver.join().unwrap();
+            assert_eq!(result.embedding, [0.25]);
+            assert_eq!(consumed.load(Ordering::Relaxed), UPLOAD_BYTES);
+            assert!(dropped.load(Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn interrupted_large_ml_uploads_release_the_source() {
+        for source_fails in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let consumed = Arc::new(AtomicU64::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let receiver = upload_receiver(
+                listener,
+                consumed.clone(),
+                (!source_fails).then_some(1024 * 1024),
+            );
+            let source = UploadSource {
+                position: 0,
+                fail_at: source_fails.then_some(1024 * 1024),
+                consumed: consumed.clone(),
+                dropped: dropped.clone(),
+            };
+            assert!(analyze_via_service(&format!("http://{address}"), Box::new(source)).is_err());
+            receiver.join().unwrap();
+            assert!(consumed.load(Ordering::Relaxed) < UPLOAD_BYTES);
+            assert!(dropped.load(Ordering::Relaxed));
+        }
+    }
+
     #[test]
     fn analysis_failure_retains_safe_service_stage() {
         use std::io::{Read, Write};

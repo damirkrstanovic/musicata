@@ -361,13 +361,17 @@ impl ProviderRegistry {
     /// Scan every scannable source and merge the results into one library. A source
     /// that fails to scan (e.g. an offline share) is logged and skipped rather than
     /// failing the whole library — the others still load.
-    pub async fn scan_all(&self) -> anyhow::Result<Library> {
+    pub async fn scan_all(&self, prior: Option<Arc<Library>>) -> anyhow::Result<Library> {
         let mut libraries = Vec::new();
         for provider in &self.providers {
             if !provider.capabilities().can_scan {
                 continue;
             }
-            match provider.scan().await {
+            let scanned = match &prior {
+                Some(_) => provider.scan_with_progress(prior.clone(), |_| {}).await,
+                None => provider.scan().await,
+            };
+            match scanned {
                 Ok(library) => libraries.push(library),
                 Err(error) => {
                     tracing::warn!(

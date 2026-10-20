@@ -9,6 +9,7 @@ import { radioFlows } from "./radio-flows.mjs";
 import { stablePlayerFlows } from "./stable-player-flows.mjs";
 import { outputPickerFlows } from "./output-picker-flows.mjs";
 import { albumPlayFlows } from "./album-play-flows.mjs";
+import { artworkFlows } from "./artwork-flows.mjs";
 import { uxFlows } from "./ux-flows.mjs";
 import { curationFlows } from "./curation-flows.mjs";
 
@@ -182,6 +183,7 @@ if (MODE === "behavior") {
   await js(`document.querySelector('[data-output="player:browser-local"]')?.click()`);
   await sleep(400);
   await albumPlayFlows({js, check, waitUntil, tap:tapMobile});
+  await artworkFlows({js, send, check, waitUntil, screenshot: mobileScreenshot});
 }
 if (process.env.MUSICATA_RADIO_ONLY) {
   await radioFlows({js, api, check, waitUntil, clickText, screenshot: mobileScreenshot});

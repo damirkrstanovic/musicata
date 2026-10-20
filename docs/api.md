@@ -281,7 +281,10 @@ event stream keeps it alive.
 | GET | `/api/albums/{id}/artwork/cover-art-archive/candidates` | Cover Art Archive candidates. |
 | GET | `/api/albums/{id}/artwork/review` | The album's artwork review. |
 | GET | `/api/albums/{id}/artwork/candidates/{artwork_id}` | One artwork candidate's bytes. |
-| PATCH | `/api/albums/{id}/artwork` | Select / set the album's artwork. |
+| PATCH | `/api/albums/{id}/artwork` | Pin an artwork candidate (`artwork_id`; `automatic` uses the current provider-resolved cover). Admin-only. |
+| POST | `/api/albums/{id}/artwork` | Replace with raw JPEG/PNG/GIF/WebP bytes, maximum 16 MiB. Admin-only. |
+| DELETE | `/api/albums/{id}/artwork` | Remove the manual choice and return to automatic artwork. Admin-only. |
+| POST | `/api/albums/{id}/artwork/refresh` | Invalidate automatic artwork/retry state while preserving a manual choice. Admin-only. |
 | GET | `/api/artists/{id}/artwork` | Artist image (404 until acquired). |
 
 ### Activity & settings

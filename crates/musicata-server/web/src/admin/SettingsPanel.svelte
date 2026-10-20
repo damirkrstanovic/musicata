@@ -5,6 +5,7 @@
 
   let settings = $state<AppSettings>({
     artwork_fetch: false,
+    artwork_cache_mib: 512,
     fingerprint_enabled: false,
     musicbrainz_enrich_enabled: false,
     fanart_tv_key: "",
@@ -100,6 +101,11 @@
   <p class="admin-hint">All on-device. Identification uses AcoustID + MusicBrainz; files are never modified.</p>
 
   <form class="field-form" onsubmit={save}>
+    <label class="field">
+      <span>Artwork cache size (MiB)</span>
+      <input type="number" min="16" max="65536" step="1" required bind:value={settings.artwork_cache_mib} />
+      <span class="admin-hint">Old automatic covers and thumbnails are removed as needed. Your selected originals are kept separately.</span>
+    </label>
     <label class="toggle-row">
       <input type="checkbox" bind:checked={settings.artwork_fetch} />
       <span>Automatically find missing album covers</span>

@@ -376,6 +376,9 @@ pub struct Album {
     #[serde(skip)]
     #[cfg_attr(feature = "ts", ts(skip))]
     pub artwork_path: Option<PathBuf>,
+    #[serde(skip)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    pub artwork_provider_id: Option<String>,
 }
 
 /// An internet radio station — a named external stream. The first non-library music
@@ -851,7 +854,13 @@ pub fn scan_source_incremental(
         ));
     }
 
-    Ok(assemble_library(provider_id, &root, built, walk_errors))
+    Ok(assemble_library(
+        provider_id,
+        &root,
+        built,
+        walk_errors,
+        prior,
+    ))
 }
 
 /// Walk a source and return its audio files (sorted by path) plus any walk errors.
@@ -913,6 +922,7 @@ pub struct BuiltTrack {
     pub album_artist_id: String,
     pub album_artist_name: String,
     pub artwork_path: Option<PathBuf>,
+    pub artwork_revision: Option<String>,
     pub issues: Vec<ScanIssue>,
     /// Whether reading this file hit a (network/IO) read error — distinct from a tag
     /// parse failure. Used by the concurrent scanner's adaptive limiter.
@@ -963,16 +973,18 @@ pub fn build_track(
             .get(&track.album_id)
             .map(|(id, name, _)| (id.clone(), name.clone()))
             .unwrap_or_else(|| (track.artist_id.clone(), track.artist_name.clone()));
-        let artwork_path = prior
+        let prior_artwork = prior
             .albums
             .get(&track.album_id)
-            .and_then(|(_, _, artwork)| artwork.clone());
+            .and_then(|(_, _, artwork)| artwork.as_deref());
+        let (artwork_path, artwork_revision) = source_artwork(&track, prior_artwork, file);
         return BuiltTrack {
             track,
             identity: None,
             album_artist_id,
             album_artist_name,
             artwork_path,
+            artwork_revision,
             issues: Vec::new(),
             io_error: false,
         };
@@ -1024,20 +1036,6 @@ pub fn build_track(
         file.modified_at_unix_seconds,
         file.content_hash.as_deref(),
     );
-    // Reuse the prior album's cover art if known, else discover a folder cover; failing
-    // that, fall back to this track's *embedded* artwork by pointing `artwork_path` at
-    // the audio file itself (the server extracts the picture on demand). So an album with
-    // no `cover.jpg` but tagged-in art still shows a cover instead of the monogram.
-    let has_embedded_artwork = observed_metadata
-        .iter()
-        .any(|observation| observation.embedded_artwork_count > 0);
-    let artwork_path = prior
-        .albums
-        .get(&album_id)
-        .and_then(|(_, _, artwork)| artwork.clone())
-        .or_else(|| find_album_artwork(fs, path.parent().unwrap_or(root)))
-        .or_else(|| has_embedded_artwork.then(|| path.clone()));
-
     let track = Track {
         id: String::new(), // assigned (deduped) in assemble_library
         provider: ProviderMapping {
@@ -1064,15 +1062,62 @@ pub fn build_track(
         path,
     };
 
+    let prior_artwork = prior
+        .albums
+        .get(&track.album_id)
+        .and_then(|(_, _, artwork)| artwork.as_deref());
+    let (artwork_path, artwork_revision) = source_artwork(&track, prior_artwork, file);
     BuiltTrack {
         track,
         identity: Some(identity),
         album_artist_id,
         album_artist_name,
         artwork_path,
+        artwork_revision,
         issues,
         io_error,
     }
+}
+
+/// Use revision metadata from the directory walk, never native filesystem metadata
+/// for a provider's logical path. Keep a selected folder candidate while it exists.
+fn source_artwork(
+    track: &Track,
+    selected: Option<&Path>,
+    file: &DiscoveredAudioFile,
+) -> (Option<PathBuf>, Option<String>) {
+    let folder = selected
+        .and_then(|path| file.folder_artwork.iter().find(|entry| entry.path == path))
+        .or_else(|| file.folder_artwork.first());
+    let (path, size, modified, content_hash) = if let Some(entry) = folder {
+        (
+            &entry.path,
+            entry.size,
+            entry.modified_at_unix_seconds,
+            None,
+        )
+    } else if track
+        .observed_metadata
+        .iter()
+        .any(|observation| observation.embedded_artwork_count > 0)
+    {
+        (
+            &file.path,
+            file.file_size_bytes,
+            file.modified_at_unix_seconds,
+            file.content_hash.as_deref(),
+        )
+    } else {
+        return (None, None);
+    };
+    let revision = stable_id(
+        "artwork",
+        &format!(
+            "source-v1|{:?}|{:?}|{size:?}|{modified:?}|{content_hash:?}",
+            track.provider.provider_id, path,
+        ),
+    );
+    (Some(path.clone()), Some(revision))
 }
 
 /// Fold built tracks into a finished [`Library`]: assign final (deduped) ids to
@@ -1083,10 +1128,42 @@ pub fn assemble_library(
     root: &Path,
     mut built: Vec<BuiltTrack>,
     mut scan_errors: Vec<ScanIssue>,
+    prior: Option<&Library>,
 ) -> Library {
     // Deterministic id assignment: order by source-relative path (matches the
     // discovery sort), so re-scans assign the same disambiguated ids.
     built.sort_by(|left, right| left.track.relative_path.cmp(&right.track.relative_path));
+
+    // A choice belongs to the album, not the first track's directory. Find its
+    // current metadata anywhere in the release before aggregating path-sorted tracks.
+    let preferred: BTreeMap<_, _> = prior
+        .into_iter()
+        .flat_map(|library| &library.albums)
+        .filter_map(|album| {
+            album
+                .artwork_path
+                .as_deref()
+                .map(|path| (album.id.as_str(), path))
+        })
+        .collect();
+    let mut selected = BTreeMap::new();
+    for item in &built {
+        if let Some(path) = &item.artwork_path
+            && preferred
+                .get(item.track.album_id.as_str())
+                .is_some_and(|wanted| *wanted == path)
+        {
+            selected
+                .entry(item.track.album_id.clone())
+                .or_insert_with(|| {
+                    (
+                        path.clone(),
+                        item.artwork_revision.clone(),
+                        item.track.provider.provider_id.clone(),
+                    )
+                });
+        }
+    }
 
     let mut tracks = Vec::with_capacity(built.len());
     let mut album_builders: BTreeMap<String, AlbumBuilder> = BTreeMap::new();
@@ -1105,10 +1182,19 @@ pub fn assemble_library(
             &item.album_artist_id,
             &item.album_artist_name,
             item.artwork_path,
+            item.artwork_revision,
             &mut album_builders,
             &mut artist_builders,
         );
         tracks.push(item.track);
+    }
+
+    for (id, (path, revision, provider)) in selected {
+        if let Some(album) = album_builders.get_mut(&id) {
+            album.artwork_path = Some(path);
+            album.artwork_revision = revision;
+            album.artwork_provider_id = Some(provider);
+        }
     }
 
     finalize_library(
@@ -1148,10 +1234,14 @@ fn finalize_library(
     let mut albums: Vec<_> = album_builders
         .into_values()
         .map(|album| {
-            let artwork_url = album
-                .artwork_path
-                .as_ref()
-                .map(|path| album_artwork_url(&album.id, path));
+            let artwork_url =
+                album
+                    .artwork_path
+                    .as_ref()
+                    .map(|path| match &album.artwork_revision {
+                        Some(key) => format!("/api/albums/{}/artwork?asset={key}", album.id),
+                        None => album_artwork_url(&album.id, path),
+                    });
             Album {
                 id: album.id,
                 title: album.title,
@@ -1161,6 +1251,7 @@ fn finalize_library(
                 track_count: album.track_count,
                 artwork_url,
                 artwork_path: album.artwork_path,
+                artwork_provider_id: album.artwork_provider_id,
             }
         })
         .collect();
@@ -1233,11 +1324,25 @@ pub fn regroup_library_with_overrides(
 ) -> Library {
     // Carry over each old album's artwork + its album-artist (used for tracks whose
     // album-artist isn't being overridden), keyed by the pre-regroup album_id.
-    let mut artwork_by_old_album: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let artwork_providers: BTreeMap<_, _> = library
+        .albums
+        .iter()
+        .filter_map(|a| {
+            a.artwork_provider_id
+                .as_ref()
+                .map(|p| (a.id.clone(), p.clone()))
+        })
+        .collect();
+    let mut artwork_by_old_album: BTreeMap<String, (PathBuf, Option<String>)> = BTreeMap::new();
     let mut album_artist_by_old_album: BTreeMap<String, String> = BTreeMap::new();
     for album in &library.albums {
         if let Some(path) = &album.artwork_path {
-            artwork_by_old_album.insert(album.id.clone(), path.clone());
+            let revision = album
+                .artwork_url
+                .as_deref()
+                .and_then(|url| url.split_once("?asset="))
+                .map(|(_, key)| key.to_owned());
+            artwork_by_old_album.insert(album.id.clone(), (path.clone(), revision));
         }
         album_artist_by_old_album.insert(album.id.clone(), album.artist_name.clone());
     }
@@ -1307,15 +1412,28 @@ pub fn regroup_library_with_overrides(
         track.artist_id = artist_id;
         track.album_id = album_id;
 
-        let artwork_path = artwork_by_old_album.get(&old_album_id).cloned();
+        let (artwork_path, artwork_revision) = artwork_by_old_album
+            .get(&old_album_id)
+            .map(|(path, revision)| (Some(path.clone()), revision.clone()))
+            .unwrap_or_default();
+        let selecting_artwork = album_builders
+            .get(&track.album_id)
+            .is_none_or(|a| a.artwork_path.is_none());
         aggregate_track(
             track,
             &album_artist_id,
             &album_artist_name,
             artwork_path,
+            artwork_revision,
             &mut album_builders,
             &mut artist_builders,
         );
+        if selecting_artwork
+            && let Some(provider) = artwork_providers.get(&old_album_id)
+            && let Some(album) = album_builders.get_mut(&track.album_id)
+        {
+            album.artwork_provider_id = Some(provider.clone());
+        }
     }
 
     finalize_library(
@@ -1337,6 +1455,7 @@ fn aggregate_track(
     album_artist_id: &str,
     album_artist_name: &str,
     artwork_path: Option<PathBuf>,
+    artwork_revision: Option<String>,
     album_builders: &mut BTreeMap<String, AlbumBuilder>,
     artist_builders: &mut BTreeMap<String, ArtistBuilder>,
 ) {
@@ -1350,13 +1469,19 @@ fn aggregate_track(
             year: track.year,
             track_count: 0,
             artwork_path: None,
+            artwork_revision: None,
+            artwork_provider_id: None,
         });
     album.track_count += 1;
     // The album takes the first cover any of its tracks supplies (a folder image or an
     // embedded fallback), so it isn't left coverless just because its first track lacked
     // one.
     if album.artwork_path.is_none() {
+        album.artwork_provider_id = artwork_path
+            .as_ref()
+            .map(|_| track.provider.provider_id.clone());
         album.artwork_path = artwork_path;
+        album.artwork_revision = artwork_revision;
     }
 
     // Count the track against its own (track) artist.
@@ -1488,6 +1613,9 @@ pub struct DiscoveredAudioFile {
     pub file_size_bytes: Option<u64>,
     pub modified_at_unix_seconds: Option<i64>,
     pub content_hash: Option<String>,
+    /// Folder-image metadata shared by tracks in one directory. Already obtained
+    /// by discovery, so unchanged audio needs no extra listing or tag read.
+    pub folder_artwork: std::sync::Arc<Vec<FsEntry>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1784,6 +1912,8 @@ struct AlbumBuilder {
     year: Option<u16>,
     track_count: usize,
     artwork_path: Option<PathBuf>,
+    artwork_revision: Option<String>,
+    artwork_provider_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1818,6 +1948,17 @@ pub fn list_dir_audio(fs: &dyn SourceFs, dir: &Path) -> DirListing {
             return listing;
         }
     };
+    let mut images: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.is_file && has_extension(&entry.path, IMAGE_EXTENSIONS))
+        .cloned()
+        .collect();
+    images.sort_by(|left, right| {
+        artwork_priority(&left.path)
+            .cmp(&artwork_priority(&right.path))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let folder_artwork = std::sync::Arc::new(images);
     for entry in entries {
         if entry.is_dir {
             listing.subdirs.push(entry.path);
@@ -1837,6 +1978,7 @@ pub fn list_dir_audio(fs: &dyn SourceFs, dir: &Path) -> DirListing {
                 file_size_bytes: entry.size,
                 modified_at_unix_seconds: entry.modified_at_unix_seconds,
                 content_hash,
+                folder_artwork: folder_artwork.clone(),
             });
         }
     }
@@ -2187,20 +2329,63 @@ fn u32_to_u16(value: u32) -> Option<u16> {
 /// picture, else the first one. `None` if the file has no embedded picture or can't be
 /// parsed. The caller decides the image content type (e.g. by sniffing the bytes).
 pub fn extract_embedded_cover(audio_bytes: &[u8], path: &Path) -> Option<Vec<u8>> {
-    let cursor = std::io::Cursor::new(audio_bytes);
-    let probe = Probe::new(cursor).options(ParseOptions::new().read_properties(false));
+    extract_embedded_cover_from(std::io::Cursor::new(audio_bytes), path)
+        .ok()
+        .flatten()
+}
+
+/// Extract artwork by seeking over the audio payload instead of buffering the recording.
+/// Bound all metadata reads, including repeated seeks; Lofty also limits each tag item's
+/// allocation to 16 MiB. Source/parser failures remain distinct from an absent picture.
+pub fn extract_embedded_cover_from<R: Read + Seek>(
+    reader: R,
+    path: &Path,
+) -> Result<Option<Vec<u8>>, lofty::error::LoftyError> {
+    struct MetadataReader<R> {
+        reader: R,
+        remaining: usize,
+    }
+    impl<R: Read> Read for MetadataReader<R> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "embedded artwork metadata exceeds the read limit",
+                ));
+            }
+            let limit = bytes.len().min(self.remaining);
+            let read = self.reader.read(&mut bytes[..limit])?;
+            self.remaining -= read;
+            Ok(read)
+        }
+    }
+    impl<R: Seek> Seek for MetadataReader<R> {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.reader.seek(position)
+        }
+    }
+    let reader = MetadataReader {
+        reader,
+        remaining: 16 * 1024 * 1024,
+    };
+    let probe = Probe::new(reader).options(ParseOptions::new().read_properties(false));
     let probe = match FileType::from_path(path) {
         Some(file_type) => probe.set_file_type(file_type),
-        None => probe.guess_file_type().ok()?,
+        None => probe.guess_file_type()?,
     };
-    let tagged = probe.read().ok()?;
-    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+    let tagged = probe.read()?;
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return Ok(None);
+    };
     let pictures = tag.pictures();
     let picture = pictures
         .iter()
         .find(|picture| picture.pic_type() == PictureType::CoverFront)
-        .or_else(|| pictures.first())?;
-    Some(picture.data().to_vec())
+        .or_else(|| pictures.first());
+    Ok(picture.map(|picture| picture.data().to_vec()))
 }
 
 pub fn album_artwork_url(album_id: &str, path: &Path) -> String {
@@ -2255,12 +2440,6 @@ fn find_album_artwork_candidates_in(fs: &dyn SourceFs, album_dir: &Path) -> Vec<
     });
 
     images
-}
-
-fn find_album_artwork(fs: &dyn SourceFs, album_dir: &Path) -> Option<PathBuf> {
-    find_album_artwork_candidates_in(fs, album_dir)
-        .into_iter()
-        .next()
 }
 
 fn artwork_priority(path: &Path) -> u8 {
@@ -2758,6 +2937,145 @@ mod tests {
         fn root(&self) -> &Path {
             &self.root
         }
+    }
+
+    #[test]
+    fn source_artwork_revision_changes_without_rereading_unchanged_audio() {
+        let cover = PathBuf::from("/Album/cover.jpg");
+        let mut source = FakeFs::new(vec![
+            (
+                PathBuf::from("/Album/Artist - Song.mp3"),
+                vec![0; INLINE_CONTENT_HASH_LIMIT_BYTES as usize + 1],
+            ),
+            (cover.clone(), b"original".to_vec()),
+        ]);
+        let first = scan_source(&source, "nas-a").unwrap();
+        let opens = source.opens.get();
+        source.bump_mtime("/Album/cover.jpg", 42);
+        let changed = scan_source_incremental(&source, "nas-a", Some(&first), &mut |_| {}).unwrap();
+        assert_eq!(
+            source.opens.get(),
+            opens,
+            "unchanged audio tags must be reused"
+        );
+        assert_ne!(
+            first.albums[0].artwork_url, changed.albums[0].artwork_url,
+            "provider mtime changes must invalidate artwork at the same logical path"
+        );
+        let same = scan_source_incremental(&source, "nas-a", Some(&changed), &mut |_| {}).unwrap();
+        assert_eq!(changed.albums[0].artwork_url, same.albums[0].artwork_url);
+        let other = scan_source(&source, "nas-b").unwrap();
+        assert_ne!(
+            changed.albums[0].artwork_url, other.albums[0].artwork_url,
+            "identical share-relative paths must not share cache identity across providers"
+        );
+    }
+
+    #[test]
+    fn source_artwork_preserves_selected_candidate_and_revision_through_regrouping() {
+        let source = FakeFs::new(vec![
+            (
+                PathBuf::from("/Album/Artist - Song.mp3"),
+                vec![0; INLINE_CONTENT_HASH_LIMIT_BYTES as usize + 1],
+            ),
+            (PathBuf::from("/Album/cover.jpg"), b"cover".to_vec()),
+            (PathBuf::from("/Album/front.png"), b"selected".to_vec()),
+        ]);
+        let mut first = scan_source(&source, "nas").unwrap();
+        first.albums[0].artwork_path = Some(PathBuf::from("/Album/front.png"));
+        let selected = scan_source_incremental(&source, "nas", Some(&first), &mut |_| {}).unwrap();
+        assert_eq!(
+            selected.albums[0].artwork_path.as_deref(),
+            Some(Path::new("/Album/front.png"))
+        );
+        let before = selected.albums[0].artwork_url.clone();
+        let regrouped =
+            regroup_library_with_overrides(selected, &BTreeMap::new(), &BTreeMap::new());
+        assert_eq!(
+            regrouped.albums[0].artwork_url, before,
+            "regrouping must retain the provider's revision rather than inspecting a logical path as a local file"
+        );
+    }
+
+    #[test]
+    fn source_artwork_keeps_a_selected_cover_from_a_later_disc_directory() {
+        let fixture = TestFixture::new("selected-disc-cover");
+        fixture.write_album_grouping_mp3(
+            "Set/Disc 1/a.mp3",
+            "First",
+            "Artist",
+            "Album",
+            None,
+            Some(1),
+            1,
+        );
+        fixture.write_album_grouping_mp3(
+            "Set/Disc 2/b.mp3",
+            "Second",
+            "Artist",
+            "Album",
+            None,
+            Some(2),
+            1,
+        );
+        fixture.write_bytes("Set/Disc 1/cover.jpg", b"first disc cover");
+        fixture.write_bytes("Set/Disc 2/front.png", b"selected second disc cover");
+        let mut prior = scan_local_library(&fixture.root).unwrap();
+        assert_eq!(prior.albums.len(), 1);
+        let selected = fixture.root.join("Set/Disc 2/front.png");
+        prior.albums[0].artwork_path = Some(selected.clone());
+        let rescanned =
+            scan_local_library_incremental(&fixture.root, Some(&prior), &mut |_| {}).unwrap();
+        assert_eq!(
+            rescanned.albums[0].artwork_path,
+            Some(selected),
+            "album-level selection must not be replaced by an earlier track's directory cover"
+        );
+    }
+
+    #[test]
+    fn source_artwork_embedded_revision_changes_at_the_same_provider_path() {
+        let fixture = TestFixture::new("source-embedded-revision");
+        fixture.write_rich_tagged_mp3("Album/track.mp3");
+        let bytes = fs::read(fixture.root.join("Album/track.mp3")).unwrap();
+        let mut source = FakeFs::new(vec![(PathBuf::from("/Album/track.mp3"), bytes)]);
+        let first = scan_source(&source, "nas").unwrap();
+        assert_eq!(
+            first.albums[0].artwork_path.as_deref(),
+            Some(Path::new("/Album/track.mp3"))
+        );
+        source.bump_mtime("/Album/track.mp3", 42);
+        let changed = scan_source_incremental(&source, "nas", Some(&first), &mut |_| {}).unwrap();
+        assert_ne!(first.albums[0].artwork_url, changed.albums[0].artwork_url);
+    }
+
+    #[test]
+    fn source_artwork_addition_and_removal_are_seen_on_unchanged_audio() {
+        let mut source = FakeFs::new(vec![(
+            PathBuf::from("/Album/Artist - Song.mp3"),
+            vec![0; INLINE_CONTENT_HASH_LIMIT_BYTES as usize + 1],
+        )]);
+        let first = scan_source(&source, "nas").unwrap();
+        assert!(first.albums[0].artwork_path.is_none());
+        let opens = source.opens.get();
+        source
+            .files
+            .push((PathBuf::from("/Album/cover.jpg"), b"cover".to_vec()));
+        let added = scan_source_incremental(&source, "nas", Some(&first), &mut |_| {}).unwrap();
+        assert_eq!(source.opens.get(), opens);
+        assert_eq!(
+            added.albums[0].artwork_path.as_deref(),
+            Some(Path::new("/Album/cover.jpg"))
+        );
+        source
+            .files
+            .retain(|(path, _)| path.extension().is_none_or(|ext| ext != "jpg"));
+        let removed = scan_source_incremental(&source, "nas", Some(&added), &mut |_| {}).unwrap();
+        assert!(
+            removed.albums[0].artwork_path.is_none(),
+            "a removed folder image must not remain selected by the prior snapshot"
+        );
+        assert_eq!(source.opens.get(), opens);
     }
 
     #[test]
@@ -3458,6 +3776,98 @@ mod tests {
 
     // A folder cover still wins over embedded art.
     #[test]
+    fn embedded_artwork_stream_skips_a_large_audio_payload() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        struct Counted<R> {
+            inner: R,
+            read: usize,
+        }
+        impl<R: Read> Read for Counted<R> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.read(bytes)?;
+                self.read += n;
+                Ok(n)
+            }
+        }
+        impl<R: Seek> Seek for Counted<R> {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+        let fixture = TestFixture::new("embedded-large-stream");
+        fixture.write_rich_tagged_mp3("Album/track.mp3");
+        let path = fixture.root.join("Album/track.mp3");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // Lofty validates frame sync against the following MPEG frame.
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&minimal_mpeg_frame()).unwrap();
+        file.set_len(1024 * 1024 * 1024).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut source = Counted {
+            inner: file,
+            read: 0,
+        };
+        let cover = extract_embedded_cover_from(&mut source, &path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cover, [0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0]);
+        assert!(
+            source.read < 64 * 1024,
+            "read {} bytes of a 1 GiB recording",
+            source.read
+        );
+    }
+
+    #[test]
+    fn embedded_artwork_stream_rejects_oversized_tag_data() {
+        // ID3v2.4: a 16 MiB + 16 byte tag, containing an APIC frame.
+        let mut bytes = b"ID3\x04\0\0\x08\0\0\x10APIC\x08\0\0\0\0\0".to_vec();
+        bytes.resize(16 * 1024 * 1024 + 26, 0);
+        assert!(
+            extract_embedded_cover_from(std::io::Cursor::new(bytes), Path::new("large.mp3"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn embedded_artwork_stream_reports_source_errors() {
+        struct Interrupted;
+        impl std::io::Read for Interrupted {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "source disconnected",
+                ))
+            }
+        }
+        impl std::io::Seek for Interrupted {
+            fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+                Ok(0)
+            }
+        }
+        assert!(extract_embedded_cover_from(Interrupted, Path::new("offline.mp3")).is_err());
+    }
+
+    #[test]
+    fn extracts_cover_from_large_flac_without_reading_audio_payload() {
+        assert_large_embedded_cover_extraction("large.flac", large_flac_with_cover());
+    }
+
+    #[test]
+    fn extracts_cover_from_large_m4a_without_reading_audio_payload() {
+        assert_large_embedded_cover_extraction("large.m4a", large_m4a_with_cover());
+    }
+
+    #[test]
+    fn extracts_cover_from_large_ogg_without_reading_audio_payload() {
+        assert_large_embedded_cover_extraction("large.ogg", large_ogg_with_cover());
+    }
+
+    #[test]
     fn folder_cover_preferred_over_embedded() {
         let fixture = TestFixture::new("folder-over-embedded");
         fixture.write_rich_tagged_mp3("Album Dir/track.mp3");
@@ -3990,6 +4400,161 @@ mod tests {
         let ftyp = mp4_atom(b"ftyp", [b"M4A ".as_slice(), [0_u8; 4].as_slice()].concat());
 
         [ftyp, moov].concat()
+    }
+
+    const TEST_COVER: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0];
+
+    fn assert_large_embedded_cover_extraction(name: &str, bytes: Vec<u8>) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        struct Counted<R> {
+            inner: R,
+            read: usize,
+        }
+        impl<R: Read> Read for Counted<R> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.inner.read(bytes)?;
+                self.read += read;
+                Ok(read)
+            }
+        }
+        impl<R: Seek> Seek for Counted<R> {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+
+        let fixture = TestFixture::new("large-embedded-cover");
+        let path = fixture.root.join(name);
+        let mut file = fs::File::create(&path).expect("create fixture");
+        file.write_all(&bytes).expect("write tag fixture");
+        // A sparse recording makes the fixture genuinely large without allocating a GiB in the
+        // test process. The extractor must stop after the container's metadata.
+        file.set_len(1024 * 1024 * 1024)
+            .expect("extend sparse audio");
+        drop(file);
+
+        let mut source = Counted {
+            inner: fs::File::open(&path).expect("open fixture"),
+            read: 0,
+        };
+        let cover = extract_embedded_cover_from(&mut source, &path)
+            .expect("parse fixture")
+            .expect("embedded cover");
+        assert_eq!(cover, TEST_COVER);
+        assert!(
+            source.read < 128 * 1024,
+            "read {} bytes of a 1 GiB recording",
+            source.read
+        );
+    }
+
+    fn flac_picture_block() -> Vec<u8> {
+        let mut picture = Vec::new();
+        picture.extend_from_slice(&3_u32.to_be_bytes()); // front cover
+        picture.extend_from_slice(&(b"image/jpeg".len() as u32).to_be_bytes());
+        picture.extend_from_slice(b"image/jpeg");
+        picture.extend_from_slice(&0_u32.to_be_bytes()); // description
+        picture.extend_from_slice(&[0_u8; 16]); // dimensions, depth and colours are optional
+        picture.extend_from_slice(&(TEST_COVER.len() as u32).to_be_bytes());
+        picture.extend_from_slice(TEST_COVER);
+        picture
+    }
+
+    fn large_flac_with_cover() -> Vec<u8> {
+        let picture = flac_picture_block();
+        let mut bytes = b"fLaC".to_vec();
+        bytes.push(0); // STREAMINFO, followed by another metadata block
+        bytes.extend_from_slice(&34_u32.to_be_bytes()[1..]);
+        bytes.extend_from_slice(&[0_u8; 34]);
+        bytes.push(0x80 | 6); // final PICTURE block
+        bytes.extend_from_slice(&(picture.len() as u32).to_be_bytes()[1..]);
+        bytes.extend_from_slice(&picture);
+        bytes
+    }
+
+    fn large_m4a_with_cover() -> Vec<u8> {
+        let cover = mp4_atom(b"covr", mp4_data_atom(13, TEST_COVER));
+        let ilst = mp4_atom(b"ilst", cover);
+        let hdlr = mp4_atom(
+            b"hdlr",
+            [
+                [0_u8; 8].as_slice(),
+                b"mdirappl".as_slice(),
+                [0_u8; 9].as_slice(),
+            ]
+            .concat(),
+        );
+        let meta = mp4_atom(
+            b"meta",
+            [[0_u8; 4].as_slice(), hdlr.as_slice(), ilst.as_slice()].concat(),
+        );
+        [
+            mp4_atom(b"ftyp", [b"M4A ".as_slice(), [0_u8; 4].as_slice()].concat()),
+            mp4_atom(b"moov", mp4_atom(b"udta", meta)),
+        ]
+        .concat()
+    }
+
+    fn large_ogg_with_cover() -> Vec<u8> {
+        let mut comment = Vec::from([3, b'v', b'o', b'r', b'b', b'i', b's']);
+        let picture = base64(&flac_picture_block());
+        let entry = format!("METADATA_BLOCK_PICTURE={picture}");
+        comment.extend_from_slice(&(b"musicata-test".len() as u32).to_le_bytes());
+        comment.extend_from_slice(b"musicata-test");
+        comment.extend_from_slice(&1_u32.to_le_bytes());
+        comment.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+        comment.extend_from_slice(entry.as_bytes());
+        ogg_page(&[
+            1, b'v', b'o', b'r', b'b', b'i', b's', 0, 0, 0, 0, 2, 0, 68, 172, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 1,
+        ])
+        .into_iter()
+        .chain(ogg_page(&comment))
+        // Lofty reads Vorbis's required three header packets even though properties are skipped.
+        .chain(ogg_page(&[5, b'v', b'o', b'r', b'b', b'i', b's']))
+        .collect()
+    }
+
+    fn ogg_page(packet: &[u8]) -> Vec<u8> {
+        let mut lacing = vec![255; packet.len() / 255];
+        let remainder = (packet.len() % 255) as u8;
+        if remainder != 0 || packet.is_empty() {
+            lacing.push(remainder);
+        }
+        let mut page = b"OggS\0\x02".to_vec();
+        page.extend_from_slice(&[0_u8; 8]); // absolute granule position
+        page.extend_from_slice(&1_u32.to_le_bytes());
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.extend_from_slice(&[0_u8; 4]); // checksum is not needed for metadata parsing
+        page.push(lacing.len() as u8);
+        page.extend_from_slice(&lacing);
+        page.extend_from_slice(packet);
+        page
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut encoded = String::new();
+        for chunk in bytes.chunks(3) {
+            let value = u32::from(chunk[0]) << 16
+                | u32::from(*chunk.get(1).unwrap_or(&0)) << 8
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            encoded.push(ALPHABET[(value >> 18) as usize & 63] as char);
+            encoded.push(ALPHABET[(value >> 12) as usize & 63] as char);
+            encoded.push(if chunk.len() > 1 {
+                ALPHABET[(value >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            encoded.push(if chunk.len() > 2 {
+                ALPHABET[value as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        encoded
     }
 
     fn mp4_ilst_text_atom(fourcc: &[u8; 4], value: &str) -> Vec<u8> {

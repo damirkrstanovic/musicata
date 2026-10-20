@@ -229,6 +229,18 @@ impl Runtime {
             }
         });
     }
+    pub fn pending_retry(&self, kind: &str, count: usize, next: Option<usize>) {
+        self.queue(kind, count, None);
+        self.change(kind, |w| {
+            w.next_retry_at = next;
+            if next.is_some_and(|deadline| deadline > super::now() as usize) {
+                w.stalled = false;
+            }
+            if w.active == 0 && w.state != "disabled" {
+                w.state = if count > 0 { "backing_off" } else { "idle" }.into();
+            }
+        });
+    }
     pub fn backoff(&self, kind: &str) -> Duration {
         let mut seconds = 20;
         self.change(kind, |w| {
@@ -381,6 +393,11 @@ pub fn finish(kind: &str, success: bool, retry: bool, category: &'static str) {
 pub fn state(kind: &str, state: &'static str) {
     if let Some(d) = super::global() {
         d.runtime().state(kind, state);
+    }
+}
+pub fn pending_retry(kind: &str, count: usize, next: Option<usize>) {
+    if let Some(d) = super::global() {
+        d.runtime().pending_retry(kind, count, next);
     }
 }
 pub fn idle_delay(kind: &str) -> Duration {
@@ -584,6 +601,31 @@ pub fn start(runtime: Arc<Runtime>, database: Database, db_path: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prewarm_retry_snapshot_is_pending_work_not_attempt_totals() {
+        let r = Runtime {
+            started: Instant::now() - Duration::from_secs(600),
+            ..Default::default()
+        };
+        r.begin("prewarm");
+        r.finish("prewarm", false, true, "cover_unavailable");
+        let next = super::super::now() as usize + 300;
+        r.pending_retry("prewarm", 2, Some(next));
+        let w = r.snapshot(false).workers.remove(0);
+        assert_eq!(w.queued, Some(2));
+        assert_eq!(w.retryable_failures, 1);
+        assert_eq!(w.next_retry_at, Some(next));
+        assert_eq!(w.state, "backing_off");
+        assert!(!w.stalled, "scheduled retries are not stalled work");
+        r.pending_retry("prewarm", 0, None);
+        let w = r.snapshot(false).workers.remove(0);
+        assert_eq!(w.queued, Some(0));
+        assert_eq!(w.next_retry_at, None);
+        assert_eq!(w.state, "idle");
+        r.state("prewarm", "disabled");
+        r.pending_retry("prewarm", 2, Some(next));
+        assert_eq!(r.snapshot(false).workers[0].state, "disabled");
+    }
     #[test]
     fn health_distinguishes_attempts_failures_and_worker_restarts() {
         let r = Runtime::default();

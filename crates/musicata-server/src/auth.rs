@@ -216,7 +216,9 @@ fn is_admin_mutation_path(path: &str, method: &axum::http::Method) -> bool {
     !matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
         && (path == "/api/snapcast/status"
             || path.starts_with("/api/snapcast/rooms")
-            || path.starts_with("/api/snapcast/groups/"))
+            || path.starts_with("/api/snapcast/groups/")
+            || (path.starts_with("/api/albums/")
+                && (path.ends_with("/artwork") || path.ends_with("/artwork/refresh"))))
 }
 
 /// Always-open endpoints (the SPA must reach these before a session exists). `/api/about`
@@ -912,6 +914,18 @@ mod tests {
 
     #[test]
     fn admin_and_open_path_classification() {
+        assert!(is_admin_mutation_path(
+            "/api/albums/a/artwork",
+            &axum::http::Method::POST
+        ));
+        assert!(is_admin_mutation_path(
+            "/api/albums/a/artwork/refresh",
+            &axum::http::Method::POST
+        ));
+        assert!(!is_admin_mutation_path(
+            "/api/albums/a/artwork",
+            &axum::http::Method::GET
+        ));
         assert!(is_admin_path("/api/users"));
         assert!(is_admin_path("/api/sources/x"));
         assert!(is_admin_path("/api/settings"));
