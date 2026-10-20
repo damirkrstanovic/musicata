@@ -708,6 +708,18 @@ background writer with coalesced pending state. History consumes a separate orde
 stream of small track/status/position samples, rather than merging independently
 scheduled state and progress channels. See `src/queue_persistence.rs` and `src/players.rs`.
 
+**Snapcast FIFO scheduling (issues #46–#48):** Snapserver 0.26's
+[`PosixStream::do_read`](https://github.com/badaix/snapcast/blob/v0.26.0/server/streamreader/posix_stream.cpp)
+reads each timed PCM chunk nonblocking and fills any unavailable bytes with silence.
+Its client transport buffer cannot repair silence already inserted at this boundary.
+A one-page FIFO fits only one 3,840-byte period at 48 kHz/stereo/s16, leaving little
+margin for writer scheduling delays. Musicata requests 8,192 bytes for two periods,
+including reopen paths, while retaining the 20 ms pacing lead. The request is rounded
+by the kernel's page size; capacity and actual queued bytes must be measured separately.
+Check contiguous silence runs as well as aggregate zero-sample counts: a 20 ms dropout
+can pass a “less than 2% silence” check. The optional `tests/audio/snapcast_latency.py`
+probe exercises this with real Snapserver/Snapclients and isolated CPU load.
+
 ---
 
 ## 11. Artist identity & variant-name merging

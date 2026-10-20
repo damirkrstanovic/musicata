@@ -34,8 +34,12 @@ use std::sync::atomic::Ordering;
 const CHUNK_FRAMES: usize = 960;
 
 /// Keep one chunk of producer lead; client synchronization buffering belongs to Snapserver.
-/// The FIFO is separately limited to one Linux page (~21 ms of stereo 48 kHz PCM).
 const PACING_LEAD: Duration = Duration::from_millis(20);
+
+/// Room for two 20 ms writes at 48 kHz/stereo/s16. Snapserver 0.26 inserts silence
+/// when its timed read finds an empty pipe; one page leaves no spare period when
+/// the writer is briefly descheduled. Keep the transport buffer separate.
+const FIFO_CAPACITY: libc::c_int = 8192;
 
 /// One decoded track queued for output, plus the playback cursor into it (in frames) and
 /// a per-track linear gain (volume leveling — see Phase 4 in docs/snapcast.md).
@@ -143,11 +147,11 @@ pub fn run(
             return;
         }
     };
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) } < 0 {
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETPIPE_SZ, FIFO_CAPACITY) } < 0 {
         use std::os::unix::fs::FileTypeExt;
         if file.metadata().is_ok_and(|m| m.file_type().is_fifo()) {
             tracing::warn!(
-                "snapcast: could not reduce FIFO capacity; producer pacing remains bounded"
+                "snapcast: could not configure FIFO capacity; producer pacing remains bounded"
             );
         }
     }
@@ -245,7 +249,7 @@ pub fn run(
                         .open(&fifo_path)
                     {
                         unsafe {
-                            libc::fcntl(reopened.as_raw_fd(), libc::F_SETPIPE_SZ, 4096);
+                            libc::fcntl(reopened.as_raw_fd(), libc::F_SETPIPE_SZ, FIFO_CAPACITY);
                         }
                         file = reopened;
                         continue;
@@ -628,7 +632,7 @@ fn write_pcm(
         {
             Ok(mut reopened) => {
                 unsafe {
-                    libc::fcntl(reopened.as_raw_fd(), libc::F_SETPIPE_SZ, 4096);
+                    libc::fcntl(reopened.as_raw_fd(), libc::F_SETPIPE_SZ, FIFO_CAPACITY);
                 }
                 if let Err(error) = reopened.write_all(scratch) {
                     tracing::error!(%error, "snapcast: FIFO write failed after reopen; writer stopping");
@@ -746,6 +750,62 @@ mod tests {
         assert!(
             bytes <= 32_000,
             "producer queued {bytes} bytes within 100 ms"
+        );
+    }
+
+    #[test]
+    fn fifo_keeps_two_periods_ready_for_a_delayed_writer() {
+        use std::io::Read;
+
+        let file = path("scheduling-headroom");
+        let name = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let mut reader = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&file)
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let fifo = file.clone();
+        let writer = std::thread::spawn(move || {
+            run(fifo, rx, events, Arc::new(AudioTap::default()));
+        });
+        tx.send(WriterMsg::Load {
+            track: Arc::new(DecodedTrack {
+                samples: vec![1000; 48000 * 2],
+                sample_rate: 48000,
+            }),
+            start_frame: 0,
+            gain: 1.0,
+            generation: 1,
+        })
+        .unwrap();
+        tx.send(WriterMsg::SetPlaying(true)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let mut queued: libc::c_int = 0;
+            assert_eq!(
+                unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &mut queued) },
+                0
+            );
+            if queued >= 7680 || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Freeze production without draining the pipe. Two 20 ms reads must still be
+        // possible: Snapserver inserts silence if either read finds an empty pipe.
+        tx.send(WriterMsg::Shutdown).unwrap();
+        writer.join().unwrap();
+        let mut pcm = vec![0; 7680];
+        let received = reader.read(&mut pcm).unwrap();
+        std::fs::remove_file(file).unwrap();
+        assert_eq!(received, pcm.len(), "FIFO cannot cover two reader periods");
+        assert!(
+            pcm.chunks_exact(2)
+                .all(|s| i16::from_le_bytes([s[0], s[1]]) == 1000)
         );
     }
 

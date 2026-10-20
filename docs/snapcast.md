@@ -82,6 +82,12 @@ track switching and retained client volume across restart, then checks MP3, 44.1
 resampling and HTTP-radio continuity. It binds Snapcast's standard ports, so use a
 dedicated pod without another server. Every child has a deadline and is cleaned up.
 This checks software delivery; it does not establish DAC latency or Wi-Fi reliability.
+Use `--load-workers 2 --continuity-seconds 20` for longer continuity windows under
+CPU load. The probe checks contiguous silence as well as total delivery; it rejects
+a silent transport chunk even when the overall zero-sample fraction is small.
+The producer requests an 8 KiB FIFO for two 20 ms chunks on a 4 KiB-page Linux host,
+while retaining its 20 ms pacing lead. This scheduling margin is separate from the
+client playback buffer; neither setting promises immunity to arbitrary host stalls.
 
 **Internet radio:** choose the Snapcast output, open **Browse radio**, and play a discovered
 or saved station. Musicata decodes direct HTTP(S) audio streams incrementally and sends them

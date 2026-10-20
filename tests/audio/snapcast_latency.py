@@ -25,7 +25,12 @@ import wave
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--server', required=True, help='freshly built Musicata server binary')
+    parser.add_argument('--load-workers', type=int, default=0, choices=range(5),
+                        help='isolated CPU load workers (0–4)')
+    parser.add_argument('--continuity-seconds', type=int, default=4, choices=range(4, 61),
+                        help='capture duration for each continuity check (4–60)')
     args = parser.parse_args()
+    deadline_seconds = 70 + 3 * args.continuity_seconds
     root = Path(tempfile.mkdtemp(prefix='musicata-snapcast-probe-'))
     library = root/'music'
     library.mkdir()
@@ -42,7 +47,8 @@ def main():
             audio.setsampwidth(2)
             audio.setframerate(rate)
             audio.writeframes(b''.join(struct.pack('<hh', sample, sample) for sample in
-                              (int(10000*math.sin(2*math.pi*440*i/rate)) for i in range(rate*12))))
+                              (int(10000*math.sin(2*math.pi*440*i/rate))
+                               for i in range(rate*(args.continuity_seconds+12)))))
         if name == 'Compressed':
             subprocess.run(['ffmpeg', '-v', 'error', '-i', str(source), str(source.with_suffix('.mp3'))], check=True, timeout=15)
             source.unlink()
@@ -52,6 +58,7 @@ def main():
     # Snapcast uses its standard stream/control ports, exclusively inside this test pod.
     for snap_port in (1704, 1705, 1780):
         with socket.socket() as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(('0.0.0.0', snap_port))
     base = f'http://127.0.0.1:{port}'
     cookie = ''
@@ -60,7 +67,8 @@ def main():
     def launch(command, name):
         log = open(root/(name+'.log'), 'wb')
         logs.append(log)
-        child = subprocess.Popen(['timeout', '--signal=TERM', '--kill-after=3s', '75s', *command],
+        child = subprocess.Popen(['timeout', '--signal=TERM', '--kill-after=3s',
+                                  f'{deadline_seconds+5}s', *command],
                                  stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         children.append(child)
         return child
@@ -102,9 +110,11 @@ def main():
                 return offset+index+4
         return None
 
-    signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError('probe exceeded 70 seconds')))
-    signal.alarm(70)
+    signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError('probe exceeded deadline')))
+    signal.alarm(deadline_seconds)
     try:
+        for index in range(args.load_workers):
+            launch([sys.executable, '-c', 'while True: pass'], f'cpu-load-{index}')
         launch([args.server, '--library', str(library), '--database', str(root/'musicata.db'),
                 '--addr', f'127.0.0.1:{port}'], 'musicata')
         wait_for(lambda: api('/api/health')[0])
@@ -166,21 +176,32 @@ def main():
             time.sleep(1.5) # Exclude the transport transition and decoder startup.
             offsets = [p.stat().st_size for p in captures]
             started = time.monotonic()
-            time.sleep(4)
-            duration = time.monotonic()-started
+            time.sleep(args.continuity_seconds)
+            snapshots = []
             for path, offset in zip(captures, offsets):
                 with path.open('rb') as audio:
                     audio.seek(offset)
                     pcm = audio.read()
+                snapshots.append((path, pcm, time.monotonic()-started))
+            # Capture both clients before analyzing either: a long PCM analysis must
+            # not extend the second client's measurement window.
+            for path, pcm, duration in snapshots:
                 frames = len(pcm)//4
                 zeros = sum(left == 0 and right == 0 for left, right in struct.iter_unpack('<hh', pcm))
+                run = longest = 0
+                for left, right in struct.iter_unpack('<hh', pcm):
+                    run = run + 1 if left == 0 and right == 0 else 0
+                    longest = max(longest, run)
                 item = {'source': name, 'client': path.name, 'audio_seconds': round(frames/48000, 3),
-                        'wall_seconds': round(duration, 3), 'zero_fraction': round(zeros/max(1, frames), 4)}
+                        'wall_seconds': round(duration, 3), 'zero_fraction': round(zeros/max(1, frames), 4),
+                        'longest_silence_ms': round(longest/48, 3)}
                 continuity.append(item)
                 assert abs(frames/48000-duration) < .15, item
                 assert zeros/max(1, frames) < .02, item
+                assert longest <= 48, item  # waveform zero crossings, never a silent 20 ms chunk
         command({'command': 'stop'})
-        results = {'artifacts': str(root), 'measurements': measurements, 'continuity': continuity}
+        results = {'artifacts': str(root), 'load_workers': args.load_workers,
+                   'measurements': measurements, 'continuity': continuity}
         (root/'results.json').write_text(json.dumps(results, indent=2)+'\n')
         print(json.dumps(results, indent=2))
     finally:
