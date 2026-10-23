@@ -11,6 +11,42 @@ sys.modules[spec.name] = m
 spec.loader.exec_module(m)
 
 class PlanningTests(unittest.TestCase):
+    def test_interactive_snapclient_selection_does_not_enable_mpd(self):
+        from unittest.mock import patch
+        cfg = m.options([])
+        with patch('builtins.input', side_effect=['p', '1']), patch.object(m, 'run', return_value=
+                'card 2: Pro [USB DAC], device 0: USB Audio [USB Audio]\n'):
+            m.choose_local_playback(cfg)
+        self.assertIn('snapclient', cfg['components'])
+        self.assertNotIn('mpd', cfg['components'])
+        self.assertEqual(cfg['alsa_device'], 'plughw:CARD=Pro,DEV=0')
+
+    def test_interactive_local_playback_provisions_mpd_without_component_flag(self):
+        from unittest.mock import patch
+        cfg = m.options([])
+        with patch('builtins.input', side_effect=['m', '1']), patch.object(m, 'run', return_value=
+                'card 2: Pro [USB DAC], device 0: USB Audio [USB Audio]\n'):
+            m.choose_local_playback(cfg)
+        self.assertIn('mpd', cfg['components'])
+        self.assertEqual(cfg['alsa_device'], 'plughw:CARD=Pro,DEV=0')
+        self.assertIn('MUSICATA_MPD=127.0.0.1:6600', m.unit_text(cfg, 1000, 1000))
+
+    def test_interactive_server_only_never_enumerates_or_claims_audio(self):
+        from unittest.mock import patch
+        cfg = m.options([])
+        with patch('builtins.input', return_value='s'), patch.object(m, 'run') as run:
+            m.choose_local_playback(cfg)
+        run.assert_not_called()
+        self.assertNotIn('mpd', cfg['components'])
+
+    def test_interactive_missing_output_does_not_silently_select_default(self):
+        from unittest.mock import patch
+        cfg = m.options([])
+        with patch('builtins.input', return_value='m'), patch.object(m, 'run', return_value=''):
+            with self.assertRaises(m.InstallError):
+                m.choose_local_playback(cfg)
+        self.assertNotIn('mpd', cfg['components'])
+
     def test_legacy_snapserver_rejects_runtime_overrides(self):
         from unittest.mock import patch
         for fragment, dropins, expected in [
@@ -98,10 +134,11 @@ class PlanningTests(unittest.TestCase):
         for mode in ('native', 'docker'):
             cfg = m.options(['--mode', mode])
             packages = set(m.packages('debian', cfg))
-            self.assertTrue({'mpd', 'alsa-utils', 'avahi-daemon', 'avahi-utils',
+            self.assertTrue({'alsa-utils', 'avahi-daemon', 'avahi-utils',
                              'libnss-mdns', 'snapserver', 'snapclient', 'shairport-sync',
                              'smartmontools', 'nvme-cli', 'lm-sensors', 'sysstat', 'pciutils'} <= packages)
             self.assertNotIn('librespot', packages)  # Supplied by the verified release.
+            self.assertNotIn('mpd', packages)
             self.assertEqual(cfg['components'], [])
             self.assertNotIn('MUSICATA_MPD=', m.unit_text(cfg, 1001, 1001))
 
@@ -344,6 +381,67 @@ class PlanningTests(unittest.TestCase):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_local_snapclient_install_sets_identity_and_checks_connection(self):
+        from unittest.mock import patch
+        self.cfg['components'] = ['snapclient']
+        self.cfg['alsa_device'] = 'plughw:CARD=Pro,DEV=0'
+        self.cfg['snapclient_id'] = 'fixture-stable-id'
+        unit = self.root / 'etc/musicata-snapclient.service'
+        with patch.object(m, 'SNAPCLIENT_UNIT', unit), patch.object(m.shutil, 'which', return_value='/usr/bin/snapclient'), \
+                patch.object(m, 'enable_local_snapcast') as enable, patch.object(m, 'verify_snapclient') as verify:
+            m.deploy(self.cfg, None, 'debian', [])
+        enable.assert_called_once_with(self.cfg)
+        verify.assert_called_once_with(self.cfg)
+        self.assertIn('--soundcard plughw:CARD=Pro,DEV=0', unit.read_text())
+        self.assertIn('--hostID ' + self.cfg['snapclient_id'], unit.read_text())
+        self.assertFalse(m.MPD_UNIT.exists())
+
+    def test_explicit_snapclient_role_is_persisted_in_product_database(self):
+        import sqlite3
+        m.DATA.mkdir(parents=True)
+        with sqlite3.connect(m.DATA / 'musicata.db') as connection:
+            connection.execute('CREATE TABLE bool_settings (key TEXT PRIMARY KEY, value INTEGER)')
+        m.enable_local_snapcast(self.cfg)
+        with sqlite3.connect(m.DATA / 'musicata.db') as connection:
+            self.assertEqual(connection.execute('SELECT value FROM bool_settings WHERE key=?',
+                                               ('snapcast.enabled',)).fetchone(), (1,))
+        self.assertLess(self.commands.index(['systemctl', 'stop', 'musicata.service']),
+                        self.commands.index(['systemctl', 'start', 'musicata.service']))
+
+    def test_fresh_mpd_failure_disables_before_removing_unit(self):
+        from unittest.mock import patch
+        self.cfg['components'] = ['mpd']
+        self.health.side_effect = m.InstallError('server failed')
+
+        def configure(*args):
+            m.MPD_UNIT.parent.mkdir(parents=True, exist_ok=True)
+            m.MPD_UNIT.write_text('new unit')
+
+        def run(command, **kwargs):
+            self.commands.append(list(map(str, command)))
+            if command == ['systemctl', 'disable', 'musicata-mpd.service']:
+                self.assertTrue(m.MPD_UNIT.exists(), 'disable must precede unit removal')
+            return ''
+
+        with patch.object(m, 'configure_mpd', side_effect=configure), patch.object(m, 'run', side_effect=run):
+            with self.assertRaisesRegex(m.InstallError, '^server failed$'):
+                m.deploy(self.cfg, None, 'debian', [])
+        self.assertFalse(m.MPD_UNIT.exists())
+
+    def test_mpd_upgrade_failure_restores_previously_inactive_service(self):
+        from unittest.mock import patch
+        self.cfg['components'] = ['mpd']
+        m.MPD_UNIT.parent.mkdir(parents=True)
+        m.MPD_UNIT.write_text('custom unit')
+        m.MPD_CONFIG.write_text('custom config')
+        self.health.side_effect = m.InstallError('server failed')
+        with patch.object(m, 'configure_mpd'), self.assertRaises(m.InstallError):
+            m.deploy(self.cfg, dict(self.cfg), 'debian', [])
+        self.assertIn(['systemctl', 'stop', 'musicata-mpd.service'], self.commands)
+        self.assertIn(['systemctl', 'disable', 'musicata-mpd.service'], self.commands)
+        self.assertNotIn(['systemctl', 'start', 'musicata-mpd.service'], self.commands)
+        self.assertEqual(m.MPD_UNIT.read_text(), 'custom unit')
+
     def setUp(self):
         from contextlib import ExitStack
         from unittest.mock import patch

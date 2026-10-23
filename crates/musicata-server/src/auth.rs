@@ -215,6 +215,7 @@ fn is_admin_path(path: &str) -> bool {
 fn is_admin_mutation_path(path: &str, method: &axum::http::Method) -> bool {
     !matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
         && (path == "/api/snapcast/status"
+            || path == "/api/snapcast/usb-wake"
             || path.starts_with("/api/snapcast/rooms")
             || path.starts_with("/api/snapcast/groups/")
             || (path.starts_with("/api/albums/")
@@ -940,6 +941,14 @@ mod tests {
         assert!(is_admin_mutation_path(
             "/api/snapcast/status",
             &axum::http::Method::PATCH
+        ));
+        assert!(is_admin_mutation_path(
+            "/api/snapcast/usb-wake",
+            &axum::http::Method::PATCH
+        ));
+        assert!(!is_admin_mutation_path(
+            "/api/snapcast/usb-wake",
+            &axum::http::Method::GET
         ));
         assert!(is_admin_mutation_path(
             "/api/snapcast/groups/living",

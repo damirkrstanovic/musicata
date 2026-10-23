@@ -2,6 +2,7 @@
   // SPDX-License-Identifier: AGPL-3.0-or-later
   import { api, ApiError } from "../lib/api";
   import type { SnapcastStatus } from "../types/SnapcastStatus";
+  import type { UsbWakePolicy } from "../types/UsbWakePolicy";
   import type { SnapClient } from "../types/SnapClient";
   import type { SnapRoomView } from "../types/SnapRoomView";
   import type { EqProfile } from "../lib/dsp";
@@ -15,10 +16,14 @@
   let message = $state("");
   let error = $state(false);
   let busy = $state(false);
+  let usbPolicy = $state<UsbWakePolicy | null>(null);
+  let usbIdleSeconds = $state<number | undefined>(undefined);
 
   async function load() {
     try {
       status = await api.snapcastStatus();
+      usbPolicy = await api.usbWakePolicy();
+      usbIdleSeconds = usbPolicy.idle_seconds;
       host = status.server_host;
       bufferMs = status.buffer_ms;
       if (status.running) rooms = await api.snapcastRooms();
@@ -29,6 +34,21 @@
     }
   }
   load();
+
+  async function saveUsbPolicy(enabled: boolean) {
+    if (usbIdleSeconds === undefined) return;
+    busy = true;
+    error = false;
+    try {
+      usbPolicy = await api.updateUsbWakePolicy({ enabled, idle_seconds: usbIdleSeconds }) ?? usbPolicy;
+      message = "Saved. Configured players apply USB settings within 15 seconds.";
+    } catch (e) {
+      message = e instanceof ApiError ? e.message : String(e);
+      error = true;
+    } finally {
+      busy = false;
+    }
+  }
 
   async function update(
     patch: {
@@ -182,6 +202,27 @@
         >Save</button>
       </div>
     </label>
+
+    {#if usbPolicy}
+      <div class="admin-subhead">USB DAC standby</div>
+      <p class="admin-hint">
+        Configured players can disconnect their DAC after playback stops and reconnect it for music.
+        First use the player installer to verify and bind an isolated USB port on each player.
+      </p>
+      <label class="toggle-row">
+        <input data-usb-wake-enabled type="checkbox" checked={usbPolicy.enabled} disabled={busy}
+          onchange={(e) => saveUsbPolicy(e.currentTarget.checked)} />
+        <span>Allow USB standby on configured players</span>
+      </label>
+      <label class="field">
+        <span>Continuous idle before standby (seconds)</span>
+        <div class="host-row">
+          <input data-usb-wake-delay type="number" min="1" max="3600" step="1" bind:value={usbIdleSeconds} disabled={busy} />
+          <button data-usb-wake-save class="ghost-button" disabled={busy || usbIdleSeconds === undefined || usbIdleSeconds === usbPolicy.idle_seconds}
+            onclick={() => saveUsbPolicy(usbPolicy!.enabled)}>Save</button>
+        </div>
+      </label>
+    {/if}
 
     <!-- Cast TO Musicata: snapserver spawns shairport-sync / librespot and exposes each as a
          stream rooms can be switched to. The phone controls playback; Musicata just routes it. -->

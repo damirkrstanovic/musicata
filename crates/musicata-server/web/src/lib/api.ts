@@ -15,6 +15,7 @@ export type { AlbumArtworkReview };
 import type { AppSettings } from "../types/AppSettings";
 import type { About } from "../types/About";
 import type { SnapcastStatus } from "../types/SnapcastStatus";
+import type { UsbWakePolicy } from "../types/UsbWakePolicy";
 import type { SnapRoomView } from "../types/SnapRoomView";
 import type { ArtistAliasGroup } from "../types/ArtistAliasGroup";
 import type { Activity } from "../types/Activity";
@@ -331,6 +332,8 @@ export const api = {
 
   // Snapcast multi-room (synchronized playback across rooms)
   snapcastStatus: () => getJson<SnapcastStatus>("/api/snapcast/status"),
+  usbWakePolicy: () => getJson<UsbWakePolicy>("/api/snapcast/usb-wake"),
+  updateUsbWakePolicy: (policy: UsbWakePolicy) => sendJson<UsbWakePolicy>("/api/snapcast/usb-wake", "PATCH", policy),
   updateSnapcast: (update: {
     buffer_ms?: number;
     enabled?: boolean;

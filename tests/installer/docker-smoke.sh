@@ -50,6 +50,8 @@ trap cleanup EXIT
 
 tar -xzf "$archive" -C "$scratch/context"
 cp "$repo/packaging/install.py" "$scratch/context/install.py"
+cp "$repo/packaging/player.py" "$scratch/context/player.py"
+cp "$repo/packaging/usb_autowake.py" "$scratch/context/usb_autowake.py"
 cat >"$scratch/context/Dockerfile.fixture" <<'EOF'
 FROM debian:bookworm-slim
 RUN useradd --system --no-create-home --uid 10001 musicata
@@ -71,6 +73,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
  && useradd --system --no-create-home --uid 10001 musicata && mkdir -p /run/systemd/system /it/bin
 COPY musicata-x86_64-linux/librespot /usr/local/bin/librespot
 COPY install.py /it/install.py
+COPY player.py /it/player.py
+COPY usb_autowake.py /it/usb_autowake.py
 COPY docker-wrapper /it/bin/docker
 COPY systemctl-stub /it/bin/systemctl
 COPY dpkg-query-stub /it/bin/dpkg-query

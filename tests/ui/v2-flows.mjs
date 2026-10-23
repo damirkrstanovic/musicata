@@ -1093,6 +1093,14 @@ await js(`(() => { const input = document.querySelector('[data-snapcast-buffer]'
 await clickText('button', 'Apply buffer');
 check("Snapcast: buffer save completes", await waitUntil(`document.querySelector('[data-snapcast-buffer]')?.value === '250' && [...document.querySelectorAll('button')].some(b => b.textContent.includes('Apply buffer') && b.disabled)`, 3000) < Infinity);
 const bufferSaved = await api('/api/snapcast/status');
+check("USB standby defaults off", await js(`document.querySelector('[data-usb-wake-enabled]')?.checked === false`));
+await js(`(() => { const input = document.querySelector('[data-usb-wake-delay]'); input.value = '30'; input.dispatchEvent(new Event('input', {bubbles:true})); })()`);
+await waitUntil(`!document.querySelector('[data-usb-wake-save]')?.disabled`, 3000);
+await js(`document.querySelector('[data-usb-wake-save]').click()`);
+check("USB idle delay saved", await waitUntil(`document.querySelector('[data-usb-wake-save]')?.disabled`, 3000) < Infinity && (await api('/api/snapcast/usb-wake')).idle_seconds === 30);
+await js(`document.querySelector('[data-usb-wake-enabled]').click()`);
+check("USB standby policy enabled", await waitUntil(`document.querySelector('[data-usb-wake-enabled]')?.checked && !document.querySelector('[data-usb-wake-enabled]')?.disabled`, 3000) < Infinity && (await api('/api/snapcast/usb-wake')).enabled === true);
+await api('/api/snapcast/usb-wake', {method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({enabled:false,idle_seconds:15})});
 check("Snapcast: desired buffer persists without claiming it is applied", bufferSaved?.buffer_ms === 250 && bufferSaved?.applied_buffer_ms === null);
 await js(`document.querySelector('[data-snapcast-buffer]')?.scrollIntoView({block:'center'})`);
 await mobileScreenshot('snapcast-buffer');

@@ -1656,6 +1656,9 @@ const SETTING_SNAPCAST_ENABLED: &str = "snapcast.enabled";
 const SETTING_SNAPCAST_AUTH: &str = "snapcast.auth_enabled";
 const SETTING_SNAPCAST_MANAGE_SERVER: &str = "snapcast.manage_server";
 const SETTING_SNAPCAST_AIRPLAY: &str = "snapcast.airplay_enabled";
+const SETTING_USB_AUTOWAKE: &str = "snapcast.usb_autowake_enabled";
+const SETTING_USB_IDLE_SECONDS: &str = "snapcast.usb_idle_seconds";
+const DEFAULT_USB_IDLE_SECONDS: u32 = 15;
 const SETTING_SNAPCAST_SPOTIFY: &str = "snapcast.spotify_enabled";
 
 /// Every boolean setting, with the value that applies when the user has never touched it.
@@ -1753,6 +1756,11 @@ pub(crate) const BOOL_SETTINGS: &[BoolSetting] = &[
         key: SETTING_SNAPCAST_AIRPLAY,
         default: false,
         doc: "AirPlay cast-in via shairport-sync. Off: needs that binary installed.",
+    },
+    BoolSetting {
+        key: SETTING_USB_AUTOWAKE,
+        default: false,
+        doc: "USB standby on explicitly bound playback hosts. Off until the user verifies isolated port control.",
     },
     BoolSetting {
         key: SETTING_SNAPCAST_SPOTIFY,
@@ -5491,6 +5499,10 @@ fn snapcast_routes() -> Router<AppState> {
             get(snapcast_status).patch(snapcast_update),
         )
         .route(
+            "/api/snapcast/usb-wake",
+            get(usb_wake_policy).patch(update_usb_wake_policy),
+        )
+        .route(
             "/api/snapcast/rooms",
             get(snapcast_rooms).post(snapcast_add_room),
         )
@@ -5506,6 +5518,59 @@ fn snapcast_routes() -> Router<AppState> {
             "/api/snapcast/groups/{id}",
             axum::routing::patch(snapcast_update_group),
         )
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+struct UsbWakePolicy {
+    enabled: bool,
+    idle_seconds: u32,
+}
+
+fn validate_usb_idle_seconds(seconds: u32) -> Result<(), AppError> {
+    if !(1..=3600).contains(&seconds) {
+        return Err(AppError::bad_request(
+            "USB idle delay must be between 1 and 3600 seconds",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "snapcast")]
+async fn usb_wake_policy(State(state): State<AppState>) -> Result<Json<UsbWakePolicy>, AppError> {
+    let idle_seconds = state
+        .database
+        .get_setting(SETTING_USB_IDLE_SECONDS)
+        .await
+        .map_err(db_error)?
+        .map(|value| value.parse::<u32>())
+        .transpose()
+        .map_err(|_| AppError::internal("Invalid stored USB idle delay"))?
+        .unwrap_or(DEFAULT_USB_IDLE_SECONDS);
+    validate_usb_idle_seconds(idle_seconds)?;
+    Ok(Json(UsbWakePolicy {
+        enabled: bool_setting(&state.database, SETTING_USB_AUTOWAKE).await,
+        idle_seconds,
+    }))
+}
+
+#[cfg(feature = "snapcast")]
+async fn update_usb_wake_policy(
+    State(state): State<AppState>,
+    Json(policy): Json<UsbWakePolicy>,
+) -> Result<Json<UsbWakePolicy>, AppError> {
+    validate_usb_idle_seconds(policy.idle_seconds)?;
+    state
+        .database
+        .set_setting(SETTING_USB_IDLE_SECONDS, &policy.idle_seconds.to_string())
+        .await
+        .map_err(db_error)?;
+    state
+        .database
+        .set_bool_setting(SETTING_USB_AUTOWAKE, policy.enabled)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(policy))
 }
 
 #[cfg(not(feature = "snapcast"))]
@@ -9242,7 +9307,7 @@ mod tests {
         // The ten toggles that existed when the string settings were retired. A new one is
         // welcome; bumping this number is the moment to confirm the default was chosen, and
         // that a network-touching feature is not being switched on for everyone by accident.
-        assert_eq!(BOOL_SETTINGS.len(), 15);
+        assert_eq!(BOOL_SETTINGS.len(), 16);
     }
 
     #[cfg(feature = "snapcast")]
@@ -9338,11 +9403,18 @@ mod tests {
             ("snapcast.manage_server", true),
             ("snapcast.airplay_enabled", false),
             ("snapcast.spotify_enabled", false),
+            ("snapcast.usb_autowake_enabled", false),
             (crate::diagnostics::profiles::CPU_STARTUP, false),
             (crate::diagnostics::profiles::HEAP_STARTUP, false),
         ] {
             assert_eq!(bool_setting_default(key), expected, "default for {key}");
         }
+    }
+    #[test]
+    fn usb_wake_idle_delay_is_bounded() {
+        assert!(super::validate_usb_idle_seconds(15).is_ok());
+        assert!(super::validate_usb_idle_seconds(0).is_err());
+        assert!(super::validate_usb_idle_seconds(3601).is_err());
     }
     use axum::{
         body::{Body, to_bytes},
@@ -11241,6 +11313,76 @@ mod tests {
             .header("authorization", "Bearer listener-token").header("content-type", "application/json")
             .body(Body::from(r#"{"profile_id":null,"enabled":true,"correction_enabled":false,"listening_profile_id":"taste-techno-bass","listening_enabled":true}"#)).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
+    async fn usb_wake_policy_persists_and_rejects_invalid_or_listener_writes() {
+        let fixture = TestFixture::new("usb-wake-policy");
+        let (router, db) = fixture.app_with_library_db(fixture.library()).await;
+        for (body, expected) in [
+            (r#"{"enabled":true,"idle_seconds":30}"#, StatusCode::OK),
+            (
+                r#"{"enabled":false,"idle_seconds":0}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri("/api/snapcast/usb-wake")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let (reloaded, _) = fixture.app_with_database(db.clone()).await;
+        let response = reloaded
+            .oneshot(
+                Request::builder()
+                    .uri("/api/snapcast/usb-wake")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let policy: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(
+            policy,
+            serde_json::json!({"enabled":true,"idle_seconds":30})
+        );
+        db.create_user(&musicata_storage::UserRecord {
+            id: "listener".into(),
+            username: "listener".into(),
+            password_hash: "unused".into(),
+            role: "listener".into(),
+            api_token: "listener-token".into(),
+            created_at_unix_seconds: 1,
+        })
+        .await
+        .unwrap();
+        for (method, expected) in [("GET", StatusCode::OK), ("PATCH", StatusCode::FORBIDDEN)] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/api/snapcast/usb-wake")
+                        .header("authorization", "Bearer listener-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"enabled":false,"idle_seconds":30}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
     }
 
     #[cfg(feature = "snapcast")]

@@ -23,6 +23,8 @@ run_one() {
     kubectl -n "$namespace" exec "$pod" -- mkdir -p /work/bin /run/systemd/system /run/lock /srv/music
     # `install.sh` falls back to an adjacent install.py in extracted releases.
     kubectl -n "$namespace" cp "$root/packaging/install.py" "$pod:/work/install.py"
+    kubectl -n "$namespace" cp "$root/packaging/player.py" "$pod:/work/player.py"
+    kubectl -n "$namespace" cp "$root/packaging/usb_autowake.py" "$pod:/work/usb_autowake.py"
     kubectl -n "$namespace" cp "$root/scripts/install.sh" "$pod:/work/install.sh"
     kubectl -n "$namespace" exec -i "$pod" -- sh -c 'cat > /work/bin/systemctl && chmod +x /work/bin/systemctl' <<'SYSTEMCTL'
 #!/bin/sh

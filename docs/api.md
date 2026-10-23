@@ -506,3 +506,12 @@ Tokio Console is not enabled: its unstable task instrumentation and continuous e
 would add release configuration and overhead to ordinary operation. Bounded CPU stacks,
 worker state/duration and progress are the first tools for investigating repeated wakeups;
 wall-clock operation duration must not be interpreted as CPU time.
+
+## USB standby policy
+
+`GET /api/snapcast/usb-wake` returns `{ "enabled": false, "idle_seconds": 15 }`
+by default. Authenticated listeners may read it; `PATCH` requires an administrator and
+accepts both fields, with an integer idle delay from 1 through 3600 seconds. Changes persist
+in the database and are polled by explicitly installed host controllers. The API does not
+accept hardware paths or perform USB writes. Unreachable policy/status endpoints are unknown
+state, not evidence of idle playback.

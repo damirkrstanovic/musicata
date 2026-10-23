@@ -30,8 +30,8 @@ Select optional components with a comma-separated list:
 # Docker server + local ML + LAN discovery, on a CPU supporting x86-64-v3:
 sudo ./scripts/install.sh --with ml,discovery
 
-# Native server and USB DAC playback; the existing account must already exist:
-sudo ./scripts/install.sh --mode native --user damirk --with mpd,discovery \
+# Native server and recommended local playback; the existing account must already exist:
+sudo ./scripts/install.sh --mode native --user damirk --with snapclient,discovery \
   --alsa-device 'plughw:CARD=Pro,DEV=0'
 
 # Pin either deployment to an existing release:
@@ -50,7 +50,59 @@ bootstrap paths/addresses and seeds the optional local MPD/ML addresses.
 service account needs read and traversal access. Docker mounts it read-only. Network sources
 such as SMB are added in the UI and need no host mount. `--port` changes the HTTP port.
 For ALSA names, use `aplay -L` after installing `alsa-utils`; `--alsa-device` defaults to
-ALSA's `default` device. MPD uses software volume and listens on loopback port 6600.
+ALSA's `default` device. Interactive player setup requires selecting a stable card identifier.
+Snapclient is the recommended player. MPD remains an explicitly selected compatibility option
+(`--with mpd`), uses software volume, and listens on loopback port 6600. Existing MPD
+configuration and service files are preserved on upgrade.
+
+### Standalone player and optional USB standby
+
+On a separate Linux player, use the player entry point from the same checkout/release:
+
+```sh
+sudo ./scripts/install-player.sh --server musicata.local
+```
+
+It selects an ALSA output, creates a stable player identity, installs only the Snapclient
+dependencies, and verifies the connection to Snapserver. It does not install another Musicata
+server, Snapserver, or MPD. On Debian/Ubuntu, Fedora and Arch it installs a non-root systemd
+service with boot activation and retry. Generic/non-systemd Linux receives a manual startup
+command and needs an existing Snapclient binary. `--check` checks installation prerequisites,
+not runtime player health;
+`--output 'plughw:CARD=Pro,DEV=0' --yes` supports unattended provisioning.
+
+USB standby is optional and disabled by default. First independently verify that switching
+the DAC's port affects only that device; the presence of a kernel `disable` attribute does
+not establish electrical isolation. With a private root-owned API token file, bind the DAC:
+
+```sh
+sudo ./scripts/install-player.sh --server musicata.local \
+  --output 'plughw:CARD=Pro,DEV=0' --usb-device /sys/bus/usb/devices/1-1 \
+  --musicata-url https://musicata.example.org --token-file /root/musicata-player.token \
+  --confirm-isolated-usb
+```
+
+The USB path above is an example to replace with the selected device. Discovery resolves the
+kernel port relationship; it does not assume PCI, a particular DAC model, or a USB bus number.
+The selected ALSA output must belong to that device. Hubs, ambiguous mappings, and devices
+without a serial are rejected. The token is copied into a root-private file; a listener API
+token suffices. Enable standby and set the idle delay in **Settings → Outputs → USB DAC
+standby**. This shared policy applies to every explicitly bound player and refreshes within
+15 seconds when Musicata is reachable. Status errors reset the idle timer and preserve the
+current USB state; playback on the player's assigned Snapcast stream restores the port.
+
+Remove the controller with `sudo ./scripts/install-player.sh --remove-usb`. It stops the
+controller and restores the port before removing its binding; Snapclient remains installed.
+If restoration fails, the binding is retained for recovery. Configuration/service backups
+are under `/var/backups/musicata-player`; check `journalctl -u musicata-usb-autowake` and
+`journalctl -u musicata-snapclient` when diagnosing failures.
+
+Raspberry Pi OS uses the Debian dependency path, but isolated port switching depends on the
+Pi, hub and kernel. Automated tests cover non-PCI topology; physical Pi wake, standby and
+reboot validation remain outstanding. This controller supports Snapcast playback. Direct
+MPD ALSA playback is unsuitable: real MPD testing showed it loses playback intent when its
+device is disconnected. MPD → Snapserver FIFO → Snapclient has passed an isolated integration
+probe, but automatic provisioning of that route is still pending.
 
 ## HTTPS with Caddy
 
@@ -141,6 +193,7 @@ sudo docker logs --tail 100 musicata-caddy          # Docker proxy
 | `caddy` | HTTPS proxy; optional Cloudflare DNS-01 for private LAN access; persistent certificates |
 | `ml` | Separate CPU-only Docker container; persistent model cache; localhost port 3091 |
 | `mpd` | Host MPD + ALSA utilities; dedicated non-root `musicata-mpd.service` with audio-device access |
+| `snapclient` | Recommended local player; dedicated non-root service, stable identity and explicit output |
 | `discovery` | Host Avahi, NSS mDNS resolution, `_http._tcp` advertisement with the Musicata port |
 | `snapcast` | Managed snapserver runtime; native packages also supply snapclient for room setup |
 | `airplay` | Shairport Sync cast-in; also selects Snapcast and discovery |
@@ -151,8 +204,9 @@ cast-in and rooms in Musicata's Multi-room settings; account/subscription requir
 upstream services still apply. Snapclient runs on each playback endpoint; installing a
 server does not create rooms or select a DAC automatically.
 
-Since 1.6.1, both installation modes install host playback utilities by default: MPD,
-ALSA tools, Snapserver/Snapclient, Shairport Sync, Librespot, and Avahi/mDNS. Storage and
+Both server installation modes install host playback utilities: ALSA tools,
+Snapserver/Snapclient, Shairport Sync, Librespot, and Avahi/mDNS. MPD is installed only
+when explicitly selected; upgrades preserve existing MPD installations. Storage and
 system troubleshooting tools are also included: `smartctl`, `nvme`, `sensors`, `iostat`,
 and `lspci`. Installing these tools does not select a DAC, create rooms, enable cast-in,
 or start a new standalone audio service. Configure playback in the web UI; `--with mpd`

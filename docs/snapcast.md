@@ -9,6 +9,34 @@ Date: 2026-06-07
 
 ## Context
 
+### Playback backend decision (2026-10-23)
+
+**Continue supporting MPD; recommend Snapclient for new Musicata players.** MPD remains an
+explicit compatibility option for existing installations and controllers. Musicata already
+owns library, queue and decoding behavior for Snapcast, so inserting MPD into that path is
+useful only when an MPD workflow needs to be retained.
+
+MPD also offers a distinct direct-output use case: matching the original track's sample
+rate/bit depth, bit-perfect playback with suitable configuration, and native DSD/DoP on
+compatible hardware. Our current Musicata library stream into Snapcast is 16-bit stereo PCM,
+48 kHz by default; this is Musicata's implementation choice, not a universal Snapcast limit.
+The current MPD installer uses software volume and does not establish bit-perfect playback.
+See the upstream [MPD playback manual](https://mpd.readthedocs.io/en/stable/user.html#bit-perfect-playback)
+and [MPD client ecosystem](https://www.musicpd.org/clients/).
+
+An independently configured MPD can play its local library and queue without Musicata;
+an MPD fetching Musicata track URLs still depends on Musicata. Endpoint decoding can also
+transfer the original compressed file rather than a centrally decoded/re-encoded stream.
+Compression itself is not unique to MPD: [Snapcast supports FLAC, Opus and Vorbis](https://github.com/snapcast/snapcast#how-does-it-work).
+Synchronized playback and grouping across rooms remain Snapcast's main advantage.
+
+For optional USB standby with MPD, the supported design is **MPD → Snapserver → Snapclient
+→ DAC**, following the assigned Snapcast stream. An integration probe showed that direct MPD
+ALSA playback loses playback intent while its device is disconnected, whereas FIFO-fed
+Snapserver retains the signal needed to wake it. This route gives up the direct-output
+format advantages above; it is a compatibility route, not a requirement for ordinary
+Musicata playback. Provisioning and hardware validation are tracked in #49, #65 and #33.
+
 Milestone 10 calls for non-browser player endpoints and "research Snapcast for synchronized
 transport." This is that research, against the checked-out source at `../snapcast`. The goal:
 **reliable audio transport from the Musicata server to networked players** — a dedicated,
