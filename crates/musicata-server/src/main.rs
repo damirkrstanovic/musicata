@@ -1656,6 +1656,7 @@ const SETTING_SNAPCAST_ENABLED: &str = "snapcast.enabled";
 const SETTING_SNAPCAST_AUTH: &str = "snapcast.auth_enabled";
 const SETTING_SNAPCAST_MANAGE_SERVER: &str = "snapcast.manage_server";
 const SETTING_SNAPCAST_AIRPLAY: &str = "snapcast.airplay_enabled";
+const SETTING_SNAPCAST_MPD: &str = "snapcast.mpd_enabled";
 const SETTING_USB_AUTOWAKE: &str = "snapcast.usb_autowake_enabled";
 const SETTING_USB_IDLE_SECONDS: &str = "snapcast.usb_idle_seconds";
 const DEFAULT_USB_IDLE_SECONDS: u32 = 15;
@@ -1761,6 +1762,11 @@ pub(crate) const BOOL_SETTINGS: &[BoolSetting] = &[
         key: SETTING_USB_AUTOWAKE,
         default: false,
         doc: "USB standby on explicitly bound playback hosts. Off until the user verifies isolated port control.",
+    },
+    BoolSetting {
+        key: SETTING_SNAPCAST_MPD,
+        default: false,
+        doc: "Local MPD input through Snapcast. Off until the installer provisions its shared FIFO.",
     },
     BoolSetting {
         key: SETTING_SNAPCAST_SPOTIFY,
@@ -2506,6 +2512,7 @@ async fn snapcast_settings_from_db(
         settings.server_host = value;
     }
     settings.airplay_enabled = bool_setting(database, SETTING_SNAPCAST_AIRPLAY).await;
+    settings.mpd_enabled = bool_setting(database, SETTING_SNAPCAST_MPD).await;
     if let Some(value) = get("snapcast.airplay_binary").await?
         && !value.is_empty()
     {
@@ -5599,6 +5606,7 @@ async fn snapcast_server_host(database: &Database) -> String {
 #[derive(Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct SnapcastStatus {
+    mpd_enabled: bool,
     /// Persisted enable flag (a disable takes full effect on restart).
     buffer_ms: u32,
     applied_buffer_ms: Option<u32>,
@@ -5667,6 +5675,7 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
         .await
         .map_err(|e| AppError::bad_request(e.to_string()))?;
     Ok(Json(SnapcastStatus {
+        mpd_enabled: bool_setting(&state.database, SETTING_SNAPCAST_MPD).await,
         buffer_ms: settings.buffer_ms,
         applied_buffer_ms: manager.as_ref().and_then(|m| m.buffer_ms()),
         manage_server: manager
@@ -5691,6 +5700,7 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
 #[cfg(feature = "snapcast")]
 #[derive(Debug, Deserialize)]
 struct SnapcastSettingsUpdate {
+    mpd_enabled: Option<bool>,
     buffer_ms: Option<u32>,
     enabled: Option<bool>,
     auth_enabled: Option<bool>,
@@ -5712,6 +5722,24 @@ async fn snapcast_update(
     State(state): State<AppState>,
     Json(update): Json<SnapcastSettingsUpdate>,
 ) -> Result<Json<SnapcastStatus>, AppError> {
+    if let Some(enabled) = update.mpd_enabled {
+        if let Some(manager) = state.players.snapcast_manager().await {
+            manager
+                .apply_mpd_and_save(state.database.clone(), enabled)
+                .await
+                .map_err(|error| AppError::bad_request(error.to_string()))?;
+        } else if enabled {
+            return Err(AppError::bad_request(
+                "Enable managed Snapcast and provision the MPD input before enabling it",
+            ));
+        } else {
+            state
+                .database
+                .set_bool_setting(SETTING_SNAPCAST_MPD, false)
+                .await
+                .map_err(db_error)?;
+        }
+    }
     if let Some(value) = update.buffer_ms {
         snapcast::validate_buffer_ms(value).map_err(|e| AppError::bad_request(e.to_string()))?;
         if !bool_setting(&state.database, SETTING_SNAPCAST_MANAGE_SERVER).await {
@@ -9307,7 +9335,7 @@ mod tests {
         // The ten toggles that existed when the string settings were retired. A new one is
         // welcome; bumping this number is the moment to confirm the default was chosen, and
         // that a network-touching feature is not being switched on for everyone by accident.
-        assert_eq!(BOOL_SETTINGS.len(), 16);
+        assert_eq!(BOOL_SETTINGS.len(), 17);
     }
 
     #[cfg(feature = "snapcast")]

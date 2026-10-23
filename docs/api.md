@@ -515,3 +515,9 @@ accepts both fields, with an integer idle delay from 1 through 3600 seconds. Cha
 in the database and are polled by explicitly installed host controllers. The API does not
 accept hardware paths or perform USB writes. Unreachable policy/status endpoints are unknown
 state, not evidence of idle playback.
+
+The Snapcast status/update API also exposes `mpd_enabled` (default false). Enabling it
+requires a running managed Snapserver and the installer-provisioned local MPD FIFO. Changes
+persist and apply immediately through a managed restart, with rollback on activation failure.
+Changing this input or the playback buffer while its MPD stream is playing/unknown is rejected;
+pause MPD and wait for idle first. Input enablement does not change room assignments.

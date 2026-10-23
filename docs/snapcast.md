@@ -15,6 +15,8 @@ Date: 2026-06-07
 explicit compatibility option for existing installations and controllers. Musicata already
 owns library, queue and decoding behavior for Snapcast, so inserting MPD into that path is
 useful only when an MPD workflow needs to be retained.
+When Musicata manages MPD, its queue is authoritative: external MPD queue edits are reconciled
+back to Musicata's queue. Existing controllers are not independent queue owners in that mode.
 
 MPD also offers a distinct direct-output use case: matching the original track's sample
 rate/bit depth, bit-perfect playback with suitable configuration, and native DSD/DoP on
@@ -36,6 +38,14 @@ ALSA playback loses playback intent while its device is disconnected, whereas FI
 Snapserver retains the signal needed to wake it. This route gives up the direct-output
 format advantages above; it is a compatibility route, not a requirement for ordinary
 Musicata playback. Provisioning and hardware validation are tracked in #49, #65 and #33.
+
+The combined installer now provisions this route with `--with mpd,snapclient`, including
+its host FIFO and Docker mount where applicable. The input toggle persists in Musicata and
+applies through a managed Snapserver restart with rollback. Snapserver 0.26 lacks the newer
+`Stream.AddStream` API, so the implementation does not depend on it. MPD must be paused before
+changing the input or playback buffer: [MPD 0.23's FIFO plugin](https://github.com/MusicPlayerDaemon/MPD/blob/v0.23.12/src/output/plugins/FifoOutputPlugin.cxx)
+flushes a full pipe and resets its pacing timer; it is not a durable queue through receiver
+outages. USB standby disconnects only the DAC and leaves Snapserver reading the FIFO.
 
 Milestone 10 calls for non-browser player endpoints and "research Snapcast for synchronized
 transport." This is that research, against the checked-out source at `../snapcast`. The goal:

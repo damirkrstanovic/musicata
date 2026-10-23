@@ -38,6 +38,8 @@ pub const STREAM_NAME: &str = "Musicata";
 pub const AIRPLAY_STREAM_NAME: &str = "AirPlay";
 /// Stream id for the Spotify Connect input (snapserver spawns librespot).
 pub const SPOTIFY_STREAM_NAME: &str = "Spotify";
+pub const SETTING_MPD_INPUT: &str = "snapcast.mpd_enabled";
+pub const MPD_FIFO_PATH: &str = "/var/lib/musicata-mpd/snapcast.fifo";
 
 /// Resolve a binary name (or path) to an existing file: an absolute/relative path is checked
 /// directly, a bare name is searched on `$PATH`. Used both to build the stream `source = ` URI
@@ -98,6 +100,8 @@ pub struct SnapcastSettings {
     /// Stream sample rate (snapserver runs at one fixed rate; we resample to it).
     pub sample_rate: u32,
     pub buffer_ms: u32,
+    pub mpd_enabled: bool,
+    pub mpd_fifo_path: PathBuf,
     /// snapserver JSON-RPC control endpoint (TCP, newline-delimited).
     pub control_host: String,
     pub control_port: u16,
@@ -139,6 +143,8 @@ impl Default for SnapcastSettings {
             fifo_path: std::env::temp_dir().join("musicata-snapcast/musicata.fifo"),
             sample_rate: 48_000,
             buffer_ms: DEFAULT_BUFFER_MS,
+            mpd_enabled: false,
+            mpd_fifo_path: MPD_FIFO_PATH.into(),
             control_host: "127.0.0.1".to_string(),
             control_port: 1705,
             http_port: 1780,
@@ -162,6 +168,7 @@ pub struct SnapcastManager {
     settings: SnapcastSettings,
     child: Mutex<Option<Child>>,
     buffer_ms: std::sync::atomic::AtomicU32,
+    mpd_enabled: std::sync::atomic::AtomicBool,
     apply_lock: tokio::sync::Mutex<()>,
 }
 
@@ -169,6 +176,9 @@ impl SnapcastManager {
     /// Ensure the FIFO exists and — when managing — snapserver is running against it.
     pub async fn start(settings: SnapcastSettings) -> Result<Self> {
         validate_buffer_ms(settings.buffer_ms)?;
+        if settings.mpd_enabled {
+            validate_mpd_fifo(&settings.mpd_fifo_path).await?;
+        }
         ensure_fifo(&settings.fifo_path).await?;
         let mut child = None;
         if settings.manage_server {
@@ -186,6 +196,7 @@ impl SnapcastManager {
         }
         Ok(Self {
             buffer_ms: std::sync::atomic::AtomicU32::new(settings.buffer_ms),
+            mpd_enabled: std::sync::atomic::AtomicBool::new(settings.mpd_enabled),
             apply_lock: tokio::sync::Mutex::new(()),
             settings,
             child: Mutex::new(child),
@@ -209,6 +220,54 @@ impl SnapcastManager {
     pub fn buffer_ms(&self) -> Option<u32> {
         (self.managed() && self.is_running())
             .then(|| self.buffer_ms.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    pub fn mpd_enabled(&self) -> bool {
+        self.mpd_enabled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Apply the input on packaged Snapserver versions, including those without AddStream.
+    pub async fn apply_mpd_and_save(
+        self: std::sync::Arc<Self>,
+        database: musicata_storage::Database,
+        enabled: bool,
+    ) -> Result<()> {
+        tokio::spawn(async move {
+            let _apply = self.apply_lock.lock().await;
+            let previous = self.mpd_enabled();
+            self.apply_mpd(enabled).await?;
+            if let Err(error) = database.set_bool_setting(SETTING_MPD_INPUT, enabled).await {
+                self.apply_mpd(previous).await.map_err(|restore| {
+                    anyhow!("Could not save MPD input ({error}) or restore it ({restore})")
+                })?;
+                return Err(error.into());
+            }
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn apply_mpd(&self, enabled: bool) -> Result<()> {
+        if !self.managed() {
+            return Err(anyhow!(
+                "Configure the MPD input on the external Snapserver"
+            ));
+        }
+        if enabled == self.mpd_enabled() {
+            return Ok(());
+        }
+        if enabled {
+            validate_mpd_fifo(&self.settings.mpd_fifo_path).await?;
+        }
+        let mut previous = self.settings.clone();
+        previous.buffer_ms = self.buffer_ms.load(std::sync::atomic::Ordering::Acquire);
+        previous.mpd_enabled = self.mpd_enabled();
+        let mut candidate = previous.clone();
+        candidate.mpd_enabled = enabled;
+        self.replace_server(&candidate, &previous).await?;
+        self.mpd_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// Complete process replacement and persistence even if the HTTP caller disconnects.
@@ -249,33 +308,55 @@ impl SnapcastManager {
         if previous == value {
             return Ok(());
         }
+        let mut candidate = self.settings.clone();
+        candidate.buffer_ms = value;
+        candidate.mpd_enabled = self.mpd_enabled();
+        let mut rollback = candidate.clone();
+        rollback.buffer_ms = previous;
+        self.replace_server(&candidate, &rollback).await?;
+        self.buffer_ms
+            .store(value, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    async fn replace_server(
+        &self,
+        candidate: &SnapcastSettings,
+        rollback: &SnapcastSettings,
+    ) -> Result<()> {
+        if self.mpd_enabled() {
+            let streams = super::control::SnapControl::new(self.control_addr())
+                .streams()
+                .await?;
+            if !streams
+                .iter()
+                .any(|stream| stream.id == "MPD" && stream.status == "idle")
+            {
+                return Err(anyhow!(
+                    "Pause MPD and wait for its input to become idle before changing the playback buffer or MPD input"
+                ));
+            }
+        }
         let old_child = self.child.lock().unwrap().take();
         if let Some(child) = old_child {
             stop_server(child).await;
         }
-        let mut candidate = self.settings.clone();
-        candidate.buffer_ms = value;
-        match start_checked(&candidate).await {
+        match start_checked(candidate).await {
             Ok(child) => {
                 *self.child.lock().unwrap() = Some(child);
-                self.buffer_ms
-                    .store(value, std::sync::atomic::Ordering::Release);
                 Ok(())
             }
-            Err(error) => {
-                candidate.buffer_ms = previous;
-                match start_checked(&candidate).await {
-                    Ok(child) => {
-                        *self.child.lock().unwrap() = Some(child);
-                        Err(anyhow!(
-                            "Buffer change failed; previous buffer restored: {error}"
-                        ))
-                    }
-                    Err(restore) => Err(anyhow!(
-                        "Buffer change failed: {error}; restoring previous server also failed: {restore}"
-                    )),
+            Err(error) => match start_checked(rollback).await {
+                Ok(child) => {
+                    *self.child.lock().unwrap() = Some(child);
+                    Err(anyhow!(
+                        "Snapserver change failed; previous configuration restored: {error}"
+                    ))
                 }
-            }
+                Err(restore) => Err(anyhow!(
+                    "Snapserver change failed: {error}; restoring previous server also failed: {restore}"
+                )),
+            },
         }
     }
 
@@ -340,6 +421,26 @@ async fn is_fifo(path: &PathBuf) -> bool {
     }
 }
 
+async fn validate_mpd_fifo(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let metadata = tokio::fs::symlink_metadata(path).await.with_context(
+        || "MPD FIFO is unavailable; provision MPD through Snapcast with the installer",
+    )?;
+    if !metadata.file_type().is_fifo() {
+        return Err(anyhow!(
+            "MPD input requires a real FIFO, not a regular file or symlink"
+        ));
+    }
+    Ok(())
+}
+
+fn mpd_stream_uri(settings: &SnapcastSettings) -> String {
+    format!(
+        "pipe://{}?name=MPD&sampleformat=48000:16:2&codec=flac&mode=read",
+        settings.mpd_fifo_path.display()
+    )
+}
+
 /// The forward-compatible `[authorization]` block: a `Streaming`-only role and one user per
 /// room. **snapserver 0.35 ignores this** (auth is stubbed upstream); it activates unchanged
 /// if/when upstream enables auth.
@@ -393,6 +494,9 @@ fn render_config(settings: &SnapcastSettings) -> String {
     );
     // Optional inputs *into* Musicata. AirPlay/librespot run at 44.1 kHz; the per-stream
     // sampleformat says so (only one stream plays per group at a time, so mixed rates are fine).
+    if settings.mpd_enabled {
+        config.push_str(&format!("source = {}\n", mpd_stream_uri(settings)));
+    }
     if settings.airplay_enabled {
         match resolve_binary(&settings.airplay_binary) {
             Some(bin) => config.push_str(&format!(
@@ -559,6 +663,33 @@ mod tests {
     }
 
     #[test]
+    fn mpd_input_is_opt_in_and_uses_its_own_fixed_format_fifo() {
+        let mut settings = SnapcastSettings::default();
+        assert!(!render_config(&settings).contains("name=MPD"));
+        settings.mpd_enabled = true;
+        assert!(render_config(&settings).contains(
+            "pipe:///var/lib/musicata-mpd/snapcast.fifo?name=MPD&sampleformat=48000:16:2&codec=flac&mode=read"
+        ));
+        assert!(render_config(&settings).contains("name=Musicata"));
+    }
+
+    #[tokio::test]
+    async fn mpd_input_rejects_missing_regular_and_symlink_paths_without_replacing_them() {
+        let root = test_dir();
+        let fifo = root.path().join("mpd.fifo");
+        assert!(validate_mpd_fifo(&fifo).await.is_err());
+        std::fs::write(&fifo, "preserve").unwrap();
+        assert!(validate_mpd_fifo(&fifo).await.is_err());
+        assert_eq!(std::fs::read_to_string(&fifo).unwrap(), "preserve");
+        std::fs::remove_file(&fifo).unwrap();
+        ensure_fifo(&fifo).await.unwrap();
+        validate_mpd_fifo(&fifo).await.unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&fifo, &alias).unwrap();
+        assert!(validate_mpd_fifo(&alias).await.is_err());
+    }
+
+    #[test]
     fn playback_buffer_is_explicit_and_validated() {
         let mut settings = SnapcastSettings::default();
         assert!(render_config(&settings).contains("buffer = 1000\n"));
@@ -636,7 +767,7 @@ while True:
         .unwrap();
         assert_eq!(manager.buffer_ms(), Some(500));
         let error = manager.apply_buffer(250).await.unwrap_err().to_string();
-        assert!(error.contains("previous buffer restored"), "{error}");
+        assert!(error.contains("previous configuration restored"), "{error}");
         assert_eq!(manager.buffer_ms(), Some(500));
         assert!(
             manager

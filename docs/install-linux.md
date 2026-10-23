@@ -55,6 +55,21 @@ Snapclient is the recommended player. MPD remains an explicitly selected compati
 (`--with mpd`), uses software volume, and listens on loopback port 6600. Existing MPD
 configuration and service files are preserved on upgrade.
 
+Choose **MPD through Snapcast** in interactive setup, or use `--with mpd,snapclient`, for
+local MPD with USB standby. The installer creates a shared FIFO, configures MPD's FIFO output,
+registers local MPD, enables its Snapcast input, and assigns the local Snapclient to it.
+Snapclient alone opens the DAC. Native and Docker servers use the same host MPD/Snapclient
+services; Docker receives a read-only mount of the FIFO directory, with matching service UID.
+An older Musicata release without this input is rejected by the post-install stream check.
+Custom direct-MPD routing is preserved and must be migrated explicitly before selecting both
+backends. Existing shared Snapcast groups are not automatically rerouted.
+
+To add playback to an installer-managed server-only host, use `--upgrade` with the desired
+components and `--alsa-device`. Existing playback device selections remain protected against
+accidental changes. The MPD compatibility input can subsequently be enabled/disabled in
+Settings → Outputs; pause MPD before changing that input or the Snapcast buffer. These changes
+briefly reconnect rooms and preserve the previous configuration if activation fails.
+
 ### Standalone player and optional USB standby
 
 On a separate Linux player, use the player entry point from the same checkout/release:
@@ -91,6 +106,14 @@ standby**. This shared policy applies to every explicitly bound player and refre
 15 seconds when Musicata is reachable. Status errors reset the idle timer and preserve the
 current USB state; playback on the player's assigned Snapcast stream restores the port.
 
+For a combined server/player host, `scripts/install.sh` accepts the same USB binding options
+with the selected `snapclient` role (or `mpd,snapclient`). Configure an API token after initial
+account setup, then pass the binding options on `--upgrade`. Both entry points use the same
+USB controller and recovery lifecycle. USB setup follows the verified playback installation
+as a separate phase: if USB setup fails, the working server/player remains installed and the
+error identifies the USB recovery step. Upgrades refresh an existing controller while
+preserving its bound port and token. The main entry point also accepts `--remove-usb`.
+
 Remove the controller with `sudo ./scripts/install-player.sh --remove-usb`. It stops the
 controller and restores the port before removing its binding; Snapclient remains installed.
 If restoration fails, the binding is retained for recovery. Configuration/service backups
@@ -101,8 +124,10 @@ Raspberry Pi OS uses the Debian dependency path, but isolated port switching dep
 Pi, hub and kernel. Automated tests cover non-PCI topology; physical Pi wake, standby and
 reboot validation remain outstanding. This controller supports Snapcast playback. Direct
 MPD ALSA playback is unsuitable: real MPD testing showed it loses playback intent when its
-device is disconnected. MPD → Snapserver FIFO → Snapclient has passed an isolated integration
-probe, but automatic provisioning of that route is still pending.
+device is disconnected. MPD → Snapserver FIFO → Snapclient is provisioned by the combined
+installer and has passed a real-process integration probe with ALSA null output. This covers
+Musicata-driven play/pause, stream assignment, guarded configuration changes and process
+restart; it does not establish physical audio, Docker audio permissions or system boot.
 
 ## HTTPS with Caddy
 

@@ -29,7 +29,7 @@ import uuid
 # Shared helpers also ship beside this entry point in release archives.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import player
-from usb_autowake import SnapcastStatus
+from usb_autowake import SnapcastStatus, MpdStatus
 
 REPO = 'damirkrstanovic/musicata'
 CONFIG = Path('/etc/musicata/install.json')
@@ -38,6 +38,8 @@ ML_DATA = Path('/var/lib/musicata-ml')
 UNIT = Path('/etc/systemd/system/musicata.service')
 MPD_UNIT = Path('/etc/systemd/system/musicata-mpd.service')
 MPD_CONFIG = Path('/etc/musicata-mpd.conf')
+MPD_ROOT = Path('/var/lib/musicata-mpd')
+PLAYBACK_OVERRIDE = Path('/etc/systemd/system/musicata.service.d/playback.conf')
 SNAPCLIENT_UNIT = Path('/etc/systemd/system/musicata-snapclient.service')
 DSP_CONFIG = Path('/etc/musicata-camilladsp.json')
 DSP_UNIT = Path('/etc/systemd/system/musicata-camilladsp.service')
@@ -102,6 +104,11 @@ def options(argv, saved=None):
     p.add_argument('--library', help='Local music directory (default /srv/music; network sources use the UI)')
     p.add_argument('--port', type=int)
     p.add_argument('--alsa-device', help='MPD ALSA device, e.g. plughw:CARD=Pro,DEV=0')
+    p.add_argument('--usb-device', help='Explicit sysfs USB device for optional standby binding')
+    p.add_argument('--musicata-url', help='Musicata HTTP(S) URL for USB policy')
+    p.add_argument('--token-file', help='Root-private Musicata API token file for USB policy')
+    p.add_argument('--confirm-isolated-usb', action='store_true', help='Confirm independently verified isolated DAC port control')
+    p.add_argument('--remove-usb', action='store_true', help='Restore the DAC port and remove its USB controller only')
     p.add_argument('--tls-domain', help='Public DNS hostname for optional Caddy HTTPS')
     p.add_argument('--tls-email', help='Optional ACME account email for Caddy')
     p.add_argument('--tls-dns', choices=['public','cloudflare'], help='ACME validation: public HTTP/TLS or Cloudflare DNS-01 for private LAN access')
@@ -120,8 +127,12 @@ def options(argv, saved=None):
         args['components'] = sorted(set(filter(None, args['components'].split(','))))
     result.update({k: v for k, v in args.items() if v is not None})
     if set(result['components']) - COMPONENTS: raise InstallError('Unknown component; use --help.')
-    if 'mpd' in result['components'] and 'snapclient' in result['components']:
-        raise InstallError('Direct MPD and Snapclient cannot own the same output; use one backend. MPD-to-Snapcast routing needs explicit setup.')
+    if result.get('usb_device') and ('snapclient' not in result['components'] or not all(result.get(key) for key in ('musicata_url', 'token_file', 'confirm_isolated_usb'))):
+        raise InstallError('USB standby requires Snapclient, --musicata-url, --token-file and --confirm-isolated-usb.')
+    if mpd_via_snapcast(result) and 'dsp' in result['components']:
+        raise InstallError('Direct MPD DSP routing cannot be combined with MPD through Snapcast.')
+    if saved and mpd_via_snapcast(saved) and not mpd_via_snapcast(result):
+        raise InstallError('Removing an existing MPD/Snapclient route needs explicit service migration; keep both components during upgrade.')
     if 'dsp' in result['components'] and (result['mode'] != 'native' or 'mpd' not in result['components']):
         raise InstallError('DSP preparation requires --mode native --with mpd,dsp and an installed CamillaDSP 4.1 executable.')
     if 'dsp' in result['components'] and result['alsa_device'] == 'default':
@@ -140,6 +151,8 @@ def options(argv, saved=None):
     if not re.fullmatch(r'/[A-Za-z0-9_./ -]+', library) or '..' in Path(library).parts or library == '/':
         raise InstallError('Library must be an absolute directory path without control characters, specifiers, or parent traversal.')
     if not re.fullmatch(r'[A-Za-z0-9_:,=.+-]+', result['alsa_device']): raise InstallError('Invalid ALSA device identifier.')
+    if 'snapclient' in result['components'] and not re.fullmatch(r'(?:plug)?hw:CARD=[A-Za-z0-9_-]+,DEV=[0-9]+', result['alsa_device']):
+        raise InstallError('Snapclient needs an explicit stable --alsa-device such as plughw:CARD=Pro,DEV=0; interactive setup lists available outputs.')
     if 'caddy' in result['components']:
         domain = result['tls_domain'].lower()
         labels = domain.split('.')
@@ -158,7 +171,8 @@ def options(argv, saved=None):
     if saved:
         for key in ('mode', 'user', 'library', 'port', 'alsa_device', 'components'):
             if result[key] != saved[key]:
-                if key=='components' and 'caddy' not in saved[key] and set(result[key])==set(saved[key])|{'caddy'}: continue
+                if key == 'alsa_device' and not {'mpd', 'snapclient'}.intersection(saved['components']) and {'mpd', 'snapclient'}.intersection(result['components']): continue
+                if key == 'components' and set(saved[key]).issubset(result[key]) and set(result[key]) - set(saved[key]) <= {'caddy', 'mpd', 'snapclient'}: continue
                 raise InstallError(f'Upgrade preserves {key}; deployment migrations are not automatic. Keep the saved installation settings.')
         if 'caddy' in saved['components']:
             for key in ('tls_domain','tls_email','tls_dns'):
@@ -579,15 +593,36 @@ WantedBy=multi-user.target
 ''')
 
 
-def configure_mpd(cfg, uid, gid):
-    root = Path('/var/lib/musicata-mpd')
+def mpd_via_snapcast(cfg):
+    return {'mpd', 'snapclient'}.issubset(cfg['components'])
+
+
+def configure_mpd(cfg, uid, gid, runtime_changes=None):
+    root = MPD_ROOT
+    fifo = root / 'snapcast.fifo' if mpd_via_snapcast(cfg) else None
+    expected = player.mpd_config(cfg['alsa_device'], root, 'dsp' in cfg['components'], fifo=fifo)
+    if fifo and MPD_CONFIG.exists() and MPD_CONFIG.read_text() != expected:
+        raise InstallError('Existing MPD routing differs from the shared Snapcast route. Preserve it and migrate explicitly before selecting both backends.')
+    if fifo and MPD_UNIT.exists() and MPD_UNIT.read_text() != player.mpd_unit(uid, gid, MPD_CONFIG):
+        raise InstallError('Existing MPD service is customized; reconcile it before enabling the shared Snapcast route.')
     for directory in (root,root/'music',root/'playlists'):
         directory.mkdir(exist_ok=True,parents=True);os.chown(directory,uid,gid);directory.chmod(0o750)
+    if fifo:
+        if fifo.is_symlink() or (fifo.exists() and not stat.S_ISFIFO(fifo.stat().st_mode)):
+            raise InstallError('The MPD Snapcast path must be a real FIFO; existing files are preserved.')
+        if not fifo.exists():
+            os.mkfifo(fifo, 0o600)
+            if runtime_changes is not None:
+                runtime_changes['mpd_fifo_created'] = True
+            os.chown(fifo, uid, gid)
     # Preserve customized routing and service overrides on upgrades.
     if not MPD_CONFIG.exists():
-        atomic_write(MPD_CONFIG, player.mpd_config(cfg['alsa_device'], root, 'dsp' in cfg['components']))
+        atomic_write(MPD_CONFIG, expected)
     if not MPD_UNIT.exists():
         atomic_write(MPD_UNIT, player.mpd_unit(uid, gid, MPD_CONFIG))
+    if cfg['mode'] == 'native':
+        atomic_write(PLAYBACK_OVERRIDE, '[Service]\nEnvironment=MUSICATA_MPD=127.0.0.1:6600\n'
+                     f'Environment=MUSICATA_PUBLIC_URL=http://127.0.0.1:{cfg["port"]}\n')
 
 
 def configure_snapclient(cfg, uid, gid):
@@ -604,6 +639,15 @@ def configure_snapclient(cfg, uid, gid):
             uid, gid, cfg['alsa_device'], '127.0.0.1', cfg['snapclient_id'], binary=binary))
 
 
+def verify_audio_access(cfg):
+    outputs = player.parse_outputs(run(['runuser', '-u', cfg['user'], '-G', 'audio', '--', 'aplay', '-l']))
+    selected = cfg['alsa_device']
+    if selected.startswith('hw:'):
+        selected = 'plug' + selected
+    if selected not in [output['device'] for output in outputs]:
+        raise InstallError('The playback service account cannot discover the selected ALSA output. Check DAC connection and audio permissions.')
+
+
 def enable_local_snapcast(cfg):
     """Persist an explicit fresh-install role choice after schema initialization."""
     command = ['systemctl', 'stop', 'musicata.service'] if cfg['mode'] == 'native' else ['docker', 'stop', 'musicata']
@@ -613,6 +657,8 @@ def enable_local_snapcast(cfg):
         raise InstallError('Musicata did not initialize its database; cannot configure local playback.')
     with sqlite3.connect(f'file:{database}?mode=rw', uri=True) as connection:
         connection.execute("INSERT INTO bool_settings (key,value) VALUES ('snapcast.enabled',1) ON CONFLICT(key) DO UPDATE SET value=1")
+        if mpd_via_snapcast(cfg):
+            connection.execute("INSERT INTO bool_settings (key,value) VALUES ('snapcast.mpd_enabled',1) ON CONFLICT(key) DO UPDATE SET value=1")
     run(['systemctl', 'start', 'musicata.service'] if cfg['mode'] == 'native' else ['docker', 'start', 'musicata'])
     healthy(f'http://127.0.0.1:{cfg["port"]}/')
 
@@ -625,6 +671,14 @@ def verify_snapclient(cfg, timeout=30):
             try:
                 observer.observe()
                 if observer.client_connected:
+                    if mpd_via_snapcast(cfg):
+                        if 'MPD' not in observer.stream_ids:
+                            raise InstallError('The running Musicata/Snapserver does not expose the provisioned MPD input. Use a release supporting MPD through Snapcast.')
+                        if observer.group_client_ids != [cfg['snapclient_id']]:
+                            raise InstallError('This player shares a Snapcast group with other rooms. Separate it before provisioning its MPD route; other rooms will not be rerouted automatically.')
+                        observer.request('Group.SetStream', {'id': observer.group_id, 'stream_id': 'MPD'})
+                        if observer.observe()[0] != 'MPD':
+                            raise InstallError('Snapclient did not retain its MPD stream assignment.')
                     return
             except (OSError, ValueError, KeyError):
                 pass
@@ -632,6 +686,21 @@ def verify_snapclient(cfg, timeout=30):
     finally:
         observer.close()
     raise InstallError('Snapclient did not connect. Check the selected DAC, audio permissions and musicata-snapclient journal.')
+
+
+def verify_mpd(timeout=15):
+    observer = MpdStatus('127.0.0.1', 6600)
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            try:
+                observer.observe()
+                return
+            except (OSError, ValueError):
+                time.sleep(1)
+    finally:
+        observer.close()
+    raise InstallError('MPD did not answer its playback protocol on localhost:6600; check musicata-mpd.service.')
 
 
 def docker_images(cfg, scratch):
@@ -670,6 +739,7 @@ def docker_command(cfg, uid, gid, component, image):
         argv += ['-v',cfg['library']+':/music:ro,z','-e',f'MUSICATA_ADDR={bind}:{cfg["port"]}']
         if 'ml' in cfg['components']: argv += ['-e','MUSICATA_ML_SERVICE_URL=http://127.0.0.1:3091']
         if 'mpd' in cfg['components']: argv += ['-e','MUSICATA_MPD=127.0.0.1:6600','-e',f'MUSICATA_PUBLIC_URL=http://127.0.0.1:{cfg["port"]}']
+        if mpd_via_snapcast(cfg): argv += ['-v', f'{MPD_ROOT}:{MPD_ROOT}:ro,z']
         argv += ['-v','/run/dbus:/run/dbus:ro']
     return argv + [image]
 
@@ -815,11 +885,16 @@ def preflight(cfg, saved, family):
     if not Path('/run/systemd/system').is_dir(): issues.append('A running systemd host is required (containers/chroots are not installation targets).')
     if cfg['upgrade'] and not saved: issues.append('No installer-managed installation found. Existing manual installs require migration; they will not be overwritten.')
     if saved and not cfg['upgrade']: issues.append('Already installed. Use --upgrade to preserve the saved deployment settings.')
+    for component, unit in [('mpd', MPD_UNIT), ('snapclient', SNAPCLIENT_UNIT)]:
+        if component in cfg['components'] and (not saved or component not in saved['components']) and unit.exists():
+            issues.append(f'An unmanaged musicata-{component}.service exists; it will not be adopted by adding this component.')
+    if saved and 'mpd' in cfg['components'] and 'mpd' not in saved['components']:
+        with socket.socket() as sock:
+            try: sock.bind(('0.0.0.0', 6600))
+            except OSError: issues.append('Port 6600 is occupied; the new local MPD service cannot be provisioned.')
     if not saved:
         if UNIT.exists() or succeeds(['systemctl','is-active','--quiet','musicata.service']): issues.append('An unmanaged native Musicata service exists. Refusing to overwrite it.')
         if DATA.exists() and any(DATA.iterdir()): issues.append('Existing /var/lib/musicata data has no installer manifest. Refusing to adopt it silently.')
-        if MPD_UNIT.exists() and 'mpd' in cfg['components']: issues.append('An unmanaged musicata-mpd.service exists.')
-        if SNAPCLIENT_UNIT.exists() and 'snapclient' in cfg['components']: issues.append('An unmanaged musicata-snapclient.service exists.')
         if shutil.which('docker'):
             for name in ['musicata']+(['musicata-ml'] if 'ml' in cfg['components'] else []):
                 if succeeds(['docker','inspect',name]): issues.append('Unmanaged container already exists: '+name)
@@ -861,7 +936,11 @@ def preflight(cfg, saved, family):
     for component, services in [('mpd',['mpd.service','mpd.socket']),('snapclient',['snapclient.service']),('snapcast',['snapserver.service','snapcast.service']),('airplay',['shairport-sync.service'])]:
         if component in cfg['components']:
             for service in services:
-                if succeeds(['systemctl','is-active','--quiet',service]): issues.append(f'{service} already runs outside Musicata. Resolve the service/port conflict before installing this component.')
+                if succeeds(['systemctl','is-active','--quiet',service]) or succeeds(['systemctl','is-enabled','--quiet',service]): issues.append(f'{service} is active/enabled outside Musicata. Resolve the service/port conflict before installing this component.')
+    if 'snapclient' in cfg['components'] and 'mpd' not in cfg['components']:
+        for service in ('mpd.service', 'mpd.socket', 'musicata-mpd.service'):
+            if succeeds(['systemctl','is-active','--quiet',service]) or succeeds(['systemctl','is-enabled','--quiet',service]):
+                issues.append(f'{service} can claim audio outside this Snapclient setup; resolve output ownership before adding playback or USB control.')
     if 'dsp' in cfg['components']:
         if not shutil.which('camilladsp'): issues.append('Install CamillaDSP 4.1 before selecting dsp; no third-party packages are downloaded.')
         elif not re.search(r'\b4\.1\.',run(['camilladsp','--version'])): issues.append('DSP preparation supports CamillaDSP 4.1.x.')
@@ -937,7 +1016,7 @@ def deploy(cfg, saved, family, missing):
         backup = BACKUPS/stamp
         backup.mkdir(parents=True,mode=0o700)
         backup.chmod(0o700)
-        managed_files = [CONFIG,UNIT,MPD_UNIT,MPD_CONFIG,NSS,AVAHI] + ([SNAPCLIENT_UNIT] if "snapclient" in cfg["components"] else []) + ([DSP_CONFIG,DSP_UNIT,DSP_MODULE] if "dsp" in cfg["components"] else []) + ([CADDY_CONFIG,CADDY_UNIT,CADDY_OVERRIDE,CADDY_ENV,CADDY_BINARY] if 'caddy' in cfg['components'] else [])
+        managed_files = [CONFIG,UNIT,MPD_UNIT,MPD_CONFIG,NSS,AVAHI] + ([PLAYBACK_OVERRIDE] if 'mpd' in cfg['components'] and cfg['mode']=='native' else []) + ([SNAPCLIENT_UNIT] if "snapclient" in cfg["components"] else []) + ([DSP_CONFIG,DSP_UNIT,DSP_MODULE] if "dsp" in cfg["components"] else []) + ([CADDY_CONFIG,CADDY_UNIT,CADDY_OVERRIDE,CADDY_ENV,CADDY_BINARY] if 'caddy' in cfg['components'] else [])
         snapclient_was_active = 'snapclient' in cfg['components'] and succeeds(['systemctl','is-active','--quiet','musicata-snapclient.service'])
         snapclient_was_enabled = 'snapclient' in cfg['components'] and succeeds(['systemctl','is-enabled','--quiet','musicata-snapclient.service'])
         mpd_was_active = 'mpd' in cfg['components'] and succeeds(['systemctl','is-active','--quiet','musicata-mpd.service'])
@@ -983,8 +1062,11 @@ def deploy(cfg, saved, family, missing):
                 if saved and not caddy_managed: expire_http_sessions()
                 configure_caddy(cfg,uid,gid)
             if 'dsp' in cfg['components']: configure_dsp(cfg,uid,gid,runtime_changes)
-            if 'mpd' in cfg['components']: configure_mpd(cfg,uid,gid)
-            if 'snapclient' in cfg['components']: configure_snapclient(cfg,uid,gid)
+            if 'mpd' in cfg['components']: configure_mpd(cfg,uid,gid,runtime_changes)
+            if 'snapclient' in cfg['components']:
+                if not saved or 'snapclient' not in saved['components']:
+                    verify_audio_access(cfg)
+                configure_snapclient(cfg,uid,gid)
             if cfg['mode'] == 'native':
                 destination = CURRENT.parent/(version+'-'+stamp)
                 CURRENT.parent.mkdir(parents=True,exist_ok=True)
@@ -1008,13 +1090,17 @@ def deploy(cfg, saved, family, missing):
                     run(docker_command(cfg,uid,gid,component,cfg['images'][component]))
             healthy(f'http://127.0.0.1:{cfg["port"]}/')
             if 'snapclient' in cfg['components']:
-                if not saved:
+                new_snapclient = not saved or 'snapclient' not in saved['components']
+                new_mpd_route = mpd_via_snapcast(cfg) and (not saved or not mpd_via_snapcast(saved))
+                if new_snapclient or new_mpd_route:
                     enable_local_snapcast(cfg)
                 run(['systemd-analyze','verify',SNAPCLIENT_UNIT])
                 snapclient_activation_attempted = True
                 run(['systemctl','enable','--now','musicata-snapclient.service'])
-                if not saved:
+                if new_snapclient or new_mpd_route:
                     verify_snapclient(cfg)
+            if 'mpd' in cfg['components']:
+                verify_mpd()
             if 'ml' in cfg['components']:
                 print('Waiting for ML model download/startup (up to 5 minutes)…',flush=True)
                 healthy('http://127.0.0.1:3091/health',300)
@@ -1026,7 +1112,7 @@ def deploy(cfg, saved, family, missing):
                     run(['systemctl','restart','musicata-caddy.service'])
                 print('Waiting for Caddy HTTPS and a trusted certificate (up to 3 minutes)…',flush=True)
                 healthy_tls(cfg['tls_domain'])
-            atomic_write(CONFIG,json.dumps({k:v for k,v in cfg.items() if k not in ('check','dry_run','yes','upgrade','tls_dns_token_file') and not k.startswith('_')},indent=2)+'\n',0o600)
+            atomic_write(CONFIG,json.dumps({k:v for k,v in cfg.items() if k not in ('check','dry_run','yes','upgrade','tls_dns_token_file','usb_device','musicata_url','token_file','confirm_isolated_usb','remove_usb') and not k.startswith('_')},indent=2)+'\n',0o600)
         except Exception as original_error:
             print('Activation failed. Recovering Musicata files/state; dependency packages are retained. Backup:',backup,file=sys.stderr,flush=True)
             recovery_errors = []
@@ -1048,6 +1134,8 @@ def deploy(cfg, saved, family, missing):
             if mpd_activation_attempted:
                 recover('stop MPD',lambda:run(['systemctl','stop','musicata-mpd.service']))
                 recover('restore MPD startup',lambda:run(['systemctl','enable' if mpd_was_enabled else 'disable','musicata-mpd.service']))
+            if runtime_changes.get('mpd_fifo_created') and not recovery_errors:
+                recover('remove new MPD FIFO', lambda: (MPD_ROOT / 'snapcast.fifo').unlink(missing_ok=True))
             if not saved:
                 succeeds(['systemctl','disable','musicata.service'])
             if runtime_changes.get('loopback_loaded'):
@@ -1106,11 +1194,11 @@ def deploy(cfg, saved, family, missing):
 
 
 def choose_local_playback(cfg):
-    choice = input('Playback on this computer: [s] server only, [p] Snapclient (recommended player), [m] MPD compatibility [s]: ').strip().lower()
+    choice = input('Playback on this computer: [s] server only, [p] Snapclient (recommended), [m] direct MPD, [r] MPD through Snapcast (USB standby compatible) [s]: ').strip().lower()
     if choice in ('', 's'):
         return
-    if choice not in ('m', 'p'):
-        raise InstallError('Choose s, p or m; no installation changes were made.')
+    if choice not in ('m', 'p', 'r'):
+        raise InstallError('Choose s, p, m or r; no installation changes were made.')
     try:
         try:
             outputs = player.parse_outputs(run(['aplay', '-l']))
@@ -1126,12 +1214,36 @@ def choose_local_playback(cfg):
     if not selection.isdigit() or not 1 <= int(selection) <= len(outputs):
         raise InstallError('No output selected; no installation changes were made.')
     cfg['alsa_device'] = outputs[int(selection) - 1]['device']
-    cfg['components'] = sorted(set(cfg['components']) | {'mpd' if choice == 'm' else 'snapclient'})
+    cfg['components'] = sorted(set(cfg['components']) | ({'mpd', 'snapclient'} if choice == 'r' else {'mpd' if choice == 'm' else 'snapclient'}))
+
+
+def configure_main_usb(cfg):
+    if not cfg.get('usb_device') and not Path('/etc/musicata/usb-autowake.json').exists():
+        return
+    # Import lazily: both entry points reuse the same binding and recovery lifecycle.
+    import install_player
+    try:
+        if cfg.get('usb_device'):
+            binding = dict(cfg, server='127.0.0.1', output=cfg['alsa_device'], identity=cfg['snapclient_id'])
+            files = install_player.usb_files(binding)
+        else:
+            files = {install_player.USB_CODE: (Path(__file__).with_name('usb_autowake.py').read_text(), 0o644)}
+        backup = BACKUPS / ('usb-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+        install_player.apply_usb(files, backup)
+    except Exception as error:
+        raise InstallError('Musicata/playback installation completed, but optional USB setup failed; '
+                           'review its retained binding and backup before retrying: ' + str(error)) from error
 
 
 def main(argv=None):
     saved = json.loads(CONFIG.read_text()) if CONFIG.exists() else None
     cfg = options(sys.argv[1:] if argv is None else argv,saved)
+    if cfg['remove_usb']:
+        if cfg['check'] or cfg['dry_run']:
+            print('Would restore the bound USB port and remove only the USB controller.')
+            return 0
+        import install_player
+        return install_player.main(['--remove-usb'])
     if not saved and not cfg['yes'] and not cfg['check'] and not cfg['dry_run'] and sys.stdin.isatty() and not {'mpd','snapclient'}.intersection(cfg['components']):
         choose_local_playback(cfg)
     family = distro_family(parse_os_release(Path('/etc/os-release').read_text()))
@@ -1170,6 +1282,7 @@ def main(argv=None):
         current_saved = json.loads(CONFIG.read_text()) if CONFIG.exists() else None
         if current_saved != saved: raise InstallError('Installation changed while reviewing the plan; rerun the installer.')
         deploy(cfg,saved,family,missing)
+        configure_main_usb(cfg)
     return 0
 
 

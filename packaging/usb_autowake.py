@@ -204,12 +204,17 @@ class SnapcastStatus(StatusConnection):
         self.client_id = client_id
         self.request_id = 0
         self.client_connected = False
+        self.group_id = None
+        self.group_client_ids = []
+        self.stream_ids = []
 
-    def observe(self):
+    def request(self, method, params=None):
         try:
             self.begin()
             self.request_id += 1
-            request = {'id': self.request_id, 'jsonrpc': '2.0', 'method': 'Server.GetStatus'}
+            request = {'id': self.request_id, 'jsonrpc': '2.0', 'method': method}
+            if params is not None:
+                request['params'] = params
             self.send((json.dumps(request) + '\r\n').encode())
             while True:
                 reply = json.loads(self.line())
@@ -219,17 +224,27 @@ class SnapcastStatus(StatusConnection):
                     continue
                 if reply['id'] != self.request_id or reply.get('error'):
                     raise ValueError('Snapcast response ID or server error')
-                server = reply['result']['server']
-                groups = [g for g in server['groups'] if any(
-                    c['id'] == self.client_id for c in g['clients'])]
-                if len(groups) != 1:
-                    raise ValueError('Player must belong to exactly one Snapcast group')
-                self.client_connected = any(c['id'] == self.client_id and c.get('connected') is True
-                                            for c in groups[0]['clients'])
-                streams = [s for s in server['streams'] if s['id'] == groups[0]['stream_id']]
-                if len(streams) != 1 or streams[0]['status'] not in ('playing', 'idle'):
-                    raise ValueError('Assigned Snapcast stream state is unknown')
-                return streams[0]['id'], streams[0]['status']
+                return reply['result']
+        except Exception:
+            self.close()
+            raise
+
+    def observe(self):
+        try:
+            server = self.request('Server.GetStatus')['server']
+            groups = [g for g in server['groups'] if any(
+                c['id'] == self.client_id for c in g['clients'])]
+            if len(groups) != 1:
+                raise ValueError('Player must belong to exactly one Snapcast group')
+            self.client_connected = any(c['id'] == self.client_id and c.get('connected') is True
+                                        for c in groups[0]['clients'])
+            self.group_id = groups[0].get('id')
+            self.group_client_ids = [c['id'] for c in groups[0]['clients']]
+            self.stream_ids = [s['id'] for s in server['streams']]
+            streams = [s for s in server['streams'] if s['id'] == groups[0]['stream_id']]
+            if len(streams) != 1 or streams[0]['status'] not in ('playing', 'idle'):
+                raise ValueError('Assigned Snapcast stream state is unknown')
+            return streams[0]['id'], streams[0]['status']
         except Exception:
             self.close()
             raise

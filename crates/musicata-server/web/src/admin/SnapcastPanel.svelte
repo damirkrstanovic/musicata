@@ -52,6 +52,7 @@
 
   async function update(
     patch: {
+      mpd_enabled?: boolean;
       buffer_ms?: number;
       enabled?: boolean;
       auth_enabled?: boolean;
@@ -223,6 +224,17 @@
         </div>
       </label>
     {/if}
+
+    <div class="admin-subhead">MPD compatibility input</div>
+    <p class="admin-hint">Use the installer to route local MPD through Snapcast. Snapclient plays
+      the audio and can wake its USB DAC. Select MPD as the input for the desired rooms.
+      Changing this setting briefly reconnects the rooms.</p>
+    <label class="toggle-row">
+      <input data-mpd-input type="checkbox" checked={status.mpd_enabled}
+        disabled={busy || !status.running || !status.manage_server}
+        onchange={(e) => update({mpd_enabled: e.currentTarget.checked}, "MPD input updated.")} />
+      <span>Accept local MPD audio</span>
+    </label>
 
     <!-- Cast TO Musicata: snapserver spawns shairport-sync / librespot and exposes each as a
          stream rooms can be switched to. The phone controls playback; Musicata just routes it. -->

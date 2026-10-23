@@ -335,6 +335,7 @@ export const api = {
   usbWakePolicy: () => getJson<UsbWakePolicy>("/api/snapcast/usb-wake"),
   updateUsbWakePolicy: (policy: UsbWakePolicy) => sendJson<UsbWakePolicy>("/api/snapcast/usb-wake", "PATCH", policy),
   updateSnapcast: (update: {
+    mpd_enabled?: boolean;
     buffer_ms?: number;
     enabled?: boolean;
     auth_enabled?: boolean;

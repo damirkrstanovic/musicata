@@ -11,6 +11,57 @@ sys.modules[spec.name] = m
 spec.loader.exec_module(m)
 
 class PlanningTests(unittest.TestCase):
+    def test_audio_permission_check_uses_service_account_and_selected_card(self):
+        from unittest.mock import patch
+        cfg = m.options(['--with', 'snapclient', '--alsa-device', 'plughw:CARD=Pro,DEV=0'])
+        with patch.object(m, 'run', return_value='card 2: Pro [USB DAC], device 0: Audio [Audio]\n') as run:
+            m.verify_audio_access(cfg)
+        self.assertEqual(run.call_args.args[0], ['runuser', '-u', cfg['user'], '-G', 'audio', '--', 'aplay', '-l'])
+        with patch.object(m, 'run', return_value='card 0: HDMI [HDMI], device 3: Audio [Audio]\n'):
+            with self.assertRaises(m.InstallError):
+                m.verify_audio_access(cfg)
+
+    def test_new_snapclient_requires_stable_explicit_output(self):
+        for device in ('default', 'hw:0,0'):
+            with self.assertRaises(m.InstallError):
+                m.options(['--with', 'snapclient', '--alsa-device', device])
+
+    def test_provisioning_does_not_reroute_other_rooms_in_a_shared_group(self):
+        from unittest.mock import Mock, patch
+        cfg = m.options(['--with', 'mpd,snapclient', '--alsa-device', 'plughw:CARD=Pro,DEV=0'])
+        cfg['snapclient_id'] = 'selected'
+        observer = Mock(client_connected=True, stream_ids=['Musicata', 'MPD'], group_client_ids=['selected', 'other'])
+        with patch.object(m, 'SnapcastStatus', return_value=observer):
+            with self.assertRaisesRegex(m.InstallError, 'other rooms'):
+                m.verify_snapclient(cfg)
+        observer.request.assert_not_called()
+        observer.close.assert_called_once()
+
+    def test_main_usb_selection_requires_snapclient_and_explicit_binding_inputs(self):
+        args = ['--with', 'snapclient', '--usb-device', '/sys/bus/usb/devices/1-1',
+                '--musicata-url', 'https://musicata.example.org', '--token-file', '/root/token',
+                '--confirm-isolated-usb', '--alsa-device', 'plughw:CARD=Pro,DEV=0']
+        cfg = m.options(args)
+        self.assertEqual(cfg['usb_device'], '/sys/bus/usb/devices/1-1')
+        with self.assertRaises(m.InstallError):
+            m.options(['--with', 'mpd'] + args[2:])
+
+    def test_upgrade_can_add_playback_and_select_output_but_not_change_existing_output(self):
+        saved = m.options(['--mode', 'native'])
+        upgraded = m.options(['--upgrade', '--with', 'mpd,snapclient', '--alsa-device', 'plughw:CARD=Pro,DEV=0'], saved)
+        self.assertTrue(m.mpd_via_snapcast(upgraded))
+        with self.assertRaises(m.InstallError):
+            m.options(['--upgrade', '--alsa-device', 'plughw:CARD=Other,DEV=0'], upgraded)
+
+    def test_mpd_and_snapclient_select_shared_transport_without_dac_competition(self):
+        cfg = m.options(['--with', 'mpd,snapclient', '--alsa-device', 'plughw:CARD=Pro,DEV=0'])
+        self.assertTrue(m.mpd_via_snapcast(cfg))
+        command = m.docker_command(cfg, 1000, 1000, 'server', 'image')
+        self.assertIn('/var/lib/musicata-mpd:/var/lib/musicata-mpd:ro,z', command)
+        self.assertFalse(m.mpd_via_snapcast(m.options(['--with', 'mpd'])))
+        with self.assertRaises(m.InstallError):
+            m.options(['--mode', 'native', '--with', 'mpd,snapclient,dsp', '--alsa-device', 'plughw:CARD=Pro,DEV=0'])
+
     def test_interactive_snapclient_selection_does_not_enable_mpd(self):
         from unittest.mock import patch
         cfg = m.options([])
@@ -381,6 +432,66 @@ class PlanningTests(unittest.TestCase):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_main_usb_reuses_standalone_binding_with_local_player_identity(self):
+        from unittest.mock import Mock, patch
+        module = Mock()
+        cfg = dict(self.cfg, usb_device='/sys/bus/usb/devices/1-1', snapclient_id='stable-local',
+                   musicata_url='https://musicata.example.org', token_file='/root/token',
+                   confirm_isolated_usb=True)
+        with patch.dict(sys.modules, {'install_player': module}):
+            m.configure_main_usb(cfg)
+        binding = module.usb_files.call_args.args[0]
+        self.assertEqual(binding['server'], '127.0.0.1')
+        self.assertEqual(binding['identity'], 'stable-local')
+        self.assertEqual(binding['output'], cfg['alsa_device'])
+        module.apply_usb.assert_called_once()
+
+    def test_existing_server_upgrade_does_not_adopt_unmanaged_player_unit(self):
+        from unittest.mock import patch
+        saved = dict(self.cfg)
+        self.cfg['components'] = ['snapclient']
+        unit = self.root / 'unmanaged-snapclient.service'
+        unit.write_text('user unit')
+        with patch.object(m, 'SNAPCLIENT_UNIT', unit):
+            issues = m.preflight(self.cfg, saved, 'debian')
+        self.assertTrue(any('unmanaged musicata-snapclient.service' in issue for issue in issues))
+
+    def test_shared_mpd_configuration_creates_fifo_without_alsa_output(self):
+        import stat
+        self.cfg['components'] = ['mpd', 'snapclient']
+        changes = {}
+        m.configure_mpd(self.cfg, 1000, 1000, changes)
+        self.assertTrue(stat.S_ISFIFO((m.MPD_ROOT / 'snapcast.fifo').stat().st_mode))
+        self.assertTrue(changes['mpd_fifo_created'])
+        self.assertIn('type "fifo"', m.MPD_CONFIG.read_text())
+        self.assertNotIn('type "alsa"', m.MPD_CONFIG.read_text())
+        self.assertIn('MUSICATA_MPD=127.0.0.1:6600', m.PLAYBACK_OVERRIDE.read_text())
+        m.configure_mpd(self.cfg, 1000, 1000, {})
+
+    def test_shared_mpd_refuses_to_overwrite_custom_direct_routing(self):
+        self.cfg['components'] = ['mpd', 'snapclient']
+        m.MPD_CONFIG.parent.mkdir(parents=True)
+        m.MPD_CONFIG.write_text('custom ALSA configuration')
+        with self.assertRaisesRegex(m.InstallError, 'Existing MPD routing'):
+            m.configure_mpd(self.cfg, 1000, 1000, {})
+        self.assertEqual(m.MPD_CONFIG.read_text(), 'custom ALSA configuration')
+        self.assertFalse((m.MPD_ROOT / 'snapcast.fifo').exists())
+
+    def test_snapclient_can_be_added_to_existing_server_and_is_verified(self):
+        from unittest.mock import patch
+        saved = dict(self.cfg)
+        self.cfg['components'] = ['snapclient']
+        self.cfg['snapclient_id'] = 'fixture-stable-id'
+        m.UNIT.parent.mkdir(parents=True)
+        m.UNIT.write_text('preserve server unit')
+        with patch.object(m, 'SNAPCLIENT_UNIT', self.root/'etc/snapclient.service'), \
+                patch.object(m.shutil, 'which', return_value='/usr/bin/snapclient'), \
+                patch.object(m, 'enable_local_snapcast') as enable, patch.object(m, 'verify_snapclient') as verify:
+            m.deploy(self.cfg, saved, 'debian', [])
+        enable.assert_called_once()
+        verify.assert_called_once()
+        self.assertEqual(m.UNIT.read_text(), 'preserve server unit')
+
     def test_local_snapclient_install_sets_identity_and_checks_connection(self):
         from unittest.mock import patch
         self.cfg['components'] = ['snapclient']
@@ -465,6 +576,10 @@ class DeploymentTests(unittest.TestCase):
         self.stack.enter_context(patch.object(m,'run',side_effect=lambda a,**kw:self.commands.append(list(map(str,a))) or ''))
         self.stack.enter_context(patch.object(m.pwd,'getpwnam',return_value=m.pwd.struct_passwd(("musicata","x",os.getuid(),os.getgid(),"","/nonexistent","/usr/sbin/nologin"))))
         self.health=self.stack.enter_context(patch.object(m,'healthy'))
+        self.mpd_health=self.stack.enter_context(patch.object(m,'verify_mpd'))
+        self.audio_access=self.stack.enter_context(patch.object(m,'verify_audio_access'))
+        self.stack.enter_context(patch.object(m,'MPD_ROOT',self.root/'mpd-state'))
+        self.stack.enter_context(patch.object(m,'PLAYBACK_OVERRIDE',self.root/'etc/musicata.service.d/playback.conf'))
         self.stack.enter_context(patch.object(m,'verify_loopback_backend',create=True))
         self.tls_health=self.stack.enter_context(patch.object(m,'healthy_tls',create=True))
         self.cfg=m.options(['--mode','native','--library',str(self.root/'music')])
