@@ -78,13 +78,44 @@ On a separate Linux player, use the player entry point from the same checkout/re
 sudo ./scripts/install-player.sh --server musicata.local
 ```
 
-It selects an ALSA output, creates a stable player identity, installs only the Snapclient
+Snapclient is the recommended default. It selects an ALSA output, creates a stable player identity, installs only the Snapclient
 dependencies, and verifies the connection to Snapserver. It does not install another Musicata
 server, Snapserver, or MPD. On Debian/Ubuntu, Fedora and Arch it installs a non-root systemd
 service with boot activation and retry. Generic/non-systemd Linux receives a manual startup
 command and needs an existing Snapclient binary. `--check` checks installation prerequisites,
 not runtime player health;
 `--output 'plughw:CARD=Pro,DEV=0' --yes` supports unattended provisioning.
+
+For a standalone MPD compatibility player, select MPD interactively or pass `--backend mpd`.
+Use a private, root-owned file containing a Musicata administrator API token (mode `0600`):
+
+```sh
+sudo ./scripts/install-player.sh --backend mpd \
+  --output 'plughw:CARD=Pro,DEV=0' \
+  --mpd-bind 192.168.1.50 --confirm-trusted-network \
+  --musicata-url https://musicata.example.org --token-file /root/musicata-player.token
+```
+
+Replace the bind address with this player's private IPv4 address reachable from Musicata.
+MPD defaults to `127.0.0.1:6600` for a server on the same host. The current Musicata MPD
+client has no password authentication; remote binding therefore requires explicit trusted-network
+confirmation. Restrict port 6600 to the Musicata host using your existing firewall/network policy;
+do not expose it to untrusted networks. The installer neither opens firewall ports nor binds all
+interfaces. Musicata's advertised/public URL must also be reachable from the player for audio fetches.
+
+This installs only MPD and audio prerequisites, creates `musicata-mpd.service` and
+`/etc/musicata-mpd.conf`, checks MPD locally, registers its address in Musicata and waits for
+Musicata to report it online. No audible playback is started. The API token is used for the
+registration operation and is not saved. Reruns reuse the registered address and preserve state;
+provide the token file again. Modified managed files are rejected rather than overwritten.
+Changing backend, bind address or Musicata server requires explicit migration; this avoids
+leaving a duplicate/stale registration. Local activation failures restore previous managed files;
+registration failure retains the working local service and reports how to retry (an offline
+registration may remain). Generic/non-systemd Linux prints a configuration and launch command
+for an existing MPD binary; setup and registration remain manual in that fallback.
+
+Standalone direct MPD rejects USB auto-disconnect. For MPD with USB standby, use the combined
+server's MPD → Snapcast route and a Snapclient player instead.
 
 USB standby is optional and disabled by default. First independently verify that switching
 the DAC's port affects only that device; the presence of a kernel `disable` attribute does
@@ -120,9 +151,10 @@ If restoration fails, the binding is retained for recovery. Configuration/servic
 are under `/var/backups/musicata-player`; check `journalctl -u musicata-usb-autowake` and
 `journalctl -u musicata-snapclient` when diagnosing failures.
 
-Raspberry Pi OS uses the Debian dependency path, but isolated port switching depends on the
-Pi, hub and kernel. Automated tests cover non-PCI topology; physical Pi wake, standby and
-reboot validation remain outstanding. This controller supports Snapcast playback. Direct
+ARM coverage and Raspberry Pi support are tracked separately in
+[#66](https://github.com/damirkrstanovic/musicata/issues/66), including package/runtime coverage,
+Pi/hub/kernel combinations, physical wake/standby and reboot. No Raspberry Pi hardware
+compatibility is claimed here. This controller supports Snapcast playback. Direct
 MPD ALSA playback is unsuitable: real MPD testing showed it loses playback intent when its
 device is disconnected. MPD → Snapserver FIFO → Snapclient is provisioned by the combined
 installer and has passed a real-process integration probe with ALSA null output. This covers

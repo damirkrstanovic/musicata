@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Install a standalone Musicata Snapclient player without installing a server."""
+"""Install a standalone Snapclient (recommended) or MPD compatibility player."""
 import argparse
 import datetime
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -13,15 +14,24 @@ import shlex
 import shutil
 import sys
 import tempfile
+import time
+import socket
+import urllib.request
+import urllib.parse
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import install as installer
 import player
-from usb_autowake import SnapcastStatus, UsbPort, PolicyClient, private_read
+from usb_autowake import SnapcastStatus, MpdStatus, UsbPort, PolicyClient, private_read
 
 CONFIG = Path('/etc/musicata/player.json')
 UNIT = Path('/etc/systemd/system/musicata-snapclient.service')
+MPD_UNIT = Path('/etc/systemd/system/musicata-mpd.service')
+MPD_CONFIG = Path('/etc/musicata-mpd.conf')
+MPD_ROOT = Path('/var/lib/musicata-mpd')
+LOCK = Path('/run/lock/musicata-install.lock')
+BACKUPS = Path('/var/backups/musicata-player')
 USB_UNIT = Path('/etc/systemd/system/musicata-usb-autowake.service')
 USB_CONFIG = Path('/etc/musicata/usb-autowake.json')
 USB_CODE = Path('/opt/musicata/player/usb_autowake.py')
@@ -30,17 +40,22 @@ USB_TOKEN = Path('/etc/musicata/usb-autowake.token')
 
 def options(argv, saved=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--backend', choices=('snapclient', 'mpd'))
+    parser.add_argument('--mpd-bind', help='MPD local IPv4 address; default loopback, port 6600')
+    parser.add_argument('--confirm-trusted-network', action='store_true', default=None,
+                        help='Acknowledge unauthenticated MPD control on an isolated trusted network')
     parser.add_argument('--server', help='Snapserver host (port 1704; control port 1705)')
     parser.add_argument('--output', help='Stable ALSA output; otherwise select interactively')
     parser.add_argument('--user', help='Non-root playback account (default: musicata)')
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--yes', action='store_true')
     parser.add_argument('--usb-device', help='Explicit sysfs USB device to bind (optional)')
-    parser.add_argument('--musicata-url', help='Musicata HTTP(S) URL for USB policy')
+    parser.add_argument('--musicata-url', help='Musicata HTTP(S) URL for registration or USB policy')
     parser.add_argument('--token-file', help='Private root-owned Musicata API token file')
     parser.add_argument('--confirm-isolated-usb', action='store_true', help='Confirm this DAC port has independently verified isolated control')
     parser.add_argument('--remove-usb', action='store_true', help='Stop USB control, restore the DAC port, and remove only its managed files')
-    result = {'server': '', 'output': '', 'identity': '', 'user': 'musicata'}
+    result = {'server': '', 'output': '', 'identity': '', 'user': 'musicata',
+              'backend': 'snapclient', 'mpd_bind': '127.0.0.1', 'confirm_trusted_network': False}
     result.update(saved or {})
     result.update({key: value for key, value in vars(parser.parse_args(argv)).items() if value is not None})
     if result['server']:
@@ -52,11 +67,37 @@ def options(argv, saved=None):
         raise ValueError('Use a non-root playback account')
     if saved and result['user'] != saved['user']:
         raise ValueError('Changing the existing service account requires migration')
+    if saved and result['backend'] != saved.get('backend', 'snapclient'):
+        raise ValueError('Changing playback backend requires migration')
+    if result['backend'] == 'mpd':
+        address = ipaddress.IPv4Address(result['mpd_bind'])
+        private = any(address in ipaddress.IPv4Network(network) for network in
+                      ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
+        if not address.is_loopback and not private:
+            raise ValueError('MPD requires a specific loopback or private IPv4 address')
+        if not address.is_loopback and not result['confirm_trusted_network']:
+            raise ValueError('Remote MPD requires --confirm-trusted-network; control is unauthenticated')
+        if address.is_loopback and result.get('musicata_url'):
+            host = urllib.parse.urlsplit(result['musicata_url']).hostname
+            try:
+                local_server = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                local_server = host == 'localhost'
+            if not local_server:
+                raise ValueError('A remote Musicata server requires an explicit reachable --mpd-bind and --confirm-trusted-network; loopback would address the server itself')
+        if result.get('usb_device'):
+            raise ValueError('Direct MPD cannot use USB disconnect automation; use MPD through Snapcast on the server')
+        if saved and (result['mpd_bind'] != saved.get('mpd_bind') or
+                      result.get('musicata_url') != saved.get('musicata_url')):
+            raise ValueError('Changing the MPD address or Musicata server requires migration')
     return result
 
 
-def dependencies(family):
+def dependencies(family, backend='snapclient'):
     base = ['alsa-utils', 'ca-certificates']
+    if backend == 'mpd':
+        accounts = {'debian': 'passwd', 'fedora': 'shadow-utils', 'arch': 'shadow'}
+        return base + ['mpd', 'util-linux', accounts[family]] if family in accounts else []
     if family == 'debian':
         return base + ['snapclient', 'util-linux', 'passwd']
     build = ['git', 'cmake', 'make', 'pkgconf']
@@ -68,6 +109,14 @@ def dependencies(family):
 
 
 def generic_command(cfg):
+    if cfg.get('backend') == 'mpd':
+        binary = shutil.which('mpd')
+        if not binary:
+            raise installer.InstallError('Generic Linux needs an existing MPD executable; see docs/install-linux.md.')
+        print('Save this configuration with writable music/playlists/state paths for your account:')
+        print(player.mpd_config(cfg['output'], root=MPD_ROOT, bind=cfg['mpd_bind']))
+        print('Register the reachable address in Musicata after configuring and starting MPD.')
+        return shlex.join([binary, '--no-daemon', str(MPD_CONFIG)])
     binary = shutil.which('snapclient')
     if not binary:
         raise installer.InstallError('Generic Linux needs an existing Snapclient executable. Install Snapcast 0.35.0 with BUILD_SERVER=OFF; see docs/install-linux.md.')
@@ -75,7 +124,20 @@ def generic_command(cfg):
 
 
 def verify(cfg):
-    import time
+    if cfg.get('backend') == 'mpd':
+        observer = MpdStatus(cfg['mpd_bind'], 6600)
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                try:
+                    if observer.observe() is not None:
+                        return
+                except (OSError, ValueError):
+                    pass
+                time.sleep(1)
+        finally:
+            observer.close()
+        raise installer.InstallError('MPD did not answer on the configured address; check musicata-mpd.service.')
     observer = SnapcastStatus(cfg['server'], 1705, cfg['identity'])
     deadline = time.monotonic() + 30
     try:
@@ -90,6 +152,48 @@ def verify(cfg):
     finally:
         observer.close()
     raise installer.InstallError('Player did not connect to Snapserver. Check server availability, ports 1704/1705, DAC permissions and the musicata-snapclient journal.')
+
+
+def playback_files(cfg, uid, gid):
+    if cfg['backend'] == 'mpd':
+        return {MPD_UNIT: (player.mpd_unit(uid, gid, MPD_CONFIG), 0o644),
+                MPD_CONFIG: (player.mpd_config(cfg['output'], root=MPD_ROOT, bind=cfg['mpd_bind']), 0o644)}
+    return {UNIT: (player.snapclient_unit(uid, gid, cfg['output'], cfg['server'],
+                  cfg['identity'], binary=shutil.which('snapclient')), 0o644)}
+
+
+def registration_request(cfg, token, payload=None):
+    client = PolicyClient(cfg['musicata_url'], token)
+    url = client.url.removesuffix('/api/snapcast/usb-wake') + '/api/players'
+    request = urllib.request.Request(url,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+    with client.opener.open(request, timeout=5) as response:
+        data = response.read(262145)
+    if len(data) > 262144:
+        raise ValueError('Musicata player response exceeded byte limit')
+    result = json.loads(data)
+    if payload is None:
+        if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
+            raise ValueError('Invalid Musicata player list')
+    elif not isinstance(result, dict) or not isinstance(result.get('id'), str):
+        raise ValueError('Invalid Musicata registration response')
+    return result
+
+
+def register_mpd(cfg, token):
+    address = cfg['mpd_bind'] + ':6600'
+    players = registration_request(cfg, token)
+    existing = next((item for item in players if item.get('kind') == 'mpd' and item.get('address') == address), None)
+    registered = existing or registration_request(cfg, token, {'kind': 'mpd', 'address': address,
+                                                               'name': 'MPD (' + address + ')'})
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if any(item.get('id') == registered['id'] and item.get('online') is True
+               for item in registration_request(cfg, token)):
+            return
+        time.sleep(1)
+    raise installer.InstallError('MPD is registered but Musicata cannot reach it. Check bind address, routing and port 6600; rerun to verify without duplicating the player.')
 
 
 def usb_files(cfg):
@@ -183,20 +287,35 @@ def apply_usb(files, backup):
 
 def main(argv=None):
     saved = json.loads(CONFIG.read_text()) if CONFIG.exists() else None
-    cfg = options(sys.argv[1:] if argv is None else argv, saved)
+    argv = sys.argv[1:] if argv is None else argv
+    if not saved and sys.stdin.isatty() and not any(arg == '--backend' or arg.startswith('--backend=') for arg in argv) and '--check' not in argv and '--remove-usb' not in argv:
+        choice = input('Playback backend: Snapclient [s, recommended] or MPD compatibility [m]: ').strip().lower()
+        if choice not in ('', 's', 'm'):
+            raise installer.InstallError('Choose Snapclient or MPD.')
+        argv = list(argv) + ['--backend', 'mpd' if choice == 'm' else 'snapclient']
+    cfg = options(argv, saved)
     if cfg['remove_usb']:
         if os.geteuid() != 0:
             raise installer.InstallError('Run with sudo to remove USB control.')
-        with open('/run/lock/musicata-install.lock', 'w') as lock:
+        with open(LOCK, 'w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             remove_usb()
         print('USB controller removed; the bound port is enabled. Snapclient remains installed.')
         return 0
-    if not cfg['server'] and sys.stdin.isatty() and not cfg['check']:
+    if cfg['backend'] == 'snapclient' and not cfg['server'] and sys.stdin.isatty() and not cfg['check']:
         cfg['server'] = input('Musicata / Snapserver host: ').strip()
         player.checked(cfg['server'], r'[A-Za-z0-9:][A-Za-z0-9.:-]*', 'Snapserver host')
-    if not cfg['server']:
+    if cfg['backend'] == 'snapclient' and not cfg['server']:
         raise installer.InstallError('Select the Musicata / Snapserver host with --server or interactively.')
+    token = None
+    if cfg['backend'] == 'mpd':
+        if USB_CONFIG.exists():
+            raise installer.InstallError('Remove existing USB automation before configuring direct MPD.')
+        if not cfg.get('musicata_url') or not cfg.get('token_file'):
+            raise installer.InstallError('MPD registration requires --musicata-url and --token-file (administrator API token).')
+        token = private_read(cfg['token_file']).strip()
+        # Check credentials and URL before modifying local services.
+        registration_request(cfg, token)
     try:
         outputs = player.parse_outputs(installer.run(['aplay', '-l']))
     except FileNotFoundError:
@@ -211,6 +330,8 @@ def main(argv=None):
             cfg['output'] = outputs[int(selection) - 1]['device']
     if cfg['output'] not in [output['device'] for output in outputs]:
         raise installer.InstallError('Select an available stable output; no default or replacement DAC is chosen automatically.')
+    if not cfg['identity'] and cfg['backend'] == 'mpd':
+        cfg['identity'] = str(uuid.uuid5(uuid.NAMESPACE_URL, 'musicata:mpd:' + cfg['mpd_bind']))
     if not cfg['identity']:
         machine_id = Path('/etc/machine-id').read_text().strip()
         player.checked(machine_id, r'[0-9a-f]{32}', 'machine identity')
@@ -225,31 +346,42 @@ def main(argv=None):
         print(generic_command(cfg))
         print('Run as your audio-capable non-root account; configure startup with your init system.')
         return 0
-    if not saved and UNIT.exists():
-        raise installer.InstallError('An existing musicata-snapclient service is unmanaged here; use its original installer.')
-    if saved and (not UNIT.is_file() or hashlib.sha256(UNIT.read_bytes()).hexdigest() != saved.get('unit_digest')):
+    unit_path = MPD_UNIT if cfg['backend'] == 'mpd' else UNIT
+    service = unit_path.name
+    if not saved and (unit_path.exists() or (cfg['backend'] == 'mpd' and MPD_CONFIG.exists())):
+        raise installer.InstallError('Existing playback configuration is unmanaged here; use its original installer.')
+    if saved and (not unit_path.is_file() or hashlib.sha256(unit_path.read_bytes()).hexdigest() != saved.get('unit_digest')):
         raise installer.InstallError('The managed service was customized or removed. Preserve and reconcile those changes before reconfiguring.')
-    for service in ('snapclient.service', 'mpd.service', 'mpd.socket', 'musicata-mpd.service'):
-        if installer.succeeds(['systemctl', 'is-active', '--quiet', service]) or installer.succeeds(['systemctl', 'is-enabled', '--quiet', service]):
-            raise installer.InstallError(service + ' can claim audio outside this setup; resolve the conflict first.')
-    missing = [name for name in dependencies(family) if not installer.package_installed(family, name)]
-    print('Player:', cfg['identity'], '; server:', cfg['server'], '; output:', cfg['output'])
+    if saved and cfg['backend'] == 'mpd' and (not MPD_CONFIG.is_file() or
+            hashlib.sha256(MPD_CONFIG.read_bytes()).hexdigest() != saved.get('config_digest')):
+        raise installer.InstallError('The MPD configuration was customized; reconcile it before reconfiguring.')
+    for other in ('snapclient.service', 'mpd.service', 'mpd.socket', 'musicata-mpd.service', 'musicata-snapclient.service'):
+        if other == service:
+            continue
+        if installer.succeeds(['systemctl', 'is-active', '--quiet', other]) or installer.succeeds(['systemctl', 'is-enabled', '--quiet', other]):
+            raise installer.InstallError(other + ' can claim audio outside this setup; resolve the conflict first.')
+    if cfg['backend'] == 'mpd' and not saved:
+        with socket.socket() as probe:
+            probe.bind((cfg['mpd_bind'], 6600))
+    missing = [name for name in dependencies(family, cfg['backend']) if not installer.package_installed(family, name)]
+    print('Player:', cfg['identity'], '; server:', cfg.get('musicata_url') if cfg['backend'] == 'mpd' else cfg['server'], '; output:', cfg['output'])
     print('Dependencies:', ', '.join(missing) or 'already installed')
     usb = usb_files(cfg)
     if cfg['check']:
-        return int(bool(missing or not shutil.which('snapclient')))
+        return int(bool(missing or not shutil.which(cfg['backend'])))
     if os.geteuid() != 0:
         raise installer.InstallError('Run with sudo to install the player service.')
     if not cfg['yes']:
         if not sys.stdin.isatty() or input('Apply player setup? [y/N] ').lower() not in ('y', 'yes'):
             return 1
-    with open('/run/lock/musicata-install.lock', 'w') as lock:
+    with open(LOCK, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if (json.loads(CONFIG.read_text()) if CONFIG.exists() else None) != saved:
             raise installer.InstallError('Installation changed; review the setup again.')
         installer.install_packages(family, missing)
-        with tempfile.TemporaryDirectory(prefix='musicata-player-') as directory:
-            installer.install_snapcast(family, Path(directory), clients_only=True)
+        if cfg['backend'] == 'snapclient':
+            with tempfile.TemporaryDirectory(prefix='musicata-player-') as directory:
+                installer.install_snapcast(family, Path(directory), clients_only=True)
         try:
             account = pwd.getpwnam(cfg['user'])
         except KeyError:
@@ -262,22 +394,39 @@ def main(argv=None):
         available = player.parse_outputs(installer.run(['runuser', '-u', cfg['user'], '-G', 'audio', '--', 'aplay', '-l']))
         if cfg['output'] not in [output['device'] for output in available]:
             raise installer.InstallError('The service account cannot access the selected output.')
-        unit = player.snapclient_unit(account.pw_uid, account.pw_gid, cfg['output'], cfg['server'],
-                                      cfg['identity'], binary=shutil.which('snapclient'))
+        files = playback_files(cfg, account.pw_uid, account.pw_gid)
+        unit = files[unit_path][0]
+        if cfg['backend'] == 'mpd':
+            for path in (MPD_ROOT, MPD_ROOT / 'music', MPD_ROOT / 'playlists'):
+                if path.is_symlink():
+                    raise installer.InstallError('MPD state path must not be a symlink')
+                path.mkdir(parents=True, exist_ok=True, mode=0o750)
+                os.chown(path, account.pw_uid, account.pw_gid)
         manifest = {key: value for key, value in cfg.items() if key not in (
             'yes', 'check', 'remove_usb', 'usb_device', 'musicata_url', 'token_file', 'confirm_isolated_usb')}
+        if cfg['backend'] == 'mpd':
+            manifest['musicata_url'] = cfg['musicata_url']
+            manifest['config_digest'] = hashlib.sha256(files[MPD_CONFIG][0].encode()).hexdigest()
         manifest['unit_digest'] = hashlib.sha256(unit.encode()).hexdigest()
-        backup = Path('/var/backups/musicata-player') / datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
-        player.apply_files({UNIT: (unit, 0o644), CONFIG: (json.dumps(manifest, indent=2) + '\n', 0o600)},
-                           'musicata-snapclient.service', backup, installer.run, installer.succeeds,
+        backup = BACKUPS / datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+        files[CONFIG] = (json.dumps(manifest, indent=2) + '\n', 0o600)
+        player.apply_files(files, service, backup, installer.run, installer.succeeds,
                            lambda: verify(cfg))
+        if cfg['backend'] == 'mpd':
+            try:
+                register_mpd(cfg, token)
+            except Exception as error:
+                raise installer.InstallError('MPD is installed and answering locally, but Musicata registration/verification failed. '
+                                             'The local setup is retained; fix connectivity/credentials and rerun. '
+                                             'An offline registration may remain in Musicata: ' + str(error)) from error
         if usb:
             try:
                 apply_usb(usb, backup / 'usb')
             except Exception as error:
                 raise installer.InstallError('Snapclient was installed and connected, but optional USB setup failed. '
                                              'Its previous files were retained/restored; review the USB service before retrying: ' + str(error)) from error
-    print('Player connected. Select its Snapcast group in Musicata; no audible test was started.')
+    print('MPD registered and online in Musicata; no audible test was started.' if cfg['backend'] == 'mpd' else
+          'Player connected. Select its Snapcast group in Musicata; no audible test was started.')
     print('Backup:', backup)
     return 0
 
