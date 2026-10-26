@@ -1,7 +1,7 @@
 # Decision log
 
 Short, dated records of non-obvious choices made while building Musicata — the "why" behind
-work that isn't self-evident from the code. Newest first. Referenced from `roadmap.md`.
+work that isn't self-evident from the code. Newest first. Task scope and progress live in [GitHub Issues](https://github.com/damirkrstanovic/musicata/issues).
 
 ## 2026-06-27 — musicata-ml Phase 1 (audio embeddings, the experiment)
 

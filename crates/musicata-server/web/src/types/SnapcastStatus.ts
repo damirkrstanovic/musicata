@@ -2,8 +2,9 @@
 import type { SnapClient } from "./SnapClient";
 import type { SnapGroup } from "./SnapGroup";
 import type { SnapStream } from "./SnapStream";
+import type { SnapcastHealth } from "./SnapcastHealth";
 
-export type SnapcastStatus = { mpd_enabled: boolean,
+export type SnapcastStatus = { mpd_enabled: boolean, health: SnapcastHealth,
 /**
  * Persisted enable flag (a disable takes full effect on restart).
  */

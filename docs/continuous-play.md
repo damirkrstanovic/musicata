@@ -4,7 +4,7 @@ Date: 2026-06-07
 
 > **Status — shipped.** Autoplay and similar-track radio run in
 > `src/recommendations.rs` + `web/src/lib/autoplay.svelte.ts`, with the toggle in the
-> player. Read the rest as the design behind what shipped; roadmap M7 tracks follow-ups.
+> player. Read the rest as the design behind what shipped; [#23](https://github.com/damirkrstanovic/musicata/issues/23) tracks follow-ups.
 
 ## Current behavior
 

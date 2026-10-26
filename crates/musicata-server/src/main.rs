@@ -427,6 +427,13 @@ async fn main() -> Result<()> {
         }
     }
 
+    #[cfg(feature = "snapcast")]
+    tokio::spawn(snapcast::health::run(
+        database.clone(),
+        players.clone(),
+        activity.clone(),
+    ));
+
     // Persist the activity log (debounced) so its history survives a restart.
     tokio::spawn(persist_activity_log(database.clone(), activity.clone()));
 
@@ -2422,6 +2429,10 @@ async fn maybe_enable_snapcast(
     database: &musicata_storage::Database,
     players: &Arc<PlayerManager>,
 ) -> anyhow::Result<()> {
+    let _start = players.snapcast_start_lock.lock().await;
+    if players.snapcast_manager().await.is_some() {
+        return Ok(());
+    }
     let settings = snapcast_settings_from_db(database).await?;
     if !settings.enabled {
         return Ok(());
@@ -5505,6 +5516,8 @@ fn snapcast_routes() -> Router<AppState> {
             "/api/snapcast/status",
             get(snapcast_status).patch(snapcast_update),
         )
+        .route("/api/snapcast/health/ws", get(snapcast_health_ws))
+        .route("/api/snapcast/health/retry", post(snapcast_health_retry))
         .route(
             "/api/snapcast/usb-wake",
             get(usb_wake_policy).patch(update_usb_wake_policy),
@@ -5607,6 +5620,7 @@ async fn snapcast_server_host(database: &Database) -> String {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 struct SnapcastStatus {
     mpd_enabled: bool,
+    health: snapcast::health::SnapcastHealth,
     /// Persisted enable flag (a disable takes full effect on restart).
     buffer_ms: u32,
     applied_buffer_ms: Option<u32>,
@@ -5637,25 +5651,52 @@ struct SnapcastStatus {
 }
 
 #[cfg(feature = "snapcast")]
+async fn snapcast_health_retry(State(state): State<AppState>) -> StatusCode {
+    state.players.snapcast_health.request_retry();
+    StatusCode::ACCEPTED
+}
+
+#[cfg(feature = "snapcast")]
+async fn snapcast_health_ws(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |mut socket| async move {
+        let mut changes = state.players.snapcast_health.subscribe();
+        loop {
+            let value = state.players.snapcast_health.snapshot();
+            changes.borrow_and_update();
+            let text = serde_json::to_string(&value).expect("health snapshot");
+            if !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    socket.send(Message::Text(text.into()))
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                break;
+            }
+            tokio::select! {
+                result = changes.changed() => { if result.is_err() { break; } },
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                incoming = socket.recv() => { match incoming {
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {},
+                } }
+            }
+        }
+    })
+}
+
+#[cfg(feature = "snapcast")]
 async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastStatus>, AppError> {
     let enabled = snapcast_enabled_setting(&state.database).await;
     let auth_enabled = bool_setting(&state.database, SETTING_SNAPCAST_AUTH).await;
     let server_host = snapcast_server_host(&state.database).await;
     let active_input = snapcast_active_input(&state.database).await;
     let manager = state.players.snapcast_manager().await;
-    let mut clients = Vec::new();
-    let mut groups = Vec::new();
-    let mut inputs = Vec::new();
-    if let Some(manager) = &manager {
-        let control = snapcast::SnapControl::new(manager.control_addr());
-        // Reading status must never alter per-group routing.
-        groups = control.groups().await.unwrap_or_default();
-        clients = groups
-            .iter()
-            .flat_map(|group| group.clients.clone())
-            .collect();
-        inputs = control.streams().await.unwrap_or_default();
-    }
+    let health = state.players.snapcast_health.snapshot();
+    let clients = health.clients.clone();
+    let inputs = health.streams.clone();
+    let groups = health.groups.clone();
     let setting = |key: &'static str| state.database.get_setting(key);
     let airplay_enabled = bool_setting(&state.database, SETTING_SNAPCAST_AIRPLAY).await;
     let spotify_enabled = bool_setting(&state.database, SETTING_SNAPCAST_SPOTIFY).await;
@@ -5682,7 +5723,9 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
             .as_ref()
             .map_or(settings.manage_server, |m| m.managed()),
         enabled,
-        running: manager.as_ref().is_some_and(|m| m.is_running()),
+        running: health.control == "connected"
+            && matches!(health.process.as_str(), "running" | "external"),
+        health,
         auth_enabled,
         server_host,
         clients,
@@ -5722,6 +5765,7 @@ async fn snapcast_update(
     State(state): State<AppState>,
     Json(update): Json<SnapcastSettingsUpdate>,
 ) -> Result<Json<SnapcastStatus>, AppError> {
+    let routing_changed = update.route_all_input.is_some() || update.active_input.is_some();
     if let Some(enabled) = update.mpd_enabled {
         if let Some(manager) = state.players.snapcast_manager().await {
             manager
@@ -5761,11 +5805,19 @@ async fn snapcast_update(
         }
     }
     if let Some(enabled) = update.enabled {
-        state
-            .database
-            .set_bool_setting(SETTING_SNAPCAST_ENABLED, enabled)
-            .await
-            .map_err(db_error)?;
+        let _start = state.players.snapcast_start_lock.lock().await;
+        if let Some(manager) = state.players.snapcast_manager().await {
+            manager
+                .set_enabled(&state.database, enabled)
+                .await
+                .map_err(|error| AppError::internal(error.to_string()))?;
+        } else {
+            state
+                .database
+                .set_bool_setting(SETTING_SNAPCAST_ENABLED, enabled)
+                .await
+                .map_err(db_error)?;
+        }
     }
     if let Some(auth) = update.auth_enabled {
         state
@@ -5883,7 +5935,11 @@ async fn snapcast_update(
             .await
             .map_err(|error| AppError::internal(error.to_string()))?;
     }
-    snapcast_status(State(state)).await
+    if routing_changed {
+        snapcast_status_after_routing(state).await
+    } else {
+        snapcast_status(State(state)).await
+    }
 }
 
 #[cfg(feature = "snapcast")]
@@ -5958,7 +6014,37 @@ async fn snapcast_update_group(
             .await
             .map_err(|error| AppError::internal(error.to_string()))?;
     }
-    snapcast_status(State(state)).await
+    snapcast_status_after_routing(state).await
+}
+
+// Explicit routing writes return authoritative post-mutation data. Ordinary GETs remain cached.
+#[cfg(feature = "snapcast")]
+async fn snapcast_status_after_routing(state: AppState) -> Result<Json<SnapcastStatus>, AppError> {
+    let manager = state
+        .players
+        .snapcast_manager()
+        .await
+        .ok_or_else(|| AppError::not_found("snapcast is not enabled"))?;
+    let observed = snapcast::SnapControl::new(manager.control_addr())
+        .status()
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+    let Json(mut status) = snapcast_status(State(state)).await?;
+    status.clients = observed.clients.clone();
+    status.groups = observed.groups.clone();
+    status.inputs = observed.streams.clone();
+    status.health.clients = observed.clients;
+    status.health.groups = observed.groups;
+    status.health.streams = observed.streams;
+    status.health.server_version = observed.server_version;
+    status.health.observed_at = diagnostics::now();
+    status.health.last_success_at = Some(status.health.observed_at);
+    status.health.control = "connected".into();
+    let (process, failure) = manager.process_status();
+    status.health.process = process.into();
+    status.health.failure = failure;
+    status.running = matches!(process, "running" | "external");
+    Ok(Json(status))
 }
 
 #[cfg(feature = "snapcast")]
@@ -6014,18 +6100,13 @@ async fn snapcast_room_views(state: &AppState) -> Vec<SnapRoomView> {
     let host = snapcast_server_host(&state.database).await;
     // Which provisioned rooms are connected: the install command sets `--hostID <name>`, which
     // becomes the snapclient's *id* (its display name still defaults to the device hostname).
-    let connected: std::collections::HashSet<String> = match state.players.snapcast_manager().await
-    {
-        Some(manager) => snapcast::SnapControl::new(manager.control_addr())
-            .clients()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| c.connected)
-            .map(|c| c.id)
-            .collect(),
-        None => std::collections::HashSet::new(),
-    };
+    let health = state.players.snapcast_health.snapshot();
+    let connected: std::collections::HashSet<String> = health
+        .clients
+        .into_iter()
+        .filter(|client| health.control == "connected" && client.connected)
+        .map(|client| client.id)
+        .collect();
     rooms
         .iter()
         .map(|room| SnapRoomView {
@@ -9570,6 +9651,199 @@ mod tests {
                 .buffer_ms,
             1000
         );
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
+    async fn snapcast_status_does_not_claim_unobserved_external_output_is_running() {
+        let fixture = TestFixture::new("snapcast-unobserved");
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .unwrap();
+        let (app, players) = fixture.app_with_database(database).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let manager = std::sync::Arc::new(
+            crate::snapcast::SnapcastManager::start(crate::snapcast::SnapcastSettings {
+                manage_server: false,
+                fifo_path: fixture.root.join("snapcast/audio.fifo"),
+                control_port: listener.local_addr().unwrap().port(),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        players.enable_snapcast(manager).await.unwrap();
+        // The port accepts TCP but never replies. An HTTP status read must use cached
+        // observations, and cannot infer successful playback from a runtime handle.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/snapcast/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("status blocked on Snapserver control")
+        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(body["running"], false);
+        assert_eq!(body["health"]["physical_output"], "unknown");
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
+    async fn snapcast_health_preserves_group_routes() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let fixture = TestFixture::new("snapcast-health-group-routes");
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .unwrap();
+        database
+            .set_bool_setting(super::SETTING_SNAPCAST_ENABLED, true)
+            .await
+            .unwrap();
+        let (_app, players) = fixture.app_with_database(database.clone()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut request = String::new();
+                stream.read_line(&mut request).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                let response = if request["method"] == "Server.GetStatus" {
+                    serde_json::json!({"id":1,"result":{"server":{"groups":[{"id":"g","stream_id":"Other","clients":[{"id":"c","connected":true}]}],"streams":[{"id":"Musicata","status":"idle"}]}}})
+                } else {
+                    panic!("health observation must not mutate routing: {request}")
+                };
+                stream
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let manager = std::sync::Arc::new(
+            crate::snapcast::SnapcastManager::start(crate::snapcast::SnapcastSettings {
+                manage_server: false,
+                control_port: port,
+                fifo_path: fixture.root.join("snapcast/audio.fifo"),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        players.enable_snapcast(manager).await.unwrap();
+        let monitor = tokio::spawn(crate::snapcast::health::run(
+            database,
+            players.clone(),
+            std::sync::Arc::new(crate::activity::ActivityLog::default()),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while players.snapcast_health.snapshot().observed_at == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let observed = players.snapcast_health.snapshot();
+        monitor.abort();
+        peer.abort();
+        assert_eq!(observed.control, "connected");
+        assert_eq!(observed.clients.len(), 1);
+        assert!(observed.failure.is_none());
+        assert_eq!(observed.groups[0].stream_id, "Other");
+        assert!(peer.await.unwrap_err().is_cancelled());
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
+    async fn snapcast_group_write_returns_fresh_routes_without_waiting_for_monitor() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let fixture = TestFixture::new("snapcast-group-write-health");
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .unwrap();
+        let (app, players) = fixture.app_with_database(database).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = tokio::spawn(async move {
+            let mut route = "Musicata".to_owned();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut request = String::new();
+                stream.read_line(&mut request).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "Server.GetStatus" => serde_json::json!({"server":{
+                        "groups":[{"id":"g","stream_id":route,"clients":[{"id":"c","connected":true}]}],
+                        "streams":[{"id":"Musicata","status":"idle"},{"id":"AirPlay","status":"idle"}]
+                    }}),
+                    "Group.SetStream" => {
+                        route = request["params"]["stream_id"].as_str().unwrap().to_owned();
+                        serde_json::json!({})
+                    }
+                    method => panic!("unexpected method {method}"),
+                };
+                stream
+                    .get_mut()
+                    .write_all(
+                        format!("{}\n", serde_json::json!({"id":1,"result":result})).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let manager = std::sync::Arc::new(
+            crate::snapcast::SnapcastManager::start(crate::snapcast::SnapcastSettings {
+                manage_server: false,
+                control_port: port,
+                fifo_path: fixture.root.join("snapcast/audio.fifo"),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        players.enable_snapcast(manager).await.unwrap();
+        // No monitor runs: a successful PATCH must not depend on a later background poll.
+        for (uri, body, expected) in [
+            (
+                "/api/snapcast/groups/g",
+                r#"{"stream_id":"AirPlay"}"#,
+                "AirPlay",
+            ),
+            (
+                "/api/snapcast/status",
+                r#"{"route_all_input":"Musicata"}"#,
+                "Musicata",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+            assert_eq!(body["groups"][0]["stream_id"], expected);
+            assert_eq!(body["health"]["groups"][0]["stream_id"], expected);
+            assert_eq!(body["running"], true);
+        }
+        peer.abort();
+        assert!(peer.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
@@ -14723,6 +14997,40 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), want);
+        }
+        #[cfg(feature = "snapcast")]
+        for (token, expected) in [
+            ("admin-token", StatusCode::ACCEPTED),
+            ("listener-token", StatusCode::FORBIDDEN),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/snapcast/health/retry")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        #[cfg(feature = "snapcast")]
+        {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/snapcast/health/ws")
+                        .header("authorization", "Bearer listener-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
         let report = serde_json::json!({"category":"browser.audio","component":"browser","action":"failure","context":{},"message":"decode failed"});
         let response = app

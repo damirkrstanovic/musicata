@@ -4,8 +4,8 @@ Date: 2026-06-07
 
 > **Status — shipped, with follow-ups.** Per-output parametric EQ and room/headphone
 > correction run in the browser player (`web/src/lib/dsp.ts`, `EqPanel.svelte`) and
-> server-side for Snapcast (`src/snapcast/dsp.rs`). The CamillaDSP/DAC tier and the
-> signal-path badge are still open — see roadmap M11 for the current state. Read the rest
+> server-side for Snapcast (`src/snapcast/dsp.rs`). See [#12](https://github.com/damirkrstanovic/musicata/issues/12) for output correction/metering and
+> physical acceptance, and [#31](https://github.com/damirkrstanovic/musicata/issues/31) for remaining sound processing. Read the rest
 > as the design behind what shipped.
 
 ## Correction and listening adjustments

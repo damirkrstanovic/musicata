@@ -1084,11 +1084,47 @@ await mobileScreenshot('phone-radio');
 check("mobile: no uncaught exceptions", exceptions.length === 0, exceptions.slice(0, 3).join(" | "));
 
 // Buffer configuration is persisted and validated even before multi-room is enabled.
+const healthCapture = await send("Page.addScriptToEvaluateOnNewDocument", {source: `
+  const OriginalWebSocket = window.WebSocket;
+  window.WebSocket = class extends OriginalWebSocket {
+    constructor(url, protocols) {
+      super(url, protocols);
+      if (String(url).includes('/api/snapcast/health/ws')) window.__healthTestSocket = this;
+    }
+  };
+`});
 await send("Emulation.setDeviceMetricsOverride", {width: 1280, height: 900, deviceScaleFactor: 1, mobile: false});
 await send("Page.navigate", {url: base + "/admin"});
 await waitUntil(`document.querySelector('[data-settings-category="outputs"]')`, 5000);
 await js(`document.querySelector('[data-settings-category="outputs"]')?.click()`);
 check("Snapcast: buffer control appears", await waitUntil(`document.querySelector('[data-snapcast-buffer]')`, 5000) < Infinity);
+check("Snapcast: live health appears", await waitUntil(`document.querySelector('[data-snapcast-health]')`, 5000) < Infinity);
+check("Snapcast: physical audio is explicitly unknown", await js(`document.querySelector('[data-physical-audio-unknown]')?.textContent.includes('Physical audio: unknown')`));
+await waitUntil(`window.__healthTestSocket?.onmessage`, 3000);
+const healthFixture = {...(await api('/api/snapcast/status')).health,
+  process:'external', control:'connected', recovery:'idle', failure:null,
+  clients:[{id:'fixture-room',name:'Fixture room',connected:true,volume_percent:40,muted:false}],
+  streams:[{id:'Musicata',status:'playing',now_playing:null}]};
+await js(`window.__deliverHealth = window.__healthTestSocket.onmessage; window.__healthTestSocket.onmessage = null; window.__deliverHealth(new MessageEvent('message', {data:${JSON.stringify(JSON.stringify(healthFixture))}}));`);
+check("Snapcast: single-stream activity is visible", await waitUntil(`document.querySelector('[data-snapcast-stream]')?.textContent.includes('playing')`, 2000) < Infinity);
+const staleHealth = {...healthFixture, control:'unavailable',recovery:'exhausted',attempts:3,failure:'Control unavailable'};
+await js(`window.__deliverHealth(new MessageEvent('message', {data:${JSON.stringify(JSON.stringify(staleHealth))}}));`);
+check("Snapcast: outage retains client observations", await waitUntil(`[...document.querySelectorAll('.room-name')].some(e => e.textContent.includes('Fixture room') && e.textContent.includes('connection unknown'))`, 2000) < Infinity);
+check("Snapcast: stale volume is disabled", await js(`[...document.querySelectorAll('.room-row')].find(e => e.textContent.includes('Fixture room'))?.querySelector('input')?.disabled === true`));
+check("Snapcast: exhausted recovery offers retry", await js(`[...document.querySelectorAll('button')].some(e => e.textContent.includes('Retry playback recovery'))`));
+await send("Emulation.setDeviceMetricsOverride", {width:360,height:800,deviceScaleFactor:1,mobile:true});
+await js(`document.querySelector('[aria-label="Close navigation"]')?.click()`);
+await sleep(350);
+check("Snapcast: health fits a phone viewport", await js(`document.documentElement.scrollWidth <= innerWidth`));
+await js(`document.querySelector('[data-snapcast-health]')?.scrollIntoView({block:'center'})`);
+await sleep(200);
+await mobileScreenshot('snapcast-health-outage');
+await send("Emulation.setDeviceMetricsOverride", {width:1280,height:900,deviceScaleFactor:1,mobile:false});
+const restoredHealth = (await api('/api/snapcast/status')).health;
+await js(`window.__healthTestSocket.onmessage = window.__deliverHealth; window.__deliverHealth(new MessageEvent('message', {data:${JSON.stringify(JSON.stringify(restoredHealth))}}));`);
+await send("Page.removeScriptToEvaluateOnNewDocument", {identifier:healthCapture.identifier});
+
+
 await js(`(() => { const input = document.querySelector('[data-snapcast-buffer]'); input.value = '250'; input.dispatchEvent(new Event('input', {bubbles:true})); })()`);
 await clickText('button', 'Apply buffer');
 check("Snapcast: buffer save completes", await waitUntil(`document.querySelector('[data-snapcast-buffer]')?.value === '250' && [...document.querySelectorAll('button')].some(b => b.textContent.includes('Apply buffer') && b.disabled)`, 3000) < Infinity);

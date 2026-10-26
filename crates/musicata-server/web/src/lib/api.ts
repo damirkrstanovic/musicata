@@ -334,6 +334,9 @@ export const api = {
   snapcastStatus: () => getJson<SnapcastStatus>("/api/snapcast/status"),
   usbWakePolicy: () => getJson<UsbWakePolicy>("/api/snapcast/usb-wake"),
   updateUsbWakePolicy: (policy: UsbWakePolicy) => sendJson<UsbWakePolicy>("/api/snapcast/usb-wake", "PATCH", policy),
+  retrySnapcast: () => fetch("/api/snapcast/health/retry", { method: "POST" }).then(async response => {
+    if (!response.ok) throw new ApiError(response.status, "Could not request playback recovery");
+  }),
   updateSnapcast: (update: {
     mpd_enabled?: boolean;
     buffer_ms?: number;

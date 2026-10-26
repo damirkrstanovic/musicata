@@ -46,6 +46,12 @@ pub async fn prepare(state: &AppState, request: ExportRequest) -> anyhow::Result
         "pending_evidence_may_overlap_history":{"incidents":pending.incidents,"transitions":pending.transitions,"performance":pending.performance},
         "description":request.description.map(|text|sanitize_description(&text)),"problem_time_unix_seconds":request.problem_time_unix_seconds,
         "detection_limits":["No analogue or DAC-side glitch measurement","Stream headers do not establish completed playback","Offline reporters have bounded queues"]});
+    #[cfg(feature = "snapcast")]
+    let context = {
+        let mut context = context;
+        context["snapcast"] = state.players.snapcast_health.export_summary();
+        context
+    };
     let destination = path(&state.db_path);
     let mut attachments = vec![(
         "runtime.json",

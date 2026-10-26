@@ -83,7 +83,7 @@ covered in **[Running & deploying Musicata](docs/deployment.md)**.
 
 - [Running & deploying](docs/deployment.md) — build from source, MPD, systemd, remote access
 - [Native + OpenSubsonic API](docs/api.md)
-- [Roadmap](docs/roadmap.md)
+- [Planned work and progress](https://github.com/damirkrstanovic/musicata/issues)
 - [Prior Art](docs/prior-art.md)
 - [Metadata Update Strategy](docs/metadata.md)
 - [DSP — EQ, room & headphone correction](docs/dsp.md)

@@ -336,7 +336,9 @@ Present only with the `snapcast` build feature.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
-| GET/PATCH | `/api/snapcast/status` | Snapcast config / state. |
+| GET/PATCH | `/api/snapcast/status` | Snapcast config and cached health; GET performs no Snapserver RPC. |
+| WS | `/api/snapcast/health/ws` | Admin-only latest health observations; bounded updates, stale-state reporting. |
+| POST | `/api/snapcast/health/retry` | Admin-only request to reset exhausted managed-process recovery; returns 202. |
 | GET/POST | `/api/snapcast/rooms` | List / add a room. |
 | DELETE | `/api/snapcast/rooms/{name}` | Remove a room. |
 | POST | `/api/snapcast/clients/{id}/volume` | Set a client's volume. |

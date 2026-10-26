@@ -516,6 +516,10 @@ pub struct PlayerManager {
     /// The managed snapserver + FIFO, present once Snapcast is enabled in settings.
     #[cfg(feature = "snapcast")]
     snapcast: RwLock<Option<Arc<SnapcastManager>>>,
+    #[cfg(feature = "snapcast")]
+    pub(crate) snapcast_health: crate::snapcast::health::HealthMonitor,
+    #[cfg(feature = "snapcast")]
+    pub(crate) snapcast_start_lock: tokio::sync::Mutex<()>,
 }
 
 impl PlayerManager {
@@ -534,6 +538,10 @@ impl PlayerManager {
             zones: RwLock::new(BTreeMap::new()),
             #[cfg(feature = "snapcast")]
             snapcast: RwLock::new(None),
+            #[cfg(feature = "snapcast")]
+            snapcast_health: crate::snapcast::health::HealthMonitor::default(),
+            #[cfg(feature = "snapcast")]
+            snapcast_start_lock: tokio::sync::Mutex::new(()),
         });
         // The local browser player always exists.
         if manager

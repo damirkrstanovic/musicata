@@ -101,4 +101,4 @@ next_up: peek_next_index(&state).and_then(|i| state.queue.get(i).cloned()),
 
 - `docs/requirements.md` (Playback And Players): add the gapless requirement.
 - `docs/native-endpoint.md`: flip "No gapless / crossfade" → gapless-via-prefetch + limits.
-- `docs/roadmap.md` M10: note the gapless follow-up.
+- [GitHub Issues](https://github.com/damirkrstanovic/musicata/issues): track any remaining endpoint verification work.

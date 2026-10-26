@@ -3,20 +3,19 @@
 //!
 //! Used to enumerate the connected snapclients (rooms), set their per-output volume, and
 //! point every group at the Musicata stream so all clients hear our audio in sync. We open
-//! a short-lived connection per call and read until the matching response — the admin page
-//! polls occasionally, so a persistent subscription isn't worth the complexity yet (a live
-//! `Server.OnUpdate` subscription is a future refinement noted in docs/snapcast.md).
+//! a bounded short-lived connection per call and read until the matching response. The
+//! independent health worker observes status; HTTP status reads use its cached snapshot.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 /// A snapclient as snapserver sees it — one synchronized output (a room/speaker).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct SnapClient {
     pub id: String,
@@ -28,7 +27,7 @@ pub struct SnapClient {
 
 /// A real Snapserver group: its member speakers hear its selected stream together. This is
 /// transport membership, deliberately separate from a Musicata playback zone and its queue.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct SnapGroup {
     pub id: String,
@@ -38,7 +37,7 @@ pub struct SnapGroup {
 }
 
 /// A snapserver stream (the Musicata library stream, or an AirPlay/Spotify input).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct SnapStream {
     pub id: String,
@@ -61,6 +60,12 @@ impl SnapControl {
     /// Issue one JSON-RPC call and return its `result`, skipping any interleaved
     /// notifications. Every step is deadline-bounded so a wedged snapserver can't block us.
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        tokio::time::timeout(Duration::from_secs(6), self.call_inner(method, params))
+            .await
+            .context("snapcast control request timeout")?
+    }
+
+    async fn call_inner(&self, method: &str, params: Value) -> Result<Value> {
         let connect = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&self.addr))
             .await
             .context("snapcast control connect timeout")?
@@ -73,19 +78,29 @@ impl SnapControl {
         }
         let mut line = serde_json::to_string(&request)?;
         line.push('\n');
-        write.write_all(line.as_bytes()).await?;
+        tokio::time::timeout(Duration::from_secs(3), write.write_all(line.as_bytes()))
+            .await
+            .context("snapcast control write timeout")??;
 
         let mut reader = BufReader::new(read);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
-            let mut buf = String::new();
-            let read = tokio::time::timeout_at(deadline, reader.read_line(&mut buf))
-                .await
-                .context("snapcast control read timeout")??;
+            let mut buf = Vec::new();
+            let read = tokio::time::timeout_at(
+                deadline,
+                (&mut reader)
+                    .take(1024 * 1024 + 1)
+                    .read_until(b'\n', &mut buf),
+            )
+            .await
+            .context("snapcast control read timeout")??;
             if read == 0 {
                 return Err(anyhow!("snapserver closed the control connection"));
             }
-            let message: Value = match serde_json::from_str(buf.trim()) {
+            if buf.len() > 1024 * 1024 || buf.last() != Some(&b'\n') {
+                return Err(anyhow!("invalid snapcast control frame"));
+            }
+            let message: Value = match serde_json::from_slice(&buf) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
@@ -98,20 +113,14 @@ impl SnapControl {
         }
     }
 
-    /// Every real Snapserver group, retaining the membership and route from its status record.
-    pub async fn groups(&self) -> Result<Vec<SnapGroup>> {
+    /// One coherent observation; malformed telemetry is never a healthy empty server.
+    pub async fn status(&self) -> Result<SnapStatus> {
         let status = self.call("Server.GetStatus", Value::Null).await?;
-        Ok(groups(&status).iter().map(parse_group).collect())
+        parse_status(status)
     }
 
-    /// Every client across all groups.
-    pub async fn clients(&self) -> Result<Vec<SnapClient>> {
-        Ok(self
-            .groups()
-            .await?
-            .into_iter()
-            .flat_map(|group| group.clients)
-            .collect())
+    pub async fn groups(&self) -> Result<Vec<SnapGroup>> {
+        Ok(self.status().await?.groups)
     }
 
     /// Set one client's output volume (0–100%), unmuting it.
@@ -127,21 +136,27 @@ impl SnapControl {
     /// The streams snapserver currently has defined (Musicata + any enabled AirPlay/Spotify
     /// inputs), with their status and now-playing metadata — for the input picker.
     pub async fn streams(&self) -> Result<Vec<SnapStream>> {
-        let status = self.call("Server.GetStatus", Value::Null).await?;
-        let streams = status
-            .pointer("/server/streams")
-            .and_then(|s| s.as_array())
-            .cloned()
-            .unwrap_or_default();
-        Ok(streams.iter().map(parse_stream).collect())
+        Ok(self.status().await?.streams)
     }
 
     /// Point every group at `stream` so all connected clients play it in sync. A no-op for a
     /// stream snapserver doesn't have (e.g. an input enabled but not yet live after a restart).
     pub async fn assign_all_to_stream(&self, stream: &str) -> Result<()> {
-        for group in self.groups().await? {
+        let status = self.status().await?;
+        self.assign_observed_to_stream(&status, stream).await
+    }
+
+    pub async fn assign_observed_to_stream(&self, status: &SnapStatus, stream: &str) -> Result<()> {
+        if !status.streams.iter().any(|item| item.id == stream) {
+            return Ok(());
+        }
+        for group in &status.groups {
             if group.stream_id != stream {
-                self.set_group_stream(&group.id, stream).await?;
+                self.call(
+                    "Group.SetStream",
+                    json!({ "id": group.id, "stream_id": stream }),
+                )
+                .await?;
             }
         }
         Ok(())
@@ -168,13 +183,63 @@ impl SnapControl {
     }
 }
 
-/// The `server.groups` array from a `Server.GetStatus` result.
-fn groups(status: &Value) -> Vec<Value> {
-    status
+pub struct SnapStatus {
+    pub clients: Vec<SnapClient>,
+    pub streams: Vec<SnapStream>,
+    pub groups: Vec<SnapGroup>,
+    pub server_version: Option<String>,
+}
+
+fn parse_status(status: Value) -> Result<SnapStatus> {
+    let groups = status
         .pointer("/server/groups")
-        .and_then(|g| g.as_array())
-        .cloned()
-        .unwrap_or_default()
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("invalid snapcast groups observation"))?;
+    let streams = status
+        .pointer("/server/streams")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("invalid snapcast streams observation"))?;
+    let mut clients = Vec::new();
+    let mut assignments = Vec::new();
+    for group in groups {
+        let _id = group
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("invalid snapcast group identity"))?;
+        let _stream = group
+            .get("stream_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("invalid snapcast group stream"))?;
+        assignments.push(parse_group(group));
+        for client in group
+            .get("clients")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("invalid snapcast clients observation"))?
+        {
+            if client.get("id").and_then(Value::as_str).is_none()
+                || client.get("connected").and_then(Value::as_bool).is_none()
+            {
+                return Err(anyhow!("invalid snapcast client observation"));
+            }
+            clients.push(parse_client(client));
+        }
+    }
+    for stream in streams {
+        if stream.get("id").and_then(Value::as_str).is_none()
+            || stream.get("status").and_then(Value::as_str).is_none()
+        {
+            return Err(anyhow!("invalid snapcast stream observation"));
+        }
+    }
+    Ok(SnapStatus {
+        clients,
+        streams: streams.iter().map(parse_stream).collect(),
+        groups: assignments,
+        server_version: status
+            .pointer("/server/server/snapserver/version")
+            .and_then(Value::as_str)
+            .map(|v| v.chars().take(64).collect()),
+    })
 }
 
 fn parse_stream(stream: &Value) -> SnapStream {
@@ -272,9 +337,93 @@ fn parse_group(group: &Value) -> SnapGroup {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_group;
-    use serde_json::json;
+    use super::*;
 
+    #[tokio::test]
+    async fn stalled_control_releases_its_socket_after_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = SnapControl::new(listener.local_addr().unwrap().to_string());
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(7), control.status())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn reply(response: String) -> (SnapControl, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = SnapControl::new(listener.local_addr().unwrap().to_string());
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut request = String::new();
+            stream.read_line(&mut request).await.unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "Server.GetStatus");
+            // Rejection of oversized replies may close the socket before writing finishes.
+            let _ = stream.get_mut().write_all(response.as_bytes()).await;
+        });
+        (control, task)
+    }
+
+    #[tokio::test]
+    async fn malformed_status_is_not_a_successful_empty_observation() {
+        for result in [
+            Value::Null,
+            json!({}),
+            json!({"server":{"groups":{},"streams":[]}}),
+        ] {
+            let (control, task) = reply(format!("{}\n", json!({"id":1,"result":result}))).await;
+            assert!(
+                control.status().await.is_err(),
+                "accepted malformed status: {result}"
+            );
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_server_and_interleaved_notifications_are_valid() {
+        let (control, task) = reply(
+            concat!(
+                "{\"method\":\"Server.OnUpdate\",\"params\":{}}\n",
+                "{\"id\":1,\"result\":{\"server\":{\"groups\":[],\"streams\":[]}}}\n"
+            )
+            .into(),
+        )
+        .await;
+        assert!(control.status().await.unwrap().clients.is_empty());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_control_response_is_rejected() {
+        let result = json!({"id":1,"result":{"server":{"groups":[],"streams":[]}},"padding":"x".repeat(1024*1024)});
+        let (control, task) = reply(format!("{result}\n")).await;
+        assert!(control.streams().await.is_err());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unterminated_control_response_is_rejected() {
+        let (control, task) =
+            reply("{\"id\":1,\"result\":{\"server\":{\"groups\":[],\"streams\":[]}}}".into()).await;
+        assert!(control.streams().await.is_err());
+        task.await.unwrap();
+    }
     #[test]
     fn preserves_group_membership_and_stream_from_snapserver_status() {
         let group = parse_group(&json!({

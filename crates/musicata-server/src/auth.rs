@@ -206,6 +206,7 @@ async fn resolve_user(
 fn is_admin_path(path: &str) -> bool {
     (path.starts_with("/api/diagnostics") && path != "/api/diagnostics/reports")
         || (path.starts_with("/api/players/") && path.ends_with("/dsp/processor"))
+        || path.starts_with("/api/snapcast/health/")
         || path.starts_with("/api/users")
         || path.starts_with("/api/sources")
         || path == "/api/settings"

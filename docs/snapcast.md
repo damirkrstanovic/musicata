@@ -4,8 +4,8 @@ Date: 2026-06-07
 
 > **Status — shipped.** Synchronized multi-room playout runs through `src/snapcast/`
 > (feature-gated on `snapcast`, needs `snapserver`/`snapclient` at runtime), configured
-> from /admin. Read the rest as the design behind what shipped; roadmap M10/M11 track
-> what's left.
+> from /admin. Read the rest as the design behind what shipped; [#64](https://github.com/damirkrstanovic/musicata/issues/64) tracks playback health and
+> [#31](https://github.com/damirkrstanovic/musicata/issues/31) tracks remaining sound processing.
 
 ## Context
 
@@ -126,6 +126,26 @@ a silent transport chunk even when the overall zero-sample fraction is small.
 The producer requests an 8 KiB FIFO for two 20 ms chunks on a 4 KiB-page Linux host,
 while retaining its 20 ms pacing lead. This scheduling margin is separate from the
 client playback buffer; neither setting promises immunity to arbitrary host stalls.
+
+**Playback health:** Settings → Outputs & groups → Multi-room shows managed-process
+state, control connectivity, observed clients/streams, timestamps and recovery. An
+independent worker samples every two seconds; requests read its cached snapshot.
+Control failures retain the last client/stream observations and mark them unavailable;
+a snapshot older than 15 seconds is stale. Neither a connected Snapclient nor a playing
+stream confirms that a DAC/amplifier produces sound: physical output health is unknown.
+Check the playback-host service, selected device, permissions and cabling for silent audio.
+After a missing/busy DAC is restored, the client service may need restarting if its own
+retry limit was exhausted. Musicata does not remotely restart host Snapclient services.
+
+Unexpected managed Snapserver exits trigger up to three restart attempts after 1, 5
+and 30 seconds (plus monitor/startup time). Recovery reuses the player, FIFO, queue,
+DSP and applied buffer; it does not restart a live child on a control-only outage or
+manage an external server. Sixty seconds of successful observations resets the budget.
+After exhaustion, an administrator can select **Retry playback recovery**. Disabling
+multi-room suppresses recovery; an already running service retains the existing
+restart-to-disable behavior. Lifecycle transitions feed the bounded activity and local
+diagnostic history. Diagnostic exports include a privacy-limited health summary and
+reported Snapserver version, omitting client names/addresses and song metadata.
 
 **Internet radio:** choose the Snapcast output, open **Browse radio**, and play a discovered
 or saved station. Musicata decodes direct HTTP(S) audio streams incrementally and sends them

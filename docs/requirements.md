@@ -26,7 +26,7 @@ Initial stack direction:
 - Use Axum for HTTP, WebSocket, streaming, and API routes.
 - Use Tower/Tower HTTP middleware for tracing, compression, CORS, timeouts, and static assets.
 - Use SQLite through SQLx for the first embedded database.
-- Use SQLite FTS5 for local full-text search (Tantivy was dropped — see roadmap M4).
+- Use SQLite FTS5 for local full-text search (Tantivy was dropped — see [decisions.md](decisions.md)).
 - Use Lofty for audio metadata extraction.
 - Evaluate Symphonia for audio decoding and stream inspection.
 - Keep FFmpeg as an optional compatibility fallback, not the core abstraction.

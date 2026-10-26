@@ -207,6 +207,71 @@ impl SnapcastManager {
         self.settings.manage_server
     }
 
+    /// Only facts available from our child handle; external process health is unknown.
+    pub fn process_status(&self) -> (&'static str, Option<String>) {
+        use std::os::unix::process::ExitStatusExt;
+        if !self.managed() {
+            return ("external", None);
+        }
+        match self.child.lock().unwrap().as_mut().map(Child::try_wait) {
+            Some(Ok(None)) => ("running", None),
+            Some(Ok(Some(exit))) => (
+                "exited",
+                Some(match exit.code() {
+                    Some(code) => format!("Snapserver exited with code {code}"),
+                    None => format!(
+                        "Snapserver terminated by signal {}",
+                        exit.signal().unwrap_or(0)
+                    ),
+                }),
+            ),
+            Some(Err(_)) => (
+                "unknown",
+                Some("Could not inspect Snapserver process".into()),
+            ),
+            None => ("stopped", Some("Managed Snapserver is stopped".into())),
+        }
+    }
+
+    /// Reuse this manager/FIFO/player and serialize with buffer replacement. A control
+    /// outage alone must never kill a live child or restart an external service.
+    pub async fn recover(&self, database: &musicata_storage::Database) -> Result<bool> {
+        let _apply = self.apply_lock.lock().await;
+        if !self.managed() || !matches!(self.process_status().0, "exited" | "stopped") {
+            return Ok(false);
+        }
+        if !database
+            .get_bool_setting(crate::SETTING_SNAPCAST_ENABLED)
+            .await?
+            .unwrap_or_else(|| crate::bool_setting_default(crate::SETTING_SNAPCAST_ENABLED))
+        {
+            return Ok(false);
+        }
+        let old_child = self.child.lock().unwrap().take();
+        if let Some(child) = old_child {
+            stop_server(child).await;
+        }
+        let mut settings = self.settings.clone();
+        settings.buffer_ms = self.buffer_ms.load(std::sync::atomic::Ordering::Acquire);
+        settings.mpd_enabled = self.mpd_enabled();
+        let child = start_checked(&settings).await?;
+        *self.child.lock().unwrap() = Some(child);
+        Ok(true)
+    }
+
+    /// Serialize enable/disable persistence with recovery's final pre-spawn check.
+    pub async fn set_enabled(
+        &self,
+        database: &musicata_storage::Database,
+        enabled: bool,
+    ) -> Result<()> {
+        let _apply = self.apply_lock.lock().await;
+        database
+            .set_bool_setting(crate::SETTING_SNAPCAST_ENABLED, enabled)
+            .await?;
+        Ok(())
+    }
+
     pub fn is_running(&self) -> bool {
         !self.managed()
             || self
@@ -719,7 +784,7 @@ while True:
  c, _ = s.accept()
  with c:
   c.recv(65536)
-  c.sendall((json.dumps({'id': 1, 'result': {'server': {'streams': []}}})+'\n').encode())
+  c.sendall((json.dumps({'id': 1, 'result': {'server': {'streams': [{'id':'MPD','status':'idle'}] if 'name=MPD' in config else [], 'groups': []}}})+'\n').encode())
 "#,
         )
         .unwrap();
@@ -727,9 +792,11 @@ while True:
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
+        ensure_fifo(&root.path().join("mpd.fifo")).await.unwrap();
         let manager = SnapcastManager::start(SnapcastSettings {
             server_binary: binary.to_string_lossy().into_owned(),
             fifo_path: root.path().join("audio.fifo"),
+            mpd_fifo_path: root.path().join("mpd.fifo"),
             control_port: port,
             ..Default::default()
         })
@@ -737,6 +804,10 @@ while True:
         .unwrap();
         let manager = std::sync::Arc::new(manager);
         let database = musicata_storage::Database::connect(root.path().join("settings.db"))
+            .await
+            .unwrap();
+        database
+            .set_bool_setting(crate::SETTING_SNAPCAST_ENABLED, true)
             .await
             .unwrap();
         let pending = tokio::spawn(manager.clone().apply_buffer_and_save(database.clone(), 500));
@@ -785,6 +856,62 @@ while True:
                 .unwrap()
                 .contains("buffer = 500\n")
         );
+        assert!(
+            !manager.recover(&database).await.unwrap(),
+            "must not restart a live process"
+        );
+        {
+            let mut child = manager.child.lock().unwrap();
+            child.as_mut().unwrap().kill().unwrap();
+            child.as_mut().unwrap().wait().unwrap();
+        }
+        assert_eq!(manager.process_status().0, "exited");
+        assert!(manager.process_status().1.unwrap().contains("signal"));
+        assert!(manager.recover(&database).await.unwrap());
+        assert_eq!(manager.process_status().0, "running");
+        assert_eq!(manager.buffer_ms(), Some(500));
+        assert!(
+            std::fs::read_to_string(root.path().join("snapserver.conf"))
+                .unwrap()
+                .contains("buffer = 500\n")
+        );
+        // Recovery uses the latest applied MPD setting in both directions.
+        for enabled in [true, false] {
+            manager
+                .clone()
+                .apply_mpd_and_save(database.clone(), enabled)
+                .await
+                .unwrap();
+            {
+                let mut child = manager.child.lock().unwrap();
+                child.as_mut().unwrap().kill().unwrap();
+                child.as_mut().unwrap().wait().unwrap();
+            }
+            assert!(manager.recover(&database).await.unwrap());
+            let config = std::fs::read_to_string(root.path().join("snapserver.conf")).unwrap();
+            assert_eq!(config.contains("name=MPD"), enabled);
+            assert!(config.contains("buffer = 500\n"));
+        }
+        // A recovery queued behind a configuration change must honor a later disable.
+        {
+            let mut child = manager.child.lock().unwrap();
+            child.as_mut().unwrap().kill().unwrap();
+            child.as_mut().unwrap().wait().unwrap();
+        }
+        let apply = manager.apply_lock.lock().await;
+        let recovering = manager.clone();
+        let recovery_database = database.clone();
+        let pending = tokio::spawn(async move { recovering.recover(&recovery_database).await });
+        database
+            .set_bool_setting(crate::SETTING_SNAPCAST_ENABLED, false)
+            .await
+            .unwrap();
+        drop(apply);
+        assert!(
+            !pending.await.unwrap().unwrap(),
+            "disabled output was restarted"
+        );
+        assert_ne!(manager.process_status().0, "running");
     }
 
     #[tokio::test]
@@ -797,7 +924,12 @@ while True:
         })
         .await
         .unwrap();
+        let database = musicata_storage::Database::connect(root.path().join("external.db"))
+            .await
+            .unwrap();
         assert_eq!(manager.buffer_ms(), None);
+        assert!(!manager.recover(&database).await.unwrap());
+        assert_eq!(manager.process_status().0, "external");
         assert!(manager.apply_buffer(250).await.is_err());
         assert!(!root.path().join("snapserver.conf").exists());
     }

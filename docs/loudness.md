@@ -4,7 +4,7 @@ Date: 2026-06-07
 
 > **Status — shipped.** EBU R128 analysis runs on its own background worker
 > (`src/loudness.rs`) and the player exposes an explicit Off / Track / Album selector.
-> Read the rest as the design behind what shipped; roadmap M11 tracks anything left.
+> Read the rest as the design behind what shipped; [#31](https://github.com/damirkrstanovic/musicata/issues/31) tracks remaining work.
 
 ## Context
 

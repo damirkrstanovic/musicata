@@ -1,5 +1,8 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
+  import { onMount } from "svelte";
+  import { connectSnapcastHealth } from "../lib/snapcast-health";
+  import type { SnapcastHealth } from "../types/SnapcastHealth";
   import { api, ApiError } from "../lib/api";
   import type { SnapcastStatus } from "../types/SnapcastStatus";
   import type { UsbWakePolicy } from "../types/UsbWakePolicy";
@@ -18,22 +21,49 @@
   let busy = $state(false);
   let usbPolicy = $state<UsbWakePolicy | null>(null);
   let usbIdleSeconds = $state<number | undefined>(undefined);
+  let health = $state<SnapcastHealth | null>(null);
+  let healthConnected = $state(false);
+  let loadError = $state("");
+  let unavailable = $state(false);
 
   async function load() {
     try {
       status = await api.snapcastStatus();
       usbPolicy = await api.usbWakePolicy();
       usbIdleSeconds = usbPolicy.idle_seconds;
+      health = status.health;
+      loadError = "";
       host = status.server_host;
       bufferMs = status.buffer_ms;
-      if (status.running) rooms = await api.snapcastRooms();
+      rooms = await api.snapcastRooms();
       dspProfiles = await api.dspProfiles().catch(() => []);
-    } catch {
-      // Built without the snapcast feature, or unavailable — hide the panel.
-      status = null;
+    } catch (e) {
+      unavailable = e instanceof ApiError && e.status === 404;
+      loadError = unavailable ? "" : "Multi-room status is unavailable. Check the server connection and try again.";
     }
   }
-  load();
+  onMount(() => {
+    const disconnect = connectSnapcastHealth(value => {
+      health = value;
+      healthConnected = true;
+      rooms = rooms.map(room => ({ ...room, connected: value.control === "connected" && value.clients.some(client => client.id === room.name && client.connected) }));
+      if (status) {
+        status.clients = value.clients;
+        status.groups = value.groups;
+        status.inputs = value.streams;
+        status.running = value.control === "connected" && ["running", "external"].includes(value.process);
+      }
+    }, () => { healthConnected = false; });
+    void load().then(() => { if (unavailable) disconnect(); });
+    return disconnect;
+  });
+
+  async function retryPlayback() {
+    busy = true;
+    try { await api.retrySnapcast(); message = "Recovery requested."; error = false; }
+    catch (e) { message = e instanceof Error ? e.message : String(e); error = true; }
+    finally { busy = false; }
+  }
 
   async function saveUsbPolicy(enabled: boolean) {
     if (usbIdleSeconds === undefined) return;
@@ -126,6 +156,12 @@
   }
 </script>
 
+{#if loadError && !unavailable}
+  <section class="admin-panel" aria-label="Multi-room connection">
+    <p role="status">{loadError}</p>
+    <button class="ghost-button" onclick={load}>Retry connection</button>
+  </section>
+{/if}
 {#if status}
   <section class="admin-panel">
     <div class="admin-panel-head"><h2>Multi-room (Snapcast)</h2></div>
@@ -133,6 +169,42 @@
       Play the same music perfectly in sync across rooms. Each room is a snapclient on the
       network; Musicata decodes and streams to them through a managed snapserver.
     </p>
+
+    {#if health}
+      <div data-snapcast-health>
+        <h3 class="admin-subhead">Playback health</h3>
+        <p class="admin-hint" role="status">
+          {#if !healthConnected}Live updates disconnected; observations may be stale.
+          {:else if health.failure}{health.failure}
+          {:else if health.process === "disabled"}Multi-room playback is disabled.
+          {:else}Control connection: {health.control}.{/if}
+        </p>
+        <p class="admin-hint">
+          Server process: {health.process}. Recovery: {health.recovery}.
+          {#if health.attempts}Attempts: {health.attempts} of 3.{/if}
+          {#if health.next_retry_at}Next attempt: {new Date(health.next_retry_at * 1000).toLocaleTimeString()}.{/if}
+          {#if health.server_version}Snapserver {health.server_version}.{/if}
+        </p>
+        <p class="admin-hint">
+          {#if health.last_success_at}Last successful observation: {new Date(health.last_success_at * 1000).toLocaleString()}.
+          {:else}No successful observation yet.{/if}
+          {#if health.control !== "connected"}Client and stream information may be stale.{/if}
+        </p>
+        {#each health.streams as stream (stream.id)}
+          <p class="admin-hint" data-snapcast-stream>
+            {stream.id}: {stream.status}{!healthConnected || health.control !== "connected" ? " (last observed; may be stale)" : ""}.
+          </p>
+        {/each}
+        <p class="admin-hint" data-physical-audio-unknown>
+          Physical audio: unknown. A connected client or playing stream cannot confirm sound from a DAC or speaker.
+          If there is no sound, check the playback host's service, selected audio device, permissions and cable.
+          A missing or busy device may require restarting the client after reconnecting it.
+        </p>
+        {#if health.recovery === "exhausted"}
+          <button class="ghost-button" disabled={busy || !healthConnected} onclick={retryPlayback}>Retry playback recovery</button>
+        {/if}
+      </div>
+    {/if}
 
     <label class="toggle-row">
       <input
@@ -151,7 +223,7 @@
     </label>
 
     {#if status.enabled && !status.running}
-      <p class="admin-hint">Enabled, but not running this session — restart the server to start it.</p>
+      <p class="admin-hint">Enabled, but a healthy control connection has not been confirmed. Check playback health above.</p>
     {/if}
 
     <label class="field">
@@ -320,7 +392,7 @@
       </select>
     </label>
 
-    {#if status.running}
+    {#if status.enabled || rooms.length > 0 || status.clients.length > 0}
       <!-- Rooms: provision a device with a name → get its install command. -->
       <div class="admin-subhead">Rooms</div>
       <div class="host-row">
@@ -344,7 +416,7 @@
               <div class="provision-head">
                 <span class="room-name">
                   {room.name}
-                  <span class="dot" class:on={room.connected} title={room.connected ? "connected" : "not connected"}></span>
+                  <span class="dot" class:on={healthConnected && health?.control === "connected" && room.connected} title={!healthConnected || health?.control !== "connected" ? "connection unknown" : room.connected ? "connected" : "not connected"}></span>
                 </span>
                 <button class="ghost-button" disabled={busy} onclick={() => removeRoom(room.name)}>Remove</button>
               </div>
@@ -362,7 +434,7 @@
           {#each status.clients as client (client.id)}
             <li class="room-row">
               <span class="room-name" class:offline={!client.connected}>
-                {client.name}{client.connected ? "" : " (offline)"}
+                {client.name}{!healthConnected || health?.control !== "connected" ? " (last observed; connection unknown)" : client.connected ? "" : " (offline)"}
               </span>
               <input
                 class="room-volume"
@@ -370,7 +442,7 @@
                 min="0"
                 max="100"
                 value={client.volume_percent}
-                disabled={!client.connected}
+                disabled={!healthConnected || health?.control !== "connected" || !client.connected}
                 oninput={(e) =>
                   setVolume(client, Number((e.currentTarget as HTMLInputElement).value))}
               />

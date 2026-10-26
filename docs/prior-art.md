@@ -437,7 +437,7 @@ rather than a 2 MB original. Where should bytes live, and who fetches them?
   Eviction: keep-all with an optional cap initially.
 
 This is the natural sequel to §4 (network never on the hot path) and §2 (cheap steady
-state — reuse by mtime/hash). See `docs/roadmap.md` M3 for the staged plan.
+state — reuse by mtime/hash). See [GitHub Issues](https://github.com/damirkrstanovic/musicata/issues) for remaining scanner work.
 
 **Client-side robustness (the loading side, learned from moode `../moode`).** Serving fast
 isn't enough — the *browser* must degrade gracefully, or covers flicker/blank during navigation.

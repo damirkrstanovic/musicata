@@ -20,6 +20,7 @@
 mod control;
 mod decode;
 mod dsp;
+pub(crate) mod health;
 mod library;
 mod server;
 mod stream;
