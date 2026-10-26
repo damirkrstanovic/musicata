@@ -362,12 +362,12 @@ Present only with the `snapcast` build feature.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
-| GET/PATCH | `/api/snapcast/status` | Snapcast config and cached health; GET performs no Snapserver RPC. |
+| GET/PATCH | `/api/snapcast/status` | Snapcast config and cached health; GET performs no Snapserver RPC. `auth_enabled` is always false; PATCH with `auth_enabled: true` returns 400 before applying any changes. |
 | WS | `/api/snapcast/health/ws` | Admin-only latest health observations; bounded updates, stale-state reporting. |
 | POST | `/api/snapcast/health/retry` | Admin-only request to reset exhausted managed-process recovery; returns 202. |
-| GET/POST | `/api/snapcast/rooms` | List / add a room. |
-| DELETE | `/api/snapcast/rooms/{name}` | Remove a room. |
-| POST | `/api/snapcast/players/provision` | Create a wizard-owned room and return `{id, command, auth_enabled}` for `{server_host}`. Snapcast must already be enabled. The supplied host is used only in the returned remote-player command; it does not change the server setting. The command includes room credentials only when `auth_enabled` is set. |
+| GET/POST | `/api/snapcast/rooms` | Legacy player-identity provisioning, retained for compatibility; commands contain no passwords. The UI discovers connected players instead. |
+| DELETE | `/api/snapcast/rooms/{name}` | Remove a legacy provisioning record. |
+| POST | `/api/snapcast/players/provision` | Legacy compatibility provisioning: create a player identity and return `{id, command, auth_enabled: false}` for `{server_host}`. Snapcast must already be enabled. The supplied host is used only in the returned remote-player command; it does not change the server setting. The command never includes credentials. The Add player wizard uses discovery instead. |
 | PATCH | `/api/snapcast/clients/{id}` | Admin-only: rename with `{ "name": "Kitchen" }`, or assign with `{ "zone_id": "zone-id" }` (`null` unassigns). Send one operation per request. |
 | POST | `/api/snapcast/clients/{id}/volume` | Set a client's volume. |
 

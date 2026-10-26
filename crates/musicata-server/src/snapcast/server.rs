@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! snapserver lifecycle + Musicata pipe streams.
 //!
-//! Snapcast broadcasts a continuous PCM stream to N synchronized clients (rooms). We run
+//! Snapcast broadcasts a continuous PCM stream to N synchronized clients (players). We run
 //! one managed `snapserver` fed by a legacy FIFO ("Musicata") plus one FIFO per active
 //! Musicata zone. Clients assigned to the same zone still play in sync; independent zones
 //! receive independently decoded streams. Snapserver 0.26 defines pipe streams at startup, so
@@ -125,15 +125,8 @@ pub struct SnapcastSettings {
     pub control_port: u16,
     /// snapserver HTTP/Snapweb port (the bundled browser client + WS control).
     pub http_port: u16,
-    /// Require a per-room password (writes an `[authorization]` block). NOTE: snapserver 0.35
-    /// **ignores** this (`auth.enabled` is hardcoded off upstream — `// TODO: auth`), so it is
-    /// not enforced today; the config + passwords are forward-compatible for when upstream
-    /// ships auth. See `docs/snapcast.md`.
-    pub auth_enabled: bool,
-    /// The address rooms dial (`tcp://<name>:<pw>@<host>:1704`) — shown in the install command.
+    /// The address players dial (`tcp://<host>:1704`) — shown in the install command.
     pub server_host: String,
-    /// Provisioned rooms (name + password). Written as `authorization.user` entries.
-    pub rooms: Vec<SnapRoom>,
     /// Accept AirPlay *into* Musicata: snapserver spawns `shairport-sync` and exposes it as the
     /// `AirPlay` stream, which rooms can be switched to. Requires shairport-sync installed.
     pub airplay_enabled: bool,
@@ -166,9 +159,7 @@ impl Default for SnapcastSettings {
             control_host: "127.0.0.1".to_string(),
             control_port: 1705,
             http_port: 1780,
-            auth_enabled: false,
             server_host: "localhost".to_string(),
-            rooms: Vec::new(),
             airplay_enabled: false,
             airplay_binary: "shairport-sync".to_string(),
             airplay_device_name: "Musicata".to_string(),
@@ -635,34 +626,16 @@ fn pipe_stream_uri(stream: &SnapcastStream, sample_rate: u32) -> String {
     )
 }
 
-/// The forward-compatible `[authorization]` block: a `Streaming`-only role and one user per
-/// room. **snapserver 0.35 ignores this** (auth is stubbed upstream); it activates unchanged
-/// if/when upstream enables auth.
-fn authorization_block(rooms: &[SnapRoom]) -> String {
-    let mut block = String::from(
-        "[authorization]\n\
-         enabled = true\n\
-         role = stream:Streaming\n",
-    );
-    for room in rooms {
-        block.push_str(&format!("user = {}:{}:stream\n", room.name, room.password));
-    }
-    block
-}
-
-/// The `snapclient` command to run on a room device: connects with the room's password and
-/// identifies itself by name. (The password is sent today but not enforced by snapserver
-/// 0.35 — see `docs/snapcast.md`; it becomes enforcing when upstream ships auth.)
-pub fn install_command(host: &str, room: &SnapRoom, auth_enabled: bool) -> String {
+/// The `snapclient` command to run on a player device. `auth_enabled` is retained in the
+/// signature for callers compiled against the old provisioning API, but Snapcast has no
+/// password authentication and the command never sends stored credentials.
+pub fn install_command(host: &str, room: &SnapRoom, _auth_enabled: bool) -> String {
     let authority = if host.contains(':') {
         format!("[{host}]")
     } else {
         host.to_string()
     };
-    let credentials = auth_enabled
-        .then(|| format!("{}:{}@", room.name, room.password))
-        .unwrap_or_default();
-    let uri = format!("tcp://{credentials}{authority}:1704");
+    let uri = format!("tcp://{authority}:1704");
     format!(
         "snapclient {} --hostID {}",
         shell_single_quote(&uri),
@@ -678,10 +651,10 @@ fn shell_single_quote(value: &str) -> String {
 
 /// Render the snapserver config: the Musicata library pipe stream, any enabled AirPlay/Spotify
 /// input streams (snapserver spawns shairport-sync/librespot itself — skipped with a warning
-/// when the binary is missing so a missing dep degrades gracefully), the control/HTTP ports, and
-/// the forward-compatible auth block. Pure (no IO) so it's unit-testable.
+/// when the binary is missing so a missing dep degrades gracefully), and the control/HTTP ports.
+/// Pure (no IO) so it's unit-testable.
 #[cfg(test)]
-fn render_config(settings: &SnapcastSettings) -> String {
+pub(crate) fn render_config(settings: &SnapcastSettings) -> String {
     render_config_with_streams(settings, &[])
 }
 
@@ -761,9 +734,6 @@ fn render_config_with_streams(
         tcp = settings.control_port,
         http = settings.http_port,
     ));
-    if settings.auth_enabled {
-        config.push_str(&authorization_block(&settings.rooms));
-    }
     config
 }
 
@@ -1099,21 +1069,13 @@ while True:
     }
 
     #[test]
-    fn authorization_block_lists_one_user_per_room() {
-        let block = authorization_block(&[room("kitchen", "aaa"), room("living", "bbb")]);
-        assert!(block.contains("[authorization]"));
-        assert!(block.contains("role = stream:Streaming"));
-        assert!(block.contains("user = kitchen:aaa:stream"));
-        assert!(block.contains("user = living:bbb:stream"));
-    }
-
-    #[test]
-    fn install_command_embeds_name_and_password() {
+    fn legacy_enabled_auth_does_not_write_room_password_to_install_command() {
         let cmd = install_command("musicata.local", &room("kitchen", "secret"), true);
         assert_eq!(
             cmd,
-            "snapclient 'tcp://kitchen:secret@musicata.local:1704' --hostID 'kitchen'"
+            "snapclient 'tcp://musicata.local:1704' --hostID 'kitchen'"
         );
+        assert!(!cmd.contains("secret"));
     }
 
     #[test]

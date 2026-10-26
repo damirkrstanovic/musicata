@@ -918,3 +918,15 @@ integration in `src/mpd_dsp.rs` covers live patching, old-filter removal and she
   fetch is relayed so `default-src 'self'` can hold with no escape hatch. Not just a security
   choice: 73% of radio streams are plain `http://`, which a TLS deployment would block as
   mixed content if the page fetched them directly. See §12.
+
+## Snapcast certificate admission and player identity (2026-10-26)
+
+Snapcast 0.35 provides working mutual TLS, but admits a certificate to both streaming and
+control RPC and trusts the client-supplied Hello identity independently of that certificate.
+Stock Snapclient also skips hostname verification and adds its configured CA to default
+trust roots. An isolated 26-check PoC demonstrated these boundaries and an audio-only gateway
+that binds certificate identity, restricts control access and revokes one session while
+another continues receiving audio. Proposed adoption: Musicata-managed enrollment and renewal,
+a dedicated instance trust anchor, and a Rust gateway around the existing Snapcast renderer.
+This is deferred as **maybe**, not planned or shipped; trusted-network operation is the chosen product direction. See [evidence and lifecycle proposal](snapcast-certificates.md)
+and [implementation plan #72](https://github.com/damirkrstanovic/musicata/issues/72).

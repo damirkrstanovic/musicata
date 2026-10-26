@@ -547,7 +547,7 @@ def main(argv=None):
                 raise installer.InstallError('Snapclient was installed and connected, but optional USB setup failed. '
                                              'Its previous files were retained/restored; review the USB service before retrying: ' + str(error)) from error
     print('MPD registered and online in Musicata; no audible test was started.' if cfg['backend'] == 'mpd' else
-          'Player connected. Select its Snapcast group in Musicata; no audible test was started.')
+          'Player connected. In Musicata, add it from Zones & players; no audible test was started.')
     print('Backup:', backup)
     return 0
 

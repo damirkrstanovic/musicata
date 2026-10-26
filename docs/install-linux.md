@@ -7,6 +7,14 @@ the shell launcher offers to install Python when missing. Other dependencies are
 through the distribution's package manager. On Arch, this includes `pacman -Syu` because
 partial upgrades are unsupported.
 
+## Network expectations
+
+Musicata is primarily intended for a trusted home or private network. Its Snapcast playback
+connections are not authenticated by Musicata account passwords or device-management pairing.
+Keep Snapcast streaming/control ports (normally 1704/1705, plus any enabled HTTP/WebSocket
+listener) off the internet and untrusted guest networks. Player setup requires a server
+address, not certificates. See [Snapcast network trust](snapcast.md#network-trust-and-player-setup).
+
 ## Choose a deployment
 
 Docker is the default. Preview and inspect before applying:
@@ -273,20 +281,20 @@ sudo docker logs --tail 100 musicata-caddy          # Docker proxy
 | `mpd` | Host MPD + ALSA utilities; dedicated non-root `musicata-mpd.service` with audio-device access |
 | `snapclient` | Recommended local player; dedicated non-root service, stable identity and explicit output |
 | `discovery` | Host Avahi, NSS mDNS resolution, `_http._tcp` advertisement with the Musicata port |
-| `snapcast` | Managed snapserver runtime; native packages also supply snapclient for room setup |
+| `snapcast` | Managed snapserver runtime; native packages also supply snapclient for player setup |
 | `airplay` | Shairport Sync cast-in; also selects Snapcast and discovery |
 | `spotify` | Librespot Spotify Connect cast-in; also selects Snapcast and discovery |
 
 Apple support means AirPlay cast-in, not a native Apple Music catalogue provider. Configure
-cast-in and rooms in Musicata's Multi-room settings; account/subscription requirements of
+cast-in in Advanced output settings and players/zones in Musicata's Outputs settings; account/subscription requirements of
 upstream services still apply. Snapclient runs on each playback endpoint; installing a
-server does not create rooms or select a DAC automatically.
+server does not create players or select a DAC automatically.
 
 Both server installation modes install host playback utilities: ALSA tools,
 Snapserver/Snapclient, Shairport Sync, Librespot, and Avahi/mDNS. MPD is installed only
 when explicitly selected; upgrades preserve existing MPD installations. Storage and
 system troubleshooting tools are also included: `smartctl`, `nvme`, `sensors`, `iostat`,
-and `lspci`. Installing these tools does not select a DAC, create rooms, enable cast-in,
+and `lspci`. Installing these tools does not select a DAC, create players, enable cast-in,
 or start a new standalone audio service. Configure playback in the web UI; `--with mpd`
 explicitly configures the dedicated MPD service. Existing audio services are preserved.
 

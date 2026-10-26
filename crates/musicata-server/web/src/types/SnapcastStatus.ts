@@ -14,16 +14,15 @@ buffer_ms: number, applied_buffer_ms: number | null, manage_server: boolean, ena
  */
 running: boolean,
 /**
- * Persisted "require a per-room password" flag. **Not enforced by snapserver 0.35** (auth
- * is stubbed upstream) — the UI says so; it's forward-compatible config.
+ * Compatibility field for older clients. Snapcast password authentication is unsupported.
  */
 auth_enabled: boolean,
 /**
- * The address rooms dial (shown in each room's install command).
+ * The address players dial (shown in each player's install command).
  */
 server_host: string,
 /**
- * Connected snapclients (rooms), each a synchronized output.
+ * Connected Snapcast players, each a synchronized output.
  */
 clients: Array<SnapClient>,
 /**

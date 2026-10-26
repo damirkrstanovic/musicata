@@ -86,7 +86,8 @@ with Snapcast. Snapcast groups and transport settings live under advanced settin
 
 The zone follows the server-side player's actual track and progress, including automatic
 track changes. Existing shared-output zone assignments and queues migrate on upgrade.
-Unassigned speakers retain the shared Musicata output. On the bundled Snapserver 0.26,
+Speakers outside named zones appear under **Shared playback** and retain the shared Musicata
+output and default queue. Independent browser/MPD players appear under **Players without a zone**. On the bundled Snapserver 0.26,
 adding the first Snapcast player to a zone or deleting its stream briefly reconnects all
 network players; normal moves between existing zone streams do not restart the server.
 
@@ -102,14 +103,24 @@ network players; normal moves between existing zone streams do not restart the s
   discovery; the Linux installer configures both. No host audio device is needed on the
   server; Snapclient accesses audio on each playback endpoint.
 
-**Set it up** — all in the web UI, no flags or config files:
+**Set it up:**
 
-1. **/admin → Multi-room (Snapcast)**: toggle it on and set the server host (the address
-   devices reach this machine at, e.g. `musicata.local`).
-2. Under **Rooms**, name a room (e.g. `kitchen`); Musicata generates it and shows the exact
-   `snapclient` command to run on that device. Repeat per device.
-3. Pick which input the rooms play, and set per-room volume live. To stream from a phone
-   instead, enable the AirPlay/Spotify inputs and cast to "Musicata".
+1. Open **Settings → Outputs → Add player** and choose **Snapcast speaker**. Enable
+   multi-room playback there if needed. Use a server address reachable from the player.
+2. On the player device, run the standalone player installer from a source checkout:
+   `sudo ./scripts/install-player.sh --server musicata.local` (substitute your server).
+   In a release archive, use `./install-player.sh` instead. The installer selects the audio
+   device, configures the playback service and gives it a stable identity. Manual Snapclient
+   startup instructions remain under Advanced in the wizard.
+3. Refresh the discovered players and explicitly select your device by name and address.
+   Existing players assigned to zones are managed in **Zones & players**.
+4. Give the player a name and choose **Shared playback**, an existing zone, or a new zone.
+   Shared playback follows the default queue; a named zone has its own queue. Connection
+   confirmation does not establish that the DAC or speaker is making sound.
+
+Optional device-management pairing enables hardware settings; basic playback does not need
+that pairing. AirPlay/Spotify inputs, playback buffer and transport diagnostics remain in
+**Advanced output settings**.
 
 **Playback buffer:** Settings → Outputs & groups → Multi-room exposes a 100–5,000 ms
 buffer for Musicata-managed Snapserver. The default remains 1,000 ms. A 250 ms value
@@ -167,9 +178,9 @@ broadcast; Play reconnects at the live point. A connection or decoding failure s
 and shows an error in the player; press Play to retry. HLS playlists and segments are not
 supported by this radio decoder.
 
-**Security:** snapserver 0.35 does **not** enforce the per-room passwords yet (auth is stubbed
-upstream), so multi-room is **LAN-only** — keep the server on a trusted network. Musicata writes
-forward-compatible auth config that starts enforcing the moment a future snapserver enables it.
+**Network trust:** use Musicata and Snapcast primarily on a trusted home/private network.
+Snapcast player passwords are not enforced; keep its streaming/control ports off the internet
+and untrusted guest networks. See [network trust and player setup](#network-trust-and-player-setup).
 
 ---
 
@@ -193,39 +204,28 @@ Its data model maps cleanly onto ours:
 
 ---
 
-## Security / endpoint auth — per-room passwords (forward-compat) + room provisioning
+## Network trust and player setup
 
-**Verified-the-hard-way fact:** Snapcast 0.35's **username/password auth is stubbed out
-upstream** — `snapserver.cpp` hardcodes `settings.auth.enabled = false; // TODO: auth`,
-overriding any `[authorization]` config. The whole framework (the Hello `Auth` field,
-`Server.Authenticate`, roles/users, per-method permissions) is *present but inert*: a client
-sending an **empty** password connects fine (confirmed live). The only access control that
-actually *enforces* on 0.35 is **mutual TLS** (`verify_clients` + client certs over `wss`),
-which works but is a meaningful lift (a CA + per-device certs, `wss` clients) for a home setup
-— so it's **not** what we ship here.
+Musicata is primarily intended for trusted home or private networks. Its current Snapcast
+setup does not authenticate players: devices that can reach the Snapcast streaming and
+control ports can connect to audio and access Snapcast controls. Do not expose those ports
+to the internet or untrusted guest networks. Musicata web-account authentication and optional
+player-management pairing do not protect the separate Snapcast transport.
 
-What Musicata implements (`server.rs`, gated by `auth_enabled`):
+The normal setup is to install Snapclient on the player, point it at the Musicata server,
+then name the discovered player and assign it to a Musicata zone. No certificate management
+is required. See [standalone player installation](install-linux.md#standalone-player-and-optional-usb-standby).
 
-- **Per-room passwords + provisioning.** `/admin` → Multi-room → *Rooms*: name a room
-  ("kitchen"), Musicata generates a 128-bit password, and gives you the ready
-  `snapclient 'tcp://kitchen:<pw>@<host>:1704' --hostID 'kitchen'` command to run on the
-  device. Rooms persist as JSON (`snapcast.rooms`); each becomes an `authorization.user` entry.
-  `--hostID` makes the room show its connection state back in `/admin`.
-- **Forward-compatible config.** When `auth_enabled`, we write the `[authorization]` block
-  (`enabled = true`, `role = stream:Streaming`, one `user = <name>:<pw>:stream` per room). On
-  0.35 it does nothing; the moment a future snapserver flips `auth.enabled`, the *same* config +
-  passwords start enforcing with zero Musicata changes. Room/auth changes are written at
-  startup, so they apply on restart.
+The former **Require a password per room** control and separate Rooms setup have been removed.
+Snapserver 0.35 disables its username/password authorization. Legacy configuration and player
+identities are preserved, but Musicata no longer emits those ineffective passwords in commands
+or Snapserver configuration. Compatibility APIs report `auth_enabled: false` and reject requests
+to enable it. Do not rely on a future Snapserver update automatically enabling enforcement.
 
-**This is honest, not enforcing-today.** The `/admin` toggle carries a loud banner: the
-passwords are *not* checked by snapserver 0.35, so rooms stay open on the LAN — keep the server
-on a trusted network. We deliberately don't dress inert config up as working auth. The
-provisioning interface (the install command per room) is useful regardless. (We prototyped the
-TLS-cert path and reverted it: too complex for the gain on a home LAN; the password plumbing is
-the cheaper bet that turns real on an upstream update.)
-
-Future: when upstream finishes auth this becomes enforcing for free; a per-room TLS option can
-return if someone needs real isolation before then.
+Certificate authentication was researched and tested, but its lifecycle and authorization
+complexity are not justified for the current trusted-network product. It is deferred as
+**maybe**, not planned implementation: [issue #72](https://github.com/damirkrstanovic/musicata/issues/72).
+The [research and PoC](snapcast-certificates.md) remain reference material only.
 
 ---
 

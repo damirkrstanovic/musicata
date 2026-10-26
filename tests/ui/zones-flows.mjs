@@ -40,6 +40,23 @@ export async function zonesFlows({api, js, check, waitUntil, tap}) {
   await js(`document.querySelector('[data-settings-category="outputs"]')?.click()`);
   check("Zones: outputs settings open", await waitUntil(`document.querySelector('[data-settings-panel="outputs"] .zones-panel')`, 3000) < Infinity);
   await waitUntil(`document.querySelector('[aria-label="Zone for Kitchen"]')`, 3000);
+  check("Zones: unzoned Snapcast speakers use shared playback", await js(`(() => {
+    const shared = [...document.querySelectorAll('.shared-playback')].find(section => section.textContent.includes('Shared playback'));
+    const unassigned = document.querySelector('.unassigned-outputs');
+    return shared?.textContent.includes('Kitchen')
+      && shared?.textContent.includes('Office')
+      && shared?.textContent.includes('default queue')
+      && !unassigned?.textContent.includes('Kitchen')
+      && !unassigned?.textContent.includes('Office');
+  })()`));
+  check("Zones: Snapcast zone menus name shared playback", await js(`
+    [...document.querySelector('[aria-label="Zone for Kitchen"]')?.options || []]
+      .some(option => option.value === '' && option.textContent.trim() === 'Shared playback')
+  `));
+  check("Zones: independent players remain unassigned", await js(`
+    [...document.querySelector('[aria-label="Zone for Remote audio"]')?.options || []]
+      .some(option => option.value === '' && option.textContent.trim() === 'No zone')
+  `));
 
   await js(`(() => { const form = document.querySelector('.zone-create'); form.querySelector('input').value = ${JSON.stringify(zoneName)}; form.requestSubmit(); })()`);
   check("Zones: create uses the admin form", await waitUntil(`[...document.querySelectorAll('.zone-card h3')].some(node => node.textContent === ${JSON.stringify(zoneName)})`, 3000) < Infinity);
@@ -66,7 +83,13 @@ export async function zonesFlows({api, js, check, waitUntil, tap}) {
     await js(`(() => { const card = [...document.querySelectorAll('.zone-card')].find(node => node.querySelector('h3')?.textContent === ${JSON.stringify(renamed)}); [...card.querySelectorAll('button')].find(button => button.textContent === 'Delete')?.click(); })()`);
     await waitUntil(`document.querySelector('.modal[role="dialog"]')`, 2000);
     await js(`document.querySelector('.modal .primary-button')?.click()`);
-    check("Zones: delete removes only the grouping", await waitUntil(`![...document.querySelectorAll('.zone-card h3')].some(node => node.textContent === ${JSON.stringify(renamed)}) && document.querySelector('[aria-label="Zone for Kitchen"]') && document.querySelector('[aria-label="Zone for Office"]')`, 3000) < Infinity);
+    check("Zones: delete returns speakers to shared playback", await waitUntil(`(() => {
+      const shared = document.querySelector('.shared-playback');
+      return ![...document.querySelectorAll('.zone-card h3')].some(node => node.textContent === ${JSON.stringify(renamed)})
+        && shared?.textContent.includes('Kitchen')
+        && shared?.textContent.includes('Office')
+        && [...document.querySelector('[aria-label="Zone for Kitchen"]')?.options || []].some(option => option.value === '' && option.textContent.trim() === 'Shared playback');
+    })()`, 3000) < Infinity);
   }
   } finally {
     await js(`window.fetch = window.__zonesNativeFetch; delete window.__zonesNativeFetch; delete window.__zonesClients`);

@@ -1,0 +1,118 @@
+{
+  "snapserver": "snapserver v0.35.0 (rev f1237347)",
+  "snapclient": "snapclient v0.35.0 (rev f1237347)",
+  "checks": [
+    {
+      "name": "native trusted certificate reaches RPC",
+      "passed": true
+    },
+    {
+      "name": "native missing certificate rejected",
+      "passed": true
+    },
+    {
+      "name": "native foreign CA rejected",
+      "passed": true
+    },
+    {
+      "name": "native expired certificate rejected",
+      "passed": true
+    },
+    {
+      "name": "native wrong certificate purpose rejected",
+      "passed": true
+    },
+    {
+      "name": "client rejects unrelated server CA",
+      "passed": true
+    },
+    {
+      "name": "native certificate can claim unrelated hostID (gap)",
+      "passed": true
+    },
+    {
+      "name": "native client accepts server SAN mismatch (gap)",
+      "passed": true,
+      "connection_host": "127.0.0.1",
+      "certificate_SAN": "DNS:localhost"
+    },
+    {
+      "name": "stock client trusts default root in addition to explicit CA (gap)",
+      "passed": true
+    },
+    {
+      "name": "stock client rejects server with restricted unrelated trust",
+      "passed": true
+    },
+    {
+      "name": "stock client works with restricted instance CA trust",
+      "passed": true
+    },
+    {
+      "name": "gateway denies player certificate on RPC",
+      "passed": true
+    },
+    {
+      "name": "gateway missing certificate rejected",
+      "passed": true
+    },
+    {
+      "name": "gateway foreign CA rejected",
+      "passed": true
+    },
+    {
+      "name": "gateway expired certificate rejected",
+      "passed": true
+    },
+    {
+      "name": "gateway wrong certificate purpose rejected",
+      "passed": true
+    },
+    {
+      "name": "gateway unknown certificate from trusted CA rejected",
+      "passed": true
+    },
+    {
+      "name": "gateway binds certificate to player ID",
+      "passed": true
+    },
+    {
+      "name": "stock Snapclient A renders through gateway",
+      "passed": true
+    },
+    {
+      "name": "stock Snapclient B renders independently",
+      "passed": true
+    },
+    {
+      "name": "renewal admits replacement before retiring old certificate",
+      "passed": true
+    },
+    {
+      "name": "revocation closes existing player session",
+      "passed": true,
+      "elapsed_ms": 102.0
+    },
+    {
+      "name": "revoked certificate cannot reconnect",
+      "passed": true
+    },
+    {
+      "name": "revoking A does not interrupt B",
+      "passed": true
+    },
+    {
+      "name": "renewed stock client renders after old credential revoked",
+      "passed": true
+    },
+    {
+      "name": "gateway rejects RPC disguised as streaming",
+      "passed": true
+    }
+  ],
+  "limitations": [
+    "Synthetic file audio only; no physical DAC or synchronization measurement.",
+    "Enrollment HTTP API, bootstrap trust, durable registry and automatic renewal scheduling are not implemented.",
+    "Experimental Python gateway; production implementation must be Rust and fully harden protocol parsing."
+  ]
+}

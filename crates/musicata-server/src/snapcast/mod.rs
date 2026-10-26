@@ -29,6 +29,8 @@ mod writer;
 pub use control::{SnapClient, SnapControl, SnapGroup, SnapStream};
 pub use dsp::StereoEq;
 pub(crate) use library::{LibraryStream, stream_track as stream_library_track};
+#[cfg(test)]
+pub(crate) use server::render_config;
 pub use server::{
     AIRPLAY_STREAM_NAME, SPOTIFY_STREAM_NAME, STREAM_NAME, SnapRoom, SnapcastManager,
     SnapcastSettings, SnapcastStream, binary_present, install_command, validate_buffer_ms,

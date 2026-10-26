@@ -1758,7 +1758,7 @@ pub(crate) const BOOL_SETTINGS: &[BoolSetting] = &[
     BoolSetting {
         key: SETTING_SNAPCAST_AUTH,
         default: false,
-        doc: "Require auth on the Snapcast control port. Off: matches snapserver's own default.",
+        doc: "Legacy Snapcast password setting. Off: ignored because players use a trusted local network.",
     },
     BoolSetting {
         key: SETTING_SNAPCAST_MANAGE_SERVER,
@@ -2532,7 +2532,6 @@ async fn snapcast_settings_from_db(
     {
         settings.http_port = port;
     }
-    settings.auth_enabled = bool_setting(database, SETTING_SNAPCAST_AUTH).await;
     if let Some(value) = get("snapcast.server_host").await?
         && !value.is_empty()
     {
@@ -2566,7 +2565,6 @@ async fn snapcast_settings_from_db(
     {
         settings.spotify_bitrate = bitrate;
     }
-    settings.rooms = snapcast_rooms_from_db(database).await;
     Ok(settings)
 }
 
@@ -5770,12 +5768,11 @@ struct SnapcastStatus {
     enabled: bool,
     /// Whether the managed snapserver + player are actually running this session.
     running: bool,
-    /// Persisted "require a per-room password" flag. **Not enforced by snapserver 0.35** (auth
-    /// is stubbed upstream) — the UI says so; it's forward-compatible config.
+    /// Compatibility field for older clients. Snapcast password authentication is unsupported.
     auth_enabled: bool,
-    /// The address rooms dial (shown in each room's install command).
+    /// The address players dial (shown in each player's install command).
     server_host: String,
-    /// Connected snapclients (rooms), each a synchronized output.
+    /// Connected Snapcast players, each a synchronized output.
     clients: Vec<snapcast::SnapClient>,
     /// Real Snapserver groups. These are transport groups, not Musicata playback zones.
     groups: Vec<snapcast::SnapGroup>,
@@ -5831,7 +5828,6 @@ async fn snapcast_health_ws(State(state): State<AppState>, upgrade: WebSocketUpg
 #[cfg(feature = "snapcast")]
 async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastStatus>, AppError> {
     let enabled = snapcast_enabled_setting(&state.database).await;
-    let auth_enabled = bool_setting(&state.database, SETTING_SNAPCAST_AUTH).await;
     let server_host = snapcast_server_host(&state.database).await;
     let active_input = snapcast_active_input(&state.database).await;
     let manager = state.players.snapcast_manager().await;
@@ -5871,7 +5867,7 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
         running: health.control == "connected"
             && matches!(health.process.as_str(), "running" | "external"),
         health,
-        auth_enabled,
+        auth_enabled: false,
         server_host,
         clients,
         groups,
@@ -5911,6 +5907,11 @@ async fn snapcast_update(
     Json(update): Json<SnapcastSettingsUpdate>,
 ) -> Result<Json<SnapcastStatus>, AppError> {
     let routing_changed = update.route_all_input.is_some() || update.active_input.is_some();
+    if update.auth_enabled == Some(true) {
+        return Err(AppError::bad_request(
+            "Snapcast does not support password authentication; keep it on a trusted local network",
+        ));
+    }
     if let Some(enabled) = update.mpd_enabled {
         if let Some(manager) = state.players.snapcast_manager().await {
             manager
@@ -5964,10 +5965,10 @@ async fn snapcast_update(
                 .map_err(db_error)?;
         }
     }
-    if let Some(auth) = update.auth_enabled {
+    if update.auth_enabled == Some(false) {
         state
             .database
-            .set_bool_setting(SETTING_SNAPCAST_AUTH, auth)
+            .set_bool_setting(SETTING_SNAPCAST_AUTH, false)
             .await
             .map_err(db_error)?;
     }
@@ -6072,7 +6073,7 @@ async fn snapcast_update(
             .map_err(db_error)?;
         apply_snapcast_dsp(&state.database, &state.players, true).await;
     }
-    // Start the subsystem immediately when newly enabled; auth/host/input-enable changes persist
+    // Start the subsystem immediately when newly enabled; host/input-enable changes persist
     // and take effect on the next restart (the snapserver config is regenerated at startup).
     if snapcast_enabled_setting(&state.database).await
         && state.players.snapcast_manager().await.is_none()
@@ -6232,8 +6233,8 @@ fn validate_snapcast_group_update(
     Ok(())
 }
 
-/// A provisioned room as shown in `/admin`: its name, the snapclient command (password
-/// embedded), and whether a snapclient with that name is currently connected.
+/// A provisioned player as shown in `/admin`: its stable identity, connection command, and
+/// whether that player is currently connected.
 #[cfg(feature = "snapcast")]
 #[derive(Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
@@ -6247,8 +6248,7 @@ struct SnapRoomView {
 async fn snapcast_room_views(state: &AppState) -> Vec<SnapRoomView> {
     let rooms = snapcast_rooms_from_db(&state.database).await;
     let host = snapcast_server_host(&state.database).await;
-    let auth_enabled = bool_setting(&state.database, SETTING_SNAPCAST_AUTH).await;
-    // Which provisioned rooms are connected: the install command sets `--hostID <name>`, which
+    // Which provisioned players are connected: the install command sets `--hostID <name>`, which
     // becomes the snapclient's *id* (its display name still defaults to the device hostname).
     let health = state.players.snapcast_health.snapshot();
     let connected: std::collections::HashSet<String> = health
@@ -6261,7 +6261,7 @@ async fn snapcast_room_views(state: &AppState) -> Vec<SnapRoomView> {
         .iter()
         .map(|room| SnapRoomView {
             name: room.name.clone(),
-            command: snapcast::install_command(&host, room, auth_enabled),
+            command: snapcast::install_command(&host, room, false),
             connected: connected.contains(&room.name),
         })
         .collect()
@@ -6352,11 +6352,10 @@ async fn snapcast_provision_player(
     };
     rooms.push(room.clone());
     save_snapcast_rooms(&state.database, &rooms).await?;
-    let auth_enabled = bool_setting(&state.database, SETTING_SNAPCAST_AUTH).await;
     Ok(Json(ProvisionedSnapcastPlayer {
         id,
-        command: snapcast::install_command(&host, &room, auth_enabled),
-        auth_enabled,
+        command: snapcast::install_command(&host, &room, false),
+        auth_enabled: false,
     }))
 }
 
@@ -10055,6 +10054,73 @@ mod tests {
             serde_json::from_str(&body_text(response.into_body()).await).unwrap();
         assert_eq!(body["running"], false);
         assert_eq!(body["health"]["physical_output"], "unknown");
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
+    async fn legacy_snapcast_auth_is_hidden_and_rejected_without_applying_other_updates() {
+        let fixture = TestFixture::new("snapcast-legacy-auth");
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .unwrap();
+        database
+            .set_bool_setting(super::SETTING_SNAPCAST_AUTH, true)
+            .await
+            .unwrap();
+        database
+            .set_setting(
+                "snapcast.rooms",
+                r#"[{"name":"kitchen","password":"legacy-secret"}]"#,
+            )
+            .await
+            .unwrap();
+        let config = crate::snapcast::render_config(
+            &super::snapcast_settings_from_db(&database).await.unwrap(),
+        );
+        assert!(!config.contains("[authorization]"));
+        assert!(!config.contains("legacy-secret"));
+        let (app, _) = fixture.app_with_database(database.clone()).await;
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/snapcast/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status: serde_json::Value =
+            serde_json::from_str(&body_text(status.into_body()).await).unwrap();
+        assert_eq!(status["auth_enabled"], false);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/snapcast/status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enabled":true,"auth_enabled":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: serde_json::Value =
+            serde_json::from_str(&body_text(response.into_body()).await).unwrap();
+        assert_eq!(
+            error["error"]["message"],
+            "Snapcast does not support password authentication; keep it on a trusted local network"
+        );
+        assert!(
+            !super::bool_setting(&database, super::SETTING_SNAPCAST_ENABLED).await,
+            "a rejected password request must not apply its other settings"
+        );
+        assert!(
+            super::bool_setting(&database, super::SETTING_SNAPCAST_AUTH).await,
+            "the legacy setting remains stored for compatibility"
+        );
     }
 
     #[cfg(feature = "snapcast")]

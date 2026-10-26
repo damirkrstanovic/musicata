@@ -7,13 +7,10 @@
   import type { SnapcastStatus } from "../types/SnapcastStatus";
   import type { UsbWakePolicy } from "../types/UsbWakePolicy";
   import type { SnapClient } from "../types/SnapClient";
-  import type { SnapRoomView } from "../types/SnapRoomView";
   import type { EqProfile } from "../lib/dsp";
 
   let status = $state<SnapcastStatus | null>(null);
-  let rooms = $state<SnapRoomView[]>([]);
   let dspProfiles = $state<EqProfile[]>([]);
-  let newRoom = $state("");
   let host = $state("");
   let bufferMs = $state(1000);
   let message = $state("");
@@ -35,7 +32,6 @@
       loadError = "";
       host = status.server_host;
       bufferMs = status.buffer_ms;
-      rooms = await api.snapcastRooms();
       dspProfiles = await api.dspProfiles().catch(() => []);
     } catch (e) {
       unavailable = e instanceof ApiError && e.status === 404;
@@ -46,7 +42,6 @@
     const disconnect = connectSnapcastHealth(value => {
       health = value;
       healthConnected = true;
-      rooms = rooms.map(room => ({ ...room, connected: value.control === "connected" && value.clients.some(client => client.id === room.name && client.connected) }));
       if (status) {
         status.clients = value.clients;
         status.groups = value.groups;
@@ -85,7 +80,6 @@
       mpd_enabled?: boolean;
       buffer_ms?: number;
       enabled?: boolean;
-      auth_enabled?: boolean;
       server_host?: string;
       airplay_enabled?: boolean;
       spotify_enabled?: boolean;
@@ -104,44 +98,11 @@
         host = next.server_host;
         bufferMs = next.buffer_ms;
       }
-      if (status?.running) rooms = await api.snapcastRooms();
       message = note;
     } catch (e) {
       message = e instanceof ApiError ? e.message : String(e);
       error = true;
       status = await api.snapcastStatus().catch(() => null);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function addRoom() {
-    const name = newRoom.trim();
-    if (!name) return;
-    busy = true;
-    error = false;
-    try {
-      const next = await api.addSnapcastRoom(name);
-      if (next) rooms = next;
-      newRoom = "";
-      message = `Added “${name}”.`;
-    } catch (e) {
-      message = e instanceof ApiError ? e.message : String(e);
-      error = true;
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function removeRoom(name: string) {
-    busy = true;
-    try {
-      const next = await api.deleteSnapcastRoom(name);
-      if (next) rooms = next;
-      message = `Removed “${name}”.`;
-    } catch (e) {
-      message = e instanceof ApiError ? e.message : String(e);
-      error = true;
     } finally {
       busy = false;
     }
@@ -166,8 +127,8 @@
   <section class="admin-panel">
     <div class="admin-panel-head"><h2>Multi-room (Snapcast)</h2></div>
     <p class="admin-hint">
-      Play the same music perfectly in sync across rooms. Each room is a snapclient on the
-      network; Musicata decodes and streams to them through a managed snapserver.
+      Play the same music perfectly in sync across Snapcast players. Musicata decodes and
+      streams to them through a managed Snapserver on your trusted local network.
     </p>
 
     {#if health}
@@ -241,31 +202,8 @@
       {#if !status.manage_server}Configure this on your external Snapserver.{:else if status.applied_buffer_ms !== null}Currently applied: {status.applied_buffer_ms} ms.{/if}
     </p>
 
-    <!-- Access control: per-room passwords. NOTE: snapserver 0.35 doesn't enforce them yet. -->
-    <div class="admin-subhead">Access</div>
-    <label class="toggle-row">
-      <input
-        type="checkbox"
-        checked={status.auth_enabled}
-        disabled={busy}
-        onchange={(e) =>
-          update(
-            { auth_enabled: (e.currentTarget as HTMLInputElement).checked },
-            "Saved. Restart the server to write the new config.",
-          )}
-      />
-      <span>Require a password per room</span>
-    </label>
-    {#if status.auth_enabled}
-      <p class="admin-hint warn">
-        ⚠️ Not enforced yet: snapserver {`0.35`} ignores these passwords (upstream is still
-        finishing auth), so rooms remain open on the local network for now. The passwords are
-        baked into each room's command and config, and become enforcing automatically when a
-        future snapserver enables auth. Keep the server on a trusted network meanwhile.
-      </p>
-    {/if}
     <label class="field">
-      <span>Server address rooms connect to</span>
+      <span>Server address players connect to</span>
       <div class="host-row">
         <input bind:value={host} placeholder="musicata.local" disabled={busy} />
         <button
@@ -299,8 +237,8 @@
 
     <div class="admin-subhead">MPD compatibility input</div>
     <p class="admin-hint">Use the installer to route local MPD through Snapcast. Snapclient plays
-      the audio and can wake its USB DAC. Select MPD as the input for the desired rooms.
-      Changing this setting briefly reconnects the rooms.</p>
+      the audio and can wake its USB DAC. Select MPD as the input for the desired players.
+      Changing this setting briefly reconnects the players.</p>
     <label class="toggle-row">
       <input data-mpd-input type="checkbox" checked={status.mpd_enabled}
         disabled={busy || !status.running || !status.manage_server}
@@ -309,10 +247,10 @@
     </label>
 
     <!-- Cast TO Musicata: snapserver spawns shairport-sync / librespot and exposes each as a
-         stream rooms can be switched to. The phone controls playback; Musicata just routes it. -->
+         stream players can be switched to. The phone controls playback; Musicata just routes it. -->
     <div class="admin-subhead">Cast to Musicata</div>
     <p class="admin-hint">
-      Let a phone AirPlay or Spotify-Connect audio into Musicata and play it across your rooms.
+      Let a phone AirPlay or Spotify-Connect audio into Musicata and play it across your players.
       Musicata doesn't own the playlist — the phone controls it — but ships it to multi-room.
     </p>
     <label class="toggle-row">
@@ -352,7 +290,7 @@
     {/if}
 
     {#if status.running && status.inputs.length > 1}
-      <!-- Which input all rooms play. Applied live; only streams snapserver actually has appear. -->
+      <!-- Which input all players play. Applied live; only streams snapserver actually has appear. -->
       <div class="admin-subhead">Route all groups</div>
       <div class="input-picker">
         {#each status.inputs as input (input.id)}
@@ -392,42 +330,8 @@
       </select>
     </label>
 
-    {#if status.enabled || rooms.length > 0 || status.clients.length > 0}
-      <!-- Rooms: provision a device with a name → get its install command. -->
-      <div class="admin-subhead">Rooms</div>
-      <div class="host-row">
-        <input
-          bind:value={newRoom}
-          placeholder="kitchen"
-          disabled={busy}
-          onkeydown={(e) => e.key === "Enter" && addRoom()}
-        />
-        <button class="primary-button" disabled={busy || !newRoom.trim()} onclick={addRoom}>
-          Add room
-        </button>
-      </div>
-
-      {#if rooms.length === 0}
-        <p class="admin-hint">No rooms yet. Add one to get a snapclient install command.</p>
-      {:else}
-        <ul class="room-list">
-          {#each rooms as room (room.name)}
-            <li class="provision">
-              <div class="provision-head">
-                <span class="room-name">
-                  {room.name}
-                  <span class="dot" class:on={healthConnected && health?.control === "connected" && room.connected} title={!healthConnected || health?.control !== "connected" ? "connection unknown" : room.connected ? "connected" : "not connected"}></span>
-                </span>
-                <button class="ghost-button" disabled={busy} onclick={() => removeRoom(room.name)}>Remove</button>
-              </div>
-              <p class="admin-hint">Install snapclient on the device, then run:</p>
-              <input class="cmd" readonly value={room.command} onclick={(e) => (e.currentTarget as HTMLInputElement).select()} />
-            </li>
-          {/each}
-        </ul>
-      {/if}
-
-      <!-- Live per-room volume for connected snapclients. -->
+    {#if status.enabled || status.clients.length > 0}
+      <!-- Live per-player volume for connected snapclients. -->
       {#if status.clients.length > 0}
         <div class="admin-subhead">Volume</div>
         <ul class="room-list">
@@ -482,32 +386,6 @@
     display: flex;
     flex-direction: column;
     gap: 0.6rem;
-  }
-  .provision {
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 0.5rem;
-    padding: 0.6rem 0.7rem;
-  }
-  .provision-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-  .cmd {
-    width: 100%;
-    font-family: ui-monospace, monospace;
-    font-size: 0.72rem;
-  }
-  .dot {
-    display: inline-block;
-    width: 0.5rem;
-    height: 0.5rem;
-    border-radius: 50%;
-    background: rgba(255, 255, 255, 0.25);
-    margin-left: 0.3rem;
-  }
-  .dot.on {
-    background: #4caf50;
   }
   .room-row {
     display: grid;
