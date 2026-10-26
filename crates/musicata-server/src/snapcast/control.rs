@@ -20,6 +20,9 @@ use tokio::net::TcpStream;
 pub struct SnapClient {
     pub id: String,
     pub name: String,
+    pub hostname: String,
+    pub ip_address: String,
+    pub zone_id: Option<String>,
     pub connected: bool,
     pub volume_percent: u8,
     pub muted: bool,
@@ -77,7 +80,9 @@ impl SnapControl {
             request["params"] = params;
         }
         let mut line = serde_json::to_string(&request)?;
-        line.push('\n');
+        // Snapserver 0.26's TCP control parser requires CRLF; a bare LF leaves the request
+        // buffered until the read deadline despite being accepted by newer/fake servers.
+        line.push_str("\r\n");
         tokio::time::timeout(Duration::from_secs(3), write.write_all(line.as_bytes()))
             .await
             .context("snapcast control write timeout")??;
@@ -133,6 +138,13 @@ impl SnapControl {
         .map(|_| ())
     }
 
+    /// Give a Snapclient a durable user-facing name.
+    pub async fn set_client_name(&self, client_id: &str, name: &str) -> Result<()> {
+        self.call("Client.SetName", json!({ "id": client_id, "name": name }))
+            .await
+            .map(|_| ())
+    }
+
     /// The streams snapserver currently has defined (Musicata + any enabled AirPlay/Spotify
     /// inputs), with their status and now-playing metadata — for the input picker.
     pub async fn streams(&self) -> Result<Vec<SnapStream>> {
@@ -180,6 +192,32 @@ impl SnapControl {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Add a Musicata-owned pipe stream on Snapserver versions that support runtime streams.
+    pub async fn add_pipe_stream(
+        &self,
+        stream: &super::server::SnapcastStream,
+        sample_rate: u32,
+    ) -> Result<()> {
+        self.call(
+            "Stream.AddStream",
+            json!({
+                "streamUri": format!(
+                    "pipe://{}?name={}&sampleformat={sample_rate}:16:2&codec=flac&mode=read",
+                    stream.fifo_path.display(), stream.name,
+                )
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Remove a stream that was previously added through [`add_pipe_stream`](Self::add_pipe_stream).
+    pub async fn remove_stream(&self, stream_id: &str) -> Result<()> {
+        self.call("Stream.RemoveStream", json!({ "id": stream_id }))
+            .await
+            .map(|_| ())
     }
 }
 
@@ -277,13 +315,33 @@ fn parse_stream(stream: &Value) -> SnapStream {
 }
 
 fn parse_client(client: &Value) -> SnapClient {
+    let hostname = client
+        .pointer("/host/name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let ip_address = client
+        .pointer("/host/ip")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let local = ip_address
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback());
     let name = client
         .pointer("/config/name")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .or_else(|| client.pointer("/host/name").and_then(|v| v.as_str()))
-        .unwrap_or("client")
-        .to_string();
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| {
+            if local {
+                "musicata-localhost"
+            } else if !hostname.is_empty() {
+                &hostname
+            } else {
+                "Snapcast player"
+            }
+        })
+        .to_owned();
     SnapClient {
         id: client
             .get("id")
@@ -291,6 +349,9 @@ fn parse_client(client: &Value) -> SnapClient {
             .unwrap_or_default()
             .to_string(),
         name,
+        hostname,
+        ip_address,
+        zone_id: None,
         connected: client
             .get("connected")
             .and_then(|v| v.as_bool())
@@ -339,6 +400,28 @@ fn parse_group(group: &Value) -> SnapGroup {
 mod tests {
     use super::*;
 
+    #[test]
+    fn client_description_preserves_location_and_names_local_output() {
+        let local = parse_client(
+            &json!({"id":"local", "host":{"name":"music-host", "ip":"127.0.0.1"}, "config":{"name":""}}),
+        );
+        assert_eq!(local.name, "musicata-localhost");
+        let value = serde_json::to_value(&local).unwrap();
+        assert_eq!(value["hostname"], "music-host");
+        assert_eq!(value["ip_address"], "127.0.0.1");
+        let named = parse_client(&json!({"host":{"ip":"::1"}, "config":{"name":"Living room"}}));
+        assert_eq!(named.name, "Living room");
+        let remote = parse_client(&json!({"host":{"name":"kitchen", "ip":"192.0.2.36"}}));
+        assert_eq!(remote.name, "kitchen");
+        assert_eq!(
+            serde_json::to_value(remote).unwrap()["ip_address"],
+            "192.0.2.36"
+        );
+        let unknown = serde_json::to_value(parse_client(&json!({}))).unwrap();
+        assert_eq!(unknown["hostname"], "");
+        assert_eq!(unknown["ip_address"], "");
+    }
+
     #[tokio::test]
     async fn stalled_control_releases_its_socket_after_timeout() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -371,6 +454,7 @@ mod tests {
             let mut stream = BufReader::new(stream);
             let mut request = String::new();
             stream.read_line(&mut request).await.unwrap();
+            assert!(request.ends_with("\r\n"));
             let request: Value = serde_json::from_str(&request).unwrap();
             assert_eq!(request["method"], "Server.GetStatus");
             // Rejection of oversized replies may close the socket before writing finishes.

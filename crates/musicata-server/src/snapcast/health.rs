@@ -366,6 +366,9 @@ mod tests {
             clients: vec![SnapClient {
                 id: "secret-id".into(),
                 name: "private-room".into(),
+                hostname: "example-host".into(),
+                ip_address: "192.0.2.1".into(),
+                zone_id: None,
                 connected: true,
                 volume_percent: 50,
                 muted: false,

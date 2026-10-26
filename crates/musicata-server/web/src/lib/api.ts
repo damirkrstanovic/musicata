@@ -25,6 +25,7 @@ import type { MetadataFieldReviewUpdate } from "../types/MetadataFieldReviewUpda
 import type { EqProfile } from "./dsp";
 import type { OutputDspState } from "../types/OutputDspState";
 import type { OutputDspSelection } from "../types/OutputDspSelection";
+import type { PlaybackState } from "../types/PlaybackState";
 
 // Re-export the generated metadata-review types under the names the editor components use.
 export type { MetadataApprovalState } from "../types/MetadataApprovalState";
@@ -351,6 +352,8 @@ export const api = {
   }) => sendJson<SnapcastStatus>("/api/snapcast/status", "PATCH", update),
   updateSnapcastGroup: (id: string, update: { client_ids?: string[]; stream_id?: string }) =>
     sendJson<SnapcastStatus>(`/api/snapcast/groups/${encodeURIComponent(id)}`, "PATCH", update),
+  updateSnapcastClient: (id: string, update: { name?: string; zone_id?: string | null }) =>
+    sendJson(`/api/snapcast/clients/${encodeURIComponent(id)}`, "PATCH", update),
   snapcastRooms: () => getJson<SnapRoomView[]>("/api/snapcast/rooms"),
   addSnapcastRoom: (name: string) =>
     sendJson<SnapRoomView[]>("/api/snapcast/rooms", "POST", { name }),
@@ -404,6 +407,7 @@ export const api = {
 
   // Players & zones
   players: () => getJson<Player[]>("/api/players"),
+  playerState: (id: string) => getJson<PlaybackState>(`/api/players/${encodeURIComponent(id)}/state`),
   playerCommand: (id: string, command: unknown) =>
     sendJson(`/api/players/${encodeURIComponent(id)}/commands`, "POST", command),
   createPlayer: (body: { kind: "mpd"; address: string; name?: string }) =>
@@ -413,7 +417,10 @@ export const api = {
   deletePlayer: (id: string) => sendJson(`/api/players/${encodeURIComponent(id)}`, "DELETE"),
   zones: () => getJson<Zone[]>("/api/zones"),
   createZone: (name: string) => sendJson<Zone>("/api/zones", "POST", { name }),
+  updateZone: (id: string, name: string) =>
+    sendJson<void>(`/api/zones/${encodeURIComponent(id)}`, "PATCH", { name }),
   deleteZone: (id: string) => sendJson(`/api/zones/${encodeURIComponent(id)}`, "DELETE"),
+  zoneState: (id: string) => getJson<PlaybackState>(`/api/zones/${encodeURIComponent(id)}/state`),
 
   // Merged artists
   aliases: () => getJson<ArtistAliasGroup[]>("/api/artists/aliases"),

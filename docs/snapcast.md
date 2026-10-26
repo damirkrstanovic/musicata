@@ -77,6 +77,19 @@ Each client uses a configurable playback buffer (1,000 ms by default) and plays 
 server-stamped timestamp so rooms stay synchronized. This is also how
 server-side per-zone DSP is applied (see [dsp.md](dsp.md)).
 
+**Zones and players (1.12):** Settings → Outputs shows your zones and their players,
+including each network player's name, hostname/IP address and connection state. Use
+**Manage zone** to change membership. A zone can include browser, MPD and Snapcast players;
+its Snapcast players share one synchronized stream. Different zones have independent queues
+and decoded streams. Browser and MPD members follow zone commands but are not sample-synchronized
+with Snapcast. Snapcast groups and transport settings live under advanced settings.
+
+The zone follows the server-side player's actual track and progress, including automatic
+track changes. Existing shared-output zone assignments and queues migrate on upgrade.
+Unassigned speakers retain the shared Musicata output. On the bundled Snapserver 0.26,
+adding the first Snapcast player to a zone or deleting its stream briefly reconnects all
+network players; normal moves between existing zone streams do not restart the server.
+
 **Prerequisites** (the Linux installer supplies these utilities by default from 1.6.1):
 
 - `snapserver` on the Musicata host.
@@ -175,7 +188,7 @@ Its data model maps cleanly onto ours:
 | Snapcast | Musicata |
 |---|---|
 | **stream** (a `source=` FIFO) | a zone's audio output |
-| **group** (plays one stream) | a **zone** |
+| **group** (plays one stream) | the Snapcast members of a Musicata zone; an advanced transport detail |
 | **client** (a snapclient device, own volume + latency) | a player/output in the zone |
 
 ---

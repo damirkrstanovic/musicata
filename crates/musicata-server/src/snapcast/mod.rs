@@ -3,13 +3,13 @@
 //!
 //! Unlike every other Musicata playback path — where the endpoint fetches a per-track URL
 //! and decodes it itself — Snapcast broadcasts one continuous, server-decoded PCM stream to
-//! N sample-accurate clients. So this module owns the genuinely new server-side stage:
+//! N sample-accurate clients per stream. So this module owns the genuinely new server-side stage:
 //!
 //! - [`decode`] — symphonia decode of a library track → stereo → `rubato` resample to the
 //!   fixed stream rate → interleaved `i16`.
 //! - [`writer`] — a dedicated OS thread streaming that PCM into the FIFO snapserver reads;
 //!   snapserver's real-time pipe pacing backpressures our blocking writes (no clock here).
-//! - [`server`] — snapserver subprocess + FIFO lifecycle (the one "Musicata" pipe stream).
+//! - [`server`] — snapserver subprocess + FIFO lifecycle (legacy + per-zone pipe streams).
 //! - [`control`] — JSON-RPC: enumerate clients (rooms), set per-output volume, point groups
 //!   at our stream.
 //!
@@ -31,7 +31,8 @@ pub use dsp::StereoEq;
 pub(crate) use library::{LibraryStream, stream_track as stream_library_track};
 pub use server::{
     AIRPLAY_STREAM_NAME, SPOTIFY_STREAM_NAME, STREAM_NAME, SnapRoom, SnapcastManager,
-    SnapcastSettings, binary_present, install_command, validate_buffer_ms,
+    SnapcastSettings, SnapcastStream, binary_present, install_command, validate_buffer_ms,
+    zone_stream_name,
 };
 pub(crate) use stream::stream_radio;
 pub use writer::{WriterEvent, WriterMsg, run as run_writer};

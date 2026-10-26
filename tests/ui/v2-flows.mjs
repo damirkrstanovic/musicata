@@ -7,6 +7,7 @@
 // non-zero on any failed assertion.
 import { radioFlows } from "./radio-flows.mjs";
 import { stablePlayerFlows } from "./stable-player-flows.mjs";
+import { zonesFlows } from "./zones-flows.mjs";
 import { outputPickerFlows } from "./output-picker-flows.mjs";
 import { albumPlayFlows } from "./album-play-flows.mjs";
 import { artworkFlows } from "./artwork-flows.mjs";
@@ -179,6 +180,7 @@ await sleep(2500);
 console.log(`Svelte UI smoke (${PATH}, ${MODE}):`);
 if (MODE === "behavior") {
   await outputPickerFlows({js, check, waitUntil, tap: tapMobile, groupedPlayerId});
+  await zonesFlows({api, js, check, waitUntil, tap: tapMobile});
   await js(`document.querySelector('.output-trigger')?.click()`);
   await js(`document.querySelector('[data-output="player:browser-local"]')?.click()`);
   await sleep(400);
@@ -230,6 +232,20 @@ if (MODE === "behavior") {
   await sleep(300);
   check('desktop title opens details above the stable player', await js(`document.querySelector('.shell').classList.contains('np-open') && !!document.querySelector('.now-playing-panel .queue-drawer') && document.querySelector('.playback-panels').getBoundingClientRect().bottom <= document.querySelector('.player-bar').getBoundingClientRect().top`));
   check('desktop Now Playing keeps transport visible', await js(`document.querySelector('.player-bar .transport')?.getBoundingClientRect().bottom <= innerHeight`));
+  for (const width of [1024, 1440, 2048]) {
+    await send('Emulation.setDeviceMetricsOverride', {width, height:1000, deviceScaleFactor:1, mobile:false});
+    check(`desktop ${width} centers transport and separates seek from volume`, await js(`(() => {
+      const main=document.querySelector('.transport-main').getBoundingClientRect();
+      const seek=document.querySelector('.player-bar .seek-row').getBoundingClientRect();
+      const aux=document.querySelector('.player-bar .transport-aux').getBoundingClientRect();
+      const play=document.querySelector('.transport-main .control.play').getBoundingClientRect();
+      return Math.abs((main.left+main.width/2)-innerWidth/2)<innerWidth*.1
+        && seek.width>=Math.min(360, innerWidth*.3) && seek.right<=aux.left
+        && play.width>=44 && play.height>=44;
+    })()`));
+    await mobileScreenshot(`desktop-transport-${width}`);
+  }
+  await send('Emulation.setDeviceMetricsOverride', {width:1440,height:1000,deviceScaleFactor:1,mobile:false});
   await mobileScreenshot('desktop-now-playing');
   await js('history.back()');
   await sleep(300);

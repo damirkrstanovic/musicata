@@ -341,6 +341,7 @@ Present only with the `snapcast` build feature.
 | POST | `/api/snapcast/health/retry` | Admin-only request to reset exhausted managed-process recovery; returns 202. |
 | GET/POST | `/api/snapcast/rooms` | List / add a room. |
 | DELETE | `/api/snapcast/rooms/{name}` | Remove a room. |
+| PATCH | `/api/snapcast/clients/{id}` | Admin-only: rename with `{ "name": "Kitchen" }`, or assign with `{ "zone_id": "zone-id" }` (`null` unassigns). Send one operation per request. |
 | POST | `/api/snapcast/clients/{id}/volume` | Set a client's volume. |
 
 ---

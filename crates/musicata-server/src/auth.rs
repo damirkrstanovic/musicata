@@ -219,6 +219,7 @@ fn is_admin_mutation_path(path: &str, method: &axum::http::Method) -> bool {
             || path == "/api/snapcast/usb-wake"
             || path.starts_with("/api/snapcast/rooms")
             || path.starts_with("/api/snapcast/groups/")
+            || (path.starts_with("/api/snapcast/clients/") && !path.ends_with("/volume"))
             || (path.starts_with("/api/albums/")
                 && (path.ends_with("/artwork") || path.ends_with("/artwork/refresh"))))
 }
@@ -953,6 +954,10 @@ mod tests {
         ));
         assert!(is_admin_mutation_path(
             "/api/snapcast/groups/living",
+            &axum::http::Method::PATCH
+        ));
+        assert!(is_admin_mutation_path(
+            "/api/snapcast/clients/living",
             &axum::http::Method::PATCH
         ));
         assert!(!is_admin_mutation_path(

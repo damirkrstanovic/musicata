@@ -3,4 +3,4 @@
 /**
  * A snapclient as snapserver sees it — one synchronized output (a room/speaker).
  */
-export type SnapClient = { id: string, name: string, connected: boolean, volume_percent: number, muted: boolean, };
+export type SnapClient = { id: string, name: string, hostname: string, ip_address: string, zone_id: string | null, connected: boolean, volume_percent: number, muted: boolean, };

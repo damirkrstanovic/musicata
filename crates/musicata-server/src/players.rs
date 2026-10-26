@@ -34,7 +34,7 @@ use crate::mpd::{MpdConnection, MpdStatus};
 use crate::providers::ProviderRegistry;
 use crate::queue_persistence::{QueueOwner, QueuePersist, QueuePersistence};
 #[cfg(feature = "snapcast")]
-use crate::snapcast::{SnapcastManager, StereoEq, WriterEvent, WriterMsg};
+use crate::snapcast::{SnapcastManager, SnapcastStream, StereoEq, WriterEvent, WriterMsg};
 
 /// Stable id of the always-present local browser player.
 pub const BROWSER_PLAYER_ID: &str = "browser-local";
@@ -124,6 +124,15 @@ impl PlayerHandle {
             PlayerHandle::Browser(player) => Ok(player.snapshot().await),
             #[cfg(feature = "snapcast")]
             PlayerHandle::Snapcast(player) => Ok(player.snapshot().await),
+        }
+    }
+
+    async fn snapshot(&self) -> PlaybackState {
+        match self {
+            PlayerHandle::Mpd(player) => player.snapshot().await,
+            PlayerHandle::Browser(player) => player.snapshot().await,
+            #[cfg(feature = "snapcast")]
+            PlayerHandle::Snapcast(player) => player.snapshot().await,
         }
     }
 
@@ -490,11 +499,16 @@ fn spawn_listen_recorder(
 struct ZoneEntry {
     player: Arc<ZonePlayer>,
     recorder: JoinHandle<()>,
+    cursor_task: Option<JoinHandle<()>>,
+    cursor_source: Option<String>,
 }
 
 impl Drop for ZoneEntry {
     fn drop(&mut self) {
         self.recorder.abort();
+        if let Some(task) = &self.cursor_task {
+            task.abort();
+        }
     }
 }
 
@@ -502,6 +516,13 @@ impl Drop for ZoneEntry {
 /// enabled in settings, like the browser player).
 #[cfg(feature = "snapcast")]
 pub const SNAPCAST_PLAYER_ID: &str = "snapcast-local";
+
+/// Runtime player id for a zone's independent Snapcast stream. Zone ids are already stable
+/// slugs, so the prefix is enough to keep this synthetic output out of ordinary player picks.
+#[cfg(feature = "snapcast")]
+pub fn zone_snapcast_player_id(zone_id: &str) -> String {
+    format!("snapcast-zone-{zone_id}")
+}
 
 /// Registry of registered players and zones, backed by the database.
 pub struct PlayerManager {
@@ -516,6 +537,9 @@ pub struct PlayerManager {
     /// The managed snapserver + FIFO, present once Snapcast is enabled in settings.
     #[cfg(feature = "snapcast")]
     snapcast: RwLock<Option<Arc<SnapcastManager>>>,
+    /// The active correction must follow every independently decoded zone stream.
+    #[cfg(feature = "snapcast")]
+    snapcast_dsp: RwLock<Option<StereoEq>>,
     #[cfg(feature = "snapcast")]
     pub(crate) snapcast_health: crate::snapcast::health::HealthMonitor,
     #[cfg(feature = "snapcast")]
@@ -538,6 +562,8 @@ impl PlayerManager {
             zones: RwLock::new(BTreeMap::new()),
             #[cfg(feature = "snapcast")]
             snapcast: RwLock::new(None),
+            #[cfg(feature = "snapcast")]
+            snapcast_dsp: RwLock::new(None),
             #[cfg(feature = "snapcast")]
             snapcast_health: crate::snapcast::health::HealthMonitor::default(),
             #[cfg(feature = "snapcast")]
@@ -566,6 +592,7 @@ impl PlayerManager {
         }
         for zone in manager.database.list_zones().await? {
             manager.bring_up_zone(&zone).await;
+            manager.refresh_zone_cursor(&zone.id).await?;
         }
         Ok(manager)
     }
@@ -580,10 +607,15 @@ impl PlayerManager {
             player.history_tx.subscribe(),
             self.database.clone(),
         );
-        self.zones
-            .write()
-            .await
-            .insert(zone.id.clone(), ZoneEntry { player, recorder });
+        self.zones.write().await.insert(
+            zone.id.clone(),
+            ZoneEntry {
+                player,
+                recorder,
+                cursor_task: None,
+                cursor_source: None,
+            },
+        );
     }
 
     pub async fn get_zone(&self, id: &str) -> Option<Arc<ZonePlayer>> {
@@ -619,11 +651,96 @@ impl PlayerManager {
                 })
                 .await?;
         }
-        if !self.players.read().await.contains_key(SNAPCAST_PLAYER_ID) {
-            let record = self.require_record(SNAPCAST_PLAYER_ID).await?;
-            self.bring_up(&record).await;
+        let mut zones = Vec::new();
+        for record in self.database.list_players().await? {
+            if record.kind == "snapcast" && !self.players.read().await.contains_key(&record.id) {
+                self.bring_up(&record).await;
+            }
+            if record.kind == "snapcast"
+                && let Some(zone_id) = record.zone_id
+            {
+                zones.push(zone_id);
+            }
+        }
+        for zone_id in zones {
+            self.refresh_zone_cursor(&zone_id).await?;
         }
         Ok(())
+    }
+
+    /// Ensure a zone has its own decoded Snapcast output and pipe stream. If an older release
+    /// had assigned the shared local output to this zone, copy its real queue/cursor into both
+    /// the new output and the zone before detaching that legacy assignment.
+    #[cfg(feature = "snapcast")]
+    pub async fn ensure_zone_snapcast(&self, zone_id: &str) -> Result<()> {
+        let zone = self
+            .get_zone(zone_id)
+            .await
+            .ok_or_else(|| anyhow!("unknown zone: {zone_id}"))?;
+        let manager = self
+            .snapcast_manager()
+            .await
+            .ok_or_else(|| anyhow!("Snapcast is not enabled"))?;
+        manager.ensure_zone_stream(zone_id).await?;
+        let id = zone_snapcast_player_id(zone_id);
+        let mut resume_migrated_playback = false;
+        let created = self.database.player_record(&id).await?.is_none();
+        if created {
+            let legacy = self.database.player_record(SNAPCAST_PLAYER_ID).await?;
+            let migrated = match legacy {
+                Some(record) if record.zone_id.as_deref() == Some(zone_id) => {
+                    resume_migrated_playback = matches!(
+                        self.get(SNAPCAST_PLAYER_ID).await,
+                        Some(PlayerHandle::Snapcast(player))
+                            if player.snapshot().await.status == PlaybackStatus::Playing
+                    );
+                    self.database.load_player_queue(SNAPCAST_PLAYER_ID).await?
+                }
+                _ => None,
+            };
+            self.database
+                .upsert_player(&PlayerRecord {
+                    id: id.clone(),
+                    kind: "snapcast".to_string(),
+                    address: format!("zone:{zone_id}"),
+                    name: format!("Zone stream: {zone_id}"),
+                    zone_id: Some(zone_id.to_string()),
+                })
+                .await?;
+            if let Some(snapshot) = migrated {
+                self.database
+                    .save_player_queue(&id, &snapshot.playback, &snapshot.items)
+                    .await?;
+                self.database
+                    .save_zone_queue(zone_id, &snapshot.playback, &snapshot.items)
+                    .await?;
+                zone.apply_migrated_snapshot(snapshot).await;
+                self.database
+                    .update_player_zone(SNAPCAST_PLAYER_ID, None)
+                    .await?;
+            }
+        }
+        if !self.players.read().await.contains_key(&id) {
+            let record = self.require_record(&id).await?;
+            self.bring_up(&record).await;
+        }
+        if let Some(PlayerHandle::Snapcast(player)) = self.get(&id).await {
+            if created {
+                player
+                    .adopt_zone_snapshot(zone.member_snapshot().await)
+                    .await;
+            }
+            let state = player.snapshot().await;
+            if resume_migrated_playback
+                && state.status == PlaybackStatus::Paused
+                && state.queue_position.is_some()
+            {
+                player
+                    .execute(PlayerCommand::Play, &self.database, "")
+                    .await?;
+            }
+        }
+        self.refresh_zone_cursor(zone_id).await
     }
 
     /// The managed snapserver, once enabled — used by the control/admin layer.
@@ -635,10 +752,25 @@ impl PlayerManager {
     /// Set (or clear) the server-side EQ correction applied to the Snapcast stream.
     #[cfg(feature = "snapcast")]
     pub async fn set_snapcast_dsp(&self, eq: Option<StereoEq>) {
-        if let Some(entry) = self.players.read().await.get(SNAPCAST_PLAYER_ID)
-            && let PlayerHandle::Snapcast(player) = &entry.handle
-        {
-            player.set_dsp(eq);
+        *self.snapcast_dsp.write().await = eq.clone();
+        for entry in self.players.read().await.values() {
+            if let PlayerHandle::Snapcast(player) = &entry.handle {
+                player.set_dsp(eq.clone());
+            }
+        }
+    }
+
+    /// Update the base equipment correction for independent zone streams without replacing
+    /// the legacy output's combined equipment/listening chain owned by `output_audio`.
+    #[cfg(feature = "snapcast")]
+    pub async fn set_zone_snapcast_dsp(&self, eq: Option<StereoEq>) {
+        *self.snapcast_dsp.write().await = eq.clone();
+        for (id, entry) in self.players.read().await.iter() {
+            if id != SNAPCAST_PLAYER_ID
+                && let PlayerHandle::Snapcast(player) = &entry.handle
+            {
+                player.set_dsp(eq.clone());
+            }
         }
     }
 
@@ -665,12 +797,28 @@ impl PlayerManager {
                     tracing::warn!(player = %record.id, "snapcast player skipped: subsystem not enabled");
                     return;
                 };
+                let stream = if record.id == SNAPCAST_PLAYER_ID {
+                    manager.legacy_stream()
+                } else if let Some(zone_id) = record.zone_id.as_deref() {
+                    match manager.ensure_zone_stream(zone_id).await {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            tracing::warn!(player = %record.id, zone = %zone_id, %error, "snapcast zone stream unavailable");
+                            return;
+                        }
+                    }
+                } else {
+                    tracing::warn!(player = %record.id, "snapcast player without a zone skipped");
+                    return;
+                };
                 let player = SnapcastPlayer::new(
                     record.id.clone(),
                     self.database.clone(),
                     self.providers.clone(),
                     manager,
+                    stream,
                 );
+                player.set_dsp(self.snapcast_dsp.read().await.clone());
                 player.restore().await;
                 let task = player.clone().spawn_control_task();
                 (PlayerHandle::Snapcast(player), Some(task), None)
@@ -759,11 +907,19 @@ impl PlayerManager {
             }
         }
         self.database.update_player_zone(id, zone_id).await?;
+        if let Some(previous_zone) = previous.zone_id.as_deref() {
+            self.refresh_zone_cursor(previous_zone).await?;
+        }
+        if let Some(next_zone) = zone_id
+            && Some(next_zone) != previous.zone_id.as_deref()
+        {
+            self.refresh_zone_cursor(next_zone).await?;
+        }
         self.descriptor(&self.require_record(id).await?).await
     }
 
     pub async fn remove(&self, id: &str) -> Result<()> {
-        self.require_record(id).await?;
+        let record = self.require_record(id).await?;
         let entry = self.players.write().await.remove(id);
         if let Some(entry) = entry {
             let handle = entry.handle.clone();
@@ -777,6 +933,11 @@ impl PlayerManager {
             }
         }
         self.database.delete_player(id).await?;
+        if let Some(zone_id) = record.zone_id.as_deref()
+            && self.get_zone(zone_id).await.is_some()
+        {
+            self.refresh_zone_cursor(zone_id).await?;
+        }
         Ok(())
     }
 
@@ -839,11 +1000,105 @@ impl PlayerManager {
         Ok(zone)
     }
 
+    /// Elect one decoded member as the zone's cursor source. Snapcast is preferred
+    /// because its decode loop is the audio clock; MPD is the fallback.
+    async fn refresh_zone_cursor(&self, zone_id: &str) -> Result<()> {
+        let zone = self
+            .get_zone(zone_id)
+            .await
+            .ok_or_else(|| anyhow!("unknown zone: {zone_id}"))?;
+        let mut source: Option<(String, PlayerHandle, u8)> = None;
+        for record in self.database.players_in_zone(zone_id).await? {
+            let Some(handle) = self.get(&record.id).await else {
+                continue;
+            };
+            let priority = match handle {
+                #[cfg(feature = "snapcast")]
+                PlayerHandle::Snapcast(_) => 2,
+                PlayerHandle::Mpd(_) => 1,
+                PlayerHandle::Browser(_) => 0,
+            };
+            if priority > source.as_ref().map_or(0, |(_, _, priority)| *priority) {
+                source = Some((record.id, handle, priority));
+            }
+        }
+        let source_id = source.as_ref().map(|(id, _, _)| id.clone());
+        let previous_task = {
+            let mut zones = self.zones.write().await;
+            let entry = zones
+                .get_mut(zone_id)
+                .ok_or_else(|| anyhow!("unknown zone: {zone_id}"))?;
+            if entry.cursor_source == source_id
+                && entry.cursor_task.is_some() == source_id.is_some()
+            {
+                return Ok(());
+            }
+            entry.cursor_source = source_id;
+            entry.cursor_task.take()
+        };
+        if let Some(task) = previous_task {
+            task.abort();
+        }
+        let Some((source_id, handle, _)) = source else {
+            zone.set_cursor_source(None).await;
+            return Ok(());
+        };
+        zone.set_cursor_source(Some(source_id.clone())).await;
+        zone.apply_member_cursor(&source_id, handle.snapshot().await)
+            .await;
+        let mut states = handle.subscribe();
+        let task_zone = zone.clone();
+        let task_source_id = source_id.clone();
+        let task_handle = handle.clone();
+        let task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    state = states.recv() => match state {
+                        Ok(_) => {
+                            task_zone.apply_member_cursor(
+                                &task_source_id,
+                                task_handle.snapshot().await,
+                            ).await;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    _ = tick.tick() => {
+                        task_zone.apply_member_cursor(&task_source_id, task_handle.snapshot().await).await;
+                    }
+                }
+            }
+        });
+        let replaced = self
+            .zones
+            .write()
+            .await
+            .get_mut(zone_id)
+            .and_then(|entry| entry.cursor_task.replace(task));
+        if let Some(task) = replaced {
+            task.abort();
+        }
+        Ok(())
+    }
+
     pub async fn rename_zone(&self, id: &str, name: &str) -> Result<()> {
         self.database.update_zone_name(id, name).await
     }
 
     pub async fn delete_zone(&self, id: &str) -> Result<()> {
+        #[cfg(feature = "snapcast")]
+        {
+            // Reconfigure Snapserver before discarding the zone runtime. A failed managed
+            // restart must leave the existing zone/player intact so playback can recover.
+            if let Some(manager) = self.snapcast_manager().await {
+                manager.remove_zone_stream(id).await?;
+            }
+            let player_id = zone_snapcast_player_id(id);
+            if self.database.player_record(&player_id).await?.is_some() {
+                self.remove(&player_id).await?;
+            }
+        }
         let entry = self.zones.write().await.remove(id);
         if let Some(entry) = entry {
             let player = entry.player.clone();
@@ -2057,17 +2312,42 @@ impl BrowserPlayer {
     }
 }
 
+#[derive(Clone)]
+struct CursorFence {
+    status: PlaybackStatus,
+    position: Option<usize>,
+    elapsed_seconds: Option<f64>,
+}
+
+impl CursorFence {
+    fn from_state(state: &QueueState) -> Self {
+        Self {
+            status: state.status,
+            position: state.position,
+            elapsed_seconds: state.elapsed_seconds,
+        }
+    }
+
+    fn matches(&self, cursor: &PlaybackState) -> bool {
+        self.status == cursor.status
+            && self.position == cursor.queue_position
+            && match (self.elapsed_seconds, cursor.elapsed_seconds) {
+                (Some(expected), Some(actual)) => (expected - actual).abs() < 0.01,
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
 /// A zone's server-owned, canonical playback queue. Modeled exactly like
 /// [`BrowserPlayer`] — the queue, position, and playback intent live here and
 /// persist to SQLite (`zone_queue` tables) — but a zone drives *member players* as
 /// outputs rather than a single browser tab. There is no audio sample-sync (see the
 /// roadmap): the zone's [`QueueState`] is the single source of truth for the queue,
-/// position, now-playing, repeat, and shuffle; `elapsed_seconds` is owned by the
-/// browser output that renders the zone. MPD members are best-effort mirrors driven
-/// by forwarding the same command, and the zone does not poll them for position —
-/// so an MPD-only zone (no browser output reporting `ended`) can drift in position
-/// until the user issues next/previous. Mapping MPD state back to the zone is a
-/// future improvement.
+/// position, now-playing, repeat, and shuffle. When a server-decoded member is present,
+/// Snapcast (preferred) or MPD is elected as the cursor source; its latest snapshot feeds
+/// natural transitions and progress back into the zone. Browser outputs render that state and
+/// cannot race the elected source with a duplicate ended/progress report.
 pub struct ZonePlayer {
     /// This zone's stable id, used as the persistence key.
     zone_id: String,
@@ -2076,6 +2356,13 @@ pub struct ZonePlayer {
     persistence: QueuePersistence,
     /// Serializes zone commands, refill completion, natural drain, and member driving.
     sync: Mutex<()>,
+    /// The server-decoded member whose cursor is authoritative for this zone, if any.
+    /// Browser outputs render the zone state and must not race that member's advance.
+    cursor_source: Mutex<Option<String>>,
+    /// A command has updated the canonical cursor and is waiting for the elected member's
+    /// matching broadcast. Older broadcasts with an identical queue must not undo a seek
+    /// or an explicit queue position change.
+    cursor_fence: Mutex<Option<CursorFence>>,
     state: Mutex<QueueState>,
     state_tx: broadcast::Sender<PlaybackState>,
     history_tx: broadcast::Sender<ListenSample>,
@@ -2093,6 +2380,8 @@ impl ZonePlayer {
             zone_id,
             database,
             sync: Mutex::new(()),
+            cursor_source: Mutex::new(None),
+            cursor_fence: Mutex::new(None),
             state: Mutex::new(QueueState::default()),
             state_tx,
             history_tx,
@@ -2117,6 +2406,30 @@ impl ZonePlayer {
         apply_restored_snapshot(&mut state, snapshot);
     }
 
+    /// Adopt a running legacy Snapcast queue while upgrading it to this zone's dedicated
+    /// stream. Unlike restart recovery, this preserves `Playing` and the measured elapsed
+    /// cursor so the newly created output can continue from the same place.
+    async fn apply_migrated_snapshot(&self, snapshot: PlayerQueueSnapshot) {
+        let _sync = self.sync.lock().await;
+        let playback = snapshot.playback;
+        let mut state = self.state.lock().await;
+        state.queue = snapshot.items;
+        state.position = playback.position.filter(|&index| index < state.queue.len());
+        state.status = if state.position.is_some() {
+            playback.status
+        } else {
+            PlaybackStatus::Stopped
+        };
+        state.elapsed_seconds = playback.elapsed_seconds;
+        state.duration_seconds = None;
+        state.volume = playback.volume;
+        state.repeat = playback.repeat;
+        state.shuffle = playback.shuffle;
+        state.shuffle_order = playback.shuffle_order;
+        drop(state);
+        self.broadcast().await;
+    }
+
     fn persist(&self, persist: QueuePersist) {
         self.persistence.submit(persist);
     }
@@ -2131,6 +2444,90 @@ impl ZonePlayer {
 
     pub async fn snapshot(&self) -> PlaybackState {
         self.state.lock().await.snapshot()
+    }
+
+    async fn member_snapshot(&self) -> PlayerQueueSnapshot {
+        let state = self.state.lock().await;
+        PlayerQueueSnapshot {
+            playback: state.playback(),
+            items: state.queue.clone(),
+        }
+    }
+
+    /// Select the sole member allowed to move this zone's playback cursor. The manager
+    /// elects a server-decoded output (Snapcast first, then MPD); browser reports remain
+    /// useful only when no such output is present.
+    async fn set_cursor_source(&self, source: Option<String>) {
+        let _sync = self.sync.lock().await;
+        let mut active = self.cursor_source.lock().await;
+        if *active == source {
+            return;
+        }
+        *active = source;
+        drop(active);
+        *self.cursor_fence.lock().await = None;
+    }
+
+    /// Fold a member's live cursor into the canonical zone state. A member that is no
+    /// longer elected, or that has not caught up with the canonical queue, cannot roll
+    /// the zone backwards after a command or membership change.
+    async fn apply_member_cursor(&self, source: &str, cursor: PlaybackState) {
+        let _sync = self.sync.lock().await;
+        if self.cursor_source.lock().await.as_deref() != Some(source) {
+            return;
+        }
+        let fence = self.cursor_fence.lock().await.clone();
+        let mut state = self.state.lock().await;
+        if state.queue != cursor.queue
+            || cursor
+                .queue_position
+                .is_some_and(|position| position >= state.queue.len())
+            || fence
+                .as_ref()
+                .is_some_and(|expected| !expected.matches(&cursor))
+        {
+            return;
+        }
+        if fence.is_some() {
+            *self.cursor_fence.lock().await = None;
+        }
+        let changed = state.status != cursor.status
+            || state.position != cursor.queue_position
+            || state.duration_seconds != cursor.duration_seconds;
+        state.status = cursor.status;
+        state.position = cursor.queue_position;
+        state.elapsed_seconds = cursor.elapsed_seconds;
+        state.duration_seconds = cursor.duration_seconds;
+        let playback = state.playback();
+        let duration = state.duration_seconds;
+        let elapsed = state.elapsed_seconds.unwrap_or(0.0);
+        drop(state);
+        if changed {
+            self.persist(QueuePersist::Playback(playback));
+            self.broadcast().await;
+        } else {
+            let state = self.state.lock().await;
+            let _ = self.history_tx.send(state.listen_sample());
+            drop(state);
+            let _ = self.progress_tx.send(ProgressTick {
+                elapsed_seconds: elapsed,
+                duration_seconds: duration,
+            });
+            let now = now_unix();
+            let last = self.last_progress_persist.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= PROGRESS_PERSIST_SECS
+                && self
+                    .last_progress_persist
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                self.persist(QueuePersist::Playback(playback));
+            }
+        }
+    }
+
+    async fn has_cursor_source(&self) -> bool {
+        self.cursor_source.lock().await.is_some()
     }
 
     async fn request_autoplay_resume(&self) -> bool {
@@ -2260,6 +2657,10 @@ impl ZonePlayer {
             };
             self.persist(persist);
         }
+        if self.has_cursor_source().await && command_moves_cursor(&command) {
+            let state = self.state.lock().await;
+            *self.cursor_fence.lock().await = Some(CursorFence::from_state(&state));
+        }
         self.broadcast().await;
         // Phase 2: drive members. Browser members render the zone's now-playing
         // straight off the broadcast above (no extra work). MPD members are driven
@@ -2308,6 +2709,9 @@ impl ZonePlayer {
     /// (honoring repeat). MPD members advance on their own — see the type docs.
     pub async fn track_ended(&self) {
         let _sync = self.sync.lock().await;
+        if self.cursor_source.lock().await.is_some() {
+            return;
+        }
         let mut state = self.state.lock().await;
         let playback = {
             if state.repeat == RepeatMode::One {
@@ -2328,6 +2732,10 @@ impl ZonePlayer {
     /// The browser output reports its real position/duration for this zone. Emits a
     /// lightweight tick (not full state) and persists the elapsed position, throttled.
     pub async fn report_progress(&self, elapsed_seconds: f64, duration_seconds: Option<f64>) {
+        let _sync = self.sync.lock().await;
+        if self.cursor_source.lock().await.is_some() {
+            return;
+        }
         let mut state = self.state.lock().await;
         let (duration, playback) = {
             state.elapsed_seconds = Some(elapsed_seconds);
@@ -2364,6 +2772,24 @@ fn command_mutates_queue(command: &PlayerCommand) -> bool {
             | PlayerCommand::Clear
             | PlayerCommand::RemoveQueueItem { .. }
             | PlayerCommand::MoveQueueItem { .. }
+            | PlayerCommand::PlayStream { .. }
+    )
+}
+
+/// Commands that update a member's playback cursor need an acknowledgement fence before an
+/// older member broadcast may change the canonical cursor again.
+fn command_moves_cursor(command: &PlayerCommand) -> bool {
+    matches!(
+        command,
+        PlayerCommand::Play
+            | PlayerCommand::Pause
+            | PlayerCommand::Stop
+            | PlayerCommand::Next
+            | PlayerCommand::Previous
+            | PlayerCommand::Seek { .. }
+            | PlayerCommand::Clear
+            | PlayerCommand::PlayQueueIndex { .. }
+            | PlayerCommand::PlayTracks { .. }
             | PlayerCommand::PlayStream { .. }
     )
 }
@@ -2908,13 +3334,14 @@ impl SnapcastPlayer {
         database: Database,
         providers: Arc<RwLock<ProviderRegistry>>,
         manager: Arc<SnapcastManager>,
+        stream: SnapcastStream,
     ) -> Arc<Self> {
         let (state_tx, _) = broadcast::channel(32);
         let (history_tx, _) = broadcast::channel(128);
         let (writer_tx, writer_rx) = std::sync::mpsc::channel();
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         let sample_rate = manager.sample_rate();
-        let fifo = manager.fifo_path();
+        let fifo = stream.fifo_path;
         let audio_tap = Arc::new(musicata_core::pcm_dsp::AudioTap::default());
         let writer_tap = audio_tap.clone();
         let writer_alive = Arc::new(AtomicBool::new(true));
@@ -3077,6 +3504,32 @@ impl SnapcastPlayer {
         };
         let mut state = self.state.lock().await;
         apply_restored_snapshot(&mut state, snapshot);
+    }
+
+    /// Seed a newly created zone stream from the zone's canonical queue. This is an in-memory
+    /// hand-off, so it keeps a live zone's exact cursor instead of applying restart's pause
+    /// remap; persistence is queued before the decoder is asked to reconcile it.
+    async fn adopt_zone_snapshot(&self, snapshot: PlayerQueueSnapshot) {
+        let mut state = self.state.lock().await;
+        let playback = snapshot.playback;
+        state.queue = snapshot.items;
+        state.position = playback.position.filter(|&index| index < state.queue.len());
+        state.status = if state.position.is_some() {
+            playback.status
+        } else {
+            PlaybackStatus::Stopped
+        };
+        state.elapsed_seconds = playback.elapsed_seconds;
+        state.duration_seconds = None;
+        state.volume = playback.volume;
+        state.repeat = playback.repeat;
+        state.shuffle = playback.shuffle;
+        state.shuffle_order = playback.shuffle_order;
+        let persistence = QueuePersist::Queue(state.playback(), state.queue.clone());
+        drop(state);
+        self.persist(persistence);
+        self.broadcast().await;
+        self.reconcile_tx.send_replace(PlayerCommand::Play);
     }
 
     fn persist(&self, persist: QueuePersist) {
@@ -4573,6 +5026,170 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
     }
 
+    #[tokio::test]
+    async fn zone_adopts_its_cursor_source_and_ignores_stale_member_state() {
+        let db_path = temp_db("zone-cursor-source");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = library_with_tracks(3);
+        database.save_library(&mut library).await.expect("save");
+        let zone = ZonePlayer::new(database.clone(), "zone-cursor".to_string());
+        zone.execute(
+            PlayerCommand::PlayTracks {
+                track_ids: vec!["track_1".into(), "track_2".into(), "track_3".into()],
+                start_index: 0,
+            },
+            &database,
+            "http://host",
+            &[],
+        )
+        .await
+        .expect("queue zone");
+        zone.set_cursor_source(Some("snapcast-local".into())).await;
+
+        let mut source = zone.snapshot().await;
+        source.status = PlaybackStatus::Paused;
+        source.queue_position = Some(1);
+        source.elapsed_seconds = Some(42.0);
+        source.duration_seconds = Some(180.0);
+        zone.apply_member_cursor("snapcast-local", source).await;
+
+        let adopted = zone.snapshot().await;
+        assert_eq!(adopted.status, PlaybackStatus::Paused);
+        assert_eq!(adopted.queue_position, Some(1));
+        assert_eq!(adopted.elapsed_seconds, Some(42.0));
+        assert_eq!(
+            adopted
+                .now_playing
+                .as_ref()
+                .and_then(|item| item.track_id.as_deref()),
+            Some("track_2")
+        );
+
+        let mut stale = zone.snapshot().await;
+        stale.queue = resolve_queue_items(&database, &["track_1".into()])
+            .await
+            .expect("stale queue");
+        stale.queue_position = Some(0);
+        stale.elapsed_seconds = Some(7.0);
+        zone.apply_member_cursor("snapcast-local", stale).await;
+        assert_eq!(zone.snapshot().await.queue_position, Some(1));
+
+        // The member has the same queue but has not yet received a request to play item 2.
+        // Its old report must not undo that explicit cursor change.
+        zone.execute(
+            PlayerCommand::PlayQueueIndex { index: 2 },
+            &database,
+            "http://host",
+            &[],
+        )
+        .await
+        .expect("move zone cursor");
+        zone.set_cursor_source(Some("snapcast-local".into())).await;
+        let stale_same_queue = adopted.clone();
+        zone.apply_member_cursor("snapcast-local", stale_same_queue)
+            .await;
+        assert_eq!(zone.snapshot().await.queue_position, Some(2));
+
+        let acknowledged = zone.snapshot().await;
+        zone.apply_member_cursor("snapcast-local", acknowledged)
+            .await;
+        zone.track_ended().await;
+        assert_eq!(
+            zone.snapshot().await.queue_position,
+            Some(2),
+            "a browser ended event cannot double-advance an elected Snapcast cursor"
+        );
+
+        let mut states = zone.subscribe();
+        let mut ticks = zone.subscribe_progress();
+        let mut progressed = zone.snapshot().await;
+        progressed.elapsed_seconds = Some(5.0);
+        zone.apply_member_cursor("snapcast-local", progressed).await;
+        assert_eq!(
+            ticks
+                .try_recv()
+                .expect("source progress tick")
+                .elapsed_seconds,
+            5.0
+        );
+        assert!(
+            matches!(
+                states.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "same-track source progress must not send a full state"
+        );
+        assert!(
+            zone.last_progress_persist.load(Ordering::Relaxed) > 0,
+            "source progress must enter the same throttled persistence path as browser progress"
+        );
+
+        let mut foreign = zone.snapshot().await;
+        foreign.queue_position = Some(2);
+        foreign.elapsed_seconds = Some(3.0);
+        zone.apply_member_cursor("another-member", foreign).await;
+        assert_eq!(zone.snapshot().await.queue_position, Some(2));
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
+    async fn new_snapcast_zone_output_adopts_existing_zone_cursor() {
+        let db_path = temp_db("snapcast-zone-adopts-queue");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut library = library_with_tracks(2);
+        database.save_library(&mut library).await.expect("save");
+        let zone = ZonePlayer::new(database.clone(), "zone-existing".into());
+        zone.execute(
+            PlayerCommand::PlayTracks {
+                track_ids: vec!["track_1".into(), "track_2".into()],
+                start_index: 1,
+            },
+            &database,
+            "http://host",
+            &[],
+        )
+        .await
+        .expect("seed zone queue");
+        zone.report_progress(37.0, Some(180.0)).await;
+        let manager = Arc::new(
+            SnapcastManager::start(crate::snapcast::SnapcastSettings {
+                manage_server: false,
+                fifo_path: db_path.with_extension("fifo"),
+                ..Default::default()
+            })
+            .await
+            .expect("snapcast manager"),
+        );
+        let player = SnapcastPlayer::new(
+            "snapcast-zone-existing".into(),
+            database,
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+            manager.clone(),
+            manager.legacy_stream(),
+        );
+        player
+            .adopt_zone_snapshot(zone.member_snapshot().await)
+            .await;
+        let adopted = player.snapshot().await;
+        assert_eq!(adopted.status, PlaybackStatus::Playing);
+        assert_eq!(adopted.queue_position, Some(1));
+        assert_eq!(adopted.elapsed_seconds, Some(37.0));
+        assert_eq!(adopted.queue.len(), 2);
+
+        let mut paused = zone.member_snapshot().await;
+        paused.playback.status = PlaybackStatus::Paused;
+        zone.apply_migrated_snapshot(paused).await;
+        assert_eq!(
+            zone.snapshot().await.status,
+            PlaybackStatus::Paused,
+            "migration must retain a persisted paused state rather than starting audio"
+        );
+        let _ = player.writer_tx.send(WriterMsg::Shutdown);
+        let _ = std::fs::remove_file(db_path.with_extension("fifo"));
+        let _ = std::fs::remove_file(db_path);
+    }
+
     // A zone's canonical queue survives a server restart, restored paused — same
     // contract as the browser player, driven through the manager lifecycle.
     #[tokio::test]
@@ -5606,7 +6223,8 @@ mod tests {
             "pending".into(),
             database,
             Arc::new(RwLock::new(ProviderRegistry::new())),
-            manager,
+            manager.clone(),
+            manager.legacy_stream(),
         );
         let item = QueueItem {
             stream_url: "/api/radio/removed/stream".into(),
@@ -5677,8 +6295,13 @@ mod tests {
         // A regular-file sink lets this test inspect decoding without physical audio.
         std::fs::remove_file(manager.fifo_path()).unwrap();
         std::fs::write(manager.fifo_path(), []).unwrap();
-        let player =
-            SnapcastPlayer::new("test-preload".into(), database.clone(), providers, manager);
+        let player = SnapcastPlayer::new(
+            "test-preload".into(),
+            database.clone(),
+            providers,
+            manager.clone(),
+            manager.legacy_stream(),
+        );
         let control = player.clone().spawn_control_task();
         player
             .execute(
@@ -6166,6 +6789,16 @@ mod tests {
         let path = temp_db("autoplay-output");
         let database = Database::connect(&path).await.unwrap();
         let mut library = library_with_tracks(12);
+        #[cfg(feature = "snapcast")]
+        if kind == "snapcast" {
+            // The dedicated output really decodes the zone command. Give its writer a valid
+            // local source so its failure path cannot turn the authoritative cursor stopped.
+            let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata-fixture/Harbourmaster/Long Player/Disc 1/01 Movement.mp3");
+            for track in &mut library.tracks {
+                track.path = fixture.clone();
+            }
+        }
         database.save_library(&mut library).await.unwrap();
         let manager = PlayerManager::load(
             database.clone(),
@@ -6175,6 +6808,8 @@ mod tests {
         .await
         .unwrap();
         let mut fifo_reader: Option<std::fs::File> = None;
+        #[cfg(feature = "snapcast")]
+        let mut snapcast_control: Option<JoinHandle<()>> = None;
         let id = match kind {
             "mpd" => {
                 manager
@@ -6185,9 +6820,28 @@ mod tests {
             }
             #[cfg(feature = "snapcast")]
             "snapcast" => {
+                // Zone streams use Snapserver JSON-RPC. Keep this backend-only autoplay
+                // test hermetic while still creating the dedicated output below.
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let control_port = listener.local_addr().unwrap().port();
+                snapcast_control = Some(tokio::spawn(async move {
+                    loop {
+                        let Ok((socket, _)) = listener.accept().await else {
+                            return;
+                        };
+                        tokio::spawn(async move {
+                            let (read, mut write) = socket.into_split();
+                            let mut request = String::new();
+                            let _ = BufReader::new(read).read_line(&mut request).await;
+                            let _ = write.write_all(b"{\"id\":1,\"result\":null}\n").await;
+                        });
+                    }
+                }));
                 let settings = crate::snapcast::SnapcastSettings {
                     manage_server: false,
                     fifo_path: path.with_extension("fifo"),
+                    control_port,
                     ..Default::default()
                 };
                 let snap = Arc::new(SnapcastManager::start(settings).await.unwrap());
@@ -6215,7 +6869,7 @@ mod tests {
         };
         {
             let mut state = state.lock().await;
-            state.queue = seed;
+            state.queue = seed.clone();
             state.position = Some(0);
             state.status = PlaybackStatus::Playing;
             state.elapsed_seconds = Some(12.0);
@@ -6268,14 +6922,61 @@ mod tests {
         );
         // A zone owns its members' queue: never refill a member independently.
         let zone = manager.create_zone("Autoplay test zone").await.unwrap();
-        manager.set_zone(&id, Some(&zone.id)).await.unwrap();
-        state.lock().await.queue.truncate(1);
-        crate::autoplay_pass(manager.clone(), database.clone(), lb.clone()).await;
-        assert_eq!(
-            state.lock().await.queue.len(),
-            1,
-            "zone members must not refill independently"
-        );
+        #[cfg(feature = "snapcast")]
+        if kind == "snapcast" {
+            // A Snapcast zone owns a distinct decoded output. The legacy local output
+            // remains unassigned, so it cannot accidentally become the zone cursor.
+            manager.ensure_zone_snapcast(&zone.id).await.unwrap();
+            let zone_member = manager
+                .get(&zone_snapcast_player_id(&zone.id))
+                .await
+                .expect("per-zone Snapcast output");
+            let PlayerHandle::Snapcast(zone_member) = zone_member else {
+                panic!("per-zone output must use Snapcast");
+            };
+            {
+                let mut member_state = zone_member.state.lock().await;
+                member_state.queue = seed.clone();
+                member_state.position = Some(0);
+                member_state.status = PlaybackStatus::Playing;
+                member_state.elapsed_seconds = Some(12.0);
+            }
+            manager
+                .get_zone(&zone.id)
+                .await
+                .unwrap()
+                .apply_member_cursor(
+                    &zone_snapcast_player_id(&zone.id),
+                    zone_member.snapshot().await,
+                )
+                .await;
+            crate::autoplay_pass(manager.clone(), database.clone(), lb.clone()).await;
+            assert_eq!(
+                zone_member.state.lock().await.queue.len(),
+                1,
+                "zone members must not refill independently"
+            );
+        } else {
+            manager.set_zone(&id, Some(&zone.id)).await.unwrap();
+            state.lock().await.queue.truncate(1);
+            crate::autoplay_pass(manager.clone(), database.clone(), lb.clone()).await;
+            assert_eq!(
+                state.lock().await.queue.len(),
+                1,
+                "zone members must not refill independently"
+            );
+        }
+        #[cfg(not(feature = "snapcast"))]
+        {
+            manager.set_zone(&id, Some(&zone.id)).await.unwrap();
+            state.lock().await.queue.truncate(1);
+            crate::autoplay_pass(manager.clone(), database.clone(), lb.clone()).await;
+            assert_eq!(
+                state.lock().await.queue.len(),
+                1,
+                "zone members must not refill independently"
+            );
+        }
         manager
             .command_zone(
                 &zone.id,
@@ -6286,20 +6987,55 @@ mod tests {
             )
             .await
             .unwrap();
+        let before_refill = manager.zone_state(&zone.id).await.unwrap();
+        assert_eq!(
+            before_refill.status,
+            PlaybackStatus::Playing,
+            "zone command must leave its canonical queue playing: {before_refill:?}"
+        );
+        assert_eq!(
+            before_refill.queue.len(),
+            1,
+            "zone command queue: {before_refill:?}"
+        );
         crate::autoplay_pass(manager.clone(), database.clone(), lb.clone()).await;
         let zone_state = manager.zone_state(&zone.id).await.unwrap();
-        assert!(zone_state.queue.len() > 1, "zones must still refill");
+        assert!(
+            zone_state.queue.len() > 1,
+            "zones must still refill: {zone_state:?}"
+        );
         if kind == "browser" {
             // Browser clients consume the zone broadcast, not a mirrored standalone queue.
             assert_eq!(state.lock().await.queue.len(), 1);
         } else {
+            #[cfg(feature = "snapcast")]
+            if kind == "snapcast" {
+                let zone_member = manager
+                    .get(&zone_snapcast_player_id(&zone.id))
+                    .await
+                    .expect("per-zone Snapcast output");
+                assert_eq!(
+                    zone_member.snapshot().await.queue.len(),
+                    zone_state.queue.len(),
+                    "zone refill reaches its dedicated Snapcast output once"
+                );
+            } else {
+                assert_eq!(
+                    state.lock().await.queue.len(),
+                    zone_state.queue.len(),
+                    "zone refill reaches its member once"
+                );
+            }
+            #[cfg(not(feature = "snapcast"))]
             assert_eq!(
                 state.lock().await.queue.len(),
                 zone_state.queue.len(),
                 "zone refill reaches its member once"
             );
         }
-        manager.set_zone(&id, None).await.unwrap();
+        if kind != "snapcast" {
+            manager.set_zone(&id, None).await.unwrap();
+        }
         state.lock().await.queue.truncate(1);
         for status in [PlaybackStatus::Paused, PlaybackStatus::Stopped] {
             state.lock().await.status = status;
@@ -6319,6 +7055,10 @@ mod tests {
         );
         drop(handle);
         drop(manager);
+        #[cfg(feature = "snapcast")]
+        if let Some(control) = snapcast_control {
+            control.abort();
+        }
         drop(fifo_reader.take());
         let _ = std::fs::remove_file(path.with_extension("fifo"));
         let _ = std::fs::remove_file(path);

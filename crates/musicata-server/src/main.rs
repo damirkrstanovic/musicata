@@ -53,6 +53,8 @@ mod scrobble;
 mod smb;
 #[cfg(feature = "snapcast")]
 mod snapcast;
+#[cfg(feature = "snapcast")]
+mod snapcast_zones;
 mod subsonic;
 
 use crate::players::{BrowserPlayer, PlayerHandle, PlayerManager, ProgressTick, ZonePlayer};
@@ -427,6 +429,8 @@ async fn main() -> Result<()> {
         }
     }
 
+    #[cfg(feature = "snapcast")]
+    tokio::spawn(snapcast_zones::run(database.clone(), players.clone()));
     #[cfg(feature = "snapcast")]
     tokio::spawn(snapcast::health::run(
         database.clone(),
@@ -2437,18 +2441,23 @@ async fn maybe_enable_snapcast(
     if !settings.enabled {
         return Ok(());
     }
+    snapcast_zones::remember_legacy_zone(database).await?;
     let manager = Arc::new(snapcast::SnapcastManager::start(settings).await?);
     players.enable_snapcast(manager).await?;
-    apply_snapcast_dsp(database, players).await;
+    apply_snapcast_dsp(database, players, false).await;
     tracing::info!("snapcast: multi-room enabled");
     Ok(())
 }
 
 /// Build the server-side EQ from the `snapcast.dsp_profile_id` setting and push it to the
-/// Snapcast writer (in-process correction — no CamillaDSP subprocess). A no-op when snapcast
-/// isn't running or no profile is selected.
+/// Snapcast writers (in-process correction — no CamillaDSP subprocess). Live settings edits
+/// update zone streams only; output_audio owns the legacy output's combined listening chain.
 #[cfg(feature = "snapcast")]
-async fn apply_snapcast_dsp(database: &musicata_storage::Database, players: &Arc<PlayerManager>) {
+async fn apply_snapcast_dsp(
+    database: &musicata_storage::Database,
+    players: &Arc<PlayerManager>,
+    zones_only: bool,
+) {
     let Some(manager) = players.snapcast_manager().await else {
         return;
     };
@@ -2467,7 +2476,11 @@ async fn apply_snapcast_dsp(database: &musicata_storage::Database, players: &Arc
         }),
         None => None,
     };
-    players.set_snapcast_dsp(eq).await;
+    if zones_only {
+        players.set_zone_snapcast_dsp(eq).await;
+    } else {
+        players.set_snapcast_dsp(eq).await;
+    }
 }
 
 /// Build [`snapcast::SnapcastSettings`] from the persisted `snapcast.*` settings keys,
@@ -4134,6 +4147,8 @@ async fn delete_zone(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
+    #[cfg(feature = "snapcast")]
+    let _routing = snapcast_zones::lock_routing().await;
     state.players.delete_zone(&id).await.map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -5516,6 +5531,10 @@ fn snapcast_routes() -> Router<AppState> {
             "/api/snapcast/status",
             get(snapcast_status).patch(snapcast_update),
         )
+        .route(
+            "/api/snapcast/clients/{id}",
+            patch(snapcast_zones::update_client),
+        )
         .route("/api/snapcast/health/ws", get(snapcast_health_ws))
         .route("/api/snapcast/health/retry", post(snapcast_health_retry))
         .route(
@@ -5694,7 +5713,10 @@ async fn snapcast_status(State(state): State<AppState>) -> Result<Json<SnapcastS
     let active_input = snapcast_active_input(&state.database).await;
     let manager = state.players.snapcast_manager().await;
     let health = state.players.snapcast_health.snapshot();
-    let clients = health.clients.clone();
+    let mut clients = health.clients.clone();
+    snapcast_zones::decorate(&state.database, &mut clients)
+        .await
+        .map_err(db_error)?;
     let inputs = health.streams.clone();
     let groups = health.groups.clone();
     let setting = |key: &'static str| state.database.get_setting(key);
@@ -5925,6 +5947,7 @@ async fn snapcast_update(
             .set_setting("snapcast.dsp_profile_id", profile_id)
             .await
             .map_err(db_error)?;
+        apply_snapcast_dsp(&state.database, &state.players, true).await;
     }
     // Start the subsystem immediately when newly enabled; auth/host/input-enable changes persist
     // and take effect on the next restart (the snapserver config is regenerated at startup).
@@ -6029,11 +6052,14 @@ async fn snapcast_status_after_routing(state: AppState) -> Result<Json<SnapcastS
         .status()
         .await
         .map_err(|error| AppError::internal(error.to_string()))?;
-    let Json(mut status) = snapcast_status(State(state)).await?;
+    let Json(mut status) = snapcast_status(State(state.clone())).await?;
     status.clients = observed.clients.clone();
+    snapcast_zones::decorate(&state.database, &mut status.clients)
+        .await
+        .map_err(db_error)?;
     status.groups = observed.groups.clone();
     status.inputs = observed.streams.clone();
-    status.health.clients = observed.clients;
+    status.health.clients = status.clients.clone();
     status.health.groups = observed.groups;
     status.health.streams = observed.streams;
     status.health.server_version = observed.server_version;
@@ -9425,6 +9451,9 @@ mod tests {
         let client = crate::snapcast::SnapClient {
             id: "kitchen".into(),
             name: "Kitchen".into(),
+            hostname: "example-host".into(),
+            ip_address: "192.0.2.1".into(),
+            zone_id: None,
             connected: true,
             volume_percent: 40,
             muted: false,

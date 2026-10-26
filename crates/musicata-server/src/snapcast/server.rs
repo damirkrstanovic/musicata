@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! snapserver lifecycle + the single "Musicata" pipe stream.
+//! snapserver lifecycle + Musicata pipe streams.
 //!
 //! Snapcast broadcasts a continuous PCM stream to N synchronized clients (rooms). We run
-//! one managed `snapserver` fed by one FIFO ("Musicata" stream); every assigned snapclient
-//! plays it sample-accurately in sync. That is the multi-room MVP — one stream, many synced
-//! rooms. (Multiple independent streams — different music per room — is a future extension;
-//! snapserver defines pipe streams at startup, so it would mean regenerating the config and
-//! restarting.) Musicata has never managed a subprocess before; this mirrors the planned
-//! CamillaDSP management and is gated behind the `snapcast` cargo feature.
+//! one managed `snapserver` fed by a legacy FIFO ("Musicata") plus one FIFO per active
+//! Musicata zone. Clients assigned to the same zone still play in sync; independent zones
+//! receive independently decoded streams. Snapserver 0.26 defines pipe streams at startup, so
+//! adding or removing a managed zone regenerates the config and restarts the child. Musicata
+//! has never managed a subprocess before; this mirrors the planned CamillaDSP management and
+//! is gated behind the `snapcast` cargo feature.
 
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -19,6 +19,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::decode::CHANNELS;
 
@@ -40,6 +41,23 @@ pub const AIRPLAY_STREAM_NAME: &str = "AirPlay";
 pub const SPOTIFY_STREAM_NAME: &str = "Spotify";
 pub const SETTING_MPD_INPUT: &str = "snapcast.mpd_enabled";
 pub const MPD_FIFO_PATH: &str = "/var/lib/musicata-mpd/snapcast.fifo";
+
+/// One independently decoded Musicata stream. Its FIFO belongs exclusively to its zone writer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapcastStream {
+    pub name: String,
+    pub fifo_path: PathBuf,
+}
+
+/// Stable Snapserver id for a zone without interpolating its opaque id into a config URI.
+pub fn zone_stream_name(zone_id: &str) -> String {
+    let digest = Sha256::digest(zone_id.as_bytes());
+    let suffix = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("Musicata-{suffix}")
+}
 
 /// Resolve a binary name (or path) to an existing file: an absolute/relative path is checked
 /// directly, a bare name is searched on `$PATH`. Used both to build the stream `source = ` URI
@@ -169,6 +187,7 @@ pub struct SnapcastManager {
     child: Mutex<Option<Child>>,
     buffer_ms: std::sync::atomic::AtomicU32,
     mpd_enabled: std::sync::atomic::AtomicBool,
+    zone_streams: Mutex<std::collections::BTreeMap<String, SnapcastStream>>,
     apply_lock: tokio::sync::Mutex<()>,
 }
 
@@ -182,7 +201,7 @@ impl SnapcastManager {
         ensure_fifo(&settings.fifo_path).await?;
         let mut child = None;
         if settings.manage_server {
-            child = Some(start_checked(&settings).await?);
+            child = Some(start_checked(&settings, &[]).await?);
             tracing::info!(
                 stream = STREAM_NAME,
                 fifo = %settings.fifo_path.display(),
@@ -197,6 +216,7 @@ impl SnapcastManager {
         Ok(Self {
             buffer_ms: std::sync::atomic::AtomicU32::new(settings.buffer_ms),
             mpd_enabled: std::sync::atomic::AtomicBool::new(settings.mpd_enabled),
+            zone_streams: Mutex::new(std::collections::BTreeMap::new()),
             apply_lock: tokio::sync::Mutex::new(()),
             settings,
             child: Mutex::new(child),
@@ -254,7 +274,8 @@ impl SnapcastManager {
         let mut settings = self.settings.clone();
         settings.buffer_ms = self.buffer_ms.load(std::sync::atomic::Ordering::Acquire);
         settings.mpd_enabled = self.mpd_enabled();
-        let child = start_checked(&settings).await?;
+        let streams = self.zone_streams();
+        let child = start_checked(&settings, &streams).await?;
         *self.child.lock().unwrap() = Some(child);
         Ok(true)
     }
@@ -329,7 +350,9 @@ impl SnapcastManager {
         previous.mpd_enabled = self.mpd_enabled();
         let mut candidate = previous.clone();
         candidate.mpd_enabled = enabled;
-        self.replace_server(&candidate, &previous).await?;
+        let streams = self.zone_streams();
+        self.replace_server(&candidate, &streams, &previous, &streams)
+            .await?;
         self.mpd_enabled
             .store(enabled, std::sync::atomic::Ordering::Release);
         Ok(())
@@ -378,7 +401,9 @@ impl SnapcastManager {
         candidate.mpd_enabled = self.mpd_enabled();
         let mut rollback = candidate.clone();
         rollback.buffer_ms = previous;
-        self.replace_server(&candidate, &rollback).await?;
+        let streams = self.zone_streams();
+        self.replace_server(&candidate, &streams, &rollback, &streams)
+            .await?;
         self.buffer_ms
             .store(value, std::sync::atomic::Ordering::Release);
         Ok(())
@@ -387,7 +412,9 @@ impl SnapcastManager {
     async fn replace_server(
         &self,
         candidate: &SnapcastSettings,
+        candidate_streams: &[SnapcastStream],
         rollback: &SnapcastSettings,
+        rollback_streams: &[SnapcastStream],
     ) -> Result<()> {
         if self.mpd_enabled() {
             let streams = super::control::SnapControl::new(self.control_addr())
@@ -406,12 +433,12 @@ impl SnapcastManager {
         if let Some(child) = old_child {
             stop_server(child).await;
         }
-        match start_checked(candidate).await {
+        match start_checked(candidate, candidate_streams).await {
             Ok(child) => {
                 *self.child.lock().unwrap() = Some(child);
                 Ok(())
             }
-            Err(error) => match start_checked(rollback).await {
+            Err(error) => match start_checked(rollback, rollback_streams).await {
                 Ok(child) => {
                     *self.child.lock().unwrap() = Some(child);
                     Err(anyhow!(
@@ -425,8 +452,90 @@ impl SnapcastManager {
         }
     }
 
+    /// Declare a private pipe stream for one zone. Managed Snapserver 0.26 cannot add streams
+    /// at runtime, so a newly created stream replaces the child once; a known stream is a no-op.
+    pub async fn ensure_zone_stream(&self, zone_id: &str) -> Result<SnapcastStream> {
+        let _apply = self.apply_lock.lock().await;
+        if let Some(stream) = self.zone_streams.lock().unwrap().get(zone_id).cloned() {
+            return Ok(stream);
+        }
+        let stream = zone_stream(&self.settings, zone_id);
+        ensure_fifo(&stream.fifo_path).await?;
+        if self.managed() {
+            let previous = self.zone_streams();
+            let mut candidate = previous.clone();
+            candidate.push(stream.clone());
+            let mut settings = self.settings.clone();
+            settings.buffer_ms = self.buffer_ms.load(std::sync::atomic::Ordering::Acquire);
+            settings.mpd_enabled = self.mpd_enabled();
+            self.replace_server(&settings, &candidate, &settings, &previous)
+                .await?;
+        } else {
+            super::control::SnapControl::new(self.control_addr())
+                .add_pipe_stream(&stream, self.sample_rate())
+                .await?;
+        }
+        self.zone_streams
+            .lock()
+            .unwrap()
+            .insert(zone_id.to_string(), stream.clone());
+        Ok(stream)
+    }
+
+    /// Stop advertising a deleted zone's stream and remove its FIFO after Snapserver has stopped
+    /// reading it. The caller drops the zone writer after this succeeds so a failed server
+    /// reconfiguration can leave the existing player intact. Its open FIFO is isolated until drop.
+    pub async fn remove_zone_stream(&self, zone_id: &str) -> Result<()> {
+        let _apply = self.apply_lock.lock().await;
+        let Some(stream) = self.zone_streams.lock().unwrap().get(zone_id).cloned() else {
+            return Ok(());
+        };
+        if self.managed() {
+            let previous = self.zone_streams();
+            let candidate = previous
+                .iter()
+                .filter(|item| item.name != stream.name)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut settings = self.settings.clone();
+            settings.buffer_ms = self.buffer_ms.load(std::sync::atomic::Ordering::Acquire);
+            settings.mpd_enabled = self.mpd_enabled();
+            self.replace_server(&settings, &candidate, &settings, &previous)
+                .await?;
+        } else {
+            super::control::SnapControl::new(self.control_addr())
+                .remove_stream(&stream.name)
+                .await?;
+        }
+        self.zone_streams.lock().unwrap().remove(zone_id);
+        if let Err(error) = tokio::fs::remove_file(&stream.fifo_path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error)
+                .with_context(|| format!("remove zone FIFO {}", stream.fifo_path.display()));
+        }
+        Ok(())
+    }
+
     pub fn fifo_path(&self) -> PathBuf {
         self.settings.fifo_path.clone()
+    }
+
+    /// The legacy stream remains the default for unassigned Snapcast clients.
+    pub fn legacy_stream(&self) -> SnapcastStream {
+        SnapcastStream {
+            name: STREAM_NAME.to_string(),
+            fifo_path: self.settings.fifo_path.clone(),
+        }
+    }
+
+    fn zone_streams(&self) -> Vec<SnapcastStream> {
+        self.zone_streams
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -506,6 +615,26 @@ fn mpd_stream_uri(settings: &SnapcastSettings) -> String {
     )
 }
 
+fn zone_stream(settings: &SnapcastSettings, zone_id: &str) -> SnapcastStream {
+    let name = zone_stream_name(zone_id);
+    let parent = settings
+        .fifo_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    SnapcastStream {
+        fifo_path: parent.join(format!("{}.fifo", name.to_ascii_lowercase())),
+        name,
+    }
+}
+
+fn pipe_stream_uri(stream: &SnapcastStream, sample_rate: u32) -> String {
+    format!(
+        "pipe://{}?name={}&sampleformat={sample_rate}:16:{CHANNELS}&codec=flac&mode=read",
+        stream.fifo_path.display(),
+        stream.name,
+    )
+}
+
 /// The forward-compatible `[authorization]` block: a `Streaming`-only role and one user per
 /// room. **snapserver 0.35 ignores this** (auth is stubbed upstream); it activates unchanged
 /// if/when upstream enables auth.
@@ -536,7 +665,15 @@ pub fn install_command(host: &str, room: &SnapRoom) -> String {
 /// input streams (snapserver spawns shairport-sync/librespot itself — skipped with a warning
 /// when the binary is missing so a missing dep degrades gracefully), the control/HTTP ports, and
 /// the forward-compatible auth block. Pure (no IO) so it's unit-testable.
+#[cfg(test)]
 fn render_config(settings: &SnapcastSettings) -> String {
+    render_config_with_streams(settings, &[])
+}
+
+fn render_config_with_streams(
+    settings: &SnapcastSettings,
+    zone_streams: &[SnapcastStream],
+) -> String {
     // Musicata's own decoded library audio.
     let mut config = format!(
         "[server]\n\
@@ -557,6 +694,12 @@ fn render_config(settings: &SnapcastSettings) -> String {
         channels = CHANNELS,
         buffer = settings.buffer_ms,
     );
+    for stream in zone_streams {
+        config.push_str(&format!(
+            "source = {}\n",
+            pipe_stream_uri(stream, settings.sample_rate)
+        ));
+    }
     // Optional inputs *into* Musicata. AirPlay/librespot run at 44.1 kHz; the per-stream
     // sampleformat says so (only one stream plays per group at a time, so mixed rates are fine).
     if settings.mpd_enabled {
@@ -637,8 +780,11 @@ async fn stop_server(child: Child) {
     let _ = child.wait();
 }
 
-async fn start_checked(settings: &SnapcastSettings) -> Result<Child> {
-    let mut guard = ChildGuard(Some(spawn_server(settings).await?));
+async fn start_checked(
+    settings: &SnapcastSettings,
+    zone_streams: &[SnapcastStream],
+) -> Result<Child> {
+    let mut guard = ChildGuard(Some(spawn_server(settings, zone_streams).await?));
     let control = super::control::SnapControl::new(format!(
         "{}:{}",
         settings.control_host, settings.control_port
@@ -659,13 +805,16 @@ async fn start_checked(settings: &SnapcastSettings) -> Result<Child> {
 }
 
 /// Write the snapserver config for our streams and spawn the process.
-async fn spawn_server(settings: &SnapcastSettings) -> Result<Child> {
+async fn spawn_server(
+    settings: &SnapcastSettings,
+    zone_streams: &[SnapcastStream],
+) -> Result<Child> {
     let config_path = settings
         .fifo_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("snapserver.conf");
-    let config = render_config(settings);
+    let config = render_config_with_streams(settings, zone_streams);
     tokio::fs::write(&config_path, config)
         .await
         .with_context(|| format!("write snapserver config {}", config_path.display()))?;
@@ -959,6 +1108,28 @@ while True:
         assert!(config.contains(&format!("name={STREAM_NAME}")));
         assert!(!config.contains("airplay://"));
         assert!(!config.contains("librespot://"));
+    }
+
+    #[test]
+    fn zone_stream_is_stable_safe_and_rendered_alongside_legacy_stream() {
+        let settings = SnapcastSettings::default();
+        let first = zone_stream(&settings, "zone/with spaces");
+        let second = zone_stream(&settings, "zone/with spaces");
+        let other = zone_stream(&settings, "other zone");
+        assert_eq!(first, second);
+        assert_ne!(first.name, other.name);
+        assert!(first.name.starts_with("Musicata-"));
+        assert!(
+            first
+                .name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        );
+
+        let config = render_config_with_streams(&settings, &[first.clone()]);
+        assert!(config.contains(&format!("name={STREAM_NAME}")));
+        assert!(config.contains(&format!("name={}", first.name)));
+        assert!(config.contains(&format!("pipe://{}?", first.fifo_path.display())));
     }
 
     #[test]

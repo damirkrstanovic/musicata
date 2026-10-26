@@ -66,7 +66,7 @@
     <div id="settings-panel" role="tabpanel" aria-labelledby="settings-tab-{category}" data-settings-panel={category}>
       {#if category === "sources"}<SourcesPanel /><ImportExportPanel />
       {:else if category === "library"}<StatusDashboard />
-      {:else if category === "outputs"}<PlayersZonesPanel /><SnapcastPanel />
+      {:else if category === "outputs"}<PlayersZonesPanel /><details class="outputs-advanced"><summary>Advanced output settings <span>Snapcast server, inputs and audio processing</span></summary><SnapcastPanel /></details>
       {:else if category === "sound"}<EqPanel management />
       {:else if category === "metadata"}<SettingsPanel group="metadata" /><MergedArtistsPanel />
       {:else if category === "history"}<SettingsPanel group="history" />
@@ -89,4 +89,9 @@
   [role="tabpanel"] { display: grid; gap: 1rem; }
   .settings-result { display: flex; justify-content: space-between; gap: 1rem; width: 100%; margin-bottom: 0.6rem; text-align: left; }
   .settings-result span { color: var(--muted); }
+  .outputs-advanced { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); overflow: hidden; }
+  .outputs-advanced > summary { cursor: pointer; padding: 1rem 1.25rem; font-weight: 600; }
+  .outputs-advanced > summary span { display: block; margin-top: .2rem; color: var(--muted); font-size: .82rem; font-weight: 400; }
+  .outputs-advanced[open] > summary { border-bottom: 1px solid var(--line); }
+  .outputs-advanced :global(.admin-panel) { border: 0; border-radius: 0; }
 </style>

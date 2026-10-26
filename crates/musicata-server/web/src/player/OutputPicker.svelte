@@ -24,7 +24,9 @@
   let snapcastVolumes = $state<Record<string, number>>({});
   const current = $derived((player.activeKind === "zone" ? zones : players).find(p => p.id === player.activeId));
   const members = $derived(players.filter(p => p.zone_id === player.activeId));
-  const standalonePlayers = $derived(players.filter(p => !p.zone_id));
+  // Per-zone stream players are internal. The default unassigned Snapcast output
+  // remains available until speakers have been placed in a Musicata zone.
+  const standalonePlayers = $derived(players.filter(p => !p.zone_id && !p.id.startsWith("snapcast-zone-")));
   function place() {
     if (!panel || !trigger) return;
     const r = trigger.getBoundingClientRect();
@@ -106,7 +108,7 @@
   <p class="output-hint">Choose where to control playback. Selecting a destination never moves speakers or transfers a queue.</p>
   <div role="group" aria-label="Players">
     {#each standalonePlayers as p (p.id)}
-      {#if p.kind === "snapcast"}
+      {#if p.kind === "snapcast" && snapcastExpanded}
         <div class="output-group">
           <div class="output-group-head">
             <button class="output-option" type="button" data-output={`player:${p.id}`} aria-pressed={player.activeKind === "player" && player.activeId === p.id} onclick={() => choose(`player:${p.id}`)}>
@@ -199,7 +201,7 @@
     <div role="group" aria-label="Zones">
       {#each zones as zone (zone.id)}
         <button class="output-option" type="button" data-output={`zone:${zone.id}`} aria-pressed={player.activeKind === "zone" && player.activeId === zone.id} onclick={() => choose(`zone:${zone.id}`)}>
-          <span><strong>{zone.name}</strong><small>{players.filter(p => p.zone_id === zone.id).length} players</small></span>
+          <span><strong>{zone.name}</strong><small>Musicata zone</small></span>
           {#if player.activeKind === "zone" && player.activeId === zone.id}<span aria-hidden="true">✓</span>{/if}
         </button>
       {/each}

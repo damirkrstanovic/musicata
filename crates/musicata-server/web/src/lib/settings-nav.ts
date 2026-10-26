@@ -2,7 +2,7 @@
 export const SETTINGS_CATEGORIES = [
   {id: "sources", label: "Music sources"},
   {id: "library", label: "Library status"},
-  {id: "outputs", label: "Outputs & groups"},
+  {id: "outputs", label: "Outputs & zones"},
   {id: "sound", label: "Sound profiles"},
   {id: "metadata", label: "Metadata & artwork"},
   {id: "history", label: "History & services"},
@@ -14,7 +14,7 @@ export const SETTINGS_DESTINATIONS: {label: string; category: SettingsCategory; 
   {label: "Music sources", category: "sources", keywords: "folder library network share smb provider connection"},
   {label: "Import & export", category: "sources", keywords: "backup restore playlists"},
   {label: "Library status", category: "library", keywords: "scan activity progress queued waiting retrying sources health identification artwork"},
-  {label: "Outputs & groups", category: "outputs", keywords: "player zone device MPD native browser"},
+  {label: "Outputs & zones", category: "outputs", keywords: "player zone device MPD native browser"},
   {label: "Synchronized playback", category: "outputs", keywords: "Snapcast server clients transport"},
   {label: "EQ profiles & room correction", category: "sound", keywords: "equalizer headphones speakers AutoEq preset impulse response import"},
   {label: "Artwork & identification", category: "metadata", keywords: "MusicBrainz AcoustID fingerprint fanart cover metadata"},
