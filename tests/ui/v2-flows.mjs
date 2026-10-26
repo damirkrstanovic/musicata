@@ -8,6 +8,8 @@
 import { radioFlows } from "./radio-flows.mjs";
 import { stablePlayerFlows } from "./stable-player-flows.mjs";
 import { addPlayerFlows } from "./add-player-flows.mjs";
+import { playerDeviceFlows } from "./player-device-flows.mjs";
+import { managedPlayerFlows } from "./managed-player-flows.mjs";
 import { zonesFlows } from "./zones-flows.mjs";
 import { outputPickerFlows } from "./output-picker-flows.mjs";
 import { albumPlayFlows } from "./album-play-flows.mjs";
@@ -182,11 +184,17 @@ console.log(`Svelte UI smoke (${PATH}, ${MODE}):`);
 if (MODE === "behavior") {
   if (process.env.MUSICATA_WIZARD_ONLY) {
     await addPlayerFlows({api, js, check, waitUntil, tap: tapMobile, send, screenshot: mobileScreenshot});
+    await playerDeviceFlows({api, js, check, waitUntil, send, screenshot: mobileScreenshot});
+    await managedPlayerFlows({api, js, check, waitUntil, send, screenshot: mobileScreenshot});
     ws.close();process.exit(failures?1:0);
   }
   await outputPickerFlows({js, check, waitUntil, tap: tapMobile, groupedPlayerId});
   await zonesFlows({api, js, check, waitUntil, tap: tapMobile});
-  if (!process.env.MUSICATA_ZONES_ONLY) await addPlayerFlows({api, js, check, waitUntil, tap: tapMobile, send, screenshot: mobileScreenshot});
+  if (!process.env.MUSICATA_ZONES_ONLY) {
+    await addPlayerFlows({api, js, check, waitUntil, tap: tapMobile, send, screenshot: mobileScreenshot});
+    await playerDeviceFlows({api, js, check, waitUntil, send, screenshot: mobileScreenshot});
+    await managedPlayerFlows({api, js, check, waitUntil, send, screenshot: mobileScreenshot});
+  }
   if (process.env.MUSICATA_ZONES_ONLY) {
     ws.close();
     process.exit(failures ? 1 : 0);

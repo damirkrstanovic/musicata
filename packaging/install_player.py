@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Install a standalone Snapclient (recommended) or MPD compatibility player."""
 import argparse
+import getpass
 import datetime
 import fcntl
 import hashlib
@@ -36,10 +37,16 @@ USB_UNIT = Path('/etc/systemd/system/musicata-usb-autowake.service')
 USB_CONFIG = Path('/etc/musicata/usb-autowake.json')
 USB_CODE = Path('/opt/musicata/player/usb_autowake.py')
 USB_TOKEN = Path('/etc/musicata/usb-autowake.token')
+MANAGEMENT_CONFIG = Path('/etc/musicata/player-management.json')
+MANAGEMENT_UNIT = Path('/etc/systemd/system/musicata-player-management.service')
+MANAGEMENT_SUDOERS = Path('/etc/sudoers.d/musicata-player-management')
+MANAGEMENT_ROOT = Path('/opt/musicata/player')
+MANAGEMENT_STATE = Path('/var/lib/musicata-player-management/state.json')
 
 
 def options(argv, saved=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--pair-code', action='store_true', help='Prompt privately for a one-time device-management pairing code')
     parser.add_argument('--backend', choices=('snapclient', 'mpd'))
     parser.add_argument('--mpd-bind', help='MPD local IPv4 address; default loopback, port 6600')
     parser.add_argument('--confirm-trusted-network', action='store_true', default=None,
@@ -285,6 +292,118 @@ def apply_usb(files, backup):
         raise
 
 
+def management_files(cfg, credentials, uid, gid):
+    player.checked(cfg['user'], r'[a-z_][a-z0-9_-]*', 'management account')
+    unit = f"""[Unit]
+Description=Musicata player device management
+After=network-online.target
+Wants=network-online.target
+[Service]
+User={uid}
+Group={gid}
+ExecStart=/usr/bin/python3 /opt/musicata/player/manage_player.py --daemon
+Restart=on-failure
+RestartSec=5
+UMask=0077
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/etc/musicata /etc/systemd/system /var/lib/musicata-player-management /var/backups/musicata-player-management /run/lock
+[Install]
+WantedBy=multi-user.target
+"""
+    sudoers = (f"{cfg['user']} ALL=(root) NOPASSWD: /usr/bin/python3 "
+               "/opt/musicata/player/manage_player.py --local\n")
+    files = {MANAGEMENT_UNIT: (unit, 0o644), MANAGEMENT_SUDOERS: (sudoers, 0o440),
+             MANAGEMENT_CONFIG: (json.dumps(credentials) + '\n', 0o640)}
+    for name in ('manage_player.py','install_player.py','install.py','player.py','usb_autowake.py'):
+        files[MANAGEMENT_ROOT/name] = (Path(__file__).with_name(name).read_text(),0o644)
+    return files
+
+
+def pair_management(cfg, saved):
+    if os.geteuid() != 0:
+        raise installer.InstallError('Run the player installer with sudo to pair device management.')
+    os.umask(0o022)
+    if not saved or saved.get('backend', 'snapclient') != 'snapclient':
+        raise installer.InstallError('Device management requires an existing Musicata-managed Snapclient installation.')
+    if not cfg.get('musicata_url'):
+        raise installer.InstallError('Pairing requires --musicata-url.')
+    if not shutil.which('sudo') or not shutil.which('visudo'):
+        raise installer.InstallError('Install sudo before enabling device management.')
+    for path in (CONFIG, UNIT):
+        metadata = path.lstat()
+        if path.is_symlink() or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise installer.InstallError('Managed playback files must be root-owned and not writable by other accounts.')
+    if hashlib.sha256(UNIT.read_bytes()).hexdigest() != saved.get('unit_digest'):
+        raise installer.InstallError('Playback service was customized; reconcile it before pairing management.')
+    account = pwd.getpwnam(saved['user'])
+    if account.pw_uid == 0:
+        raise installer.InstallError('Management requires a non-root playback account.')
+    client = PolicyClient(cfg['musicata_url'], '')
+    # Validate all local installation content before consuming the one-time pairing code.
+    files = management_files(saved, {}, account.pw_uid, account.pw_gid)
+    for path in files:
+        for parent in (path, *path.parents):
+            if parent.exists() and (parent.is_symlink() or parent.stat().st_uid != 0 or parent.stat().st_mode & 0o022):
+                raise installer.InstallError('Management installation paths must be owned and protected by root.')
+    with tempfile.NamedTemporaryFile(mode='w', prefix='musicata-sudoers-') as candidate:
+        candidate.write(files[MANAGEMENT_SUDOERS][0]); candidate.flush()
+        installer.run(['visudo','-cf',candidate.name])
+    if not cfg['yes']:
+        if not sys.stdin.isatty() or input('Enable device management for this player? [y/N] ').lower() not in ('y','yes'):
+            return 1
+    if not sys.stdin.isatty():
+        raise installer.InstallError('Pairing requires an interactive terminal for the private code prompt.')
+    pairing_code = getpass.getpass('Musicata pairing code: ').strip()
+    player.checked(pairing_code, r'[0-9a-f]{64}', 'pairing code')
+    was_active = installer.succeeds(['systemctl','is-active','--quiet',MANAGEMENT_UNIT.name])
+    installer.run(['systemctl','stop',MANAGEMENT_UNIT.name]) if MANAGEMENT_UNIT.exists() else None
+    enrolled = False
+    try:
+        import manage_player
+        # Recover a prior interrupted change before resetting this host's management generation.
+        with open(LOCK, 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            manage_player.recover_interrupted_apply()
+            if json.loads(CONFIG.read_text()) != saved:
+                raise installer.InstallError('Playback configuration changed during pairing; retry.')
+            url = client.url.removesuffix('/api/snapcast/usb-wake') + '/api/managed-players/enroll'
+            request = urllib.request.Request(url, data=json.dumps({'pairing_token':pairing_code,
+                'client_id':saved['identity']}).encode(),headers={'Content-Type':'application/json'})
+            try:
+                with client.opener.open(request,timeout=5) as response:
+                    data=response.read(65537)
+                if len(data)>65536: raise ValueError('Oversized pairing response')
+                enrolled_result=json.loads(data)
+                player.checked(enrolled_result['token'],r'[0-9a-f]{64}','management credential')
+                if enrolled_result['client_id'] != saved['identity']: raise ValueError('Player identity mismatch')
+            except Exception:
+                raise installer.InstallError('Pairing failed. Check the server URL, player identity and unexpired code.') from None
+            credentials={'server_url':cfg['musicata_url'],'client_id':saved['identity'],'token':enrolled_result['token']}
+            # Retain the new credential if starting the service fails: the old one is revoked.
+            player.atomic_write(MANAGEMENT_CONFIG,json.dumps(credentials)+'\n',0o640)
+            os.chown(MANAGEMENT_CONFIG,0,account.pw_gid)
+            enrolled=True
+            MANAGEMENT_STATE.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+            MANAGEMENT_STATE.unlink(missing_ok=True)
+            Path('/var/backups/musicata-player-management').mkdir(parents=True,exist_ok=True,mode=0o700)
+            files=management_files(saved,credentials,account.pw_uid,account.pw_gid)
+            for path,(text,mode) in files.items():
+                player.atomic_write(path,text,mode)
+                os.chown(path,0,account.pw_gid if path==MANAGEMENT_CONFIG else 0)
+            installer.run(['systemctl','daemon-reload'])
+            installer.run(['systemctl','enable','--now',MANAGEMENT_UNIT.name])
+            if not installer.succeeds(['systemctl','is-active','--quiet',MANAGEMENT_UNIT.name]):
+                raise installer.InstallError('Management is paired but its service did not start. Check its journal; the credential is retained.')
+    except Exception:
+        if was_active and not enrolled:
+            installer.run(['systemctl','start',MANAGEMENT_UNIT.name])
+        raise
+    print('Device management paired. Playback configuration and the current device are unchanged.')
+    return 0
+
+
 def main(argv=None):
     saved = json.loads(CONFIG.read_text()) if CONFIG.exists() else None
     argv = sys.argv[1:] if argv is None else argv
@@ -294,6 +413,8 @@ def main(argv=None):
             raise installer.InstallError('Choose Snapclient or MPD.')
         argv = list(argv) + ['--backend', 'mpd' if choice == 'm' else 'snapclient']
     cfg = options(argv, saved)
+    if cfg.get('pair_code'):
+        return pair_management(cfg, saved)
     if cfg['remove_usb']:
         if os.geteuid() != 0:
             raise installer.InstallError('Run with sudo to remove USB control.')
@@ -403,7 +524,7 @@ def main(argv=None):
                 path.mkdir(parents=True, exist_ok=True, mode=0o750)
                 os.chown(path, account.pw_uid, account.pw_gid)
         manifest = {key: value for key, value in cfg.items() if key not in (
-            'yes', 'check', 'remove_usb', 'usb_device', 'musicata_url', 'token_file', 'confirm_isolated_usb')}
+            'yes', 'check', 'pair_code', 'remove_usb', 'usb_device', 'musicata_url', 'token_file', 'confirm_isolated_usb')}
         if cfg['backend'] == 'mpd':
             manifest['musicata_url'] = cfg['musicata_url']
             manifest['config_digest'] = hashlib.sha256(files[MPD_CONFIG][0].encode()).hexdigest()

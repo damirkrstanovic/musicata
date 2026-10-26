@@ -254,3 +254,22 @@ class UsbLifecycleTests(unittest.TestCase):
                 entry.remove_usb()
         for path in (entry.USB_CONFIG, entry.USB_CODE, entry.USB_UNIT, entry.USB_TOKEN):
             self.assertTrue(path.exists())
+
+class ManagementPairingTests(unittest.TestCase):
+    def test_pairing_option_is_not_a_playback_backend_or_admin_token(self):
+        cfg = entry.options(['--pair-code', '--musicata-url', 'http://musicata.local'],
+                            {'backend':'snapclient','user':'musicata','identity':'speaker'})
+        self.assertIs(cfg['pair_code'], True)
+        self.assertEqual(cfg['backend'], 'snapclient')
+        self.assertIsNone(cfg.get('token_file'))
+
+    def test_management_unit_runs_as_playback_account_and_fixed_local_sudo_command(self):
+        files = entry.management_files({'user':'musicata'}, {'server_url':'http://musicata.local',
+                                      'client_id':'speaker','token':'scoped-token'},123,456)
+        unit = files[entry.MANAGEMENT_UNIT][0]
+        self.assertIn('User=123',unit)
+        self.assertNotIn('User=0',unit)
+        sudoers = files[entry.MANAGEMENT_SUDOERS][0]
+        self.assertIn('/usr/bin/python3 /opt/musicata/player/manage_player.py --local',sudoers)
+        self.assertNotIn('*',sudoers)
+        self.assertEqual(files[entry.MANAGEMENT_CONFIG][1],0o640)

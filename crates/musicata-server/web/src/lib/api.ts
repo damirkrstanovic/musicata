@@ -76,6 +76,46 @@ export interface UnidentifiedArtist {
   track_count: number;
 }
 
+import type { MpdOutput } from "../types/MpdOutput";
+export type { MpdOutput };
+
+export interface MpdOutputsView {
+  outputs: MpdOutput[];
+  selected: { name: string; plugin: string } | null;
+  selection_supported: boolean;
+  reason: string | null;
+}
+
+export interface ManagedPlayerDevice {
+  id: string;
+  name: string;
+  available: boolean;
+}
+
+export interface ManagedPlayerReport {
+  inventory_revision: string;
+  devices: ManagedPlayerDevice[];
+  selected_device_id: string | null;
+  attempted_revision: number;
+  applied_revision: number;
+  status: "idle" | "applied" | "failed" | "unsupported";
+  error: string | null;
+  selection_supported: boolean;
+}
+
+export interface ManagedPlayerView {
+  paired: boolean;
+  stale: boolean;
+  last_seen: number | null;
+  desired: { revision: number; device_id: string | null; inventory_revision: string | null };
+  report: ManagedPlayerReport | null;
+}
+
+export interface ManagedPlayerPairing {
+  pairing_token: string;
+  expires_at: number;
+}
+
 /** The display + playback fields of the server's `Track` — a structural view, so the deep
  *  metadata-observation graph isn't generated until the metadata panel (which consumes it). */
 export interface TrackRow {
@@ -422,6 +462,20 @@ export const api = {
     sendJson<{ address: string; connected: boolean }>("/api/players/probe", "POST", body),
   updatePlayer: (id: string, body: { name?: string; zone_id?: string | null }) =>
     sendJson(`/api/players/${encodeURIComponent(id)}`, "PATCH", body),
+  updatePlayerConnection: (id: string, body: { host: string; port: number; password?: string }) =>
+    sendJson<Player>(`/api/players/${encodeURIComponent(id)}/connection`, "PUT", body),
+  playerOutputs: (id: string) =>
+    getJson<MpdOutputsView>(`/api/players/${encodeURIComponent(id)}/outputs`),
+  savePlayerOutput: (id: string, body: { name: string; plugin: string }) =>
+    sendJson<MpdOutputsView>(`/api/players/${encodeURIComponent(id)}/outputs`, "PUT", body),
+  createManagedPlayerPairing: (clientId: string) =>
+    sendJson<ManagedPlayerPairing>("/api/managed-players/pairings", "POST", { client_id: clientId }),
+  managedPlayer: (clientId: string) =>
+    getJson<ManagedPlayerView>(`/api/managed-players/${encodeURIComponent(clientId)}`),
+  saveManagedPlayerDevice: (clientId: string, body: { device_id: string; inventory_revision: string }) =>
+    sendJson<ManagedPlayerView>(`/api/managed-players/${encodeURIComponent(clientId)}/device`, "PUT", body),
+  revokeManagedPlayer: (clientId: string) =>
+    sendJson(`/api/managed-players/${encodeURIComponent(clientId)}`, "DELETE"),
   deletePlayer: (id: string) => sendJson(`/api/players/${encodeURIComponent(id)}`, "DELETE"),
   zones: () => getJson<Zone[]>("/api/zones"),
   createZone: (name: string) => sendJson<Zone>("/api/zones", "POST", { name }),

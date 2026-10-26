@@ -1006,6 +1006,8 @@ pub async fn set_processor(
     Path(id): Path<String>,
     Json(binding): Json<Option<ProcessorBinding>>,
 ) -> Result<Json<Option<ProcessorBinding>>, AppError> {
+    let change_lock = crate::player_devices::configuration_lock(&state, &id).await;
+    let _change = change_lock.lock().await;
     let output = state
         .output_audio
         .entry(&state.database, &state.players, &id)

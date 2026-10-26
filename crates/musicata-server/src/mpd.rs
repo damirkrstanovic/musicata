@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use musicata_core::{PlaybackState, PlaybackStatus, QueueItem, RepeatMode};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -21,12 +22,28 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 /// seconds to minutes — and command handlers connect on the request's hot path.
 /// Two seconds is plenty for a reachable daemon and bounds the worst case.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const OUTPUT_PHASE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_OUTPUTS: usize = 64;
+
+/// One MPD-configured audio output. `id` is only meaningful for this MPD process: callers
+/// persist the `(name, plugin)` identity and resolve its current id immediately before use.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct MpdOutput {
+    pub id: u32,
+    pub name: String,
+    pub plugin: String,
+    pub enabled: bool,
+}
 
 /// A single MPD connection. Not internally synchronized: callers serialize access
 /// (one connection for commands, a separate one for the blocking `idle` loop).
 pub struct MpdConnection {
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
+    addr: String,
+    password: Option<String>,
+    output_stream_tainted: bool,
 }
 
 impl MpdConnection {
@@ -39,6 +56,9 @@ impl MpdConnection {
         let mut connection = Self {
             reader: BufReader::new(read),
             writer,
+            addr: addr.to_string(),
+            password: None,
+            output_stream_tainted: false,
         };
         let greeting = tokio::time::timeout(CONNECT_TIMEOUT, connection.read_line())
             .await
@@ -64,6 +84,7 @@ impl MpdConnection {
             .await
             .map_err(|_| anyhow!("MPD authentication failed"))?
             .map_err(|_| anyhow!("MPD authentication failed"))?;
+            connection.password = Some(password.to_string());
         }
         Ok(connection)
     }
@@ -79,6 +100,131 @@ impl MpdConnection {
         })
         .await
         .map_err(|_| anyhow!("MPD probe timed out"))?
+    }
+
+    /// List configured MPD outputs. This is MPD configuration, not a hardware discovery API.
+    pub async fn outputs(&mut self) -> Result<Vec<MpdOutput>> {
+        parse_outputs(&self.output_command("outputs").await?)
+    }
+
+    /// Select exactly one configured output, identified by its persistent `(name, plugin)` pair.
+    ///
+    /// MPD assigns output ids at runtime, so this resolves the id from a fresh `outputs` reply
+    /// and never asks callers to retain it. All output commands (including recovery) have a
+    /// deadline. Queue and transport commands are intentionally never issued here.
+    pub async fn select_output(&mut self, name: &str, plugin: &str) -> Result<Vec<MpdOutput>> {
+        if self.output_stream_tainted {
+            bail!("MPD output connection is unusable after a timed-out command; reconnect first");
+        }
+        let before = self.outputs().await?;
+        ensure_unique_output_identities(&before)?;
+        let target = unique_output(&before, name, plugin)?.clone();
+
+        let change = match tokio::time::timeout(OUTPUT_PHASE_TIMEOUT, async {
+            // Disable existing outputs before enabling a disabled target. This avoids a period
+            // where an old speaker and the requested one are both enabled.
+            for output in before
+                .iter()
+                .filter(|output| output.enabled && output.id != target.id)
+            {
+                self.set_output_enabled(output.id, false).await?;
+            }
+            if !target.enabled {
+                self.set_output_enabled(target.id, true).await?;
+            }
+            let after = self.outputs().await?;
+            ensure_unique_output_identities(&after)?;
+            if !is_only_enabled_output(&after, name, plugin) {
+                bail!("MPD output selection verification failed");
+            }
+            Ok(after)
+        })
+        .await
+        {
+            Ok(change) => change,
+            Err(_) => {
+                self.output_stream_tainted = true;
+                Err(anyhow!("MPD output selection timed out"))
+            }
+        };
+
+        match change {
+            Ok(outputs) => Ok(outputs),
+            Err(change_error) => match self.rollback_outputs(&before).await {
+                Ok(()) => Err(anyhow!(
+                    "MPD output selection failed ({change_error}); prior outputs restored"
+                )),
+                Err(rollback_error) => Err(anyhow!(
+                    "MPD output selection failed: {change_error}; rollback failed: {rollback_error}"
+                )),
+            },
+        }
+    }
+
+    async fn output_command(&mut self, command: &str) -> Result<Vec<(String, String)>> {
+        tokio::time::timeout(CONNECT_TIMEOUT, self.command(command))
+            .await
+            .map_err(|_| {
+                self.output_stream_tainted = true;
+                anyhow!("MPD output command timed out")
+            })?
+    }
+
+    async fn set_output_enabled(&mut self, id: u32, enabled: bool) -> Result<()> {
+        let command = if enabled {
+            format!("enableoutput {id}")
+        } else {
+            format!("disableoutput {id}")
+        };
+        self.output_command(&command).await?;
+        Ok(())
+    }
+
+    /// Restore exactly the enabled set observed before this operation. Fetching first resolves
+    /// current ids rather than trusting a persisted id after an MPD reload.
+    async fn restore_outputs(&mut self, before: &[MpdOutput]) -> Result<()> {
+        let current = self.outputs().await?;
+        ensure_unique_output_identities(&current)?;
+        for output in &current {
+            let wanted = output_enabled(before, output)?;
+            if output.enabled && !wanted {
+                self.set_output_enabled(output.id, false).await?;
+            }
+        }
+        for output in &current {
+            let wanted = output_enabled(before, output)?;
+            if !output.enabled && wanted {
+                self.set_output_enabled(output.id, true).await?;
+            }
+        }
+        let restored = self.outputs().await?;
+        ensure_unique_output_identities(&restored)?;
+        if !same_enabled_outputs(before, &restored)? {
+            bail!("MPD output rollback verification failed");
+        }
+        Ok(())
+    }
+
+    /// A timed-out MPD command can still produce an ACK/OK after its caller has given up.
+    /// Never read that uncertain framing while restoring speakers: reconnect, authenticate, and
+    /// resolve the output identities again. The caller receives an explicit unverified rollback
+    /// error if that fresh recovery cannot complete.
+    async fn rollback_outputs(&mut self, before: &[MpdOutput]) -> Result<()> {
+        let rollback = async {
+            if self.output_stream_tainted {
+                let mut recovery =
+                    Self::connect_with_password(&self.addr, self.password.as_deref())
+                        .await
+                        .context("fresh MPD recovery connection failed")?;
+                recovery.restore_outputs(before).await
+            } else {
+                self.restore_outputs(before).await
+            }
+        };
+        tokio::time::timeout(OUTPUT_PHASE_TIMEOUT, rollback)
+            .await
+            .map_err(|_| anyhow!("MPD output rollback unverified: timed out"))?
+            .map_err(|error| anyhow!("MPD output rollback unverified: {error}"))
     }
 
     async fn read_line(&mut self) -> Result<String> {
@@ -182,6 +328,121 @@ fn seekcur_arg(position_seconds: f64) -> String {
         0.0
     };
     format!("{seconds}")
+}
+
+fn parse_outputs(pairs: &[(String, String)]) -> Result<Vec<MpdOutput>> {
+    let mut outputs = Vec::new();
+    let mut current: Option<MpdOutput> = None;
+    for (key, value) in pairs {
+        match key.as_str() {
+            "outputid" => {
+                if let Some(output) = current.take() {
+                    outputs.push(output);
+                    if outputs.len() > MAX_OUTPUTS {
+                        bail!("MPD reported too many outputs");
+                    }
+                }
+                current = Some(MpdOutput {
+                    id: value.parse().context("invalid MPD output id")?,
+                    name: String::new(),
+                    plugin: String::new(),
+                    enabled: false,
+                });
+            }
+            "outputname" => {
+                current
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("MPD output name without output id"))?
+                    .name = value.clone()
+            }
+            "plugin" => {
+                current
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("MPD output plugin without output id"))?
+                    .plugin = value.clone()
+            }
+            "outputenabled" => {
+                let output = current
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("MPD output enabled state without output id"))?;
+                output.enabled = match value.as_str() {
+                    "0" => false,
+                    "1" => true,
+                    _ => bail!("invalid MPD output enabled state"),
+                };
+            }
+            _ => {}
+        }
+    }
+    if let Some(output) = current {
+        outputs.push(output);
+    }
+    if outputs.len() > MAX_OUTPUTS {
+        bail!("MPD reported too many outputs");
+    }
+    if outputs
+        .iter()
+        .any(|output| output.name.is_empty() || output.plugin.is_empty())
+    {
+        bail!("incomplete MPD output response");
+    }
+    Ok(outputs)
+}
+
+fn unique_output<'a>(outputs: &'a [MpdOutput], name: &str, plugin: &str) -> Result<&'a MpdOutput> {
+    let mut matched = outputs
+        .iter()
+        .filter(|output| output.name == name && output.plugin == plugin);
+    let Some(output) = matched.next() else {
+        bail!("MPD output {name:?} ({plugin}) is not configured");
+    };
+    if matched.next().is_some() {
+        bail!("MPD output {name:?} ({plugin}) is ambiguous");
+    }
+    Ok(output)
+}
+
+fn ensure_unique_output_identities(outputs: &[MpdOutput]) -> Result<()> {
+    for (index, output) in outputs.iter().enumerate() {
+        if outputs[..index]
+            .iter()
+            .any(|other| other.name == output.name && other.plugin == output.plugin)
+        {
+            bail!(
+                "MPD output {:?} ({}) is ambiguous",
+                output.name,
+                output.plugin
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_only_enabled_output(outputs: &[MpdOutput], name: &str, plugin: &str) -> bool {
+    outputs
+        .iter()
+        .filter(|output| output.enabled)
+        .all(|output| output.name == name && output.plugin == plugin)
+        && outputs
+            .iter()
+            .find(|output| output.name == name && output.plugin == plugin)
+            .is_some_and(|output| output.enabled)
+}
+
+fn output_enabled(before: &[MpdOutput], output: &MpdOutput) -> Result<bool> {
+    Ok(unique_output(before, &output.name, &output.plugin)?.enabled)
+}
+
+fn same_enabled_outputs(before: &[MpdOutput], after: &[MpdOutput]) -> Result<bool> {
+    if before.len() != after.len() {
+        return Ok(false);
+    }
+    for output in after {
+        if output_enabled(before, output)? != output.enabled {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 impl MpdConnection {
@@ -404,8 +665,11 @@ fn parse_playback_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
 
     fn pairs(text: &str) -> Vec<(String, String)> {
         text.lines()
@@ -514,6 +778,260 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A stricter scripted server: every received command must match the next expected command.
+    /// The recorded sequence also proves output selection never touches queue or transport state.
+    async fn scripted_mpd(
+        script: Vec<(&'static str, &'static str)>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let recorded = commands.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"OK MPD 0.23.0\n").await.unwrap();
+            let mut script: VecDeque<_> = script.into();
+            let mut buffer = vec![0_u8; 1024];
+            let mut pending = String::new();
+            loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                pending.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                while let Some(newline) = pending.find('\n') {
+                    let command: String = pending.drain(..=newline).collect();
+                    let command = command.trim_end().to_string();
+                    recorded.lock().await.push(command.clone());
+                    let Some((expected, reply)) = script.pop_front() else {
+                        socket
+                            .write_all(b"ACK [5@0] {} unexpected command\n")
+                            .await
+                            .unwrap();
+                        continue;
+                    };
+                    assert_eq!(command, expected, "unexpected MPD command");
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                    if !reply.starts_with("ACK") {
+                        socket.write_all(b"OK\n").await.unwrap();
+                    }
+                }
+            }
+        });
+        (addr, commands)
+    }
+
+    /// Serve one script per TCP connection. `<silent>` simulates a peer which accepts a command
+    /// but never frames a reply, so recovery must open a new connection rather than consume a
+    /// delayed ACK/OK from the first one.
+    async fn scripted_mpd_connections(
+        scripts: Vec<Vec<(&'static str, &'static str)>>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn({
+            let commands = commands.clone();
+            async move {
+                for script in scripts {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let commands = commands.clone();
+                    tokio::spawn(async move {
+                        socket.write_all(b"OK MPD 0.23.0\n").await.unwrap();
+                        let mut script: VecDeque<_> = script.into();
+                        let mut buffer = vec![0_u8; 1024];
+                        let mut pending = String::new();
+                        loop {
+                            let read = socket.read(&mut buffer).await.unwrap();
+                            if read == 0 {
+                                break;
+                            }
+                            pending.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                            while let Some(newline) = pending.find('\n') {
+                                let command: String = pending.drain(..=newline).collect();
+                                let command = command.trim_end().to_string();
+                                commands.lock().await.push(command.clone());
+                                let (expected, reply) = script.pop_front().expect("script command");
+                                assert_eq!(command, expected, "unexpected MPD command");
+                                if reply == "<silent>" {
+                                    tokio::time::sleep(CONNECT_TIMEOUT + Duration::from_secs(1))
+                                        .await;
+                                } else {
+                                    socket.write_all(reply.as_bytes()).await.unwrap();
+                                    if !reply.starts_with("ACK") {
+                                        socket.write_all(b"OK\n").await.unwrap();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        (addr, commands)
+    }
+
+    const INITIAL_OUTPUTS: &str = "outputid: 1\noutputname: Living room\nplugin: alsa\noutputenabled: 1\noutputid: 2\noutputname: Kitchen\nplugin: pulse\noutputenabled: 0\n";
+    const KITCHEN_ONLY_RENUMBERED: &str = "outputid: 19\noutputname: Living room\nplugin: alsa\noutputenabled: 0\noutputid: 20\noutputname: Kitchen\nplugin: pulse\noutputenabled: 1\n";
+    const NOTHING_ENABLED: &str = "outputid: 1\noutputname: Living room\nplugin: alsa\noutputenabled: 0\noutputid: 2\noutputname: Kitchen\nplugin: pulse\noutputenabled: 0\n";
+    const NOTHING_ENABLED_RENUMBERED: &str = "outputid: 19\noutputname: Living room\nplugin: alsa\noutputenabled: 0\noutputid: 20\noutputname: Kitchen\nplugin: pulse\noutputenabled: 0\n";
+    const INITIAL_OUTPUTS_RENUMBERED: &str = "outputid: 19\noutputname: Living room\nplugin: alsa\noutputenabled: 1\noutputid: 20\noutputname: Kitchen\nplugin: pulse\noutputenabled: 0\n";
+
+    #[tokio::test]
+    async fn select_output_disables_other_outputs_and_rechecks_the_current_ids() {
+        let (addr, commands) = scripted_mpd(vec![
+            ("outputs", INITIAL_OUTPUTS),
+            ("disableoutput 1", ""),
+            ("enableoutput 2", ""),
+            ("outputs", KITCHEN_ONLY_RENUMBERED),
+        ])
+        .await;
+        let mut connection = MpdConnection::connect(&addr).await.unwrap();
+
+        let outputs = connection.select_output("Kitchen", "pulse").await.unwrap();
+
+        assert_eq!(outputs.iter().filter(|output| output.enabled).count(), 1);
+        assert_eq!(outputs.iter().find(|output| output.enabled).unwrap().id, 20);
+        assert_eq!(
+            *commands.lock().await,
+            vec![
+                "outputs".to_string(),
+                "disableoutput 1".to_string(),
+                "enableoutput 2".to_string(),
+                "outputs".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn select_output_rejects_an_ambiguous_name_and_plugin_without_changing_outputs() {
+        let duplicate = "outputid: 1\noutputname: Kitchen\nplugin: alsa\noutputenabled: 1\noutputid: 2\noutputname: Kitchen\nplugin: alsa\noutputenabled: 0\n";
+        let (addr, commands) = scripted_mpd(vec![("outputs", duplicate)]).await;
+        let mut connection = MpdConnection::connect(&addr).await.unwrap();
+
+        let error = connection
+            .select_output("Kitchen", "alsa")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("ambiguous"));
+        assert_eq!(*commands.lock().await, vec!["outputs".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn select_output_rejects_an_unknown_output_without_changing_outputs() {
+        let (addr, commands) = scripted_mpd(vec![("outputs", INITIAL_OUTPUTS)]).await;
+        let mut connection = MpdConnection::connect(&addr).await.unwrap();
+
+        let error = connection
+            .select_output("Office", "alsa")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not configured"));
+        assert_eq!(*commands.lock().await, vec!["outputs".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn select_output_rolls_back_after_a_partial_apply_failure_with_renumbered_ids() {
+        let (addr, commands) = scripted_mpd(vec![
+            ("outputs", INITIAL_OUTPUTS),
+            ("disableoutput 1", ""),
+            ("enableoutput 2", "ACK [5@0] {enableoutput} denied\n"),
+            ("outputs", NOTHING_ENABLED_RENUMBERED),
+            ("enableoutput 19", ""),
+            ("outputs", INITIAL_OUTPUTS_RENUMBERED),
+        ])
+        .await;
+        let mut connection = MpdConnection::connect(&addr).await.unwrap();
+
+        let error = connection
+            .select_output("Kitchen", "pulse")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("enableoutput"));
+        assert_eq!(
+            *commands.lock().await,
+            vec![
+                "outputs".to_string(),
+                "disableoutput 1".to_string(),
+                "enableoutput 2".to_string(),
+                "outputs".to_string(),
+                "enableoutput 19".to_string(),
+                "outputs".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn select_output_rolls_back_when_readback_does_not_select_only_the_target() {
+        let (addr, commands) = scripted_mpd(vec![
+            ("outputs", INITIAL_OUTPUTS),
+            ("disableoutput 1", ""),
+            ("enableoutput 2", ""),
+            ("outputs", NOTHING_ENABLED),
+            ("outputs", NOTHING_ENABLED),
+            ("enableoutput 1", ""),
+            ("outputs", INITIAL_OUTPUTS),
+        ])
+        .await;
+        let mut connection = MpdConnection::connect(&addr).await.unwrap();
+
+        let error = connection
+            .select_output("Kitchen", "pulse")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("verification"));
+        assert_eq!(
+            *commands.lock().await,
+            vec![
+                "outputs".to_string(),
+                "disableoutput 1".to_string(),
+                "enableoutput 2".to_string(),
+                "outputs".to_string(),
+                "outputs".to_string(),
+                "enableoutput 1".to_string(),
+                "outputs".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn select_output_reconnects_before_rollback_after_a_silent_command() {
+        let (addr, commands) = scripted_mpd_connections(vec![
+            vec![
+                ("outputs", INITIAL_OUTPUTS),
+                ("disableoutput 1", "<silent>"),
+            ],
+            vec![
+                ("outputs", NOTHING_ENABLED),
+                ("enableoutput 1", ""),
+                ("outputs", INITIAL_OUTPUTS),
+            ],
+        ])
+        .await;
+        let mut connection = MpdConnection::connect(&addr).await.unwrap();
+
+        let error = connection
+            .select_output("Kitchen", "pulse")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(
+            *commands.lock().await,
+            vec![
+                "outputs".to_string(),
+                "disableoutput 1".to_string(),
+                "outputs".to_string(),
+                "enableoutput 1".to_string(),
+                "outputs".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]

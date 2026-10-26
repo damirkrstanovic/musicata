@@ -147,6 +147,9 @@ streaming fetches only the requested byte range.
 | GET | `/api/players` | List registered players. Each carries `capabilities` (`seek`/`volume`/`repeat`/`shuffle`/`queue`) advertised by the backend. |
 | POST | `/api/players` | Register an MPD player: `{ "kind": "mpd", "address", "name", "password"?: string, "issue_token"?: bool }`. `kind` defaults to `mpd`. An omitted password keeps the credential already stored for the same address; an empty password clears it. Credentials are never returned in player descriptors. With `issue_token`, the response carries `auth_token` **once**; only its hash is stored. Snapcast is managed by the server and browser playback is always available as `browser-local`. |
 | POST | `/api/players/probe` | Test MPD setup without registering a player: `{ "host", "port", "password"?: string }` → `{ "address", "connected": true }`. It performs greeting, optional authentication, and `status` under a short timeout. Failure is `502` with `error.code: "probe_failed"`; credentials are never included in an error. |
+| PUT | `/api/players/{id}/connection` | Admin-only MPD address change: `{host, port, password?}` → `Player`. Preserves player ID, queue, zone, token and sound settings; reconnects in the background. Omitted password preserves the saved credential; empty password clears it. Refuses an address already assigned to another player. |
+| GET | `/api/players/{id}/outputs` | Admin-only configured MPD outputs: `{outputs: [{id, name, plugin, enabled}], selected: {name, plugin} \| null, selection_supported, reason}`. These are configured outputs, not hardware discovery or proof of audible sound. Processor-bound players report selection unsupported. |
+| PUT | `/api/players/{id}/outputs` | Admin-only `{name, plugin}` selection. Resolves current MPD IDs, enables the chosen output and disables others, verifies the result and persists the selection. Failure attempts verified rollback; an unverified rollback is explicitly reported. The transaction continues if the HTTP caller disconnects. Never sends transport/queue commands. |
 | PATCH | `/api/players/{id}` | Rename (`{"name"}`) or set zone (`{"zone_id"}`/`null`). User-gated. |
 | DELETE | `/api/players/{id}` | Remove a player. User-gated. |
 | GET | `/api/players/{id}/state` | Current `PlaybackState` snapshot. A player's own scoped token authenticates this channel (Bearer/`?token=`) in place of a user session. |
@@ -157,6 +160,28 @@ streaming fetches only the requested byte range.
 | GET | `/api/zones/{id}/state` | Current `PlaybackState` for the zone. |
 | POST | `/api/zones/{id}/commands` | Apply a command to every player in the zone. |
 | GET | `/api/zones/{id}/ws` | WebSocket of live zone `PlaybackState`. |
+
+### Managed Snapclient audio devices
+
+These routes manage a physical Snapclient host independently of Musicata's shared stream
+player. Administrator sessions control pairing and desired selections; the host uses a
+separate credential that cannot access playback or administrator APIs.
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| POST | `/api/managed-players/pairings` | Admin `{client_id}` → `{pairing_token, expires_at}`. One-use pairing code, valid for ten minutes. Creating a code does not revoke the current host. |
+| POST | `/api/managed-players/enroll` | `{client_id, pairing_token}` → `{client_id, token}`. Requires the matching identity; consumes the code and rotates that host's credential. Token is returned once; only its hash is stored. |
+| POST | `/api/managed-players/report` | Host Bearer token only. Accepts current inventory and apply result; returns `{revision, device_id, inventory_revision}`. |
+| GET | `/api/managed-players/{client_id}` | Admin → `{paired, stale, last_seen, report, desired}`. Reports become stale after 30 seconds. |
+| PUT | `/api/managed-players/{client_id}/device` | Admin `{device_id, inventory_revision}` → updated view. Requires a fresh, supported inventory and one available device. A queued selection is not confirmation that it was applied. |
+| DELETE | `/api/managed-players/{client_id}` | Admin revocation, returns 204. The host keeps its existing playback configuration. |
+
+A report contains `inventory_revision`, `devices: [{id, name, available}]`,
+`selected_device_id`, `applied_revision`, `attempted_revision`, `status`
+(`idle`, `applied`, `failed`, or `unsupported`), `error`, and `selection_supported`.
+Device IDs must be unique. Reports are limited to 64 devices and 64 KiB. Revisions cannot
+acknowledge future requests or move backwards. Device IDs are opaque host identifiers;
+clients cannot submit shell commands, ALSA routes or file paths.
 
 The local browser player is always present as id `browser-local`.
 

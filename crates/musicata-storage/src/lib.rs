@@ -518,6 +518,20 @@ impl Database {
             }
             set_user_version(&self.pool, 39).await?;
         }
+
+        if version < 40 {
+            for statement in MIGRATION_040_PLAYER_OUTPUT_SELECTION {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 40).await?;
+        }
+
+        if version < 41 {
+            for statement in MIGRATION_041_MANAGED_PLAYERS {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 41).await?;
+        }
         Ok(())
     }
 
@@ -3758,6 +3772,247 @@ impl Database {
         Ok(())
     }
 
+    // ---- Managed playback hosts -------------------------------------------------------------
+
+    /// A new pairing deliberately leaves an enrolled host credential intact until the pairing
+    /// is redeemed. This makes re-pairing recoverable when setup is abandoned midway.
+    pub async fn create_managed_player_pairing(
+        &self,
+        client_id: &str,
+        token_hash: &str,
+        expires_at_unix_seconds: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO managed_player_pairings (client_id, token_hash, expires_at_unix_seconds)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(client_id) DO UPDATE SET
+               token_hash = excluded.token_hash,
+               expires_at_unix_seconds = excluded.expires_at_unix_seconds",
+        )
+        .bind(client_id)
+        .bind(token_hash)
+        .bind(expires_at_unix_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Atomically consume a live pairing, rotate the host credential, and discard state reported
+    /// by the previous host. `None` means the token was absent, used, or expired.
+    pub async fn enroll_managed_player(
+        &self,
+        expected_client_id: &str,
+        pairing_token_hash: &str,
+        now_unix_seconds: i64,
+        host_token_hash: &str,
+    ) -> Result<Option<String>> {
+        let mut transaction = self.pool.begin().await?;
+        let client_id = sqlx::query("SELECT client_id FROM managed_player_pairings WHERE client_id = ?1 AND token_hash = ?2 AND expires_at_unix_seconds > ?3")
+            .bind(expected_client_id)
+            .bind(pairing_token_hash)
+            .bind(now_unix_seconds)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(|row| row.try_get("client_id"))
+            .transpose()?;
+        let Some(client_id) = client_id else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+        let consumed = sqlx::query(
+            "DELETE FROM managed_player_pairings WHERE client_id = ?1 AND token_hash = ?2",
+        )
+        .bind(&client_id)
+        .bind(pairing_token_hash)
+        .execute(&mut *transaction)
+        .await?;
+        if consumed.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        sqlx::query(
+            "INSERT INTO managed_player_hosts (client_id, token_hash, enrolled_at_unix_seconds)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(client_id) DO UPDATE SET
+               token_hash = excluded.token_hash,
+               enrolled_at_unix_seconds = excluded.enrolled_at_unix_seconds",
+        )
+        .bind(&client_id)
+        .bind(host_token_hash)
+        .bind(now_unix_seconds)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("DELETE FROM managed_player_reports WHERE client_id = ?1")
+            .bind(&client_id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM managed_player_desired WHERE client_id = ?1")
+            .bind(&client_id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(Some(client_id))
+    }
+
+    pub async fn managed_player_for_host_token(&self, token_hash: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT client_id FROM managed_player_hosts WHERE token_hash = ?1")
+            .bind(token_hash)
+            .fetch_optional(&self.reads)
+            .await?;
+        Ok(row.map(|row| row.try_get("client_id")).transpose()?)
+    }
+
+    pub async fn save_managed_player_report(
+        &self,
+        client_id: &str,
+        host_token_hash: &str,
+        inventory_revision: &str,
+        report_json: &str,
+        last_seen_unix_seconds: i64,
+        applied_revision: u64,
+        attempted_revision: u64,
+    ) -> Result<bool> {
+        let mut transaction = self.pool.begin().await?;
+        let credential_is_current = sqlx::query(
+            "SELECT 1 FROM managed_player_hosts WHERE client_id = ?1 AND token_hash = ?2",
+        )
+        .bind(client_id)
+        .bind(host_token_hash)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .is_some();
+        if !credential_is_current {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let previous = sqlx::query("SELECT applied_revision, attempted_revision FROM managed_player_reports WHERE client_id = ?1")
+            .bind(client_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        if let Some(previous) = previous {
+            let previous_applied = previous.try_get::<i64, _>("applied_revision")? as u64;
+            let previous_attempted = previous.try_get::<i64, _>("attempted_revision")? as u64;
+            if previous_applied > applied_revision || previous_attempted > attempted_revision {
+                transaction.rollback().await?;
+                return Ok(false);
+            }
+        }
+        sqlx::query(
+            "INSERT INTO managed_player_reports
+                (client_id, inventory_revision, report_json, last_seen_unix_seconds, applied_revision, attempted_revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(client_id) DO UPDATE SET
+               inventory_revision = excluded.inventory_revision,
+               report_json = excluded.report_json,
+               last_seen_unix_seconds = excluded.last_seen_unix_seconds,
+               applied_revision = excluded.applied_revision,
+               attempted_revision = excluded.attempted_revision",
+        )
+        .bind(client_id)
+        .bind(inventory_revision)
+        .bind(report_json)
+        .bind(last_seen_unix_seconds)
+        .bind(applied_revision as i64)
+        .bind(attempted_revision as i64)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn managed_player_state(&self, client_id: &str) -> Result<ManagedPlayerState> {
+        let row = sqlx::query(
+            "SELECT host.client_id AS paired_client_id, report.inventory_revision,
+                    report.report_json, report.last_seen_unix_seconds,
+                    desired.revision, desired.device_id, desired.inventory_revision AS desired_inventory_revision
+             FROM (SELECT ?1 AS client_id) requested
+             LEFT JOIN managed_player_hosts host ON host.client_id = requested.client_id
+             LEFT JOIN managed_player_reports report ON report.client_id = requested.client_id
+             LEFT JOIN managed_player_desired desired ON desired.client_id = requested.client_id",
+        )
+        .bind(client_id)
+        .fetch_one(&self.reads)
+        .await?;
+        Ok(ManagedPlayerState {
+            paired: row
+                .try_get::<Option<String>, _>("paired_client_id")?
+                .is_some(),
+            inventory_revision: row.try_get("inventory_revision")?,
+            report_json: row.try_get("report_json")?,
+            last_seen_unix_seconds: row.try_get("last_seen_unix_seconds")?,
+            desired: match row.try_get::<Option<i64>, _>("revision")? {
+                Some(revision) => Some(ManagedPlayerDesired {
+                    revision: revision as u64,
+                    device_id: row.try_get("device_id")?,
+                    inventory_revision: row.try_get("desired_inventory_revision")?,
+                }),
+                None => None,
+            },
+        })
+    }
+
+    /// Changes desired device only when the inventory revision observed by the caller remains
+    /// current. This prevents a stale browser from selecting a device from another report.
+    pub async fn set_managed_player_device(
+        &self,
+        client_id: &str,
+        device_id: Option<&str>,
+        inventory_revision: Option<&str>,
+        expected_report_json: Option<&str>,
+    ) -> Result<Option<ManagedPlayerDesired>> {
+        let mut transaction = self.pool.begin().await?;
+        let matches_inventory = match (inventory_revision, expected_report_json) {
+            (Some(inventory_revision), Some(expected_report_json)) => sqlx::query("SELECT 1 FROM managed_player_reports WHERE client_id = ?1 AND inventory_revision = ?2 AND report_json = ?3")
+                .bind(client_id).bind(inventory_revision).bind(expected_report_json).fetch_optional(&mut *transaction).await?.is_some(),
+            _ => false,
+        };
+        if !matches_inventory {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        sqlx::query(
+            "INSERT INTO managed_player_desired (client_id, revision, device_id, inventory_revision)
+             VALUES (?1, 1, ?2, ?3)
+             ON CONFLICT(client_id) DO UPDATE SET
+               revision = managed_player_desired.revision + 1,
+               device_id = excluded.device_id,
+               inventory_revision = excluded.inventory_revision",
+        )
+        .bind(client_id)
+        .bind(device_id)
+        .bind(inventory_revision)
+        .execute(&mut *transaction)
+        .await?;
+        let row = sqlx::query("SELECT revision, device_id, inventory_revision FROM managed_player_desired WHERE client_id = ?1")
+            .bind(client_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let desired = ManagedPlayerDesired {
+            revision: row.try_get::<i64, _>("revision")? as u64,
+            device_id: row.try_get("device_id")?,
+            inventory_revision: row.try_get("inventory_revision")?,
+        };
+        transaction.commit().await?;
+        Ok(Some(desired))
+    }
+
+    pub async fn revoke_managed_player(&self, client_id: &str) -> Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        for table in [
+            "managed_player_pairings",
+            "managed_player_hosts",
+            "managed_player_reports",
+            "managed_player_desired",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE client_id = ?1"))
+                .bind(client_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     // ---- Users + sessions (hashing/token generation live in the server crate) ----
 
     /// How many accounts exist — zero means the app is in first-run "setup" mode.
@@ -3929,6 +4184,23 @@ impl Database {
         row.as_ref().map(player_record_from_row).transpose()
     }
 
+    /// Finds the registered player for an exact canonical transport address. This lets callers
+    /// keep a player id stable when the address is edited rather than treating it as identity.
+    pub async fn player_by_kind_address(
+        &self,
+        kind: &str,
+        address: &str,
+    ) -> Result<Option<PlayerRecord>> {
+        let row = sqlx::query(
+            "SELECT id, kind, address, name, zone_id FROM players WHERE kind = ?1 AND address = ?2",
+        )
+        .bind(kind)
+        .bind(address)
+        .fetch_optional(&self.reads)
+        .await?;
+        row.as_ref().map(player_record_from_row).transpose()
+    }
+
     pub async fn players_in_zone(&self, zone_id: &str) -> Result<Vec<PlayerRecord>> {
         let rows =
             sqlx::query("SELECT id, kind, address, name, zone_id FROM players WHERE zone_id = ?1")
@@ -3938,7 +4210,7 @@ impl Database {
         rows.iter().map(player_record_from_row).collect()
     }
 
-    /// Insert or replace a registered player (keyed by id derived from kind+address).
+    /// Insert or replace a registered player by its permanent id.
     pub async fn upsert_player(&self, record: &PlayerRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO players (id, kind, address, name, zone_id, created_at)
@@ -3997,6 +4269,43 @@ impl Database {
         Ok(())
     }
 
+    /// Update an MPD address without replacing its player row. A nonempty password stores a
+    /// replacement credential; an empty one clears it. Omitting a password is deliberately
+    /// handled by the caller, which leaves the credential untouched.
+    pub async fn update_mpd_connection(
+        &self,
+        player_id: &str,
+        address: &str,
+        password: Option<&str>,
+    ) -> Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("UPDATE players SET address = ?2 WHERE id = ?1 AND kind = 'mpd'")
+            .bind(player_id)
+            .bind(address)
+            .execute(&mut *transaction)
+            .await?;
+        if password.is_some() {
+            let password = password.filter(|password| !password.is_empty());
+            if let Some(password) = password {
+                sqlx::query(
+                    "INSERT INTO player_mpd_credentials (player_id, password) VALUES (?1, ?2)
+                     ON CONFLICT(player_id) DO UPDATE SET password = excluded.password",
+                )
+                .bind(player_id)
+                .bind(password)
+                .execute(&mut *transaction)
+                .await?;
+            } else {
+                sqlx::query("DELETE FROM player_mpd_credentials WHERE player_id = ?1")
+                    .bind(player_id)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Returns a stored MPD credential for transport use only. It is deliberately absent from
     /// `PlayerRecord`, which is used to form API descriptors and diagnostic fields.
     pub async fn player_mpd_password(&self, player_id: &str) -> Result<Option<String>> {
@@ -4005,6 +4314,37 @@ impl Database {
             .fetch_optional(&self.reads)
             .await
             .map_err(Into::into)
+    }
+
+    /// The selected named MPD output, kept with the permanent player identity rather than a
+    /// mutable network address. Removing a player cascades this row away.
+    pub async fn player_output_selection(
+        &self,
+        player_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        sqlx::query_as("SELECT name, plugin FROM player_output_selection WHERE player_id = ?1")
+            .bind(player_id)
+            .fetch_optional(&self.reads)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn set_player_output_selection(
+        &self,
+        player_id: &str,
+        name: &str,
+        plugin: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO player_output_selection (player_id, name, plugin) VALUES (?1, ?2, ?3)
+             ON CONFLICT(player_id) DO UPDATE SET name = excluded.name, plugin = excluded.plugin",
+        )
+        .bind(player_id)
+        .bind(name)
+        .bind(plugin)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Whether a supported player has this exact scoped-token hash. Retired player rows retain
@@ -5439,6 +5779,22 @@ pub struct PlayerRecord {
     pub zone_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedPlayerDesired {
+    pub revision: u64,
+    pub device_id: Option<String>,
+    pub inventory_revision: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedPlayerState {
+    pub paired: bool,
+    pub inventory_revision: Option<String>,
+    pub report_json: Option<String>,
+    pub last_seen_unix_seconds: Option<i64>,
+    pub desired: Option<ManagedPlayerDesired>,
+}
+
 fn player_record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PlayerRecord> {
     Ok(PlayerRecord {
         id: row.try_get("id")?,
@@ -6587,6 +6943,45 @@ const MIGRATION_039_PLAYER_CREDENTIALS: &[&str] =
         password TEXT NOT NULL
     )"];
 
+// The active named MPD output is device state. It belongs to the permanent player id, so an
+// address rebind does not silently discard it; deleting the player still removes it.
+const MIGRATION_040_PLAYER_OUTPUT_SELECTION: &[&str] =
+    &["CREATE TABLE IF NOT EXISTS player_output_selection (
+        player_id TEXT PRIMARY KEY REFERENCES players(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        plugin TEXT NOT NULL
+    )"];
+
+// A managed host is a narrowly scoped remote process, not a user or a normal playback player.
+// Pairing tokens and host credentials are SHA-256 hashes supplied by the server; reports remain
+// opaque JSON here so protocol validation can evolve at the API boundary without a migration.
+const MIGRATION_041_MANAGED_PLAYERS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS managed_player_pairings (
+        client_id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        expires_at_unix_seconds INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS managed_player_hosts (
+        client_id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        enrolled_at_unix_seconds INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS managed_player_reports (
+        client_id TEXT PRIMARY KEY REFERENCES managed_player_hosts(client_id) ON DELETE CASCADE,
+        inventory_revision TEXT NOT NULL,
+        report_json TEXT NOT NULL,
+        last_seen_unix_seconds INTEGER NOT NULL,
+        applied_revision INTEGER NOT NULL,
+        attempted_revision INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS managed_player_desired (
+        client_id TEXT PRIMARY KEY REFERENCES managed_player_hosts(client_id) ON DELETE CASCADE,
+        revision INTEGER NOT NULL,
+        device_id TEXT,
+        inventory_revision TEXT
+    )",
+];
+
 // Server-owned persistent playback queue, one queue per player. `player_queue`
 // holds the lightweight playback row (status/position/elapsed/volume/repeat/
 // shuffle) updated frequently; `player_queue_items` holds the ordered queue and
@@ -7221,6 +7616,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn updating_mpd_connection_keeps_player_keyed_state() {
+        use musicata_core::dsp::OutputDspSelection;
+        let path = temp_db_path("mpd-connection-update");
+        let database = Database::connect(&path).await.unwrap();
+        database.insert_zone("zone-main", "Main").await.unwrap();
+        database
+            .upsert_player(&super::PlayerRecord {
+                id: "mpd-permanent-id".into(),
+                name: "Living room".into(),
+                kind: "mpd".into(),
+                address: "old.example:6600".into(),
+                zone_id: Some("zone-main".into()),
+            })
+            .await
+            .unwrap();
+        database
+            .set_player_mpd_password("mpd-permanent-id", Some("old-password"))
+            .await
+            .unwrap();
+        database
+            .set_player_auth_token_hash("mpd-permanent-id", "token-hash")
+            .await
+            .unwrap();
+        let selection = OutputDspSelection {
+            profile_id: Some("speakers".into()),
+            enabled: true,
+            ..Default::default()
+        };
+        database
+            .set_player_dsp("mpd-permanent-id", &selection)
+            .await
+            .unwrap();
+
+        database
+            .update_mpd_connection("mpd-permanent-id", "new.example:6600", Some("new-password"))
+            .await
+            .unwrap();
+
+        let record = database
+            .player_record("mpd-permanent-id")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.id, "mpd-permanent-id");
+        assert_eq!(record.address, "new.example:6600");
+        assert_eq!(record.zone_id.as_deref(), Some("zone-main"));
+        assert_eq!(
+            database
+                .player_mpd_password("mpd-permanent-id")
+                .await
+                .unwrap(),
+            Some("new-password".into())
+        );
+        assert_eq!(
+            database
+                .player_auth_token_hash("mpd-permanent-id")
+                .await
+                .unwrap(),
+            Some("token-hash".into())
+        );
+        assert_eq!(
+            database.player_dsp("mpd-permanent-id").await.unwrap(),
+            Some(selection)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn output_selection_is_keyed_to_player_and_cascades_on_removal() {
+        let path = temp_db_path("player-output-selection");
+        let database = Database::connect(&path).await.unwrap();
+        database
+            .upsert_player(&super::PlayerRecord {
+                id: "mpd-permanent-id".into(),
+                name: "Living room".into(),
+                kind: "mpd".into(),
+                address: "living.example:6600".into(),
+                zone_id: None,
+            })
+            .await
+            .unwrap();
+
+        database
+            .set_player_output_selection("mpd-permanent-id", "ALSA", "output")
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .player_output_selection("mpd-permanent-id")
+                .await
+                .unwrap(),
+            Some(("ALSA".into(), "output".into()))
+        );
+
+        database.delete_player("mpd-permanent-id").await.unwrap();
+        assert_eq!(
+            database
+                .player_output_selection("mpd-permanent-id")
+                .await
+                .unwrap(),
+            None
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn clearing_one_dsp_profile_binding_preserves_the_other_layer() {
         // A regression here makes deleting a correction preset also erase a user's separate
         // listening adjustment.
@@ -7316,6 +7817,168 @@ mod tests {
                 listening_profile_id: None,
                 listening_enabled: false,
             })
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn managed_player_enrollment_consumes_pairing_and_rotates_host() {
+        let path = temp_db_path("managed-player-enrollment");
+        let database = Database::connect(&path).await.unwrap();
+        database
+            .create_managed_player_pairing("host-a", "pairing-hash", 1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            database
+                .enroll_managed_player("host-a", "pairing-hash", 999, "host-token-one")
+                .await
+                .unwrap(),
+            Some("host-a".into())
+        );
+        assert_eq!(
+            database
+                .managed_player_for_host_token("host-token-one")
+                .await
+                .unwrap(),
+            Some("host-a".into())
+        );
+        assert_eq!(
+            database
+                .enroll_managed_player("host-a", "pairing-hash", 999, "host-token-two")
+                .await
+                .unwrap(),
+            None
+        );
+
+        database
+            .create_managed_player_pairing("host-a", "replacement-pairing", 2_000)
+            .await
+            .unwrap();
+        database
+            .enroll_managed_player("host-a", "replacement-pairing", 1_999, "host-token-two")
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .managed_player_for_host_token("host-token-one")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            database
+                .managed_player_for_host_token("host-token-two")
+                .await
+                .unwrap(),
+            Some("host-a".into())
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn managed_device_selection_requires_current_inventory_without_revoking_host() {
+        let path = temp_db_path("managed-player-device-selection");
+        let database = Database::connect(&path).await.unwrap();
+        database
+            .create_managed_player_pairing("host-a", "pairing-hash", 1_000)
+            .await
+            .unwrap();
+        database
+            .enroll_managed_player("host-a", "pairing-hash", 999, "host-token")
+            .await
+            .unwrap();
+        assert!(database
+            .save_managed_player_report(
+                "host-a",
+                "host-token",
+                "inventory-one",
+                "{}",
+                10,
+                0,
+                0,
+            )
+            .await
+            .unwrap());
+
+        let desired = database
+            .set_managed_player_device("host-a", Some("usb-dac"), Some("inventory-one"), Some("{}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(desired.revision, 1);
+        assert_eq!(desired.device_id.as_deref(), Some("usb-dac"));
+        // A host that has only applied revision zero must be able to report again and learn
+        // desired revision one. It is not a stale acknowledgement of the new choice.
+        assert!(database
+            .save_managed_player_report(
+                "host-a",
+                "host-token",
+                "inventory-two",
+                "{}",
+                11,
+                0,
+                0,
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            database
+                .managed_player_state("host-a")
+                .await
+                .unwrap()
+                .desired
+                .unwrap()
+                .revision,
+            1
+        );
+        assert!(
+            database
+                .save_managed_player_report(
+                    "host-a",
+                    "host-token",
+                    "inventory-three",
+                    "{}",
+                    12,
+                    1,
+                    1,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !database
+                .save_managed_player_report(
+                    "host-a",
+                    "host-token",
+                    "inventory-four",
+                    "{}",
+                    13,
+                    0,
+                    0,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            database
+                .managed_player_for_host_token("host-token")
+                .await
+                .unwrap(),
+            Some("host-a".into())
+        );
+        assert!(
+            database
+                .set_managed_player_device(
+                    "host-a",
+                    Some("usb-dac"),
+                    Some("inventory-zero"),
+                    Some("{}")
+                )
+                .await
+                .unwrap()
+                .is_none()
         );
         let _ = std::fs::remove_file(path);
     }

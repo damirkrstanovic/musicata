@@ -533,6 +533,9 @@ pub struct PlayerManager {
     #[cfg_attr(not(feature = "snapcast"), allow(dead_code))]
     providers: Arc<RwLock<ProviderRegistry>>,
     players: RwLock<BTreeMap<String, PlayerEntry>>,
+    /// Registration, connection edits, and removal change the persistent player registry.
+    /// Serialize those administrative ownership changes without involving playback locks.
+    administration: Mutex<()>,
     zones: RwLock<BTreeMap<String, ZoneEntry>>,
     /// The managed snapserver + FIFO, present once Snapcast is enabled in settings.
     #[cfg(feature = "snapcast")]
@@ -559,6 +562,7 @@ impl PlayerManager {
             mpd_stream_auth: MpdStreamAuth::new(),
             providers,
             players: RwLock::new(BTreeMap::new()),
+            administration: Mutex::new(()),
             zones: RwLock::new(BTreeMap::new()),
             #[cfg(feature = "snapcast")]
             snapcast: RwLock::new(None),
@@ -878,17 +882,21 @@ impl PlayerManager {
         if kind != "mpd" {
             return Err(anyhow!("unsupported player kind: {kind}"));
         }
-        let id = player_id(kind, address);
+        if address.trim().is_empty() {
+            return Err(anyhow!("MPD address is required"));
+        }
+        let _administration = self.administration.lock().await;
+        let existing = self.database.player_by_kind_address(kind, address).await?;
+        let id = existing
+            .as_ref()
+            .map(|record| record.id.clone())
+            .unwrap_or_else(new_mpd_player_id);
         let record = PlayerRecord {
             id: id.clone(),
             kind: kind.to_string(),
             address: address.to_string(),
             name: name.to_string(),
-            zone_id: self
-                .database
-                .player_record(&id)
-                .await?
-                .and_then(|existing| existing.zone_id),
+            zone_id: existing.and_then(|record| record.zone_id),
         };
         self.database.upsert_player(&record).await?;
         if let Some(password) = password {
@@ -902,6 +910,41 @@ impl PlayerManager {
             self.bring_up(&record).await;
         }
         self.descriptor(&record).await
+    }
+
+    /// Change an MPD transport endpoint without changing its permanent player id or replacing
+    /// its runtime. Queue subscribers keep their current state; background MPD work observes
+    /// the new connection generation before it can apply another old-endpoint cursor.
+    pub async fn rebind_mpd(
+        &self,
+        id: &str,
+        address: &str,
+        password: Option<&str>,
+    ) -> Result<Player> {
+        if address.trim().is_empty() {
+            return Err(anyhow!("MPD address is required"));
+        }
+        let _administration = self.administration.lock().await;
+        let record = self.require_record(id).await?;
+        if record.kind != "mpd" {
+            return Err(anyhow!("only MPD player connections can be changed"));
+        }
+        if let Some(other) = self.database.player_by_kind_address("mpd", address).await?
+            && other.id != id
+        {
+            return Err(anyhow!("another MPD player already uses this address"));
+        }
+
+        self.database
+            .update_mpd_connection(id, address, password)
+            .await?;
+        let updated = self.require_record(id).await?;
+        if let Some(PlayerHandle::Mpd(player)) = self.get(id).await {
+            player.rebind(address.to_string(), password).await;
+        } else {
+            self.bring_up(&updated).await;
+        }
+        self.descriptor(&updated).await
     }
 
     pub async fn rename(&self, id: &str, name: &str) -> Result<Player> {
@@ -940,6 +983,7 @@ impl PlayerManager {
     }
 
     pub async fn remove(&self, id: &str) -> Result<()> {
+        let _administration = self.administration.lock().await;
         let record = self.require_record(id).await?;
         let entry = self.players.write().await.remove(id);
         if let Some(entry) = entry {
@@ -1211,19 +1255,11 @@ impl PlayerManager {
     }
 }
 
-/// Deterministic, stable id from a player's kind and address.
-fn player_id(kind: &str, address: &str) -> String {
-    let slug: String = address
-        .chars()
-        .map(|character| {
-            if character.is_alphanumeric() {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("{kind}-{slug}")
+/// Fresh opaque identity for a newly registered MPD endpoint. Existing address-derived ids are
+/// retained as permanent compatibility keys; only new registrations stop deriving identity from
+/// mutable network coordinates.
+fn new_mpd_player_id() -> String {
+    format!("mpd-{}", crate::auth::generate_token())
 }
 
 fn zone_id(name: &str) -> String {
@@ -1250,11 +1286,11 @@ fn zone_id(name: &str) -> String {
 /// an external client editing MPD's queue is re-asserted over (server always wins).
 pub struct MpdPlayer {
     id: String,
-    addr: String,
-    /// Kept out of descriptors and diagnostics; read only immediately before creating a
-    /// transport connection, so every command/idle/poll reconnect authenticates alike.
-    password: RwLock<Option<String>>,
-    password_changed: tokio::sync::Notify,
+    /// Mutable endpoint configuration. Its generation invalidates any in-flight idle result
+    /// from a previous address before it can overwrite the preserved live queue/cursor.
+    connection_config: RwLock<MpdConnectionConfig>,
+    connection_changed: tokio::sync::Notify,
+    connection_generation: AtomicU64,
     database: Database,
     persistence: QueuePersistence,
     public_base_url: String,
@@ -1279,6 +1315,13 @@ pub struct MpdPlayer {
     restored: AtomicBool,
 }
 
+#[derive(Clone)]
+struct MpdConnectionConfig {
+    address: String,
+    password: Option<String>,
+    generation: u64,
+}
+
 impl MpdPlayer {
     fn new(
         id: String,
@@ -1293,9 +1336,13 @@ impl MpdPlayer {
         Self {
             persistence: QueuePersistence::new(database.clone(), QueueOwner::Player(id.clone())),
             id,
-            addr,
-            password: RwLock::new(password),
-            password_changed: tokio::sync::Notify::new(),
+            connection_config: RwLock::new(MpdConnectionConfig {
+                address: addr,
+                password,
+                generation: 0,
+            }),
+            connection_changed: tokio::sync::Notify::new(),
+            connection_generation: AtomicU64::new(0),
             database,
             public_base_url,
             stream_auth,
@@ -1314,9 +1361,12 @@ impl MpdPlayer {
         self.online.load(Ordering::Relaxed)
     }
 
-    async fn connect(&self) -> Result<MpdConnection> {
-        let password = self.password.read().await.clone();
-        MpdConnection::connect_with_password(&self.addr, password.as_deref()).await
+    async fn connect(&self) -> Result<(u64, MpdConnection)> {
+        let config = self.connection_config.read().await.clone();
+        let connection =
+            MpdConnection::connect_with_password(&config.address, config.password.as_deref())
+                .await?;
+        Ok((config.generation, connection))
     }
 
     async fn ensure_connected<'a>(
@@ -1324,17 +1374,41 @@ impl MpdPlayer {
         guard: &'a mut Option<MpdConnection>,
     ) -> Result<&'a mut MpdConnection> {
         if guard.is_none() {
-            *guard = Some(self.connect().await?);
+            *guard = Some(self.connect().await?.1);
         }
         Ok(guard.as_mut().expect("connection just set"))
     }
 
     async fn set_password(&self, password: Option<String>) {
-        *self.password.write().await = password;
+        self.reconfigure(None, Some(password)).await;
+    }
+
+    async fn rebind(&self, address: String, password: Option<&str>) {
+        self.reconfigure(
+            Some(address),
+            password.map(|password| (!password.is_empty()).then_some(password.to_string())),
+        )
+        .await;
+    }
+
+    async fn reconfigure(&self, address: Option<String>, password: Option<Option<String>>) {
+        let _sync = self.sync.lock().await;
+        let generation = self.connection_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        {
+            let mut config = self.connection_config.write().await;
+            if let Some(address) = address {
+                config.address = address;
+            }
+            if let Some(password) = password {
+                config.password = password;
+            }
+            config.generation = generation;
+        }
         // Existing authenticated sessions can finish their in-flight command; force all
-        // following commands, polling and idle work to establish an authenticated session.
+        // following commands, polling and idle work to establish a new connection.
         *self.connection.lock().await = None;
-        self.password_changed.notify_one();
+        self.online.store(false, Ordering::Relaxed);
+        self.connection_changed.notify_waiters();
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<PlaybackState> {
@@ -1791,7 +1865,10 @@ impl MpdPlayer {
     }
 
     async fn run_idle_loop(&self, database: &Database) -> Result<()> {
-        let mut idle = self.connect().await?;
+        let (generation, mut idle) = self.connect().await?;
+        if generation != self.connection_generation.load(Ordering::Acquire) {
+            return Ok(());
+        }
         crate::diagnostics::recovery("mpd.connection", "mpd", Some(&self.id));
         self.online.store(true, Ordering::Relaxed);
         // MPD just (re)connected — it may have restarted with an empty queue while we
@@ -1817,15 +1894,24 @@ impl MpdPlayer {
         loop {
             tokio::select! {
                 changed = idle.idle() => changed?,
-                _ = self.password_changed.notified() => return Ok(()),
+                _ = self.connection_changed.notified() => return Ok(()),
             };
+            if generation != self.connection_generation.load(Ordering::Acquire) {
+                return Ok(());
+            }
             let _sync = self.sync.lock().await;
+            if generation != self.connection_generation.load(Ordering::Acquire) {
+                return Ok(());
+            }
             let status = {
                 let mut guard = self.connection.lock().await;
                 let connection = self.ensure_connected(&mut guard).await?;
                 self.read_reconciled_status(connection).await?
             };
 
+            if generation != self.connection_generation.load(Ordering::Acquire) {
+                return Ok(());
+            }
             self.apply_cursor(status).await;
             self.broadcast().await;
             // Persist the cursor (cheap row); the queue itself is unchanged here.
@@ -4472,6 +4558,121 @@ mod tests {
             .expect("clock after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("musicata-{name}-{nanos}.db"))
+    }
+
+    #[tokio::test]
+    async fn rebinding_mpd_keeps_the_live_player_and_its_permanent_state() {
+        use musicata_core::dsp::OutputDspSelection;
+
+        let path = temp_db("mpd-rebind");
+        let database = Database::connect(&path).await.unwrap();
+        let manager = PlayerManager::load(
+            database.clone(),
+            "http://localhost".into(),
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+        )
+        .await
+        .unwrap();
+        let registered = manager
+            .register(
+                "mpd",
+                "old.example:6600",
+                "Living room",
+                Some("old-password"),
+            )
+            .await
+            .unwrap();
+        let id = registered.id.clone();
+        database
+            .set_player_auth_token_hash(&id, "token-hash")
+            .await
+            .unwrap();
+        let selection = OutputDspSelection {
+            profile_id: Some("speakers".into()),
+            enabled: true,
+            ..Default::default()
+        };
+        database.set_player_dsp(&id, &selection).await.unwrap();
+        let before = match manager.get(&id).await.unwrap() {
+            PlayerHandle::Mpd(player) => player,
+            _ => panic!("registered MPD has MPD runtime"),
+        };
+        {
+            let mut state = before.state.lock().await;
+            state.queue = vec![QueueItem {
+                track_id: Some("saved-track".into()),
+                title: "Saved track".into(),
+                ..Default::default()
+            }];
+            state.position = Some(0);
+            state.elapsed_seconds = Some(42.0);
+            state.status = PlaybackStatus::Paused;
+        }
+
+        let rebound = manager
+            .rebind_mpd(&id, "new.example:6600", Some("new-password"))
+            .await
+            .unwrap();
+
+        assert_eq!(rebound.id, id);
+        assert_eq!(rebound.address, "new.example:6600");
+        let after = match manager.get(&id).await.unwrap() {
+            PlayerHandle::Mpd(player) => player,
+            _ => panic!("rebound MPD keeps MPD runtime"),
+        };
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "rebind must not replace live state"
+        );
+        let state = after.snapshot().await;
+        assert_eq!(
+            state.now_playing.and_then(|item| item.track_id),
+            Some("saved-track".into())
+        );
+        assert_eq!(state.elapsed_seconds, Some(42.0));
+        assert_eq!(state.status, PlaybackStatus::Paused);
+        assert_eq!(
+            database.player_mpd_password(&id).await.unwrap(),
+            Some("new-password".into())
+        );
+        assert_eq!(
+            database.player_auth_token_hash(&id).await.unwrap(),
+            Some("token-hash".into())
+        );
+        assert_eq!(database.player_dsp(&id).await.unwrap(), Some(selection));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn registering_an_existing_mpd_address_keeps_its_id() {
+        let path = temp_db("mpd-register-idempotent");
+        let database = Database::connect(&path).await.unwrap();
+        database
+            .upsert_player(&PlayerRecord {
+                id: "mpd-legacy-address-id".into(),
+                kind: "mpd".into(),
+                address: "living.example:6600".into(),
+                name: "Old name".into(),
+                zone_id: None,
+            })
+            .await
+            .unwrap();
+        let manager = PlayerManager::load(
+            database,
+            "http://localhost".into(),
+            Arc::new(RwLock::new(ProviderRegistry::new())),
+        )
+        .await
+        .unwrap();
+
+        let player = manager
+            .register("mpd", "living.example:6600", "New name", None)
+            .await
+            .unwrap();
+
+        assert_eq!(player.id, "mpd-legacy-address-id");
+        assert_eq!(player.name, "New name");
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ mod diagnostics;
 mod dsp;
 mod fingerprint;
 mod loudness;
+mod managed_players;
 mod ml;
 mod mpd;
 mod mpd_dsp;
@@ -38,6 +39,7 @@ mod musicbrainz;
 #[cfg(feature = "provider-opensubsonic")]
 mod opensubsonic;
 mod output_audio;
+mod player_devices;
 mod players;
 #[cfg(feature = "provider-podcast")]
 mod podcast;
@@ -121,6 +123,7 @@ struct AppState {
     output_audio: Arc<output_audio::OutputAudio>,
     providers: Arc<RwLock<ProviderRegistry>>,
     players: Arc<PlayerManager>,
+    player_device_changes: Arc<Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>>,
     musicbrainz: MusicBrainzClient,
     radio_browser: radiobrowser::RadioBrowserClient,
     listenbrainz: Arc<recommendations::ListenBrainzClient>,
@@ -2944,6 +2947,7 @@ fn app_with_diagnostics(
         diagnostic_export: Arc::new(std::sync::Mutex::new(Default::default())),
         diagnostic_reports: Arc::new(std::sync::Mutex::new(Default::default())),
         output_audio: Arc::new(output_audio::OutputAudio::default()),
+        player_device_changes: Arc::new(Mutex::new(BTreeMap::new())),
         database,
         providers,
         players,
@@ -3040,6 +3044,31 @@ fn app_with_diagnostics(
         )
         .route("/api/players", get(list_players).post(register_player))
         .route("/api/players/probe", post(probe_player))
+        .route(
+            "/api/managed-players/pairings",
+            post(managed_players::create_pairing),
+        )
+        .route("/api/managed-players/enroll", post(managed_players::enroll))
+        .route(
+            "/api/managed-players/report",
+            post(managed_players::report).layer(axum::extract::DefaultBodyLimit::max(65536)),
+        )
+        .route(
+            "/api/managed-players/{client_id}",
+            get(managed_players::get).delete(managed_players::revoke),
+        )
+        .route(
+            "/api/managed-players/{client_id}/device",
+            put(managed_players::set_device),
+        )
+        .route(
+            "/api/players/{id}/connection",
+            put(player_devices::connection),
+        )
+        .route(
+            "/api/players/{id}/outputs",
+            get(player_devices::outputs).put(player_devices::select),
+        )
         .route(
             "/api/players/{id}",
             patch(update_player).delete(delete_player),
@@ -3991,6 +4020,8 @@ async fn delete_player(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
+    let lock = player_devices::configuration_lock(&state, &id).await;
+    let _guard = lock.lock().await;
     state
         .players
         .remove(&id)
@@ -15382,6 +15413,34 @@ while True:
                 .oneshot(
                     Request::builder()
                         .method("POST")
+                        .uri(path)
+                        .header("authorization", "Bearer listener-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        for (method, path, body) in [
+            ("GET", "/api/players/example/outputs", ""),
+            (
+                "PUT",
+                "/api/players/example/outputs",
+                r#"{"name":"DAC","plugin":"alsa"}"#,
+            ),
+            (
+                "PUT",
+                "/api/players/example/connection",
+                r#"{"host":"localhost","port":6600}"#,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
                         .uri(path)
                         .header("authorization", "Bearer listener-token")
                         .header("content-type", "application/json")

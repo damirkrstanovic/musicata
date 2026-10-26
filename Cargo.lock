@@ -1913,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-core"
-version = "1.13.0"
+version = "1.14.0"
 dependencies = [
  "lofty",
  "serde",
@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-ml"
-version = "1.13.0"
+version = "1.14.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1940,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-server"
-version = "1.13.0"
+version = "1.14.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1982,7 +1982,7 @@ dependencies = [
 
 [[package]]
 name = "musicata-storage"
-version = "1.13.0"
+version = "1.14.0"
 dependencies = [
  "anyhow",
  "libsqlite3-sys",

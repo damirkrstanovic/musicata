@@ -112,7 +112,7 @@ pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 /// sha256 of a session token — what we store, so a DB leak yields no live sessions.
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     to_hex(&Sha256::digest(token.as_bytes()))
 }
 
@@ -204,8 +204,12 @@ async fn resolve_user(
 /// Admin-only API surfaces — user management and the configuration panels. The player
 /// (listener) app never calls these; everything it needs only requires authentication.
 fn is_admin_path(path: &str) -> bool {
-    (path.starts_with("/api/diagnostics") && path != "/api/diagnostics/reports")
-        || (path.starts_with("/api/players/") && path.ends_with("/dsp/processor"))
+    path.starts_with("/api/managed-players")
+        || (path.starts_with("/api/diagnostics") && path != "/api/diagnostics/reports")
+        || (path.starts_with("/api/players/")
+            && (path.ends_with("/dsp/processor")
+                || path.ends_with("/outputs")
+                || path.ends_with("/connection")))
         || path.starts_with("/api/snapcast/health/")
         || path.starts_with("/api/users")
         || path.starts_with("/api/sources")
@@ -313,6 +317,14 @@ impl MpdStreamAuth {
 /// role. The resolved [`CurrentUser`] is injected as a request extension.
 pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
+    // These two endpoints authenticate only their one-time pairing or scoped host token.
+    // They must not inherit setup-mode, administrator or renderer-token authorization.
+    if matches!(
+        path.as_str(),
+        "/api/managed-players/enroll" | "/api/managed-players/report"
+    ) {
+        return next.run(request).await;
+    }
     if !path.starts_with("/api/") || is_open_path(&path) {
         return next.run(request).await;
     }
@@ -323,6 +335,12 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
     // CLOSED on a DB error (only an explicit `Ok(0)` opens the API) so a transient query failure
     // can't drop auth on an instance that actually has users.
     if matches!(state.database.count_users().await, Ok(0)) {
+        if path.starts_with("/api/managed-players") {
+            return AppError::unauthorized(
+                "Create an administrator before pairing player management",
+            )
+            .into_response();
+        }
         if let (Some(player_id), Some(token)) = (player_channel_id(&path), api_token.as_deref()) {
             if state
                 .database
@@ -934,6 +952,8 @@ mod tests {
         assert!(is_admin_path("/api/sources/x"));
         assert!(is_admin_path("/api/settings"));
         assert!(is_admin_path("/api/players/mpd/dsp/processor"));
+        assert!(is_admin_path("/api/players/mpd/outputs"));
+        assert!(is_admin_path("/api/players/mpd/connection"));
         assert!(!is_admin_path("/api/players/mpd/dsp"));
         assert!(!is_admin_path("/api/tracks"));
         assert!(!is_admin_path("/api/playlists"));

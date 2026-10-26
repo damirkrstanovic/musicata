@@ -86,6 +86,29 @@ command and needs an existing Snapclient binary. `--check` checks installation p
 not runtime player health;
 `--output 'plughw:CARD=Pro,DEV=0' --yes` supports unattended provisioning.
 
+To enable audio-device selection for an existing Musicata-installed standalone Snapclient,
+open **Settings → Players → Audio device → Enable device management** and run the displayed
+pairing command on that player host. From a release archive, use `./install-player.sh` in
+place of `scripts/install-player.sh`. Paste the code at the private terminal prompt; it is not passed as a command-line argument.
+The code expires after ten minutes and works once.
+Pairing requires `sudo` and `visudo` on the host and an existing non-root playback account.
+
+The optional management service runs as that playback account. A narrowly scoped sudo rule
+permits only the root-owned local inventory/apply worker. The scoped server credential is
+stored in `/etc/musicata/player-management.json` with root ownership and mode `0640` for the
+playback group. The server container receives no additional host privileges. Disabling
+management in Settings revokes this credential without stopping playback.
+
+The initial managed selector supports verified installer-owned standalone Snapclient units.
+It inventories USB, PCI and platform devices as the playback account, applies a selected
+stable identity with a brief client restart, and attempts verified rollback on failure.
+Custom services, USB standby routing and DSP-bound routing are reported as unsupported;
+they are never adopted or rewritten automatically. A failed recovery retains its journal
+for local attention. Connection and applied status do not prove audible sound.
+
+MPD players need no helper to select their already configured outputs in Settings. Adding
+new physical MPD outputs and switching the final device of a DSP chain remain unsupported.
+
 For a standalone MPD compatibility player, select MPD interactively or pass `--backend mpd`.
 Use a private, root-owned file containing a Musicata administrator API token (mode `0600`):
 
