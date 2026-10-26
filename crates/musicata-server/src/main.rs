@@ -9695,6 +9695,109 @@ mod tests {
 
     #[cfg(feature = "snapcast")]
     #[tokio::test]
+    async fn successful_third_snapcast_recovery_never_publishes_exhaustion() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = TestFixture::new("snapcast-recovery-refresh");
+        let database = Database::connect(fixture.root.join("musicata.db"))
+            .await
+            .unwrap();
+        database
+            .set_bool_setting(super::SETTING_SNAPCAST_ENABLED, true)
+            .await
+            .unwrap();
+        let (_app, players) = fixture.app_with_database(database.clone()).await;
+        let binary = fixture.root.join("fake-snapserver");
+        std::fs::write(
+            &binary,
+            r#"#!/usr/bin/python3
+import json, os, pathlib, re, socket, sys
+config = pathlib.Path(sys.argv[2])
+port = int(re.search(r'\[tcp\]\nenabled = true\nport = (\d+)', config.read_text()).group(1))
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', port)); s.listen()
+config.with_suffix('.pid').write_text(str(os.getpid()))
+while True:
+ c, _ = s.accept()
+ with c:
+  c.recv(65536)
+  status = {'server': {'groups': [], 'streams': [{'id': 'Musicata', 'status': 'idle'}],
+                       'server': {'snapserver': {'version': str(os.getpid())}}}}
+  c.sendall((json.dumps({'id': 1, 'result': status})+'\n').encode())
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let manager = std::sync::Arc::new(
+            crate::snapcast::SnapcastManager::start(crate::snapcast::SnapcastSettings {
+                server_binary: binary.to_string_lossy().into_owned(),
+                fifo_path: fixture.root.join("audio.fifo"),
+                control_port: port,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        players.enable_snapcast(manager).await.unwrap();
+        let activity = std::sync::Arc::new(crate::activity::ActivityLog::default());
+        // Abort the worker even on assertion failure so it cannot outlive the fixture.
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(crate::snapcast::health::run(
+            database,
+            players.clone(),
+            activity.clone(),
+        ));
+        async fn observe(players: &crate::players::PlayerManager, attempt: u8, control: &str) {
+            tokio::time::timeout(std::time::Duration::from_secs(45), async {
+                loop {
+                    let value = players.snapcast_health.snapshot();
+                    if value.attempts == attempt && value.control == control {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let kill = || {
+            let pid = std::fs::read_to_string(fixture.root.join("snapserver.pid")).unwrap();
+            assert!(
+                std::process::Command::new("kill")
+                    .args(["-KILL", pid.trim()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        observe(&players, 0, "connected").await;
+        for attempt in 1..=3 {
+            kill();
+            observe(&players, attempt, "connected").await;
+            let value = players.snapcast_health.snapshot();
+            let pid = std::fs::read_to_string(fixture.root.join("snapserver.pid")).unwrap();
+            assert_eq!(value.process, "running");
+            assert_eq!(value.recovery, "idle");
+            assert!(value.failure.is_none());
+            assert_eq!(value.server_version.as_deref(), Some(pid.trim()));
+            assert!(
+                !activity.list().iter().any(|item| item
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("recovery: exhausted"))),
+                "a successful restart published false exhaustion"
+            );
+        }
+        // Refreshing a successful attempt must not reset the budget while it is flapping.
+        kill();
+        observe(&players, 3, "unavailable").await;
+        assert_eq!(players.snapcast_health.snapshot().recovery, "exhausted");
+    }
+
+    #[cfg(feature = "snapcast")]
+    #[tokio::test]
     async fn snapcast_health_preserves_group_routes() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let fixture = TestFixture::new("snapcast-health-group-routes");

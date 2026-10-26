@@ -237,7 +237,10 @@ impl RetryBudget {
             .map(|next| crate::diagnostics::now() + next.saturating_sub(elapsed) as i64);
         value.recovery = if self.next.is_some() {
             "waiting"
-        } else if self.attempts >= 3 && self.healthy_since.is_none() {
+        } else if self.attempts >= 3
+            && self.healthy_since.is_none()
+            && matches!(value.process.as_str(), "stopped" | "exited")
+        {
             "exhausted"
         } else {
             "idle"
@@ -306,6 +309,11 @@ pub async fn run(
                             .await
                             .map(|_| true),
                     };
+                    if matches!(recovered, Ok(true)) {
+                        // Observe the replacement before publishing: the pre-restart process
+                        // state would otherwise falsely exhaust a successful third attempt.
+                        continue;
+                    }
                     if matches!(recovered, Ok(false)) {
                         budget = RetryBudget::default();
                     }
@@ -412,6 +420,24 @@ mod tests {
         budget.failed(111);
         assert!(budget.take_due(112));
     }
+    #[test]
+    fn live_process_control_outage_is_not_restart_exhaustion() {
+        let budget = RetryBudget {
+            attempts: 3,
+            ..Default::default()
+        };
+        let mut value = SnapcastHealth {
+            process: "running".into(),
+            control: "unavailable".into(),
+            ..Default::default()
+        };
+        budget.apply(&mut value, 40);
+        assert_eq!(value.recovery, "idle");
+        value.process = "exited".into();
+        budget.apply(&mut value, 40);
+        assert_eq!(value.recovery, "exhausted");
+    }
+
     #[test]
     fn stale_snapshot_never_claims_current_connectivity() {
         let monitor = HealthMonitor::default();

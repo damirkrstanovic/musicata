@@ -127,11 +127,29 @@ def main():
             assert snap_pid() == pid and health()['attempts'] == attempts
             os.kill(pid, signal.SIGCONT)
             wait(lambda: health()['control'] == 'connected')
+            def recovered_without_false_exhaustion():
+                observed = health()
+                assert observed['recovery'] != 'exhausted', 'successful restart reported exhaustion'
+                return observed['control'] == 'connected'
+
             # Fail repeatedly without 60 healthy seconds: budget cannot reset on flapping.
             while health()['attempts'] < 3:
                 old = snap_pid()
                 os.kill(old, signal.SIGKILL)
-                wait(lambda: snap_pid() is not None and snap_pid() != old and health()['control'] == 'connected', 45)
+                wait(lambda: snap_pid() is not None and snap_pid() != old, 45)
+                wait(recovered_without_false_exhaustion)
+            activities = api('/api/activity')[0]
+            assert not any('recovery: exhausted' in (item.get('message') or '') for item in activities), 'false exhaustion persisted in activity history'
+            # A live process with broken control is not an exhausted restart, even at attempt 3.
+            pid = snap_pid()
+            os.kill(pid, signal.SIGSTOP)
+            try:
+                wait(lambda: health()['control'] == 'unavailable', 20)
+                assert health()['recovery'] != 'exhausted'
+                assert snap_pid() == pid
+            finally:
+                os.kill(pid, signal.SIGCONT)
+            wait(recovered_without_false_exhaustion)
             os.kill(snap_pid(), signal.SIGKILL)
             wait(lambda: health()['recovery'] == 'exhausted')
             api('/api/snapcast/health/retry', method='POST')
