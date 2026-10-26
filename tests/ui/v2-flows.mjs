@@ -7,6 +7,7 @@
 // non-zero on any failed assertion.
 import { radioFlows } from "./radio-flows.mjs";
 import { stablePlayerFlows } from "./stable-player-flows.mjs";
+import { addPlayerFlows } from "./add-player-flows.mjs";
 import { zonesFlows } from "./zones-flows.mjs";
 import { outputPickerFlows } from "./output-picker-flows.mjs";
 import { albumPlayFlows } from "./album-play-flows.mjs";
@@ -39,7 +40,7 @@ const api = (path, init = {}) =>
 
 const remoteOutput = MODE === "behavior" ? await api("/api/players", {
   method:"POST", headers:{"content-type":"application/json"},
-  body:JSON.stringify({kind:"native",address:"smoke-native",name:"Remote audio",issue_token:true}),
+  body:JSON.stringify({kind:"mpd",address:"127.0.0.1:16601",name:"Remote audio"}),
 }) : null;
 
 let failures = 0;
@@ -49,7 +50,7 @@ function check(name, ok, detail = "") {
 }
 
 let groupedPlayerId = null;
-// Behavior phase: pre-create a zone (holding a separate native speaker) and a radio station via the
+// Behavior phase: pre-create a zone (holding a separate MPD speaker) and a radio station via the
 // API, so the page loads with them present.
 if (MODE === "behavior") {
   const saved = await api('/api/playlists', {
@@ -63,7 +64,7 @@ if (MODE === "behavior") {
   });
   const grouped = await api("/api/players", {
     method:"POST", headers:{"content-type":"application/json"},
-    body:JSON.stringify({kind:"native",address:"smoke-grouped",name:"Grouped speaker"}),
+    body:JSON.stringify({kind:"mpd",address:"127.0.0.1:16602",name:"Grouped speaker"}),
   });
   groupedPlayerId = grouped?.id;
   const zone = await api("/api/zones", {
@@ -179,8 +180,17 @@ await sleep(2500);
 
 console.log(`Svelte UI smoke (${PATH}, ${MODE}):`);
 if (MODE === "behavior") {
+  if (process.env.MUSICATA_WIZARD_ONLY) {
+    await addPlayerFlows({api, js, check, waitUntil, tap: tapMobile, send, screenshot: mobileScreenshot});
+    ws.close();process.exit(failures?1:0);
+  }
   await outputPickerFlows({js, check, waitUntil, tap: tapMobile, groupedPlayerId});
   await zonesFlows({api, js, check, waitUntil, tap: tapMobile});
+  if (!process.env.MUSICATA_ZONES_ONLY) await addPlayerFlows({api, js, check, waitUntil, tap: tapMobile, send, screenshot: mobileScreenshot});
+  if (process.env.MUSICATA_ZONES_ONLY) {
+    ws.close();
+    process.exit(failures ? 1 : 0);
+  }
   await js(`document.querySelector('.output-trigger')?.click()`);
   await js(`document.querySelector('[data-output="player:browser-local"]')?.click()`);
   await sleep(400);
@@ -626,48 +636,21 @@ check("vu meter opens with L/R meters", (await js(`document.querySelectorAll('.v
 await clickText(".vu-head button", "Close");
 await sleep(300);
 
-// Remote controls consume the native renderer's measurements while this browser is silent.
+// An MPD destination must not route its audio through the controller browser.
 if (remoteOutput) {
-  const remoteSocket = new WebSocket(`ws://127.0.0.1:${PORT}/api/players/${remoteOutput.id}/audio/ws?token=${remoteOutput.auth_token}`);
-  let remoteConfig = null;
-  let remoteSequence = 0;
-  remoteSocket.onmessage = event => {
-    const frame = JSON.parse(event.data);
-    if (frame.type === "renderer_granted" || frame.type === "dsp_config") {
-      remoteConfig = frame.config;
-      remoteSocket.send(JSON.stringify({type:"dsp_applied",session_id:remoteConfig.state.session_id,revision:remoteConfig.state.desired_revision}));
-    }
-  };
-  await new Promise((resolve,reject) => {remoteSocket.onopen=resolve; remoteSocket.onerror=reject;});
-  remoteSocket.send(JSON.stringify({type:"renderer"}));
-  const remoteTrack = (await api("/api/tracks?limit=1")).items[0];
-  await api(`/api/players/${remoteOutput.id}/commands`, {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({command:"play_tracks",track_ids:[remoteTrack.id]})});
-  await js(`(()=>{document.querySelector('[data-output="player:${remoteOutput.id}"]')?.click();})()`);
+  await tapMobile('.output-trigger');
+  await waitUntil(`document.querySelector('.output-picker:popover-open')`, 2000);
+  await tapMobile(`[data-output="player:${remoteOutput.id}"]`);
   await sleep(500);
-  await js(`[...document.querySelectorAll('.eq-btn')].find(b=>/equalizer/i.test(b.title))?.click()`);
-  await sleep(100);
-  await js(`(()=>{const s=document.querySelector('.eq-field select:not(.leveling-select)');if(s){s.value='demo-warm';s.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
-  await sleep(500);
-  const selectedRemote = await api(`/api/players/${remoteOutput.id}/dsp`);
-  check("remote EQ writes the selected output",selectedRemote?.selection?.profile_id === "demo-warm",JSON.stringify(selectedRemote));
-  check("remote EQ does not change browser correction",(await api("/api/players/browser-local/dsp"))?.selection?.profile_id !== "demo-warm");
   check("remote controller keeps browser audio silent",await js('document.querySelector("audio")?.paused === true'));
-  check("remote controls hide browser leveling",await js('!document.querySelector(".leveling-select")'));
-  await js(`[...document.querySelectorAll('.eq-btn')].find(b=>/vu/i.test(b.title))?.click()`);
+  await js(`[...document.querySelectorAll('.eq-btn')].find(b=>/equalizer/i.test(b.title))?.click()`);
   await sleep(200);
-  const needlesBefore = await js('[...document.querySelectorAll(".vu-needle")].map(p=>p.getAttribute("d")).join()');
-  await js('window.__n=0');
-  const publish = setInterval(() => {if(remoteConfig) remoteSocket.send(JSON.stringify({type:"levels",session_id:remoteConfig.state.session_id,revision:remoteConfig.state.desired_revision,sequence:++remoteSequence,levels:{rms_l:0.2,rms_r:0.4,peak_l:0.3,peak_r:0.5}}));},100);
-  await sleep(700);
-  check("remote measured levels move both needles",(await js('[...document.querySelectorAll(".vu-needle")].map(p=>p.getAttribute("d")).join()')) !== needlesBefore);
-  check("meter frames do not sweep now-title",(await js('window.__n'))===0);
-  await mobileScreenshot("desktop-remote-eq-vu");
-  clearInterval(publish);
-  remoteSocket.close();
-  check("disconnected remote levels expire",
-    await waitUntil('document.querySelector(".vu-drawer")?.dataset.available === "false"', 3000) < Infinity);
-  await clickText(".vu-head button", "Close");
-  await js(`(()=>{document.querySelector('[data-output="player:browser-local"]')?.click();})()`);
+  check("remote controls hide browser leveling",await js('!document.querySelector(".leveling-select")'));
+  const selectedRemote = await api(`/api/players/${remoteOutput.id}/dsp`);
+  check("unconfigured MPD does not claim software metering",selectedRemote?.capabilities?.meter === false,JSON.stringify(selectedRemote));
+  await tapMobile('.output-trigger');
+  await waitUntil(`document.querySelector('.output-picker:popover-open')`, 2000);
+  await tapMobile('[data-output="player:browser-local"]');
   await sleep(300);
 }
 
@@ -839,13 +822,15 @@ check("radio play sets now-playing", /smoke fm/i.test((await js(`document.queryS
 await radioFlows({js, api, check, waitUntil, clickText, screenshot: mobileScreenshot});
 if (MODE === "behavior") await curationFlows({js, api, check, waitUntil, clickText});
 
+// The offline MPD fixture is for membership UI only; isolate browser audio from it.
+await api(`/api/players/${groupedPlayerId}`, {method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({zone_id:null})});
 // Temporarily join the browser for the real zone-audio check; it stays standalone elsewhere.
 const audioZone = (await api('/api/zones')).find(zone => zone.name === 'Smoke Zone');
 await api('/api/players/browser-local', {method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({zone_id:audioZone.id})});
 await send('Page.reload');
 await waitUntil(`document.querySelector('.output-option[data-output^="zone:"]')`,5000);
 // Zone: switch the output to the zone (which holds the browser player) and play.
-await js(`(()=>{[...document.querySelectorAll('.output-option')].find(o=>o.dataset.output.startsWith('zone:'))?.click();})()`);
+await js(`document.querySelector('[data-output="zone:${audioZone.id}"]')?.click()`);
 await sleep(1200);
 check("switched output to a zone", /zone/i.test((await js(`document.querySelector('.output-option[aria-pressed="true"]')?.dataset.output`)) || ""));
 await clickText(".seg", "Tracks");

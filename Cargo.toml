@@ -3,13 +3,10 @@ members = [
     "crates/musicata-core",
     "crates/musicata-server",
     "crates/musicata-storage",
-    "crates/musicata-endpoint",
     "crates/musicata-ml",
 ]
-# The endpoint (rodio/cpal → ALSA) and the ml service (ort/ONNX Runtime) carry heavy, optional
-# native dependencies. They are deliberately NOT default members, so the server's
-# `cargo build`/`cargo test`/release path never pulls them in. Build them explicitly:
-# `cargo build -p musicata-endpoint`, `cargo build -p musicata-ml`.
+# The ML service (ort/ONNX Runtime) carries optional native dependencies.
+# Build it explicitly with `cargo build -p musicata-ml`.
 default-members = [
     "crates/musicata-core",
     "crates/musicata-server",

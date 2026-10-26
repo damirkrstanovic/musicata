@@ -306,7 +306,7 @@ async fn main() -> Result<()> {
     // Seed any players given on the command line / config (idempotent).
     for addr in &config.mpd_addrs {
         if let Err(error) = players
-            .register("mpd", addr, &format!("MPD ({addr})"))
+            .register("mpd", addr, &format!("MPD ({addr})"), None)
             .await
         {
             tracing::warn!(%addr, %error, "failed to register configured MPD player");
@@ -2907,13 +2907,39 @@ fn app(
     db_path: PathBuf,
     ml_trigger: Arc<tokio::sync::Notify>,
 ) -> Router {
+    app_with_diagnostics(
+        database,
+        providers,
+        players,
+        activity,
+        rescan_lock,
+        subsonic_auth,
+        artwork_cache,
+        db_path,
+        ml_trigger,
+        None,
+    )
+}
+
+fn app_with_diagnostics(
+    database: Database,
+    providers: Arc<RwLock<ProviderRegistry>>,
+    players: Arc<PlayerManager>,
+    activity: Arc<activity::ActivityLog>,
+    rescan_lock: Arc<Mutex<()>>,
+    subsonic_auth: subsonic::SubsonicAuth,
+    artwork_cache: Arc<artwork::ArtworkCache>,
+    db_path: PathBuf,
+    ml_trigger: Arc<tokio::sync::Notify>,
+    diagnostics_recorder: Option<diagnostics::Diagnostics>,
+) -> Router {
     let artwork_dir = db_path
         .parent()
         .map(|parent| parent.join("artwork"))
         .unwrap_or_else(|| PathBuf::from("artwork"));
     let state = AppState {
-        diagnostics: diagnostics::global()
-            .cloned()
+        diagnostics: diagnostics_recorder
+            .or_else(|| diagnostics::global().cloned())
             .unwrap_or_else(|| diagnostics::Diagnostics::start(diagnostics::data_path(&db_path))),
         diagnostic_export: Arc::new(std::sync::Mutex::new(Default::default())),
         diagnostic_reports: Arc::new(std::sync::Mutex::new(Default::default())),
@@ -2972,10 +2998,6 @@ fn app(
             post(diagnostics::http::browser_report).layer(DefaultBodyLimit::max(4096)),
         )
         .route(
-            "/api/players/{id}/diagnostics",
-            post(diagnostics::http::native_report).layer(DefaultBodyLimit::max(4096)),
-        )
-        .route(
             "/api/diagnostics/export",
             post(diagnostics::http::prepare_export).layer(DefaultBodyLimit::max(4096)),
         )
@@ -3017,6 +3039,7 @@ fn app(
             get(playback_session_events),
         )
         .route("/api/players", get(list_players).post(register_player))
+        .route("/api/players/probe", post(probe_player))
         .route(
             "/api/players/{id}",
             patch(update_player).delete(delete_player),
@@ -3829,8 +3852,10 @@ struct RegisterPlayerRequest {
     kind: Option<String>,
     address: String,
     name: Option<String>,
-    /// Issue a per-player endpoint auth token (M10) so a self-registered endpoint can reach
-    /// its own channels without a user session. The token is returned once, here.
+    /// MPD credential, persisted separately from player descriptors. Omitting it keeps an
+    /// existing credential; an empty string explicitly clears one.
+    password: Option<String>,
+    /// Issue a per-player scoped token for its own channels. The token is returned once here.
     #[serde(default)]
     issue_token: bool,
 }
@@ -3856,7 +3881,7 @@ async fn register_player(
         .unwrap_or_else(|| format!("MPD ({})", request.address));
     let player = state
         .players
-        .register(kind, &request.address, &name)
+        .register(kind, &request.address, &name, request.password.as_deref())
         .await
         .map_err(|error| AppError::bad_request(error.to_string()))?;
     let auth_token = if request.issue_token {
@@ -3871,6 +3896,69 @@ async fn register_player(
         None
     };
     Ok(Json(RegisteredPlayer { player, auth_token }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbePlayerRequest {
+    host: String,
+    port: u16,
+    password: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PlayerProbeResult {
+    address: String,
+    connected: bool,
+}
+
+/// Probe only: it never creates a player or queues a background reconnect task.
+async fn probe_player(
+    Json(request): Json<ProbePlayerRequest>,
+) -> Result<Json<PlayerProbeResult>, AppError> {
+    let address = mpd_address(&request.host, request.port).map_err(AppError::bad_request)?;
+    mpd::MpdConnection::probe(&address, request.password.as_deref())
+        .await
+        .map_err(|_| AppError::probe_failed("Musicata could not connect to that MPD player"))?;
+    Ok(Json(PlayerProbeResult {
+        address,
+        connected: true,
+    }))
+}
+
+/// Render a socket address from a host form accepted by the wizard. This rejects URL and shell
+/// syntax, and brackets IPv6 for both TCP and stored player addresses.
+fn mpd_address(host: &str, port: u16) -> Result<String, &'static str> {
+    if port == 0 {
+        return Err("port must be between 1 and 65535");
+    }
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("host is required");
+    }
+    let host = host.trim_matches(['[', ']']);
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        });
+    }
+    if valid_hostname(host) {
+        Ok(format!("{host}:{port}"))
+    } else {
+        Err("host must be a hostname, IPv4 address, or IPv6 address")
+    }
+}
+
+fn valid_hostname(host: &str) -> bool {
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
 }
 
 async fn update_player(
@@ -5550,6 +5638,10 @@ fn snapcast_routes() -> Router<AppState> {
             axum::routing::delete(snapcast_delete_room),
         )
         .route(
+            "/api/snapcast/players/provision",
+            post(snapcast_provision_player),
+        )
+        .route(
             "/api/snapcast/clients/{id}/volume",
             post(snapcast_set_volume),
         )
@@ -6124,6 +6216,7 @@ struct SnapRoomView {
 async fn snapcast_room_views(state: &AppState) -> Vec<SnapRoomView> {
     let rooms = snapcast_rooms_from_db(&state.database).await;
     let host = snapcast_server_host(&state.database).await;
+    let auth_enabled = bool_setting(&state.database, SETTING_SNAPCAST_AUTH).await;
     // Which provisioned rooms are connected: the install command sets `--hostID <name>`, which
     // becomes the snapclient's *id* (its display name still defaults to the device hostname).
     let health = state.players.snapcast_health.snapshot();
@@ -6137,7 +6230,7 @@ async fn snapcast_room_views(state: &AppState) -> Vec<SnapRoomView> {
         .iter()
         .map(|room| SnapRoomView {
             name: room.name.clone(),
-            command: snapcast::install_command(&host, room),
+            command: snapcast::install_command(&host, room, auth_enabled),
             connected: connected.contains(&room.name),
         })
         .collect()
@@ -6178,10 +6271,76 @@ async fn snapcast_add_room(
     }
     rooms.push(snapcast::SnapRoom {
         name,
-        password: generate_room_password(),
+        password: generate_room_password()?,
     });
     save_snapcast_rooms(&state.database, &rooms).await?;
     Ok(Json(snapcast_room_views(&state).await))
+}
+
+#[cfg(feature = "snapcast")]
+#[derive(Debug, Deserialize)]
+struct ProvisionSnapcastPlayerRequest {
+    server_host: String,
+}
+
+#[cfg(feature = "snapcast")]
+#[derive(Serialize)]
+struct ProvisionedSnapcastPlayer {
+    id: String,
+    command: String,
+    auth_enabled: bool,
+}
+
+/// Create one persisted room for the setup wizard. Its server address is deliberately scoped to
+/// this command: remote players must not inherit a silently rewritten global server setting.
+#[cfg(feature = "snapcast")]
+async fn snapcast_provision_player(
+    State(state): State<AppState>,
+    Json(request): Json<ProvisionSnapcastPlayerRequest>,
+) -> Result<Json<ProvisionedSnapcastPlayer>, AppError> {
+    if !snapcast_enabled_setting(&state.database).await {
+        return Err(AppError::bad_request(
+            "Enable Snapcast before provisioning a player",
+        ));
+    }
+    let host = snapcast_command_host(&request.server_host).map_err(AppError::bad_request)?;
+    let mut rooms = snapcast_rooms_from_db(&state.database).await;
+    let mut id = None;
+    for _ in 0..16 {
+        let candidate = format!("musicata-player-{}", generate_room_password()?);
+        if !rooms.iter().any(|room| room.name == candidate) {
+            id = Some(candidate);
+            break;
+        }
+    }
+    let id =
+        id.ok_or_else(|| AppError::internal("could not allocate a unique Snapcast player id"))?;
+    let room = snapcast::SnapRoom {
+        name: id.clone(),
+        password: generate_room_password()?,
+    };
+    rooms.push(room.clone());
+    save_snapcast_rooms(&state.database, &rooms).await?;
+    let auth_enabled = bool_setting(&state.database, SETTING_SNAPCAST_AUTH).await;
+    Ok(Json(ProvisionedSnapcastPlayer {
+        id,
+        command: snapcast::install_command(&host, &room, auth_enabled),
+        auth_enabled,
+    }))
+}
+
+#[cfg(feature = "snapcast")]
+fn snapcast_command_host(host: &str) -> Result<String, &'static str> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("server host is required");
+    }
+    let host = host.trim_matches(['[', ']']);
+    if host.parse::<std::net::IpAddr>().is_ok() || valid_hostname(host) {
+        Ok(host.to_string())
+    } else {
+        Err("server host must be a hostname, IPv4 address, or IPv6 address")
+    }
 }
 
 #[cfg(feature = "snapcast")]
@@ -6210,13 +6369,14 @@ async fn save_snapcast_rooms(
 
 /// A random 128-bit room password as 32 hex chars (URI-safe — it goes in `tcp://name:pw@host`).
 #[cfg(feature = "snapcast")]
-fn generate_room_password() -> String {
+fn generate_room_password() -> Result<String, AppError> {
     use std::io::Read;
     let mut buf = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    let mut f = std::fs::File::open("/dev/urandom")
+        .map_err(|_| AppError::internal("system random source is unavailable"))?;
+    f.read_exact(&mut buf)
+        .map_err(|_| AppError::internal("system random source is unavailable"))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 #[cfg(feature = "snapcast")]
@@ -8807,6 +8967,14 @@ impl AppError {
             message: message.into(),
         }
     }
+
+    fn probe_failed(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            code: "probe_failed",
+            message: message.into(),
+        }
+    }
 }
 
 impl From<std::io::Error> for AppError {
@@ -9204,11 +9372,11 @@ fn init_logging() {
 mod tests {
     use super::{
         ARTWORK_CACHE_CONTROL, BOOL_SETTINGS, Config, DEFAULT_SOURCE_URL, PlayerManager,
-        ProviderHandle, ProviderRegistry, acoustid_lookup_duration, app, artwork_etag,
-        bool_setting_default, folder_name_from_relative_path, normalize_size, parse_range,
-        resize_to_jpeg, schedule_autoplay_refills,
+        ProviderHandle, ProviderRegistry, acoustid_lookup_duration, app_with_diagnostics,
+        artwork_etag, bool_setting_default, folder_name_from_relative_path, normalize_size,
+        parse_range, resize_to_jpeg, schedule_autoplay_refills,
     };
-    use crate::{artwork, now_unix_seconds};
+    use crate::{artwork, diagnostics, now_unix_seconds};
     use std::sync::Arc;
 
     #[test]
@@ -9577,6 +9745,142 @@ mod tests {
         assert_eq!(parse_range("bytes=10-19", 100), Some((10, 19)));
         assert_eq!(parse_range("bytes=-10", 100), Some((90, 99)));
         assert_eq!(parse_range("bytes=150-", 100), None);
+    }
+
+    #[test]
+    fn player_probe_addresses_reject_injection_and_bracket_ipv6() {
+        assert_eq!(
+            super::mpd_address("2001:db8::1", 6600).unwrap(),
+            "[2001:db8::1]:6600"
+        );
+        assert_eq!(
+            super::mpd_address("player.example", 6600).unwrap(),
+            "player.example:6600"
+        );
+        assert!(super::mpd_address("player.example; touch /tmp/no", 6600).is_err());
+        assert!(super::mpd_address("player.example", 0).is_err());
+        #[cfg(feature = "snapcast")]
+        assert!(super::snapcast_command_host("musicata.example'$(id)").is_err());
+    }
+
+    #[tokio::test]
+    async fn player_probe_succeeds_without_persisting_a_player() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"OK MPD 0.23.0\n").await.unwrap();
+            let mut request = [0_u8; 128];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket.write_all(b"OK\n").await.unwrap();
+        });
+
+        let fixture = TestFixture::new("player-probe-success");
+        let (app, database) = fixture.app_with_library_db(fixture.library()).await;
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/players/probe")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"host":"127.0.0.1","port":{}}}"#,
+                        address.port()
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["address"], address.to_string());
+        assert_eq!(body["connected"], true);
+        assert_eq!(database.list_players().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn player_probe_failure_is_generic_and_does_not_persist() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let fixture = TestFixture::new("player-probe-failure");
+        let (app, database) = fixture.app_with_library_db(fixture.library()).await;
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/players/probe")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"host":"127.0.0.1","port":{port},"password":"do-not-leak"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("probe_failed"));
+        assert!(!body.contains("do-not-leak"));
+        assert_eq!(database.list_players().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_mpd_registration_preserves_omitted_password() {
+        let fixture = TestFixture::new("mpd-password-idempotency");
+        let (app, database) = fixture.app_with_library_db(fixture.library()).await;
+        let request = |body: &'static str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/players")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    r#"{"kind":"mpd","address":"127.0.0.1:1","password":"persist-me"}"#,
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.oneshot(request(
+                r#"{"kind":"mpd","address":"127.0.0.1:1","name":"New name"}"#
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::OK
+        );
+        let player = database
+            .list_players()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|player| player.address == "127.0.0.1:1")
+            .unwrap();
+        assert_eq!(
+            database.player_mpd_password(&player.id).await.unwrap(),
+            Some("persist-me".into())
+        );
     }
 
     #[test]
@@ -10023,9 +10327,9 @@ while True:
             .expect("save library");
         let (_app, players) = fixture.app_with_database(database.clone()).await;
         let second = players
-            .register("native", "second-output", "Second output")
+            .register("mpd", "127.0.0.1:6601", "Second output", None)
             .await
-            .expect("register native output");
+            .expect("register second output");
 
         let (release_held, held) = tokio::sync::oneshot::channel::<()>();
         let mut jobs = tokio::task::JoinSet::new();
@@ -11526,10 +11830,9 @@ while True:
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
     }
 
-    /// A native endpoint (M10) registers itself, gets a token, and that token authenticates
-    /// both the player channels and the audio streams it must fetch to play.
+    /// The retired native player kind must not be registered again.
     #[tokio::test]
-    async fn native_endpoint_registers_and_streams_with_its_token() {
+    async fn native_player_registration_is_rejected() {
         let fixture = TestFixture::new("native-endpoint");
         let app = fixture.app().await;
 
@@ -11556,7 +11859,7 @@ while True:
             .expect("session cookie")
             .to_string();
 
-        // Self-register a native endpoint with a token.
+        // A former endpoint must not be able to recreate its removed renderer.
         let registered = app
             .clone()
             .oneshot(
@@ -11572,67 +11875,7 @@ while True:
             )
             .await
             .unwrap();
-        assert_eq!(registered.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_str(&body_text(registered.into_body()).await).unwrap();
-        assert_eq!(body["kind"], "native");
-        let token = body["auth_token"]
-            .as_str()
-            .expect("token issued")
-            .to_string();
-
-        // A real track id from the fixture library (via the admin session).
-        let tracks: serde_json::Value = serde_json::from_str(
-            &body_text(
-                app.clone()
-                    .oneshot(
-                        Request::builder()
-                            .uri("/api/tracks")
-                            .header("cookie", &cookie)
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap()
-                    .into_body(),
-            )
-            .await,
-        )
-        .unwrap();
-        let track_id = tracks["items"][0]["id"]
-            .as_str()
-            .expect("a track id")
-            .to_string();
-        let stream_path = format!("/api/tracks/{track_id}/stream");
-
-        let stream = |auth: Option<String>| {
-            let mut builder = Request::builder().uri(&stream_path);
-            if let Some(value) = auth {
-                builder = builder.header("authorization", value);
-            }
-            app.clone().oneshot(builder.body(Body::empty()).unwrap())
-        };
-
-        // The endpoint token authenticates the stream (auth passes — not 401).
-        assert_ne!(
-            stream(Some(format!("Bearer {token}")))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::UNAUTHORIZED
-        );
-        // No credential and a wrong token are both rejected.
-        assert_eq!(
-            stream(None).await.unwrap().status(),
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            stream(Some("Bearer nope".to_string()))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::UNAUTHORIZED
-        );
+        assert_eq!(registered.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -15130,6 +15373,25 @@ while True:
                 .unwrap();
             assert_eq!(response.status(), want);
         }
+        for (path, body) in [
+            ("/api/players", r#"{"kind":"mpd","address":"127.0.0.1:1"}"#),
+            ("/api/players/probe", r#"{"host":"127.0.0.1","port":1}"#),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("authorization", "Bearer listener-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
         #[cfg(feature = "snapcast")]
         for (token, expected) in [
             ("admin-token", StatusCode::ACCEPTED),
@@ -15163,6 +15425,20 @@ while True:
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/snapcast/players/provision")
+                        .header("authorization", "Bearer listener-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"server_host":"musicata.local"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
         let report = serde_json::json!({"category":"browser.audio","component":"browser","action":"failure","context":{},"message":"decode failed"});
         let response = app
@@ -15185,7 +15461,9 @@ while True:
         use tower::ServiceExt;
         let fixture = TestFixture::new("diagnostics-fallback");
         fs::create_dir(fixture.root.join("musicata.db.diagnostics.db")).unwrap();
-        let (app, db) = fixture.app_with_library_db(fixture.library()).await;
+        let (app, db, recorder) = fixture
+            .app_with_library_db_and_recorder(fixture.library())
+            .await;
         db.create_user(&musicata_storage::UserRecord {
             id: "admin".into(),
             username: "admin".into(),
@@ -15205,37 +15483,13 @@ while True:
                 .body(Body::from(body.to_owned()))
                 .unwrap()
         };
-        let registered = app
-            .clone()
-            .oneshot(request(
-                "/api/players",
-                r#"{"kind":"native","address":"diagnostic-test","issue_token":true}"#,
-            ))
-            .await
-            .unwrap();
-        let registered: serde_json::Value = serde_json::from_slice(
-            &axum::body::to_bytes(registered.into_body(), 10000)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        let id = registered["id"].as_str().unwrap();
-        let token = registered["auth_token"].as_str().unwrap();
-        let report = r#"{"category":"native.audio","component":"native","action":"failure","context":{},"message":"decode failed https://private.invalid/?token=secret"}"#;
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/players/{id}/diagnostics"))
-                    .header("authorization", format!("Bearer {token}"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(report))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        recorder.record(crate::diagnostics::event(
+            "browser.audio",
+            "browser",
+            musicata_core::diagnostics::DiagnosticAction::Failure,
+            Some(crate::players::BROWSER_PLAYER_ID),
+            "decode failed https://private.invalid/?token=secret",
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(
             app.clone()
@@ -15267,7 +15521,7 @@ while True:
         assert_eq!(context["history_scope"], "pending_memory_only");
         let incidents: serde_json::Value =
             serde_json::from_reader(zip.by_name("incidents.json").unwrap()).unwrap();
-        assert_eq!(incidents[0]["category"], "native.audio");
+        assert_eq!(incidents[0]["category"], "browser.audio");
         assert!(!incidents.to_string().contains("secret"));
         let pool = sqlx::SqlitePool::connect(&format!(
             "sqlite://{}",
@@ -15306,89 +15560,6 @@ while True:
         let context: serde_json::Value =
             serde_json::from_reader(zip.by_name("context.json").unwrap()).unwrap();
         assert_eq!(context["output_context_unavailable"], true);
-    }
-
-    #[tokio::test]
-    async fn diagnostics_endpoint_token_is_scoped_and_lost_reports_are_accepted() {
-        use tower::ServiceExt;
-        let fixture = TestFixture::new("diagnostics-endpoint");
-        let (app, db) = fixture.app_with_library_db(fixture.library()).await;
-        db.create_user(&musicata_storage::UserRecord {
-            id: "admin".into(),
-            username: "admin".into(),
-            password_hash: "unused".into(),
-            role: "admin".into(),
-            api_token: "admin-token".into(),
-            created_at_unix_seconds: 1,
-        })
-        .await
-        .unwrap();
-        let registered = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/players")
-                    .header("authorization", "Bearer admin-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"kind":"native","address":"diagnostics-test","issue_token":true}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(registered.status(), StatusCode::OK);
-        let player: serde_json::Value =
-            serde_json::from_str(&body_text(registered.into_body()).await).unwrap();
-        let id = player["id"].as_str().unwrap();
-        let token = player["auth_token"].as_str().unwrap();
-        let report = serde_json::json!({"category":"native.audio","component":"native","action":"failure","context":{},"message":"connection refused","measurements":{"lost_reports":2}});
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/players/{id}/diagnostics"))
-                    .header("authorization", format!("Bearer {token}"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(report.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        for path in [
-            "/api/players/someone-else/diagnostics",
-            "/api/diagnostics/export/download",
-            "/api/diagnostics",
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(path)
-                        .header("authorization", format!("Bearer {token}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/players/{id}/diagnostics"))
-                    .header("authorization", format!("Bearer {token}"))
-                    .header("content-type", "application/json")
-                    .body(Body::from("x".repeat(5000)))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     struct TestFixture {
@@ -15440,6 +15611,27 @@ while True:
             (router, database)
         }
 
+        async fn app_with_library_db_and_recorder(
+            &self,
+            mut library: Library,
+        ) -> (axum::Router, Database, diagnostics::Diagnostics) {
+            let database = Database::connect(self.root.join("musicata.db"))
+                .await
+                .expect("connect fixture database");
+            database
+                .save_library(&mut library)
+                .await
+                .expect("save fixture library");
+            let recorder = diagnostics::Diagnostics::start(diagnostics::data_path(
+                &self.root.join("musicata.db"),
+            ));
+            let router = self
+                .app_with_database_and_recorder(database.clone(), recorder.clone())
+                .await
+                .0;
+            (router, database, recorder)
+        }
+
         async fn app_with_database(
             &self,
             database: Database,
@@ -15451,10 +15643,39 @@ while True:
             .await
         }
 
+        async fn app_with_database_and_recorder(
+            &self,
+            database: Database,
+            recorder: diagnostics::Diagnostics,
+        ) -> (axum::Router, std::sync::Arc<PlayerManager>) {
+            self.app_with_database_cache_and_recorder(
+                database,
+                Arc::new(artwork::ArtworkCache::new(self.root.join("artwork"))),
+                recorder,
+            )
+            .await
+        }
+
         async fn app_with_database_cache(
             &self,
             database: Database,
             artwork_cache: Arc<artwork::ArtworkCache>,
+        ) -> (axum::Router, std::sync::Arc<PlayerManager>) {
+            self.app_with_database_cache_and_recorder(
+                database,
+                artwork_cache,
+                diagnostics::Diagnostics::start(diagnostics::data_path(
+                    &self.root.join("musicata.db"),
+                )),
+            )
+            .await
+        }
+
+        async fn app_with_database_cache_and_recorder(
+            &self,
+            database: Database,
+            artwork_cache: Arc<artwork::ArtworkCache>,
+            recorder: diagnostics::Diagnostics,
         ) -> (axum::Router, std::sync::Arc<PlayerManager>) {
             let mut registry = ProviderRegistry::new();
             registry.push(ProviderHandle::local(LocalDiskProvider::new(&self.root)));
@@ -15469,7 +15690,7 @@ while True:
             )
             .await
             .expect("player manager");
-            let router = app(
+            let router = app_with_diagnostics(
                 database.clone(),
                 providers,
                 players.clone(),
@@ -15482,6 +15703,7 @@ while True:
                 artwork_cache,
                 self.root.join("musicata.db"),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
+                Some(recorder),
             );
             (router, players)
         }

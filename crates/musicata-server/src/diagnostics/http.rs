@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use super::DiagnosticHealth;
-use crate::{AppError, AppState, auth::CurrentUser, output_audio::EndpointIdentity};
+use crate::{AppError, AppState, auth::CurrentUser};
 use axum::{
     Extension, Json,
     extract::{Path, State},
@@ -70,30 +70,16 @@ pub async fn detail(
     }
     status(State(state), user).await
 }
-fn validate_report(
-    mut event: DiagnosticEvent,
-    output: &str,
-    native: bool,
-) -> Result<DiagnosticEvent, AppError> {
-    let categories = if native {
-        &[
-            "native.connection",
-            "native.decode",
-            "native.audio",
-            "native.dsp",
-            "native.buffering",
-        ][..]
-    } else {
-        &[
-            "browser.audio",
-            "browser.buffering",
-            "browser.graph",
-            "browser.routing",
-            "browser.dsp",
-        ][..]
-    };
+fn validate_report(mut event: DiagnosticEvent, output: &str) -> Result<DiagnosticEvent, AppError> {
+    let categories = [
+        "browser.audio",
+        "browser.buffering",
+        "browser.graph",
+        "browser.routing",
+        "browser.dsp",
+    ];
     if !categories.contains(&event.category.as_str())
-        || event.component != if native { "native" } else { "browser" }
+        || event.component != "browser"
         || !matches!(
             event.action,
             DiagnosticAction::Failure | DiagnosticAction::Recovery
@@ -156,21 +142,9 @@ pub async fn browser_report(
     if !state.output_audio.owns_browser_reporter(token).await {
         return Err(AppError::forbidden("active browser renderer required"));
     }
-    let mut event = validate_report(event, "browser-local", false)?;
+    let mut event = validate_report(event, "browser-local")?;
     event.context.renderer_session_id = Some(token.to_owned());
     record_report(&state, &format!("user:{}", user.id), event)
-}
-pub async fn native_report(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    identity: Option<Extension<EndpointIdentity>>,
-    Json(event): Json<DiagnosticEvent>,
-) -> Result<StatusCode, AppError> {
-    if !identity.is_some_and(|Extension(identity)| identity.0 == id) {
-        return Err(AppError::unauthorized("output credentials required"));
-    }
-    let event = validate_report(event, &id, true)?;
-    record_report(&state, &format!("output:{id}"), event)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -261,18 +235,18 @@ mod tests {
     #[test]
     fn reports_cannot_forge_attribution_or_capture_arbitrary_fields() {
         let mut report = super::super::event(
-            "native.audio",
-            "native",
+            "browser.audio",
+            "browser",
             DiagnosticAction::Failure,
             Some("other"),
             "failed",
         );
-        assert!(validate_report(report.clone(), "mine", true).is_err());
+        assert!(validate_report(report.clone(), "mine").is_err());
         report.context.output_id = None;
         // Wire reporters cannot choose internal source locations.
         report.measurements.clear();
         assert_eq!(
-            validate_report(report.clone(), "mine", true)
+            validate_report(report.clone(), "mine")
                 .unwrap()
                 .context
                 .output_id
@@ -280,7 +254,7 @@ mod tests {
             Some("mine")
         );
         report.category = "arbitrary.secret".into();
-        assert!(validate_report(report, "mine", true).is_err());
+        assert!(validate_report(report, "mine").is_err());
     }
     #[test]
     fn rate_limits_bound_repeat_and_global_reports() {

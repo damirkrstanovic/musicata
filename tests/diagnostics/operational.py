@@ -26,8 +26,10 @@ with tempfile.TemporaryDirectory(prefix='musicata-diagnostics-') as directory:
     process = None
     log = (root/'bootstrap.log').open('wb')
 
-    def request(path, body=None, auth=None):
+    def request(path, body=None, auth=None, extra_headers=None):
         headers = {'authorization':f'Bearer {auth}'} if auth else {'cookie': cookie}
+        if extra_headers:
+            headers.update(extra_headers)
         if body is not None:
             headers['content-type'] = 'application/json'
         req = urllib.request.Request(base+path, data=None if body is None else json.dumps(body).encode(), headers=headers)
@@ -58,7 +60,7 @@ with tempfile.TemporaryDirectory(prefix='musicata-diagnostics-') as directory:
             payload = response.read(16*1024*1024+1)
         assert len(payload) <= 16*1024*1024
         archive = zipfile.ZipFile(io.BytesIO(payload))
-        assert len(archive.namelist()) == 5
+        assert set(archive.namelist()) == {'manifest.json', 'incidents.json', 'transitions.json', 'performance.json', 'context.json', 'runtime.json'}
         result = {name:json.loads(archive.read(name)) for name in archive.namelist()}
         text = json.dumps(result)
         assert 'private-secret' not in text and '/home/private' not in text
@@ -69,14 +71,37 @@ with tempfile.TemporaryDirectory(prefix='musicata-diagnostics-') as directory:
         wait(lambda: api('/api/health'))
         with request('/api/auth/setup', {'username':'test','password':'diagnostics-test-only'}) as response:
             cookie = response.headers['set-cookie'].split(';')[0]
+        renderer_auth = 'diagnostics-browser-renderer'
+        with sqlite3.connect(database) as bootstrap:
+            bootstrap.execute('UPDATE users SET api_token=?', (renderer_auth,))
         wait(lambda: api('/api/diagnostics')['health']['available'])
         def rss_bytes():
             for line in Path(f"/proc/{process.pid}/status").read_text().splitlines():
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1])*1024
             return 0
-        output=api('/api/players',{'kind':'native','address':'diagnostics-test','issue_token':True})
-        output_id=output['id']; output_token=output['auth_token']
+        renderer_script = '''
+const socket = new WebSocket(process.argv[1]);
+const timeout = setTimeout(() => process.exit(1), 5000);
+socket.addEventListener('open', () => socket.send(JSON.stringify({type: 'renderer'})));
+socket.addEventListener('message', ({data}) => {
+  const frame = JSON.parse(data);
+  if (frame.type === 'renderer_granted') {
+    console.log(frame.reporter_token);
+    clearTimeout(timeout);
+  }
+});
+process.stdin.resume();
+process.stdin.on('data', () => socket.close());
+socket.addEventListener('close', () => process.exit(0));
+'''
+        renderer = subprocess.Popen(
+            ['node', '-e', renderer_script,
+             f'ws://127.0.0.1:{port}/api/players/browser-local/audio/ws?token={renderer_auth}'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        reporter_token = renderer.stdout.readline().strip()
+        assert len(reporter_token) == 64, reporter_token
         baseline_rss=rss_bytes()
         baseline = []
         for _ in range(20):
@@ -85,8 +110,8 @@ with tempfile.TemporaryDirectory(prefix='musicata-diagnostics-') as directory:
             baseline.append(time.monotonic()-begin)
         store = sqlite3.connect(str(database)+'.diagnostics.db', timeout=.1)
         store.execute('BEGIN IMMEDIATE')
-        report = {'category':'native.audio','component':'native','action':'failure','context':{},'message':'permission denied /home/private https://private.invalid/?token=private-secret'}
-        with request(f'/api/players/{output_id}/diagnostics', report, output_token) as response:
+        report = {'category':'browser.audio','component':'browser','action':'failure','context':{},'message':'permission denied /home/private https://private.invalid/?token=private-secret'}
+        with request('/api/diagnostics/reports', report, renderer_auth, {'x-musicata-renderer': reporter_token}) as response:
             assert response.status == 202
         wait(lambda: not api('/api/diagnostics')['health']['available'])
         latency = []
@@ -101,12 +126,12 @@ with tempfile.TemporaryDirectory(prefix='musicata-diagnostics-') as directory:
         time.sleep(2.2)  # allow the independent writer to drain retained queue evidence
         bundle = export()
         assert bundle['context.json']['recorder']['storage_gaps'] >= 1
-        assert any(row['category']=='native.audio' for row in bundle['context.json']['pending_evidence_may_overlap_history']['incidents'])
+        assert any(row['category']=='browser.audio' for row in bundle['context.json']['pending_evidence_may_overlap_history']['incidents'])
         store.rollback()
         store.close()
         wait(lambda: api('/api/diagnostics')['health']['available'])
         bundle = export()
-        assert any(row['category']=='native.audio' for row in bundle['incidents.json'])
+        assert any(row['category']=='browser.audio' for row in bundle['incidents.json'])
         assert bundle['manifest.json']['storage_gaps'] >= 1
         assert bundle['manifest.json']['dropped_events'] > 0
         api('/api/diagnostics/debug', {'enabled':True})
@@ -128,13 +153,17 @@ with tempfile.TemporaryDirectory(prefix='musicata-diagnostics-') as directory:
         wait(lambda: api('/api/diagnostics')['health']['available'])
         assert api('/api/diagnostics')['health']['detail_remaining_seconds'] == 0
         bundle = export()
-        assert any(row['category']=='native.audio' for row in bundle['incidents.json'])
+        assert any(row['category']=='browser.audio' for row in bundle['incidents.json'])
         size = Path(str(database)+'.diagnostics.db').stat().st_size
         wal = Path(str(database)+'.diagnostics.db-wal')
         assert size <= 64*1024*1024
         assert not wal.exists() or wal.stat().st_size <= 8*1024*1024
         print(json.dumps({'baseline_rss_bytes':baseline_rss,'blocked_rss_bytes':blocked_rss,'controls':len(latency),'baseline_mean_ms':round(1000*sum(baseline)/len(baseline),2),'blocked_writer_mean_ms':round(1000*sum(latency)/len(latency),2),'blocked_writer_max_ms':round(1000*max(latency),2),'database_bytes':size,'dropped_events':bundle['manifest.json']['dropped_events'],'restart_retained':True}))
     finally:
+        if 'renderer' in locals() and renderer.poll() is None:
+            renderer.stdin.write('\n')
+            renderer.stdin.close()
+            renderer.wait(timeout=5)
         if process and process.poll() is None:
             process.terminate()
             process.wait(timeout=8)

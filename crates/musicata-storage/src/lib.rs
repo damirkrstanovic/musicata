@@ -511,6 +511,13 @@ impl Database {
             }
             set_user_version(&self.pool, 38).await?;
         }
+
+        if version < 39 {
+            for statement in MIGRATION_039_PLAYER_CREDENTIALS {
+                sqlx::query(statement).execute(&self.pool).await?;
+            }
+            set_user_version(&self.pool, 39).await?;
+        }
         Ok(())
     }
 
@@ -3964,15 +3971,52 @@ impl Database {
         Ok(())
     }
 
-    /// Whether any player has this exact endpoint-token hash. Used to let an authenticated
-    /// endpoint fetch the audio streams it needs to play (it presents its player token; the
-    /// token isn't tied to a track, so any valid endpoint token authorizes a stream — LAN-first).
-    pub async fn player_token_exists(&self, token_hash: &str) -> Result<bool> {
-        let found: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM players WHERE auth_token_hash = ?1 LIMIT 1")
-                .bind(token_hash)
-                .fetch_optional(&self.reads)
+    /// Store an MPD password separately from the player descriptor. `None` removes an
+    /// existing credential, so callers can distinguish an omitted password from an explicit
+    /// request to clear it.
+    pub async fn set_player_mpd_password(
+        &self,
+        player_id: &str,
+        password: Option<&str>,
+    ) -> Result<()> {
+        if let Some(password) = password {
+            sqlx::query(
+                "INSERT INTO player_mpd_credentials (player_id, password) VALUES (?1, ?2)\
+                 ON CONFLICT(player_id) DO UPDATE SET password = excluded.password",
+            )
+            .bind(player_id)
+            .bind(password)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query("DELETE FROM player_mpd_credentials WHERE player_id = ?1")
+                .bind(player_id)
+                .execute(&self.pool)
                 .await?;
+        }
+        Ok(())
+    }
+
+    /// Returns a stored MPD credential for transport use only. It is deliberately absent from
+    /// `PlayerRecord`, which is used to form API descriptors and diagnostic fields.
+    pub async fn player_mpd_password(&self, player_id: &str) -> Result<Option<String>> {
+        sqlx::query_scalar("SELECT password FROM player_mpd_credentials WHERE player_id = ?1")
+            .bind(player_id)
+            .fetch_optional(&self.reads)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Whether a supported player has this exact scoped-token hash. Retired player rows retain
+    /// their hashes for non-destructive migration, but their credentials are inert.
+    pub async fn active_player_token_exists(&self, token_hash: &str) -> Result<bool> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM players
+                 WHERE auth_token_hash = ?1 AND kind IN ('browser', 'mpd', 'snapcast') LIMIT 1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.reads)
+        .await?;
         Ok(found.is_some())
     }
 
@@ -6534,6 +6578,15 @@ const MIGRATION_010_PLAYERS_AND_ZONES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_players_zone_id ON players(zone_id)",
 ];
 
+// MPD credentials are intentionally separate from `players`: records feed descriptors and
+// diagnostics, while this table is only read by the MPD transport. The foreign key removes a
+// password when its player is removed.
+const MIGRATION_039_PLAYER_CREDENTIALS: &[&str] =
+    &["CREATE TABLE IF NOT EXISTS player_mpd_credentials (
+        player_id TEXT PRIMARY KEY REFERENCES players(id) ON DELETE CASCADE,
+        password TEXT NOT NULL
+    )"];
+
 // Server-owned persistent playback queue, one queue per player. `player_queue`
 // holds the lightweight playback row (status/position/elapsed/volume/repeat/
 // shuffle) updated frequently; `player_queue_items` holds the ordered queue and
@@ -6738,9 +6791,8 @@ const MIGRATION_029_ALBUM_LOUDNESS: &[&str] = &["CREATE TABLE IF NOT EXISTS albu
         analyzed_at_unix_seconds INTEGER NOT NULL
     )"];
 
-// Per-player endpoint auth token (M10): the sha256 of a token issued at registration to a
-// self-registering endpoint, so it can authenticate on its own channels without a user
-// session. NULL for server-initiated players (browser/MPD/Snapcast), which carry no token.
+// Per-player scoped token (M10): the sha256 of a token issued at registration so a player can
+// authenticate on its own channels without a user session. NULL for the common case.
 // The `auth_token_hash` column is added idempotently via `ensure_column` in `migrate`.
 
 /// Audio-ML (musicata-ml): a `vec0` virtual table holds each track's embedding for KNN
@@ -7100,7 +7152,7 @@ mod tests {
             .upsert_player(&super::PlayerRecord {
                 id: "output".into(),
                 name: "Output".into(),
-                kind: "native".into(),
+                kind: "browser".into(),
                 address: "local".into(),
                 zone_id: None,
             })
@@ -7130,6 +7182,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mpd_credentials_are_separate_and_deleted_with_player() {
+        let path = temp_db_path("mpd-credential");
+        let database = Database::connect(&path).await.unwrap();
+        database
+            .upsert_player(&super::PlayerRecord {
+                id: "mpd-living".into(),
+                name: "Living room".into(),
+                kind: "mpd".into(),
+                address: "player.example:6600".into(),
+                zone_id: None,
+            })
+            .await
+            .unwrap();
+        database
+            .set_player_mpd_password("mpd-living", Some("not-a-descriptor-field"))
+            .await
+            .unwrap();
+        assert_eq!(
+            database.player_mpd_password("mpd-living").await.unwrap(),
+            Some("not-a-descriptor-field".into())
+        );
+        assert_eq!(
+            database
+                .player_record("mpd-living")
+                .await
+                .unwrap()
+                .unwrap()
+                .address,
+            "player.example:6600"
+        );
+        database.delete_player("mpd-living").await.unwrap();
+        assert_eq!(
+            database.player_mpd_password("mpd-living").await.unwrap(),
+            None
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn clearing_one_dsp_profile_binding_preserves_the_other_layer() {
         // A regression here makes deleting a correction preset also erase a user's separate
         // listening adjustment.
@@ -7139,7 +7230,7 @@ mod tests {
             .upsert_player(&super::PlayerRecord {
                 id: "output".into(),
                 name: "Output".into(),
-                kind: "native".into(),
+                kind: "browser".into(),
                 address: "local".into(),
                 zone_id: None,
             })
@@ -7183,7 +7274,7 @@ mod tests {
             .upsert_player(&super::PlayerRecord {
                 id: "output".into(),
                 name: "Output".into(),
-                kind: "native".into(),
+                kind: "browser".into(),
                 address: "local".into(),
                 zone_id: None,
             })

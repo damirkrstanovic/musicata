@@ -39,7 +39,7 @@ pub async fn prepare(state: &AppState, request: ExportRequest) -> anyhow::Result
     let kinds: Vec<_> = players
         .iter()
         .take(256)
-        .map(|player| serde_json::json!({"id":super::identity(&player.id),"kind":match player.kind.as_str(){"browser"=>"browser","native"=>"native","mpd"=>"mpd","snapcast"=>"snapcast",_=>"other"}}))
+        .map(|player| serde_json::json!({"id":super::identity(&player.id),"kind":match player.kind.as_str(){"browser"=>"browser","mpd"=>"mpd","snapcast"=>"snapcast",_=>"other"}}))
         .collect();
     let pending = state.diagnostics.memory_snapshot();
     let context = serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"history_scope":history_scope,"output_context_unavailable":output_context_unavailable,"outputs":kinds,"omitted_outputs":players.len().saturating_sub(256),"recorder":state.diagnostics.health(),

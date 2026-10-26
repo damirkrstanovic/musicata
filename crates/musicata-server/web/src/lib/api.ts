@@ -362,6 +362,12 @@ export const api = {
       `/api/snapcast/rooms/${encodeURIComponent(name)}`,
       "DELETE",
     ),
+  provisionSnapcastPlayer: (server_host: string) =>
+    sendJson<{ id: string; command: string; auth_enabled: boolean }>(
+      "/api/snapcast/players/provision",
+      "POST",
+      { server_host },
+    ),
   setSnapcastVolume: (clientId: string, percent: number) =>
     sendJson(
       `/api/snapcast/clients/${encodeURIComponent(clientId)}/volume`,
@@ -410,8 +416,10 @@ export const api = {
   playerState: (id: string) => getJson<PlaybackState>(`/api/players/${encodeURIComponent(id)}/state`),
   playerCommand: (id: string, command: unknown) =>
     sendJson(`/api/players/${encodeURIComponent(id)}/commands`, "POST", command),
-  createPlayer: (body: { kind: "mpd"; address: string; name?: string }) =>
+  createPlayer: (body: { kind: "mpd"; address: string; name?: string; password?: string }) =>
     sendJson("/api/players", "POST", body),
+  probePlayer: (body: { host: string; port: number; password?: string }) =>
+    sendJson<{ address: string; connected: boolean }>("/api/players/probe", "POST", body),
   updatePlayer: (id: string, body: { name?: string; zone_id?: string | null }) =>
     sendJson(`/api/players/${encodeURIComponent(id)}`, "PATCH", body),
   deletePlayer: (id: string) => sendJson(`/api/players/${encodeURIComponent(id)}`, "DELETE"),

@@ -92,7 +92,7 @@ Authenticate with any of:
 | GET | `/api/browse` | Facets for genre/year/composer/folder, plus `tags` (musicata-ml audio tags, most-common first; empty until tracks are analysed). |
 | GET | `/api/browse/recently-added` | Newest tracks first. |
 | GET | `/api/search?query=…` | Full-text search; returns `{ artists, albums, tracks }`. |
-| GET | `/api/tracks/{id}/stream` | Stream a track (supports HTTP `Range`). |
+| GET | `/api/tracks/{id}/stream` | Stream a track (supports HTTP `Range`). A valid scoped player token may fetch a library stream without a user session. |
 | GET | `/api/albums/{id}/artwork` | Album cover image (ETag-cached). |
 
 ### Music sources
@@ -145,12 +145,13 @@ streaming fetches only the requested byte range.
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
 | GET | `/api/players` | List registered players. Each carries `capabilities` (`seek`/`volume`/`repeat`/`shuffle`/`queue`) advertised by the backend. |
-| POST | `/api/players` | Register a player: `{ "kind": "mpd"\|"native", "address", "name", "issue_token"?: bool }`. `native` is a self-registering endpoint (see [native-endpoint.md](native-endpoint.md)). With `issue_token`, the response also carries `auth_token` **once** — a per-player endpoint token (only its hash is stored). |
+| POST | `/api/players` | Register an MPD player: `{ "kind": "mpd", "address", "name", "password"?: string, "issue_token"?: bool }`. `kind` defaults to `mpd`. An omitted password keeps the credential already stored for the same address; an empty password clears it. Credentials are never returned in player descriptors. With `issue_token`, the response carries `auth_token` **once**; only its hash is stored. Snapcast is managed by the server and browser playback is always available as `browser-local`. |
+| POST | `/api/players/probe` | Test MPD setup without registering a player: `{ "host", "port", "password"?: string }` → `{ "address", "connected": true }`. It performs greeting, optional authentication, and `status` under a short timeout. Failure is `502` with `error.code: "probe_failed"`; credentials are never included in an error. |
 | PATCH | `/api/players/{id}` | Rename (`{"name"}`) or set zone (`{"zone_id"}`/`null`). User-gated. |
 | DELETE | `/api/players/{id}` | Remove a player. User-gated. |
-| GET | `/api/players/{id}/state` | Current `PlaybackState` snapshot. A player's own endpoint token authenticates this channel (Bearer/`?token=`) in place of a user session. |
-| POST | `/api/players/{id}/commands` | Send a `PlayerCommand` (see below). Endpoint-token auth as for `/state`. |
-| GET | `/api/players/{id}/ws` | WebSocket of live `PlaybackState`. Endpoint-token auth via `?token=`. |
+| GET | `/api/players/{id}/state` | Current `PlaybackState` snapshot. A player's own scoped token authenticates this channel (Bearer/`?token=`) in place of a user session. |
+| POST | `/api/players/{id}/commands` | Send a `PlayerCommand` (see below). A player's own scoped token authenticates this channel as for `/state`. |
+| GET | `/api/players/{id}/ws` | WebSocket of live `PlaybackState`. A player's own scoped token authenticates via `?token=`. |
 | GET/POST | `/api/zones` | List zones / create a zone (named groups of players). |
 | PATCH/DELETE | `/api/zones/{id}` | Rename / remove a zone. |
 | GET | `/api/zones/{id}/state` | Current `PlaybackState` for the zone. |
@@ -341,6 +342,7 @@ Present only with the `snapcast` build feature.
 | POST | `/api/snapcast/health/retry` | Admin-only request to reset exhausted managed-process recovery; returns 202. |
 | GET/POST | `/api/snapcast/rooms` | List / add a room. |
 | DELETE | `/api/snapcast/rooms/{name}` | Remove a room. |
+| POST | `/api/snapcast/players/provision` | Create a wizard-owned room and return `{id, command, auth_enabled}` for `{server_host}`. Snapcast must already be enabled. The supplied host is used only in the returned remote-player command; it does not change the server setting. The command includes room credentials only when `auth_enabled` is set. |
 | PATCH | `/api/snapcast/clients/{id}` | Admin-only: rename with `{ "name": "Kitchen" }`, or assign with `{ "zone_id": "zone-id" }` (`null` unassigns). Send one operation per request. |
 | POST | `/api/snapcast/clients/{id}/volume` | Set a client's volume. |
 
@@ -435,7 +437,7 @@ opaque. `coverArt` on albums and songs is the album id.
 | Method | Path | Purpose |
 |---|---|---|
 | GET/PUT | `/api/players/{id}/dsp` | Desired `{profile_id, enabled, correction_enabled, listening_profile_id, listening_enabled}` selection; response includes capabilities, desired/applied revisions, status/error and measurement point. `?migrate=true` writes only if no explicit selection exists. |
-| GET | `/api/players/{id}/audio/ws` | Dedicated audio config/telemetry channel. User session or that native endpoint's scoped token. |
+| GET | `/api/players/{id}/audio/ws` | Dedicated audio config/telemetry channel. Requires a user session. |
 | GET/PUT | `/api/players/{id}/dsp/processor` | Admin-only MPD processor `{host, port}` binding; `null` disconnects it. |
 
 Audio sockets begin with `dsp_state`. A renderer sends `{type:"renderer"}` and receives
@@ -447,8 +449,9 @@ Legacy requests default to correction enabled and no listening adjustment. Apply
 `session_id`, `revision`, and optional `error`. Renderer `levels` adds a monotonic `sequence`
 and `{rms_l,rms_r,peak_l,peak_r}`. Stale/unowned/unapplied generations are rejected.
 Controllers send `{type:"meter_subscription",enabled:true}` and receive at most 20 snapshots/s;
-`levels:null` means unavailable/stale/paused. Native rendering requires its own endpoint token.
-Endpoint tokens cannot edit desired settings, processor bindings, or another output's channel.
+`levels:null` means unavailable/stale/paused. Only the browser renderer that holds its
+connection-scoped lease can apply browser audio settings or report levels; controllers cannot
+edit another output's processor binding.
 
 ## Runtime diagnostics and profiling
 

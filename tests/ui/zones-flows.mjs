@@ -48,14 +48,21 @@ export async function zonesFlows({api, js, check, waitUntil, tap}) {
   if (!created) {
     check("Zones: created zone is available through the API", false);
   } else {
+    // MPD refresh can finish after the new card is visible. Wait for the save to release
+    // the form before clicking Manage, including the offline-player timeout path.
+    await waitUntil(`document.querySelector('[aria-label="Zone for Office"]:not(:disabled)')`, 15000);
     await js(`(() => { const card = [...document.querySelectorAll('.zone-card')].find(node => node.querySelector('h3')?.textContent === ${JSON.stringify(zoneName)}); card.querySelector('button')?.click(); })()`);
     check("Zones: manage opens inline membership editor", await waitUntil(`document.querySelector('.zone-editor input')`, 2000) < Infinity);
     await js(`(() => { const input=document.querySelector('.zone-editor input'); input.value=${JSON.stringify(renamed)}; input.dispatchEvent(new Event('input',{bubbles:true})); [...document.querySelectorAll('.zone-editor .membership-list label')].find(label => label.textContent.includes('Kitchen'))?.querySelector('input')?.click(); document.querySelector('.zone-editor')?.requestSubmit(); })()`);
     check("Zones: rename and bulk speaker membership save", await waitUntil(`(() => { const card=[...document.querySelectorAll('.zone-card')].find(node => node.querySelector('h3')?.textContent === ${JSON.stringify(renamed)}); return card?.textContent.includes('Kitchen') && card?.textContent.includes('192.0.2.36'); })()`, 3000) < Infinity);
 
+    // Saving refreshes MPD state/processor bindings after the rows appear. Wait until the
+    // form is interactive before dispatching the next change, just as a user must.
+    await waitUntil(`document.querySelector('[aria-label="Zone for Office"]:not(:disabled)')`, 15000);
     await js(`(() => { const select=document.querySelector('[aria-label="Zone for Office"]'); select.value=${JSON.stringify(created.id)}; select.dispatchEvent(new Event('change',{bubbles:true})); })()`);
     check("Zones: physical speaker assignment moves the visible row", await waitUntil(`(() => { const card=[...document.querySelectorAll('.zone-card')].find(node => node.querySelector('h3')?.textContent === ${JSON.stringify(renamed)}); return card?.textContent.includes('Office') && card?.textContent.includes('192.0.2.48'); })()`, 3000) < Infinity);
 
+    await waitUntil(`document.querySelector('[aria-label="Zone for Office"]:not(:disabled)')`, 15000);
     await js(`(() => { const card = [...document.querySelectorAll('.zone-card')].find(node => node.querySelector('h3')?.textContent === ${JSON.stringify(renamed)}); [...card.querySelectorAll('button')].find(button => button.textContent === 'Delete')?.click(); })()`);
     await waitUntil(`document.querySelector('.modal[role="dialog"]')`, 2000);
     await js(`document.querySelector('.modal .primary-button')?.click()`);

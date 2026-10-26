@@ -40,11 +40,45 @@ impl MpdConnection {
             reader: BufReader::new(read),
             writer,
         };
-        let greeting = connection.read_line().await?;
+        let greeting = tokio::time::timeout(CONNECT_TIMEOUT, connection.read_line())
+            .await
+            .map_err(|_| anyhow!("MPD greeting timed out"))??;
         if !greeting.starts_with("OK MPD") {
             bail!("unexpected MPD greeting: {greeting}");
         }
         Ok(connection)
+    }
+
+    /// Connect and authenticate before any status or control command. Authentication failures
+    /// intentionally do not expose MPD's echoed command, which can include the password.
+    pub async fn connect_with_password(addr: &str, password: Option<&str>) -> Result<Self> {
+        if password.is_some_and(|password| password.contains('\r') || password.contains('\n')) {
+            bail!("MPD password must not contain a line break");
+        }
+        let mut connection = Self::connect(addr).await?;
+        if let Some(password) = password {
+            tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                connection.command(&format!("password {}", quote_arg(password))),
+            )
+            .await
+            .map_err(|_| anyhow!("MPD authentication failed"))?
+            .map_err(|_| anyhow!("MPD authentication failed"))?;
+        }
+        Ok(connection)
+    }
+
+    /// Verify the complete MPD setup path without retaining the connection. The single outer
+    /// deadline covers greeting, optional authentication and status, so a peer that accepts TCP
+    /// but never speaks cannot hold a wizard request open.
+    pub async fn probe(addr: &str, password: Option<&str>) -> Result<()> {
+        tokio::time::timeout(CONNECT_TIMEOUT, async {
+            let mut connection = Self::connect_with_password(addr, password).await?;
+            connection.command("status").await?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow!("MPD probe timed out"))?
     }
 
     async fn read_line(&mut self) -> Result<String> {
@@ -584,6 +618,70 @@ mod tests {
         assert_eq!(status.state.status, PlaybackStatus::Paused);
         // The server owns the queue, so read_status never fetches it.
         assert!(status.state.queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn password_authenticates_before_status() {
+        let addr = fake_mpd(vec![
+            ("password \"secret\"", ""),
+            ("status", "state: stop\n"),
+            ("currentsong", ""),
+        ])
+        .await;
+        let mut connection = MpdConnection::connect_with_password(&addr, Some("secret"))
+            .await
+            .expect("authenticated connect");
+        connection
+            .read_status()
+            .await
+            .expect("authenticated status");
+    }
+
+    #[tokio::test]
+    async fn password_failure_does_not_echo_the_secret() {
+        let addr = fake_mpd(vec![(
+            "password \"secret\"",
+            "ACK [3@0] {password \"secret\"} incorrect password\n",
+        )])
+        .await;
+        let error = MpdConnection::connect_with_password(&addr, Some("secret"))
+            .await
+            .err()
+            .expect("authentication must fail");
+        assert_eq!(error.to_string(), "MPD authentication failed");
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn password_with_line_break_is_rejected_before_connecting() {
+        let error = MpdConnection::connect_with_password("127.0.0.1:1", Some("secret\nnext"))
+            .await
+            .err()
+            .expect("line break must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "MPD password must not contain a line break"
+        );
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn password_response_is_bounded_and_generic_when_mpd_goes_silent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"OK MPD 0.23.0\n").await.unwrap();
+            let mut request = [0_u8; 128];
+            let _ = socket.read(&mut request).await;
+            tokio::time::sleep(CONNECT_TIMEOUT + Duration::from_secs(1)).await;
+        });
+        let error = MpdConnection::connect_with_password(&addr, Some("secret"))
+            .await
+            .err()
+            .expect("silent authentication must time out");
+        assert_eq!(error.to_string(), "MPD authentication failed");
+        assert!(!error.to_string().contains("secret"));
     }
 
     // ---- Live test against a real `mpd` process -------------------------------

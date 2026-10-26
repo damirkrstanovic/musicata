@@ -36,13 +36,12 @@ jobs:
 
       # The generator reads each crate's own LICENSE/COPYING/NOTICE out of the registry cache
       # and fails loudly if any crate in Cargo.lock is missing, rather than omitting it. Plain
-      # `cargo fetch` resolves the default members; the two opt-in crates are fetched by
-      # manifest path so their trees (ort, rodio/cpal) are cached too.
+      # `cargo fetch` resolves the default members; the opt-in ML crate is fetched by manifest
+      # path so its ONNX Runtime tree is cached too.
       - name: Fetch crate sources
         run: |
           cargo fetch
           cargo fetch --manifest-path crates/musicata-ml/Cargo.toml
-          cargo fetch --manifest-path crates/musicata-endpoint/Cargo.toml
 
       - uses: actions/setup-node@v5
         with:

@@ -5,12 +5,15 @@
   import type { PlaybackState } from "../types/PlaybackState";
   import type { SnapClient } from "../types/SnapClient";
   import { promptText, confirmAction } from "../lib/modal";
+  import AddPlayerWizard from "./AddPlayerWizard.svelte";
+  import type { SnapcastStatus } from "../types/SnapcastStatus";
 
   let players = $state<Player[]>([]);
   let zones = $state<Zone[]>([]);
   let states = $state<Record<string, PlaybackState | undefined>>({});
   let snapClients = $state<SnapClient[]>([]);
   let snapcastControl = $state("unknown");
+  let snapcastStatus = $state<SnapcastStatus | null>(null);
   let loadError = $state("");
   let status = $state("");
   let error = $state(false);
@@ -26,6 +29,7 @@
       players = nextPlayers;
       zones = nextZones;
       snapClients = snapcast?.clients ?? snapcast?.health.clients ?? [];
+      snapcastStatus = snapcast;
       snapcastControl = snapcast?.health.control ?? "unavailable";
       loadError = "";
       const stateEntries = await Promise.all([
@@ -61,27 +65,16 @@
     return state?.status === "playing" ? "Playing" : state?.status === "paused" ? "Paused" : state ? "Idle" : "Status unavailable";
   }
 
-  async function addPlayer(event: SubmitEvent) {
-    event.preventDefault();
-    const form = event.currentTarget as HTMLFormElement;
-    const data = new FormData(form);
-    const address = String(data.get("address") ?? "").trim();
-    const name = String(data.get("name") ?? "").trim();
-    if (!address) return;
-    busy = true; setStatus("Connecting…");
-    try { await api.createPlayer({ kind: "mpd", address, name: name || undefined }); form.reset(); setStatus("Output added."); await load(); }
-    catch (e) { fail(e); } finally { busy = false; }
-  }
   async function configureProcessor(player: Player) {
     const current = processors[player.id];
-    const host = await promptText({title: "Output processor", label: "CamillaDSP hostname or IP (empty to disconnect)", value: current?.host ?? ""});
+    const host = await promptText({title: "Player processor", label: "CamillaDSP hostname or IP (empty to disconnect)", value: current?.host ?? ""});
     if (host == null) return;
-    const port = host ? await promptText({title: "Output processor", label: "WebSocket port", value: String(current?.port ?? 1234)}) : "1234";
+    const port = host ? await promptText({title: "Player processor", label: "WebSocket port", value: String(current?.port ?? 1234)}) : "1234";
     if (port == null) return;
     try { processors[player.id] = await api.saveDspProcessor(player.id, host ? {host, port:Number(port)} : null); } catch (e) { fail(e); }
   }
   async function renamePlayer(player: Player) {
-    const name = await promptText({ title: "Rename output", label: "Name", value: player.name });
+    const name = await promptText({ title: "Rename player", label: "Name", value: player.name });
     if (name == null || !name.trim()) return;
     try { await api.updatePlayer(player.id, { name: name.trim() }); await load(); } catch (e) { fail(e); }
   }
@@ -144,18 +137,18 @@
     if (!name) return;
     if (busy) return;
     busy = true;
-    try { await api.createZone(name); form.reset(); setStatus("Zone created. Add outputs from their zone menus."); await load(); } catch (e) { fail(e); } finally { busy = false; }
+    try { await api.createZone(name); form.reset(); setStatus("Zone created. Add players from their zone menus."); await load(); } catch (e) { fail(e); } finally { busy = false; }
   }
   async function removeZone(zone: Zone) {
-    if (!(await confirmAction({title: `Delete zone ${zone.name}?`, message: "Its outputs become unassigned. They are not removed.", confirmLabel: "Delete zone"}))) return;
+    if (!(await confirmAction({title: `Delete zone ${zone.name}?`, message: "Its players become unassigned. They are not removed.", confirmLabel: "Delete zone"}))) return;
     if (busy) return;
     busy = true;
-    try { await api.deleteZone(zone.id); setStatus("Zone deleted. Its outputs are now unassigned. Network players briefly reconnect while their audio zone is removed."); await load(); } catch (e) { fail(e); } finally { busy = false; }
+    try { await api.deleteZone(zone.id); setStatus("Zone deleted. Its players are now unassigned. Network players briefly reconnect while their audio zone is removed."); await load(); } catch (e) { fail(e); } finally { busy = false; }
   }
 </script>
 
 <section class="admin-panel players-panel zones-panel" aria-labelledby="zones-heading">
-  <div class="admin-panel-head zones-panel-head"><div><h2 id="zones-heading">Zones &amp; players</h2><p class="admin-hint">Choose which outputs Musicata controls together.</p></div></div>
+  <div class="admin-panel-head zones-panel-head"><div><h2 id="zones-heading">Zones &amp; players</h2><p class="admin-hint">Choose which players Musicata controls together.</p></div></div>
   {#if loadError}<p class="form-status error" role="alert">{loadError}</p>{/if}
 
   {#each zones as zone (zone.id)}
@@ -192,11 +185,11 @@
         {#if !members.length && !clients.length}<p class="admin-hint zone-empty">No players in this zone yet. Assign one below.</p>{/if}
       </div>
     </section>
-  {:else}<p class="admin-hint zone-empty">Create a zone to control a set of outputs together.</p>{/each}
+  {:else}<p class="admin-hint zone-empty">Create a zone to control a set of players together.</p>{/each}
 
   <form class="field-form zone-create" onsubmit={addZone}><h3>Create a zone</h3><div class="field-actions"><label class="field field-name"><span>Name</span><input name="name" placeholder="Upstairs" required /></label><button type="submit" class="primary-button" disabled={busy}>Create zone</button></div><p class="admin-hint">Adding the first speaker to a new audio zone briefly reconnects network players.</p></form>
 
-  <section class="unassigned-outputs" aria-labelledby="unassigned-heading"><h3 id="unassigned-heading">Players without a zone</h3><p class="admin-hint">Assign an output to a zone when it should receive that zone’s controls and queue.</p>
+  <section class="unassigned-outputs" aria-labelledby="unassigned-heading"><h3 id="unassigned-heading">Players without a zone</h3><p class="admin-hint">Assign a player to a zone when it should receive that zone’s controls and queue.</p>
     {#each zonePlayers(null) as player (player.id)}
       <div class="admin-row zone-member unassigned-member"><div class="zone-member-title"><span class="dot" class:online={player.online} class:offline={!player.online}></span><div><strong>{player.name}</strong><span class="member-detail">{player.address}</span></div><span class="member-state" class:offline={!player.online}>{stateLabel(player)}</span></div><label class="zone-member-picker"><span>Zone</span><select disabled={busy} aria-label="Zone for {player.name}" value="" onchange={(event) => assignZone(player, event.currentTarget.value)}><option value="">No zone</option>{#each zones as choice (choice.id)}<option value={choice.id}>{choice.name}</option>{/each}</select></label>{#if player.kind === "mpd"}<button type="button" class="ghost-button" onclick={() => configureProcessor(player)}>{processors[player.id] ? "Processor" : "Connect processor"}</button>{/if}{#if player.kind !== "browser"}<button type="button" class="ghost-button" onclick={() => renamePlayer(player)}>Rename</button><button type="button" class="ghost-button danger" onclick={() => removePlayer(player)}>Remove</button>{/if}</div>
     {/each}
@@ -206,7 +199,7 @@
     {#if zoneMemberCount(null) === 0}<p class="admin-hint zone-empty">Every player belongs to a zone.</p>{/if}
   </section>
 
-  <details class="add-output"><summary>Add an MPD output</summary><form class="field-form" onsubmit={addPlayer}><div class="field-grid"><label class="field field-addr"><span>Address</span><input name="address" placeholder="127.0.0.1:6600" required /></label><label class="field field-name"><span>Name <em>(optional)</em></span><input name="name" placeholder="Living room" /></label></div><div class="field-actions"><button type="submit" class="primary-button" disabled={busy}>Add output</button></div></form></details>
+  <AddPlayerWizard {players} {zones} snapcast={snapcastStatus} oncomplete={load} />
   {#if status}<p class="form-status" class:error role="status">{status}</p>{/if}
 </section>
 
@@ -217,6 +210,6 @@
   .zone-member { min-width: 0; padding: .7rem 0; border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent); flex-wrap: wrap; } .zone-member-title { display: flex; align-items: center; gap: .6rem; flex: 1 1 12rem; min-width: 0; } .zone-member-title strong, .snapcast-client strong { overflow-wrap: anywhere; }
   .member-state { color: var(--muted); font-size: .78rem; margin-left: auto; white-space: nowrap; } .member-state.offline { color: var(--danger); } .zone-member-picker { display: grid; gap: .2rem; color: var(--muted); font-size: .72rem; } .zone-member-picker select { min-width: 9rem; }
   .snapcast-client { padding: .45rem 0; } .snapcast-client > div { min-width: 0; } .zone-empty { margin: .8rem 0 0; }
-  .zone-editor { margin: .9rem 0; padding: 1rem; background: var(--panel-strong); border-radius: 10px; } .zone-editor h4 { margin: 1rem 0 .45rem; font-size: .9rem; } .membership-list { display: grid; gap: .35rem; } .membership-list label { display: flex; align-items: center; gap: .55rem; min-height: 2.5rem; } .membership-list small { display: block; color: var(--muted); font-size: .75rem; } .zone-create { margin-top: .2rem; } .zone-create .field-actions { align-items: end; } .zone-create .primary-button { white-space: nowrap; } .unassigned-outputs { border-top: 1px solid var(--line); margin-top: 1.2rem; padding-top: 1rem; } .unassigned-member { margin-top: .5rem; } .add-output { border-top: 1px solid var(--line); margin-top: 1.1rem; padding-top: .8rem; } .add-output summary { cursor: pointer; color: var(--muted); } .add-output[open] summary { color: var(--text); }
+  .zone-editor { margin: .9rem 0; padding: 1rem; background: var(--panel-strong); border-radius: 10px; } .zone-editor h4 { margin: 1rem 0 .45rem; font-size: .9rem; } .membership-list { display: grid; gap: .35rem; } .membership-list label { display: flex; align-items: center; gap: .55rem; min-height: 2.5rem; } .membership-list small { display: block; color: var(--muted); font-size: .75rem; } .zone-create { margin-top: .2rem; } .zone-create .field-actions { align-items: end; } .zone-create .primary-button { white-space: nowrap; } .unassigned-outputs { border-top: 1px solid var(--line); margin-top: 1.2rem; padding-top: 1rem; } .unassigned-member { margin-top: .5rem; }
   @media (max-width: 720px) { .zone-card-head { align-items: flex-start; flex-direction: column; } .zone-member-picker { flex: 1 1 100%; } .zone-member-picker select { width: 100%; } }
 </style>

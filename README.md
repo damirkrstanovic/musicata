@@ -91,7 +91,6 @@ covered in **[Running & deploying Musicata](docs/deployment.md)**.
 - [Recommendations & Radio](docs/recommendations.md)
 - [Continuous Play](docs/continuous-play.md)
 - [Snapcast Transport](docs/snapcast.md)
-- [Native Playback Endpoint](docs/native-endpoint.md)
 - [Audio ML Service (embeddings & tags)](docs/musicata-ml.md)
 - [Plugins](docs/plugins.md)
 - [Web UI Style Guide](docs/style-guide.md)

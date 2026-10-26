@@ -12,9 +12,9 @@ Severity legend: 🔴 bug (wrong/unsafe behavior) · 🟡 issue (suboptimal/frag
 > binaries were ever published for those tags; if you built one from source, upgrade.
 > Report anything new privately instead — see [SECURITY.md](../SECURITY.md).
 
-**Status summary:** 15 bugs (✅ all 15 fixed with tests) · issues ISS-01..44 (✅ 39 fixed, 5 deferred: ISS-05/06 MPD race+poll, ISS-09 jsonp, ISS-23 concurrent scan, ISS-43 endpoint async download) · overcomplicated CPX-01..10 (✅ 4 fixed: CPX-02/03/07/08; 6 deferred/won't-fix with rationale: CPX-01 scanner hot path, CPX-04 needs fingerprint column, CPX-05 migration de-dup risk, CPX-06 needs streaming dep, CPX-09 embedding stability, CPX-10 index keying is correct).
+**Status summary:** 14 bugs (✅ all 14 fixed with tests) · issues ISS-01..42 (✅ 38 fixed, 4 deferred: ISS-05/06 MPD race+poll, ISS-09 jsonp, ISS-23 concurrent scan) · overcomplicated CPX-01..10 (✅ 4 fixed: CPX-02/03/07/08; 6 deferred/won't-fix with rationale: CPX-01 scanner hot path, CPX-04 needs fingerprint column, CPX-05 migration de-dup risk, CPX-06 needs streaming dep, CPX-09 embedding stability, CPX-10 index keying is correct).
 
-Deferred items each carry a one-line rationale inline. (The "38 issues" headline from the original audit corresponds to this ISS-01..44 list.)
+Deferred items each carry a one-line rationale inline.
 
 Verified clean (audited, no defect): browser playback hot path (now-title never re-renders on a
 progress tick); all background `*_loop` workers (own queue, idle sleep, no coupling, no busy-spin,
@@ -47,12 +47,6 @@ Security-sensitive bugs are marked **[security]**.
   **Repro:** zip with entry `artwork/../escaped.txt` (+ a `musicata.db` entry so `found_db` passes);
   call `extract_import` with `artwork_import=/tmp/x/artwork`. Actual: file written to
   `/tmp/x/escaped.txt`, outside the staging dir. Expected: write confined under the staging dir.
-
-- [x] **BUG-04 [security] Endpoint leaks its Bearer token to look-alike hosts** ✅ fixed: pure `resolve_request` attaches the token only for relative (library) URLs; tests `lookalike_host_does_not_receive_token`, `external_stream_does_not_receive_token`, `library_relative_url_resolves_and_carries_token` — `crates/musicata-endpoint/src/audio.rs:56`
-  `fetch` attaches the player token when `url.starts_with(&self.base_url)` — a prefix check, not
-  scheme+authority. `stream_url` for radio/podcast can be external.
-  **Repro:** `AudioPlayer::new("http://127.0.0.1:3030","secret")`; `fetch("http://127.0.0.1:3030.example.com/track")`.
-  Actual: `Authorization: Bearer secret` sent to the attacker host. Expected: no auth header.
 
 - [x] **BUG-05 Shuffle is a no-op for browser, zone, and Snapcast players** ✅ fixed: shuffled-order semantics (no repeats until exhausted, reshuffle on repeat-all), current track first. `QueueState.shuffle_order` walked by `advance`/`step_previous` (browser + zone) and `next_index` (Snapcast); seeded by a dependency-free SplitMix64; persisted across restart via a JSON `shuffle_order` column (migration 033). Tests: `build_shuffle_order_*`, `shuffle_order_valid_*`, `advance_and_previous_follow_the_shuffle_order`, `shuffle_advance_stops_at_end_without_repeat`, `shuffle_advance_reshuffles_at_end_with_repeat_all`, `next_index_follows_shuffle_order` (snapcast), and the storage round-trip in `save_player_queue`/`load_player_queue`. — `crates/musicata-server/src/players.rs:1847` (SetShuffle), `:1906` (advance), `:1997` (next_index)
   `SetShuffle` only stores+broadcasts the flag; server-owned `advance` and Snapcast `next_index`
@@ -222,11 +216,6 @@ Security-sensitive bugs are marked **[security]**.
 - [x] **ISS-40 Detail views stuck on "Loading…" on fetch failure** — Album/Artist/Playlist/SmartPlaylist ✅ each tracks a `failed` state and renders an error branch instead of a perpetual spinner.
 - [x] **ISS-41 Sidebar search debounce timer not cleared on destroy** — `Sidebar.svelte:30` ✅ `onDestroy(() => clearTimeout(searchTimer))`.
 - [x] **ISS-42 `session.init` registers the unauthorized listener inside `init()`** — `session.svelte.ts:31` ✅ moved to the constructor (registered once for the singleton; catches a 401 during init).
-
-### Endpoint
-
-- [ ] **ISS-43 Whole-track HTTP download runs on the single control-loop thread** — `endpoint/main.rs:185` ⏸️ DEFERRED — fixing this means making the fetch async/off-thread, which is a real redesign of the endpoint's single-threaded control loop (the rodio `Sink` isn't trivially `Send`). Endpoint is opt-in/non-default.
-- [x] **ISS-44 Dropped session rebuilds `AudioPlayer`, restarting the track from 0** — `endpoint/main.rs:49` ✅ `AudioPlayer`/`EndpointView` are owned by `main` and passed into `run_session`, so a reconnect keeps the current track playing (and the preserved view avoids a reload-from-0). Verified by build/tests.
 
 ---
 

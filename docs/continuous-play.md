@@ -8,8 +8,8 @@ Date: 2026-06-07
 
 ## Current behavior
 
-The global **Autoplay** switch in Queue applies to browser, standalone MPD, Snapcast,
-native endpoints, and zones. A background scheduler checks each output every second.
+The global **Autoplay** switch in Queue applies to browser, standalone MPD, Snapcast, and zones.
+A background scheduler checks each output every second.
 With repeat off and fewer than five upcoming tracks, it starts one lookup per output and
 appends up to ten similar library tracks, using the current song as the seed. Lookups run
 independently, so a slow output cannot delay another. Zone members are skipped individually;
@@ -147,7 +147,7 @@ Coverage: **browser ✓, zone ✓** (both via `track_ended`); **MPD ✓** with t
    `((•))` button; `playTrackIds`/`startRadio` in the web player.
 3. **[DONE] Autoplay + `< 5` refill** — a decoupled `autoplay_loop` (global `autoplay` setting,
    `GET/PUT /api/autoplay`, an "Autoplay" toggle in the queue drawer) that tops up a playing
-   queue (browser, MPD, Snapcast, native endpoints, and zones) with similar tracks when fewer than 5 remain, sliding the seed to the
+   queue (browser, MPD, Snapcast, and zones) with similar tracks when fewer than 5 remain, sliding the seed to the
    current track and excluding what's queued + recently played.
 4. **[DONE] Per-artist cap** (≤2 per batch, round-robin so no artist dominates). **Next:** a
    skip-penalty cooldown (`event_kind='skipped'`).

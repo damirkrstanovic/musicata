@@ -19,7 +19,7 @@ Building the optional audio-ML service (`crates/musicata-ml`). Design + run guid
   track (a dub track scored Music/Drum/Bass/Percussion — correct).
 - **Model is fetched + cached at runtime, never committed** (~327 MB). The 527 AudioSet display
   names *are* bundled (8 KB) so tags are human-readable without a download.
-- **Excluded from the default workspace build** (like the endpoint) — `ort`/ONNX Runtime is heavy
+- **Excluded from the default workspace build** — `ort`/ONNX Runtime is heavy
   and network-fetched; the server's build/test/release path must not depend on it. Build with
   `cargo build -p musicata-ml`.
 - **HTTP boundary, POST raw bytes to `/analyze`.** Keeps the ML service stateless and fully
@@ -61,10 +61,12 @@ Building the optional audio-ML service (`crates/musicata-ml`). Design + run guid
   the seed vector and `ORDER BY distance LIMIT k+1`, dropping the seed. Validated end-to-end (a
   vec0 KNN test + a 2048-d store/similarity test).
 
-## 2026-06-27 — Native endpoint prototype (M10)
+## 2026-06-27 — Native endpoint prototype (M10, superseded 2026-10-26)
 
-A native playback endpoint (`crates/musicata-endpoint`). Design + usage in `native-endpoint.md`;
-the key calls:
+This records the rationale for the former native playback endpoint. The endpoint crate, service,
+and `native` player kind were removed on 2026-10-26 in favour of browser playback, MPD, and
+Snapcast, so the implementation and usage guide no longer exist. The decisions below describe
+the retired prototype rather than supported behavior.
 
 - **Reuse the browser player server-side.** A native endpoint and a browser tab are the same
   server-side thing — a queue-output driven over the bidirectional WS. So `bring_up` maps the
@@ -81,12 +83,12 @@ the key calls:
   simple; a single-threaded blocking design (WS read with a short socket timeout as a ~2 Hz tick
   for progress/ended) is far less code than an async runtime. `ws://`-only (LAN); whole-track
   buffering; no seek-follow/gapless — all acceptable prototype limits, documented.
-- **Excluded from the default workspace build.** rodio pulls cpal → ALSA, which the server build
+- **Excluded from the default workspace build.** rodio pulled cpal → ALSA, which the server build
   must not require. `default-members` lists the three server crates only, so the pre-commit's
   plain `cargo test` and the `-p musicata-server` release/Docker builds never touch the endpoint;
-  it builds on demand (`cargo build -p musicata-endpoint`).
+  therefore did not build by default.
 - **Control logic is a pure `decide()` function** separate from audio/IO, so the state machine is
-  unit-tested without a sound device; the audio path itself is a manual run (like `live_mpd`).
+  unit-tested without a sound device; the audio path itself was a manual run (like `live_mpd`).
 
 ## 2026-06-27 — Roadmap sweep #3: UI surfacing (M7 stats view, M11 leveling selector)
 
@@ -135,21 +137,22 @@ Surface two already-shipped backends in the web player.
   re-decode. Stored in a new `album_loudness` table (migration), recomputed from `track_loudness`
   after each loudness pass that did work.
 
-### M10 — Player endpoint auth
+### M10 — Player endpoint auth (native-endpoint portion superseded 2026-10-26)
 
-- **Implemented the per-player token mechanism now (not deferred).** Last round it was designed
+- **Implemented the per-player token mechanism now (not deferred).** At the time, the mechanism was designed
   but deferred "until something presents a token." This round, the user asked for M10, so the
   mechanism shipped: token issuance (`issue_token` at registration), SHA-256 storage
   (`players.auth_token_hash`, migration v30), and `require_auth` accepting a player token on that
   player's `/state`/`/commands`/`/ws` channels in place of a user session.
-- **It is additive and opt-in, so it changes nothing for existing players.** The token is
+- **It is additive and opt-in, so it changed nothing for existing players.** The token is
   consulted only when user auth fails, only for those three channel paths, and only for a player
-  that has a token. Server-initiated backends (browser/MPD/Snapcast) carry no token and stay
-  user-gated — the web app keeps working unchanged. This is why it was safe to enforce now even
+  that has a token. The browser and Snapcast stay user-gated; supported MPD registrations can
+  opt in. The web app keeps working unchanged. This is why it was safe to enforce now even
   though the self-registering native-endpoint *kind* (which would actually present the token)
   doesn't exist yet; that endpoint program + its player variant remain the open M10 piece.
 - Tested end to end over HTTP (tokened channel reachable token-only; wrong/absent token 401;
-  token scoped to its own player) plus unit tests. See `player-auth.md`.
+  token scoped to its own player) plus unit tests. The native endpoint's use of the protocol was
+  retired; supported MPD registrations retain it. See `player-auth.md`.
 
 ## 2026-06-27 — Roadmap sweep: M7, M9, M10, M12
 
@@ -201,21 +204,17 @@ A batch of milestone work was done autonomously; the judgement calls are recorde
   "define PlayerProvider and endpoint capabilities" item: a controller can now ask what a player
   supports (seek, volume, queue editing, streams) instead of probing.
 - **Per-player endpoint auth token: designed and documented, enforcement deferred.** See
-  `player-auth.md`. The token column + issuance are *not* added yet because the only thing that
+  `player-auth.md`. At this point the token column + issuance were *not* added yet because the only thing that
   would present it — a native non-browser endpoint that registers *itself* — does not exist; the
   browser, MPD and Snapcast players are all **server-initiated** and already covered by the
   user-session `require_auth` middleware. Adding an unenforced token now would be security
   theatre. The design is committed so it lands with the native endpoint (the M10 "native endpoint
   prototype" task).
-- **The self-registering `native` endpoint is the finished M10 endpoint; no more bridges
-  (2026-06-27).** `musicata-endpoint` self-registers (`issue_token`), persists its scoped token,
-  and reuses the same player identity across restarts — now service-ready (env-var config +
-  `packaging/musicata-endpoint.service`) and verified end-to-end. The other transports are
-  **deliberately not planned**: **Squeezelite/LMS** — out of scope; **Chromecast** — no open
-  self-contained sender (proprietary); **UPnP/DLNA** — aging and low-value (its only draw is
-  pushing to an existing AV receiver, which a native endpoint or **Snapcast** already covers,
-  without UPnP's no-auth / flaky-discovery / no-sync drawbacks). Snapcast remains our
-  sync-transport answer. This closes M10.
+- **The self-registering `native` endpoint was the finished M10 endpoint (2026-06-27).** It
+  self-registered (`issue_token`), persisted its scoped token, and reused the same player
+  identity across restarts. This decision was superseded on 2026-10-26: the endpoint and its
+  service were removed. Browser playback, MPD, and Snapcast are the supported outputs; Snapcast
+  remains the synchronized transport.
 
 ### M12 — Packaging, security & operations
 
@@ -267,4 +266,3 @@ Rejected, with the reason:
   the library serves, and a heavy native dep would undercut the single-binary story.
 - **Native mobile apps.** The installable PWA is the client. If a desktop package is ever wanted,
   a Tauri wrapper around the same web app is the likely path.
-

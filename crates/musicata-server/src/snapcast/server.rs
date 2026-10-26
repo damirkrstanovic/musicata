@@ -653,12 +653,27 @@ fn authorization_block(rooms: &[SnapRoom]) -> String {
 /// The `snapclient` command to run on a room device: connects with the room's password and
 /// identifies itself by name. (The password is sent today but not enforced by snapserver
 /// 0.35 — see `docs/snapcast.md`; it becomes enforcing when upstream ships auth.)
-pub fn install_command(host: &str, room: &SnapRoom) -> String {
+pub fn install_command(host: &str, room: &SnapRoom, auth_enabled: bool) -> String {
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let credentials = auth_enabled
+        .then(|| format!("{}:{}@", room.name, room.password))
+        .unwrap_or_default();
+    let uri = format!("tcp://{credentials}{authority}:1704");
     format!(
-        "snapclient 'tcp://{name}:{pw}@{host}:1704' --hostID '{name}'",
-        name = room.name,
-        pw = room.password,
+        "snapclient {} --hostID {}",
+        shell_single_quote(&uri),
+        shell_single_quote(&room.name),
     )
+}
+
+/// The command is copied into a shell on a remote player. The provisioning endpoint validates
+/// host syntax too, but quote here as a second boundary for existing stored settings.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Render the snapserver config: the Musicata library pipe stream, any enabled AirPlay/Spotify
@@ -1094,11 +1109,32 @@ while True:
 
     #[test]
     fn install_command_embeds_name_and_password() {
-        let cmd = install_command("musicata.local", &room("kitchen", "secret"));
+        let cmd = install_command("musicata.local", &room("kitchen", "secret"), true);
         assert_eq!(
             cmd,
             "snapclient 'tcp://kitchen:secret@musicata.local:1704' --hostID 'kitchen'"
         );
+    }
+
+    #[test]
+    fn install_command_without_auth_does_not_expose_password() {
+        let cmd = install_command("2001:db8::1", &room("kitchen", "secret"), false);
+        assert_eq!(
+            cmd,
+            "snapclient 'tcp://[2001:db8::1]:1704' --hostID 'kitchen'"
+        );
+        assert!(!cmd.contains("secret"));
+    }
+
+    #[test]
+    fn install_command_quotes_a_stored_host_safely() {
+        let cmd = install_command(
+            "musicata.example'; touch /tmp/pwned",
+            &room("kitchen", "pw"),
+            false,
+        );
+        assert!(cmd.contains("'\\''"));
+        assert!(!cmd.contains("; touch /tmp/pwned' --hostID"));
     }
 
     #[test]

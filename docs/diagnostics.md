@@ -20,11 +20,11 @@ session information, and recorder loss counters. Output/source/track references 
 hashed; names, addresses, filesystem paths, credentials and unrestricted exception
 strings are excluded. It contains neither music nor the library database.
 
-Browser and native audio clients report scoped audio, buffering, routing and DSP
-failures. Server-owned MPD, Snapcast, source, persistence and analysis boundaries
-retain their failures. Reports require authentication: an endpoint token can report
-only for its own output; browser reports require a private capability for the current
-renderer lease, so another listener or an old tab cannot recover its incidents.
+Browser audio clients report scoped audio, buffering, routing and DSP failures.
+Server-owned MPD, Snapcast, source, persistence and analysis boundaries retain their
+failures. Reports require authentication: browser reports require a private capability
+for the current renderer lease, so another listener or an old tab cannot recover its
+incidents.
 Inspecting, exporting or enabling detail requires an administrator, including during
 initial setup.
 
@@ -65,10 +65,9 @@ use the backend's actual available playback time.
 
 These signals identify reported software failures and delays. They cannot measure
 analogue glitches, establish what reached the DAC, or prove uninterrupted audible
-playback. Offline browser history is bounded; the native reporter coalesces five
-categories into fixed pending failure/recovery state and spaces requests to respect
-ingestion limits. Undelivered current recovery remains eligible for retry. Both
-report known losses after reconnecting; a process killed abruptly can lose uncommitted evidence. Physical
+playback. Offline browser history is bounded and report delivery is rate-limited. Undelivered
+current recovery remains eligible for retry. A process killed abruptly can lose uncommitted
+evidence. Physical
 output validation and sustained listening complement the automated checks.
 
 ## Background-work retry status

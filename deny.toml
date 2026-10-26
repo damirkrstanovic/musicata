@@ -10,8 +10,8 @@
 # Run locally:  cargo deny check licenses
 
 [graph]
-# Check every optional feature and both non-default workspace members (musicata-ml,
-# musicata-endpoint), so a license problem can't hide behind a feature flag.
+# Check every optional feature and the non-default musicata-ml workspace member,
+# so a license problem can't hide behind a feature flag.
 all-features = true
 
 [licenses]

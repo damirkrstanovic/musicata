@@ -215,7 +215,7 @@ copyright banners removed. The notices below restore that attribution. Regenerat
 
 The Rust inventory is the union of every crate in \`Cargo.lock\`, which spans the whole
 workspace — a given binary links a subset (\`musicata-server\` never links the \`musicata-ml\`
-or \`musicata-endpoint\` trees). Over-listing is deliberate: it cannot under-attribute. The
+tree). Over-listing is deliberate: it cannot under-attribute. The
 npm inventory is the opposite — narrowed to the packages whose code actually reaches
 \`web/dist\`, because build-time tooling is never redistributed.
 

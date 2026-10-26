@@ -231,10 +231,8 @@ Activation failures restore the old proxy, credentials, binary/container and Mus
 HTTPS activation succeeds only after a trusted certificate and the proxied health endpoint
 are available.
 
-The native **audio endpoint** currently supports only HTTP/WebSocket connections; it cannot
-connect remotely to an HTTPS-only installation until HTTPS/WSS support is added. Native
-server installation and local MPD playback work with Caddy. With discovery selected, host
-mDNS and cast-in discovery remain enabled, but the loopback HTTP backend is no longer
+Native server installation and local MPD playback work with Caddy. With discovery selected,
+host mDNS and cast-in discovery remain enabled, but the loopback HTTP backend is no longer
 advertised; access the web app using its configured TLS hostname.
 
 ```sh

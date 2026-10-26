@@ -478,7 +478,6 @@ Profiles remain shared; physical browser sink bindings and browser loudness mode
 | Output | Processing | Meter tap | Room convolution |
 |---|---|---|---|
 | Browser | Web Audio | After EQ, leveling and software volume | Supported |
-| Native endpoint | Shared Rust PEQ/preamp, rodio adapter | Final clipped software output | Unsupported |
 | Snapcast | Shared Rust PEQ/preamp in PCM writer | Shared stream, before network/DAC buffering | Unsupported |
 | MPD | Optional CamillaDSP 4.1.x on the playback host | Processor playback RMS/sample peak | Unsupported by this binding |
 | Zone | Choose a member | That member's tap | Member capability |
@@ -487,8 +486,8 @@ Snapcast correction affects all clients receiving its stream. A stream meter can
 room-specific DAC levels or independent room correction. Downstream hardware volume is outside
 all software taps. RMS and sample peak are linear full-scale amplitude, not true peak or sound
 pressure. Meter subscriptions publish bounded snapshots; stale, paused and disconnected readings
-clear. The first browser renderer holds a connection-scoped lease; scoped native endpoint tokens
-can render only their own output. Controllers cannot impersonate native or MPD renderers.
+clear. The first browser renderer holds a connection-scoped lease. Controllers cannot impersonate
+the renderer or MPD processor.
 
 ![A controller displaying measured stereo levels for a remote output](images/output-vu.png)
 

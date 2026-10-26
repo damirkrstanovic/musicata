@@ -26,10 +26,6 @@ use std::{
 };
 use tokio::sync::{Mutex, watch};
 
-/// Set only by scoped endpoint authentication, never by a WebSocket payload.
-#[derive(Clone)]
-pub struct EndpointIdentity(pub String);
-
 pub struct OutputRuntime {
     pub state: OutputDspState,
     owner: Option<u64>,
@@ -314,6 +310,9 @@ impl OutputAudio {
             .await
             .map_err(db_error)?
             .ok_or_else(|| AppError::not_found("unknown output"))?;
+        if !matches!(record.kind.as_str(), "browser" | "mpd" | "snapcast") {
+            return Err(AppError::not_found("inactive output"));
+        }
         let mut entries = self.entries.lock().await;
         if let Some(entry) = entries.get(id) {
             return Ok(entry.clone());
@@ -337,7 +336,6 @@ impl OutputAudio {
             }
         }
         let point = match record.kind.as_str() {
-            "native" => MeasurementPoint::NativeOutput,
             "mpd" => MeasurementPoint::CamilladspPlayback,
             "snapcast" => MeasurementPoint::SnapcastStream,
             _ => MeasurementPoint::BrowserOutput,
@@ -620,7 +618,6 @@ pub async fn set_selection(
 pub async fn audio_ws(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    identity: Option<axum::Extension<EndpointIdentity>>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let _profiles = state.output_audio.profile_changes.lock().await;
@@ -636,8 +633,7 @@ pub async fn audio_ws(
                 .connections
                 .fetch_add(1, Ordering::Relaxed)
                 + 1;
-            let can_render = output.kind == "browser"
-                || (output.kind == "native" && identity.is_some_and(|identity| identity.0.0 == id));
+            let can_render = output.kind == "browser";
             upgrade.on_upgrade(move |socket| {
                 socket_loop(socket, state, output, connection, can_render)
             })
@@ -828,7 +824,6 @@ async fn socket_loop(
                     Inbound::Renderer => {
                         if can_render && output.runtime.lock().await.claim(connection) {
                             rendering = true;
-                            if output.kind=="native" {crate::diagnostics::recovery("native.connection","native",Some(&id));}
                             output.publish_state().await;
                             let config = output.config.borrow().clone();
                             let reporter_token=output.runtime.lock().await.reporter_token();
@@ -870,14 +865,6 @@ async fn socket_loop(
         output
             .config
             .send_modify(|config| config.meter_subscribed = active);
-    }
-    if rendering && playing && output.kind == "native" && !output.closed.load(Ordering::Acquire) {
-        crate::diagnostics::failure(
-            "native.connection",
-            "native",
-            Some(&id),
-            "connection closed",
-        );
     }
     output.runtime.lock().await.release(connection);
     output.publish_state().await;

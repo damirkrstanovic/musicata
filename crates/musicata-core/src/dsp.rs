@@ -165,7 +165,6 @@ pub enum DspStatus {
 #[serde(rename_all = "snake_case")]
 pub enum MeasurementPoint {
     BrowserOutput,
-    NativeOutput,
     SnapcastStream,
     CamilladspPlayback,
 }

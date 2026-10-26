@@ -215,9 +215,12 @@ fn is_admin_path(path: &str) -> bool {
 
 fn is_admin_mutation_path(path: &str, method: &axum::http::Method) -> bool {
     !matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
-        && (path == "/api/snapcast/status"
+        && (path == "/api/players"
+            || path == "/api/players/probe"
+            || path == "/api/snapcast/status"
             || path == "/api/snapcast/usb-wake"
             || path.starts_with("/api/snapcast/rooms")
+            || path == "/api/snapcast/players/provision"
             || path.starts_with("/api/snapcast/groups/")
             || (path.starts_with("/api/snapcast/clients/") && !path.ends_with("/volume"))
             || (path.starts_with("/api/albums/")
@@ -235,18 +238,12 @@ fn is_open_path(path: &str) -> bool {
     )
 }
 
-/// If `path` is a player's own endpoint channel — `/api/players/{id}/{state,commands,ws}` —
-/// return its player id. These are the channels a self-registered endpoint authenticates on
-/// with its per-player token (M10); player *management* paths (PATCH/DELETE `/api/players/{id}`)
-/// are excluded and still require a user.
+/// If `path` is a player's own control channel, return its player id. Player management paths
+/// remain user-gated.
 fn player_channel_id(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/api/players/")?;
     let (id, tail) = rest.split_once('/')?;
-    matches!(
-        tail,
-        "state" | "commands" | "ws" | "audio/ws" | "diagnostics"
-    )
-    .then_some(id)
+    matches!(tail, "state" | "commands" | "ws").then_some(id)
 }
 
 /// Track and radio audio relays that a playback endpoint may fetch with its token.
@@ -335,18 +332,16 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
                 .flatten()
                 .is_some_and(|hash| hash == hash_token(token))
             {
-                request
-                    .extensions_mut()
-                    .insert(crate::output_audio::EndpointIdentity(player_id.to_owned()));
+                if state.players.get(player_id).await.is_some() {
+                    return next.run(request).await;
+                }
             }
         }
         return next.run(request).await;
     }
     let Some(user) = resolve_user(&state, cookie, api_token.clone()).await else {
-        // Fall back to per-player endpoint auth (M10): a self-registered endpoint authenticates
-        // with just its player token (no user session) for (a) its own channels and (b) the
-        // audio streams it must fetch to play. Only for players that actually have a token;
-        // everything else stays user-gated.
+        // Fall back to a supported player's scoped token for its own control channel or an
+        // audio relay. Retired player rows keep their hashes but cannot authenticate.
         if let Some(token) = api_token {
             if matches!(
                 *request.method(),
@@ -360,16 +355,14 @@ pub async fn require_auth(state: AppState, mut request: Request, next: Next) -> 
             if let Some(player_id) = player_channel_id(&path)
                 && let Ok(Some(stored)) = state.database.player_auth_token_hash(player_id).await
                 && constant_time_eq(&stored, &hashed)
+                && state.players.get(player_id).await.is_some()
             {
-                request
-                    .extensions_mut()
-                    .insert(crate::output_audio::EndpointIdentity(player_id.to_string()));
                 return next.run(request).await;
             }
             if is_stream_path(&path)
                 && state
                     .database
-                    .player_token_exists(&hashed)
+                    .active_player_token_exists(&hashed)
                     .await
                     .unwrap_or(false)
             {
@@ -925,6 +918,14 @@ mod tests {
             "/api/albums/a/artwork/refresh",
             &axum::http::Method::POST
         ));
+        assert!(is_admin_mutation_path(
+            "/api/players",
+            &axum::http::Method::POST
+        ));
+        assert!(is_admin_mutation_path(
+            "/api/players/probe",
+            &axum::http::Method::POST
+        ));
         assert!(!is_admin_mutation_path(
             "/api/albums/a/artwork",
             &axum::http::Method::GET
@@ -947,6 +948,10 @@ mod tests {
         assert!(is_admin_mutation_path(
             "/api/snapcast/usb-wake",
             &axum::http::Method::PATCH
+        ));
+        assert!(is_admin_mutation_path(
+            "/api/snapcast/players/provision",
+            &axum::http::Method::POST
         ));
         assert!(!is_admin_mutation_path(
             "/api/snapcast/usb-wake",
@@ -973,10 +978,7 @@ mod tests {
         assert_eq!(player_channel_id("/api/players/mpd/state"), Some("mpd"));
         assert_eq!(player_channel_id("/api/players/mpd/commands"), Some("mpd"));
         assert_eq!(player_channel_id("/api/players/abc-1/ws"), Some("abc-1"));
-        assert_eq!(
-            player_channel_id("/api/players/abc-1/audio/ws"),
-            Some("abc-1")
-        );
+        assert_eq!(player_channel_id("/api/players/abc-1/audio/ws"), None);
         assert_eq!(player_channel_id("/api/players/abc-1/dsp"), None);
         assert_eq!(player_channel_id("/api/players/abc-1/dsp/processor"), None);
         // Management paths and unknown tails are NOT endpoint channels (stay user-gated).

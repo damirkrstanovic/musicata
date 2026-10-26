@@ -4,9 +4,8 @@ name: ci
 # the UI smoke suite), but it is opt-in — `git config core.hooksPath .githooks` — so a
 # contributor's first PR arrives unverified without this.
 #
-# Only the default workspace members are built: `musicata-endpoint` (ALSA) and `musicata-ml`
-# (ONNX Runtime) carry heavy native dependencies and are deliberately excluded, exactly as a
-# plain `cargo test` excludes them locally.
+# `musicata-ml` carries heavy ONNX Runtime dependencies and is deliberately excluded from the
+# default workspace members, exactly as a plain `cargo test` excludes it locally.
 
 on:
   pull_request:

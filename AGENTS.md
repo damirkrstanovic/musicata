@@ -63,14 +63,12 @@ cargo build                         # default members; runs the Vite web build
 cargo build --no-default-features   # minimal: drop the SMB `smb` dep
 cargo test                          # default members (SMB tests run by default)
 cargo run -p musicata-server -- --library <dir> --addr 127.0.0.1:3030
-cargo build -p musicata-endpoint    # the native audio endpoint — opt-in (needs audio dev libs)
 cargo build -p musicata-ml          # the audio-ML service — opt-in (ort/ONNX Runtime; network)
 ```
 
-`musicata-endpoint` (native playback client, rodio → ALSA) and `musicata-ml` (audio-embedding
-service, ort/ONNX Runtime) are workspace members but **not** default members, so plain `cargo
-build`/`cargo test` skip them and the server never needs audio or ML libraries. Build/test them
-explicitly. See `docs/native-endpoint.md` and `docs/musicata-ml.md`.
+`musicata-ml` (audio-embedding service, ort/ONNX Runtime) is not a default workspace member, so
+plain `cargo build`/`cargo test` skip it and the server never needs ML libraries. Build/test it
+explicitly. See `docs/musicata-ml.md`.
 
 - **Node + npm are build dependencies** — `build.rs` runs the Vite build on every `cargo
   build`. Set `MUSICATA_SKIP_WEB_BUILD=1` with a prebuilt `web/dist/` to skip (offline /

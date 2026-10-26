@@ -11,7 +11,6 @@
 
   const points = {
     browser_output: "Browser output, after correction and volume",
-    native_output: "Native output, after correction and volume",
     snapcast_stream: "Shared Snapcast stream, before network buffering",
     camilladsp_playback: "Output processor playback",
   };

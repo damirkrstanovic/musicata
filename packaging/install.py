@@ -1268,7 +1268,6 @@ def main(argv=None):
         else:
             print('Public validation requires public DNS pointing to this host and internet access to ports 80/443.')
         if saved and 'caddy' not in saved['components']: print('Enabling HTTPS signs out existing browser sessions; sign in again at the HTTPS address.')
-        print('Native audio endpoints currently lack HTTPS/WSS support; the loopback backend is not reachable directly from other devices.')
     for issue in issues: print('BLOCKER:',issue)
     if cfg['check'] or cfg['dry_run']: return 1 if issues or (cfg['check'] and (missing or missing_librespot or missing_snapcast)) else 0
     if issues: raise InstallError('Resolve the blockers above before installing.')

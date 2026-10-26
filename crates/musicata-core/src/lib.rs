@@ -669,7 +669,7 @@ pub struct PlaybackState {
     #[serde(default)]
     pub queue_activity: Option<String>,
     /// The track the server will play next, given the current repeat/shuffle order — a hint
-    /// for clients that prefetch (the native endpoint's gapless playback). `None` when the
+    /// for clients that prefetch upcoming playback. `None` when the
     /// next item can't be predicted (end of a shuffle cycle, or the queue stops at the end).
     #[serde(default)]
     pub next_up: Option<QueueItem>,
