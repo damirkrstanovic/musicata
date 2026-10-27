@@ -1167,6 +1167,12 @@ if (sourceFixture) {
   check("sources: failed validation is visible", await waitUntil(`document.body.textContent.includes('Could not validate the changed source settings.')`, 7000) < Infinity);
   const preservedSource = (await api('/api/sources')).find(source => source.id === sourceFixture.id);
   check("sources: failed validation retains saved identity and configuration", preservedSource?.display_name === 'Renamed smoke source' && preservedSource.host === sourceFixture.host);
+  await js(`([...document.querySelectorAll('.admin-row')].find(row => row.textContent.includes('Renamed smoke source'))?.querySelector('button')?.click())`);
+  check("sources: failed validation retains the non-secret edit draft", await waitUntil(`document.querySelector('.source-edit input:not([readonly])')?.value === 'Rejected source name'`, 2000) < Infinity);
+  await js(`document.querySelector('.source-edit .field-actions button[type="button"]')?.click()`);
+  await js(`([...document.querySelectorAll('.admin-row')].find(row => row.textContent.includes('Renamed smoke source'))?.querySelector('button')?.click())`);
+  check("sources: cancelling a failed edit discards its draft", await waitUntil(`document.querySelector('.source-edit input:not([readonly])')?.value === 'Renamed smoke source'`, 2000) < Infinity);
+  await js(`document.querySelector('.source-edit .field-actions button[type="button"]')?.click()`);
   sourceFixtureAvailable = true;
 }
 await js(`document.querySelector('[data-settings-category="outputs"]')?.click()`);

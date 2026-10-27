@@ -17,6 +17,8 @@
   let clearPassword = $state(false);
   let updatingSourceId = $state<string | null>(null);
   let sourceRefreshFailed = $state(false);
+  type SourceDraft = { displayName: string; username: string; domain: string };
+  let sourceDrafts = $state<Record<string, SourceDraft>>({});
   let kind = $state<"smb" | "opensubsonic" | "podcast" | "archive">("smb");
 
   const CAPS: [keyof SourceView["capabilities"], string][] = [
@@ -108,13 +110,25 @@
   }
 
   function edit(source: SourceView) {
+    const draft = sourceDrafts[source.id];
     editing = source.id;
-    editName = source.display_name;
-    editUsername = source.username ?? "";
-    editDomain = source.domain ?? "";
+    editName = draft?.displayName ?? source.display_name;
+    editUsername = draft?.username ?? source.username ?? "";
+    editDomain = draft?.domain ?? source.domain ?? "";
     editPassword = "";
     clearPassword = false;
     setStatus("");
+  }
+
+  function discardDraft(id: string) {
+    const remaining = { ...sourceDrafts };
+    delete remaining[id];
+    sourceDrafts = remaining;
+  }
+
+  function cancelEdit() {
+    if (editing) discardDraft(editing);
+    editing = null;
   }
 
   async function saveSource(source: SourceView) {
@@ -123,6 +137,10 @@
     try {
       const password = clearPassword ? null : editPassword === "" ? undefined : editPassword;
       sourceRefreshFailed = false;
+      sourceDrafts = {
+        ...sourceDrafts,
+        [source.id]: { displayName: editName, username: editUsername, domain: editDomain },
+      };
       await api.updateSource(source.id, {
         display_name: editName,
         username: editUsername === "" ? null : editUsername,
@@ -155,10 +173,11 @@
         setStatus("This source was removed before its settings could be saved.", true);
         updatingSourceId = null;
       } else if (source.update_status?.state === "failed") {
-        setStatus(source.update_status.message ?? "Could not validate the changed source settings.", true);
+        setStatus("Could not validate the changed source settings. Check the credentials and connection; the saved source is unchanged.", true);
         updatingSourceId = null;
       } else if (!source.update_status) {
         setStatus("Source settings saved.");
+        discardDraft(id);
         updatingSourceId = null;
       }
     } catch {
@@ -227,7 +246,7 @@
           </div>
           <div class="field-actions">
             <button type="submit" class="primary-button" disabled={busy}>Save changes</button>
-            <button type="button" class="ghost-button" disabled={busy} onclick={() => editing = null}>Cancel</button>
+            <button type="button" class="ghost-button" disabled={busy} onclick={cancelEdit}>Cancel</button>
           </div>
         </form>
       {/if}
