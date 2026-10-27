@@ -532,6 +532,24 @@ impl Database {
             }
             set_user_version(&self.pool, 41).await?;
         }
+
+        if version < 42 {
+            ensure_column(
+                &self.pool,
+                "player_queue_items",
+                "automatically_added",
+                "ALTER TABLE player_queue_items ADD COLUMN automatically_added INTEGER NOT NULL DEFAULT 0 CHECK (automatically_added IN (0, 1))",
+            )
+            .await?;
+            ensure_column(
+                &self.pool,
+                "zone_queue_items",
+                "automatically_added",
+                "ALTER TABLE zone_queue_items ADD COLUMN automatically_added INTEGER NOT NULL DEFAULT 0 CHECK (automatically_added IN (0, 1))",
+            )
+            .await?;
+            set_user_version(&self.pool, 42).await?;
+        }
         Ok(())
     }
 
@@ -4569,8 +4587,8 @@ impl Database {
             for (seq, item) in items.iter().enumerate() {
                 sqlx::query(
                     "INSERT INTO player_queue_items
-                        (player_id, seq, track_id, title, artist, album, stream_url, artwork_url)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        (player_id, seq, track_id, title, artist, album, stream_url, artwork_url, automatically_added)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 )
                 .bind(player_id)
                 .bind(seq as i64)
@@ -4580,6 +4598,7 @@ impl Database {
                 .bind(&item.album)
                 .bind(&item.stream_url)
                 .bind(&item.artwork_url)
+                .bind(item.automatically_added)
                 .execute(&mut *conn)
                 .await?;
             }
@@ -4638,7 +4657,7 @@ impl Database {
             shuffle_order: decode_shuffle_order(row.try_get("shuffle_order")?),
         };
         let item_rows = sqlx::query(
-            "SELECT track_id, title, artist, album, stream_url, artwork_url
+            "SELECT track_id, title, artist, album, stream_url, artwork_url, automatically_added
              FROM player_queue_items WHERE player_id = ?1 ORDER BY seq",
         )
         .bind(player_id)
@@ -4654,6 +4673,7 @@ impl Database {
                     album: row.try_get("album")?,
                     stream_url: row.try_get("stream_url")?,
                     artwork_url: row.try_get("artwork_url")?,
+                    automatically_added: row.try_get::<i64, _>("automatically_added")? != 0,
                     ..Default::default()
                 })
             })
@@ -4710,8 +4730,8 @@ impl Database {
             for (seq, item) in items.iter().enumerate() {
                 sqlx::query(
                     "INSERT INTO zone_queue_items
-                        (zone_id, seq, track_id, title, artist, album, stream_url, artwork_url)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        (zone_id, seq, track_id, title, artist, album, stream_url, artwork_url, automatically_added)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 )
                 .bind(zone_id)
                 .bind(seq as i64)
@@ -4721,6 +4741,7 @@ impl Database {
                 .bind(&item.album)
                 .bind(&item.stream_url)
                 .bind(&item.artwork_url)
+                .bind(item.automatically_added)
                 .execute(&mut *conn)
                 .await?;
             }
@@ -4779,7 +4800,7 @@ impl Database {
             shuffle: row.try_get::<i64, _>("shuffle")? != 0,
         };
         let item_rows = sqlx::query(
-            "SELECT track_id, title, artist, album, stream_url, artwork_url
+            "SELECT track_id, title, artist, album, stream_url, artwork_url, automatically_added
              FROM zone_queue_items WHERE zone_id = ?1 ORDER BY seq",
         )
         .bind(zone_id)
@@ -4795,6 +4816,7 @@ impl Database {
                     album: row.try_get("album")?,
                     stream_url: row.try_get("stream_url")?,
                     artwork_url: row.try_get("artwork_url")?,
+                    automatically_added: row.try_get::<i64, _>("automatically_added")? != 0,
                     ..Default::default()
                 })
             })
@@ -5595,6 +5617,23 @@ impl Database {
         .bind(&source.password)
         .bind(&source.domain)
         .bind(source.created_at_unix_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Replace the editable configuration of an existing source without changing its identity
+    /// or creation time. Callers validate a candidate before invoking this method.
+    pub async fn update_source(&self, source: &SourceRecord) -> Result<()> {
+        sqlx::query(
+            "UPDATE sources SET display_name = ?2, enabled = ?3, username = ?4, password = ?5, domain = ?6 WHERE id = ?1",
+        )
+        .bind(&source.id)
+        .bind(&source.display_name)
+        .bind(source.enabled as i64)
+        .bind(&source.username)
+        .bind(&source.password)
+        .bind(&source.domain)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -8544,6 +8583,27 @@ mod tests {
         assert!(!fetched.enabled);
         assert_eq!(fetched.password.as_deref(), Some("secret"));
 
+        let updated = SourceRecord {
+            display_name: "Living room NAS".to_string(),
+            username: Some("music-user".to_string()),
+            password: Some(" password with spaces ".to_string()),
+            domain: Some("HOME".to_string()),
+            ..record.clone()
+        };
+        database
+            .update_source(&updated)
+            .await
+            .expect("update source");
+        assert_eq!(
+            database
+                .source(&record.id)
+                .await
+                .expect("get")
+                .expect("source"),
+            updated,
+            "an update replaces editable source configuration without changing its identity"
+        );
+
         database.delete_source(&record.id).await.expect("delete");
         assert!(database.list_sources().await.unwrap().is_empty());
 
@@ -10474,6 +10534,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_042_preserves_queue_items_and_defaults_provenance_to_manual() {
+        use musicata_core::{PlaybackStatus, QueueItem, RepeatMode};
+
+        let db_path = temp_db_path("queue-provenance-migration");
+        let playback = super::PlayerPlayback {
+            status: PlaybackStatus::Paused,
+            position: Some(0),
+            elapsed_seconds: Some(12.0),
+            volume: Some(55),
+            repeat: RepeatMode::All,
+            shuffle: false,
+            shuffle_order: Vec::new(),
+        };
+        let items = vec![QueueItem {
+            track_id: Some("track_1".to_string()),
+            title: "Saved queue item".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            stream_url: "/api/tracks/track_1/stream".to_string(),
+            artwork_url: None,
+            automatically_added: false,
+            ..Default::default()
+        }];
+
+        {
+            let database = Database::connect(&db_path).await.expect("connect");
+            database
+                .save_player_queue("player", &playback, &items)
+                .await
+                .expect("seed player queue");
+            database
+                .save_zone_queue("zone", &playback, &items)
+                .await
+                .expect("seed zone queue");
+
+            // Recreate an existing v41 database: its saved queue rows predate the
+            // provenance column, but must remain readable after the upgrade.
+            sqlx::query("ALTER TABLE player_queue_items DROP COLUMN automatically_added")
+                .execute(&database.pool)
+                .await
+                .expect("rewind player queue schema");
+            sqlx::query("ALTER TABLE zone_queue_items DROP COLUMN automatically_added")
+                .execute(&database.pool)
+                .await
+                .expect("rewind zone queue schema");
+            sqlx::query("PRAGMA user_version = 41")
+                .execute(&database.pool)
+                .await
+                .expect("rewind user version");
+        }
+
+        let database = Database::connect(&db_path)
+            .await
+            .expect("upgrade v41 database");
+        assert_eq!(
+            super::user_version(&database.pool).await.expect("version"),
+            42
+        );
+        for snapshot in [
+            database
+                .load_player_queue("player")
+                .await
+                .expect("load player queue")
+                .expect("player queue"),
+            database
+                .load_zone_queue("zone")
+                .await
+                .expect("load zone queue")
+                .expect("zone queue"),
+        ] {
+            assert_eq!(snapshot.playback, playback);
+            assert_eq!(snapshot.items, items);
+            assert!(
+                !snapshot.items[0].automatically_added,
+                "legacy queue rows default to manually added"
+            );
+        }
+
+        let mut automatic = items.clone();
+        automatic[0].automatically_added = true;
+        database
+            .save_player_queue("player", &playback, &automatic)
+            .await
+            .expect("save automatic player item");
+        database
+            .save_zone_queue("zone", &playback, &automatic)
+            .await
+            .expect("save automatic zone item");
+        assert!(
+            database
+                .load_player_queue("player")
+                .await
+                .expect("reload player queue")
+                .expect("player queue")
+                .items[0]
+                .automatically_added
+        );
+        assert!(
+            database
+                .load_zone_queue("zone")
+                .await
+                .expect("reload zone queue")
+                .expect("zone queue")
+                .items[0]
+                .automatically_added
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn saves_and_loads_a_player_queue() {
         use musicata_core::{PlaybackStatus, QueueItem, RepeatMode};
 
@@ -10497,6 +10668,7 @@ mod tests {
                 album: "Album".to_string(),
                 stream_url: "/api/tracks/track_1/stream".to_string(),
                 artwork_url: Some("/api/albums/a/cover".to_string()),
+                automatically_added: false,
                 ..Default::default()
             },
             QueueItem {
@@ -10506,6 +10678,7 @@ mod tests {
                 album: String::new(),
                 stream_url: "http://radio.example/stream".to_string(),
                 artwork_url: None,
+                automatically_added: true,
                 ..Default::default()
             },
         ];
@@ -10593,6 +10766,7 @@ mod tests {
                 album: "Album".to_string(),
                 stream_url: "/api/tracks/track_1/stream".to_string(),
                 artwork_url: Some("/api/albums/a/cover".to_string()),
+                automatically_added: false,
                 ..Default::default()
             },
             QueueItem {
@@ -10602,6 +10776,7 @@ mod tests {
                 album: "Album".to_string(),
                 stream_url: "/api/tracks/track_2/stream".to_string(),
                 artwork_url: None,
+                automatically_added: true,
                 ..Default::default()
             },
         ];

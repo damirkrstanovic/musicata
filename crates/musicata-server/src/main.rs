@@ -110,6 +110,8 @@ use tokio_stream::{Stream, StreamExt, wrappers::IntervalStream};
 use tracing_subscriber::EnvFilter;
 
 const PLAYBACK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+/// A candidate source must never hold its per-source operation slot indefinitely.
+const SOURCE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(35);
 const ARTWORK_CACHE_CONTROL: &str = "public, max-age=86400, must-revalidate";
 const TAG_WRITE_BACK_DISABLED_REASON: &str =
     "File tag write-back is disabled. Musicata currently updates only its database.";
@@ -129,6 +131,9 @@ struct AppState {
     listenbrainz: Arc<recommendations::ListenBrainzClient>,
     activity: Arc<activity::ActivityLog>,
     rescan_lock: Arc<Mutex<()>>,
+    source_mutation_locks: Arc<Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>>,
+    source_update_status: Arc<Mutex<BTreeMap<String, SourceUpdateStatus>>>,
+    next_source_update: Arc<AtomicU64>,
     most_played_cache: Arc<Mutex<Option<MostPlayedCache>>>,
     playback_sessions: Arc<RwLock<BTreeMap<String, PlaybackSession>>>,
     next_playback_session: Arc<AtomicU64>,
@@ -2954,6 +2959,9 @@ fn app_with_diagnostics(
         listenbrainz: Arc::new(recommendations::ListenBrainzClient::new()),
         activity,
         rescan_lock,
+        source_mutation_locks: Arc::new(Mutex::new(BTreeMap::new())),
+        source_update_status: Arc::new(Mutex::new(BTreeMap::new())),
+        next_source_update: Arc::new(AtomicU64::new(0)),
         most_played_cache: Arc::new(Mutex::new(None)),
         playback_sessions: Arc::new(RwLock::new(BTreeMap::new())),
         next_playback_session: Arc::new(AtomicU64::new(1)),
@@ -3120,7 +3128,10 @@ fn app_with_diagnostics(
         .route("/api/autoeq/index", get(autoeq_index))
         .route("/api/autoeq/preset", get(autoeq_preset))
         .route("/api/sources", get(list_sources).post(create_source))
-        .route("/api/sources/{id}", delete(delete_source))
+        .route(
+            "/api/sources/{id}",
+            patch(update_source).delete(delete_source),
+        )
         .route("/api/sources/{id}/rescan", post(rescan_source))
         .route("/api/sources/{id}/browse", get(browse_source))
         .route("/api/sources/{id}/resolve", get(resolve_source))
@@ -5361,6 +5372,23 @@ struct SourceView {
     display_name: String,
     enabled: bool,
     capabilities: musicata_core::ProviderCapabilities,
+    host: Option<String>,
+    share: Option<String>,
+    base_path: Option<String>,
+    username: Option<String>,
+    domain: Option<String>,
+    password_configured: bool,
+    update_status: Option<SourceUpdateStatus>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+struct SourceUpdateStatus {
+    #[serde(skip)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    request_id: u64,
+    state: String,
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5374,6 +5402,34 @@ struct CreateSourceRequest {
     username: Option<String>,
     password: Option<String>,
     domain: Option<String>,
+}
+
+/// Editable source credentials and display name. The location is deliberately immutable in
+/// this patch: changing it changes the provider identity and must be an explicit replacement.
+/// Nested options distinguish a missing credential (keep it) from JSON `null` (clear it).
+fn optional_source_field<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateSourceRequest {
+    display_name: Option<String>,
+    #[serde(default, deserialize_with = "optional_source_field")]
+    username: Option<Option<String>>,
+    #[serde(default, deserialize_with = "optional_source_field")]
+    password: Option<Option<String>>,
+    #[serde(default, deserialize_with = "optional_source_field")]
+    domain: Option<Option<String>>,
+    kind: Option<String>,
+    #[serde(default, deserialize_with = "optional_source_field")]
+    host: Option<Option<String>>,
+    #[serde(default, deserialize_with = "optional_source_field")]
+    share: Option<Option<String>>,
+    #[serde(default, deserialize_with = "optional_source_field")]
+    base_path: Option<Option<String>>,
 }
 
 /// Recent and in-progress background activities (scans, rescans), newest first.
@@ -6442,6 +6498,13 @@ async fn list_sources(State(state): State<AppState>) -> Result<Json<Vec<SourceVi
             display_name: "Local library".to_string(),
             enabled: true,
             capabilities: musicata_core::ProviderCapabilities::DISK,
+            host: None,
+            share: None,
+            base_path: None,
+            username: None,
+            domain: None,
+            password_configured: false,
+            update_status: None,
         },
         SourceView {
             id: providers::RADIO_PROVIDER_ID.to_string(),
@@ -6449,15 +6512,26 @@ async fn list_sources(State(state): State<AppState>) -> Result<Json<Vec<SourceVi
             display_name: "Internet radio".to_string(),
             enabled: true,
             capabilities: musicata_core::ProviderCapabilities::STREAM_ONLY,
+            host: None,
+            share: None,
+            base_path: None,
+            username: None,
+            domain: None,
+            password_configured: false,
+            update_status: None,
         },
     ];
+    let statuses = state.source_update_status.lock().await.clone();
     for record in state.database.list_sources().await.map_err(db_error)? {
-        views.push(source_view(&record));
+        views.push(source_view(&record, statuses.get(&record.id).cloned()));
     }
     Ok(Json(views))
 }
 
-fn source_view(record: &musicata_storage::SourceRecord) -> SourceView {
+fn source_view(
+    record: &musicata_storage::SourceRecord,
+    update_status: Option<SourceUpdateStatus>,
+) -> SourceView {
     // Most persisted sources are scannable disk-like sources; a podcast feed is a
     // browse-only stream source, so report its capabilities honestly (the UI uses this
     // to decide whether to offer a rescan, etc.).
@@ -6471,7 +6545,33 @@ fn source_view(record: &musicata_storage::SourceRecord) -> SourceView {
         display_name: record.display_name.clone(),
         enabled: record.enabled,
         capabilities,
+        host: source_host_view(&record.host),
+        share: record.share.clone(),
+        base_path: record.base_path.clone(),
+        username: record.username.clone(),
+        domain: record.domain.clone(),
+        password_configured: record.password.is_some(),
+        update_status,
     }
+}
+
+/// A source URL may contain user-info even though credentials have dedicated fields. Keep the
+/// location useful in the admin form without ever reflecting that accidental secret back out.
+fn source_host_view(host: &Option<String>) -> Option<String> {
+    host.as_ref().map(|host| {
+        let (scheme, authority_and_path) = host
+            .split_once("://")
+            .map(|(scheme, rest)| (Some(scheme), rest))
+            .unwrap_or((None, host.as_str()));
+        let authority_and_path = authority_and_path
+            .rsplit_once('@')
+            .filter(|(user_info, _)| user_info.contains(':'))
+            .map(|(_, without_user_info)| without_user_info)
+            .unwrap_or(authority_and_path);
+        scheme
+            .map(|scheme| format!("{scheme}://{authority_and_path}"))
+            .unwrap_or_else(|| authority_and_path.to_string())
+    })
 }
 
 /// Add a network source, register it, and rescan so its tracks merge into the
@@ -6692,7 +6792,219 @@ async fn create_source(
         &format!("Scanning new source {}", record.display_name),
     );
 
-    Ok(Json(source_view(&record)))
+    Ok(Json(source_view(&record, None)))
+}
+
+fn source_update_candidate(
+    mut current: musicata_storage::SourceRecord,
+    request: &UpdateSourceRequest,
+) -> Result<musicata_storage::SourceRecord, AppError> {
+    if request.kind.is_some()
+        || request.host.is_some()
+        || request.share.is_some()
+        || request.base_path.is_some()
+    {
+        return Err(AppError::bad_request(
+            "source type and location cannot be changed; remove this source and add the new location",
+        ));
+    }
+    if let Some(display_name) = &request.display_name {
+        if display_name.trim().is_empty() {
+            return Err(AppError::bad_request("source name cannot be empty"));
+        }
+        current.display_name = display_name.clone();
+    }
+    if let Some(username) = &request.username {
+        current.username = username.clone();
+    }
+    if let Some(password) = &request.password {
+        current.password = password.clone();
+    }
+    if let Some(domain) = &request.domain {
+        current.domain = domain.clone();
+    }
+    Ok(current)
+}
+
+async fn set_source_update_status(
+    statuses: &Arc<Mutex<BTreeMap<String, SourceUpdateStatus>>>,
+    id: String,
+    status: Option<SourceUpdateStatus>,
+) {
+    let mut statuses = statuses.lock().await;
+    if let Some(status) = status {
+        statuses.insert(id, status);
+    } else {
+        statuses.remove(&id);
+    }
+}
+
+async fn finish_source_update(
+    statuses: &Arc<Mutex<BTreeMap<String, SourceUpdateStatus>>>,
+    id: String,
+    request_id: u64,
+    status: Option<SourceUpdateStatus>,
+) {
+    let mut statuses = statuses.lock().await;
+    if statuses
+        .get(&id)
+        .is_none_or(|current| current.request_id != request_id)
+    {
+        return;
+    }
+    if let Some(status) = status {
+        statuses.insert(id, status);
+    } else {
+        statuses.remove(&id);
+    }
+}
+
+async fn source_update_is_current(
+    statuses: &Arc<Mutex<BTreeMap<String, SourceUpdateStatus>>>,
+    id: &str,
+    request_id: u64,
+) -> bool {
+    statuses
+        .lock()
+        .await
+        .get(id)
+        .is_some_and(|status| status.request_id == request_id)
+}
+
+async fn source_mutation_lock(state: &AppState, id: &str) -> Arc<Mutex<()>> {
+    let mut locks = state.source_mutation_locks.lock().await;
+    locks.retain(|_, lock| lock.upgrade().is_some());
+    if let Some(lock) = locks.get(id).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(id.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+/// Check a changed source away from the request path, then swap it into both persistent and
+/// live state only after the candidate succeeds. The operation lock also serializes deletion,
+/// so a failed candidate cannot resurrect a removed source.
+async fn apply_source_update(
+    state: AppState,
+    id: String,
+    request_id: u64,
+    activity_id: u64,
+    request: UpdateSourceRequest,
+) {
+    let lock = source_mutation_lock(&state, &id).await;
+    let _operation = lock.lock().await;
+    let result = async {
+        if !source_update_is_current(&state.source_update_status, &id, request_id).await {
+            return Ok::<bool, AppError>(false);
+        }
+        let current = state
+            .database
+            .source(&id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| AppError::not_found(format!("unknown source: {id}")))?;
+        let candidate = source_update_candidate(current, &request)?;
+        let handle = providers::provider_from_record(&candidate)
+            .map_err(|_| AppError::bad_request("the changed source settings are invalid"))?;
+        tokio::time::timeout(SOURCE_VALIDATION_TIMEOUT, handle.validate())
+            .await
+            .map_err(|_| {
+                AppError::bad_request("could not connect using the changed source settings")
+            })?
+            .map_err(|_| {
+                AppError::bad_request("could not connect using the changed source settings")
+            })?;
+        if !source_update_is_current(&state.source_update_status, &id, request_id).await {
+            return Ok(false);
+        }
+        state
+            .database
+            .update_source(&candidate)
+            .await
+            .map_err(db_error)?;
+        state.providers.write().await.push(handle);
+        spawn_library_scan(
+            &state,
+            &format!("Scanning updated source {}", candidate.display_name),
+        );
+        Ok(true)
+    }
+    .await;
+    let (status, succeeded, message) = match result {
+        Ok(true) => (None, true, "Source settings saved.".to_string()),
+        Ok(false) => (
+            None,
+            true,
+            "Superseded by newer source settings.".to_string(),
+        ),
+        Err(_) => (
+            Some(SourceUpdateStatus {
+                request_id,
+                state: "failed".to_string(),
+                // Provider errors can include an upstream URL. Never reflect a candidate's raw
+                // error because URL user-info and authentication failures may contain a secret.
+                message: Some("Could not validate the changed source settings.".to_string()),
+            }),
+            false,
+            "Could not validate the changed source settings.".to_string(),
+        ),
+    };
+    // The activity WebSocket wakes the panel. Publish only after the source view's terminal
+    // status is in place, otherwise the panel can reload the still-pending snapshot and wait
+    // forever for another activity frame.
+    finish_source_update(&state.source_update_status, id, request_id, status).await;
+    state.activity.finish(activity_id, succeeded, Some(message));
+}
+
+async fn update_source(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateSourceRequest>,
+) -> Result<StatusCode, AppError> {
+    if id == "local-disk" || id == providers::RADIO_PROVIDER_ID {
+        return Err(AppError::bad_request("built-in sources cannot be edited"));
+    }
+    // Reject location changes synchronously so the admin can correct the form immediately;
+    // candidate validation itself happens in the spawned task below.
+    if request.kind.is_some()
+        || request.host.is_some()
+        || request.share.is_some()
+        || request.base_path.is_some()
+    {
+        return Err(AppError::bad_request(
+            "source type and location cannot be changed; remove this source and add the new location",
+        ));
+    }
+    if state
+        .database
+        .source(&id)
+        .await
+        .map_err(db_error)?
+        .is_none()
+    {
+        return Err(AppError::not_found(format!("unknown source: {id}")));
+    }
+    let request_id = state.next_source_update.fetch_add(1, Ordering::Relaxed);
+    let activity_id = state.activity.start("source", "Checking source settings…");
+    set_source_update_status(
+        &state.source_update_status,
+        id.clone(),
+        Some(SourceUpdateStatus {
+            request_id,
+            state: "pending".to_string(),
+            message: Some("Checking the new source settings…".to_string()),
+        }),
+    )
+    .await;
+    tokio::spawn(apply_source_update(
+        state,
+        id,
+        request_id,
+        activity_id,
+        request,
+    ));
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn delete_source(
@@ -6709,8 +7021,11 @@ async fn delete_source(
             "the internet-radio source is built in; remove individual stations instead",
         ));
     }
+    let lock = source_mutation_lock(&state, &id).await;
+    let _operation = lock.lock().await;
     state.database.delete_source(&id).await.map_err(db_error)?;
     state.providers.write().await.remove(&id);
+    set_source_update_status(&state.source_update_status, id.clone(), None).await;
     // Re-merge the library without the removed source's tracks, in the background.
     spawn_library_scan(&state, "Rescan after removing a source");
     Ok(StatusCode::NO_CONTENT)
@@ -9402,12 +9717,15 @@ fn init_logging() {
 mod tests {
     use super::{
         ARTWORK_CACHE_CONTROL, BOOL_SETTINGS, Config, DEFAULT_SOURCE_URL, PlayerManager,
-        ProviderHandle, ProviderRegistry, acoustid_lookup_duration, app_with_diagnostics,
-        artwork_etag, bool_setting_default, folder_name_from_relative_path, normalize_size,
-        parse_range, resize_to_jpeg, schedule_autoplay_refills,
+        ProviderHandle, ProviderRegistry, SourceUpdateStatus, UpdateSourceRequest,
+        acoustid_lookup_duration, app_with_diagnostics, artwork_etag, bool_setting_default,
+        finish_source_update, folder_name_from_relative_path, normalize_size, parse_range,
+        resize_to_jpeg, schedule_autoplay_refills, set_source_update_status, source_host_view,
+        source_update_candidate, source_update_is_current, source_view,
     };
     use crate::{artwork, diagnostics, now_unix_seconds};
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
+    use tokio::sync::Mutex;
 
     #[test]
     fn album_display_hint_uses_only_the_final_relative_folder() {
@@ -15110,6 +15428,166 @@ while True:
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn source_update_keeps_an_omitted_password_and_rejects_location_changes() {
+        let current = musicata_storage::SourceRecord {
+            id: "smb:nas/music".to_string(),
+            kind: "smb".to_string(),
+            display_name: "NAS".to_string(),
+            enabled: true,
+            host: Some("nas.local".to_string()),
+            share: Some("music".to_string()),
+            base_path: None,
+            username: Some("old-user".to_string()),
+            password: Some(" secret with spaces ".to_string()),
+            domain: Some("OLD".to_string()),
+            created_at_unix_seconds: 10,
+        };
+        let edited = source_update_candidate(
+            current.clone(),
+            &UpdateSourceRequest {
+                display_name: Some("Listening room".to_string()),
+                username: Some(Some(" new-user ".to_string())),
+                password: None,
+                domain: Some(None),
+                kind: None,
+                host: None,
+                share: None,
+                base_path: None,
+            },
+        )
+        .expect("editable fields are valid");
+        assert_eq!(edited.display_name, "Listening room");
+        assert_eq!(edited.username.as_deref(), Some(" new-user "));
+        assert_eq!(edited.password.as_deref(), Some(" secret with spaces "));
+        assert_eq!(edited.domain, None);
+
+        let rejected = source_update_candidate(
+            current,
+            &UpdateSourceRequest {
+                display_name: None,
+                username: None,
+                password: None,
+                domain: None,
+                kind: None,
+                host: Some(Some("other-nas".to_string())),
+                share: None,
+                base_path: None,
+            },
+        )
+        .expect_err("a provider location must remain immutable");
+        assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn source_update_request_distinguishes_omitted_null_and_whitespace_credentials() {
+        let request: UpdateSourceRequest = serde_json::from_str(
+            r#"{"password":null,"username":" user with spaces ","domain":""}"#,
+        )
+        .expect("valid update request");
+        assert_eq!(
+            request.username.as_ref().map(|value| value.as_deref()),
+            Some(Some(" user with spaces "))
+        );
+        assert_eq!(request.password, Some(None));
+        assert_eq!(
+            request.domain.as_ref().map(|value| value.as_deref()),
+            Some(Some(""))
+        );
+        assert_eq!(
+            request.host, None,
+            "an omitted location is distinct from null"
+        );
+
+        let location: UpdateSourceRequest =
+            serde_json::from_str(r#"{"host":null}"#).expect("valid explicit null");
+        assert_eq!(location.host, Some(None));
+    }
+
+    #[test]
+    fn source_view_never_serializes_a_password() {
+        let view = source_view(
+            &musicata_storage::SourceRecord {
+                id: "smb:nas/music".to_string(),
+                kind: "smb".to_string(),
+                display_name: "NAS".to_string(),
+                enabled: true,
+                host: Some("https://music-user:do-not-return-me@nas.local/music".to_string()),
+                share: Some("music".to_string()),
+                base_path: None,
+                username: Some("music-user".to_string()),
+                password: Some("do-not-return-me".to_string()),
+                domain: None,
+                created_at_unix_seconds: 10,
+            },
+            None,
+        );
+        let json = serde_json::to_string(&view).expect("serialize source view");
+        assert!(!json.contains("do-not-return-me"));
+        assert!(json.contains("https://nas.local/music"));
+        assert!(json.contains("\"password_configured\":true"));
+        assert_eq!(
+            source_host_view(&Some("music-user:do-not-return-me@nas.local".to_string())),
+            Some("nas.local".to_string()),
+            "bare SMB-style user-info must not appear in a source DTO either"
+        );
+    }
+
+    #[tokio::test]
+    async fn older_source_validation_cannot_clear_a_newer_pending_update() {
+        let statuses = Arc::new(Mutex::new(BTreeMap::new()));
+        set_source_update_status(
+            &statuses,
+            "smb:nas/music".to_string(),
+            Some(SourceUpdateStatus {
+                request_id: 1,
+                state: "pending".to_string(),
+                message: None,
+            }),
+        )
+        .await;
+        set_source_update_status(
+            &statuses,
+            "smb:nas/music".to_string(),
+            Some(SourceUpdateStatus {
+                request_id: 2,
+                state: "pending".to_string(),
+                message: None,
+            }),
+        )
+        .await;
+        finish_source_update(&statuses, "smb:nas/music".to_string(), 1, None).await;
+        assert_eq!(
+            statuses
+                .lock()
+                .await
+                .get("smb:nas/music")
+                .map(|status| status.request_id),
+            Some(2),
+            "a slow older validation must not claim that a newer edit finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_source_update_is_not_current_for_persistence() {
+        let statuses = Arc::new(Mutex::new(BTreeMap::new()));
+        set_source_update_status(
+            &statuses,
+            "smb:nas/music".to_string(),
+            Some(SourceUpdateStatus {
+                request_id: 2,
+                state: "pending".to_string(),
+                message: None,
+            }),
+        )
+        .await;
+        assert!(
+            !source_update_is_current(&statuses, "smb:nas/music", 1).await,
+            "a stale candidate must not reach persistence"
+        );
+        assert!(source_update_is_current(&statuses, "smb:nas/music", 2).await);
     }
 
     #[tokio::test]

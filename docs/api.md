@@ -107,6 +107,7 @@ network sources are added at runtime and persisted.
 | ------ | ---- | ------- |
 | GET | `/api/sources` | List sources: `{ id, kind, display_name, enabled, capabilities }`. |
 | POST | `/api/sources` | Add a network source. SMB: `{ "kind":"smb", "host", "share", "base_path"?, "display_name"?, "username"?, "password"? }`. OpenSubsonic: `{ "kind":"opensubsonic", "host", "username", "password" }`. Podcast: `{ "kind":"podcast", "host":"<feed-url>", "display_name"? }` (browse-only; episodes are streams, not scanned — requires the `provider-podcast` build feature). Internet Archive: `{ "kind":"archive", "host":"<item-id-or-details-url>", "display_name"? }` (browse-only; an item's audio files are streamed — requires the `provider-archive` build feature). Builds + scans/validates it. |
+| PATCH | `/api/sources/{id}` | Admin-only background update; accepts `display_name`, `username`, `password`, `domain`. Omitted credentials stay unchanged, `null` clears them, strings retain whitespace. Type/location are immutable. Returns 202; `/api/sources` exposes safe configuration, `password_configured`, and pending/failed `update_status`, never passwords. Activity WebSocket signals completion. Failed validation preserves the existing source. |
 | DELETE | `/api/sources/{id}` | Remove a source and re-merge the library (not the local source). |
 | POST | `/api/sources/{id}/rescan` | Rescan all sources and persist the merged library. |
 | GET | `/api/sources/{id}/browse` | Browse a source's hierarchy (for browse-only providers like radio). |
@@ -200,6 +201,7 @@ consume the connections needed for authentication and browsing.
 | `command` | Extra fields |
 | --------- | ------------ |
 | `play`, `pause`, `stop`, `next`, `previous`, `clear` | — |
+| `restore_cleared_queue` | Restore the exact server-held queue from the last clear, without starting playback. Valid only while the queue remains empty and untouched in this server session. |
 | `seek` | `position_seconds` (number) |
 | `set_volume` | `volume` (0–100) |
 | `set_repeat` | `mode` (`off`/`all`/`one`) |

@@ -1631,6 +1631,17 @@ impl MpdPlayer {
                     }
                     Some((None, _)) => connection.play().await?,
                     None if defer_next => {}
+                    None if matches!(command, PlayerCommand::RestoreClearedQueue) => {
+                        let uris = {
+                            let state = self.state.lock().await;
+                            queue_to_mpd_uris(
+                                &state.queue,
+                                &self.public_base_url,
+                                &self.stream_auth,
+                            )
+                        };
+                        connection.load_queue(&uris).await?
+                    }
                     None => {
                         apply_command(
                             connection,
@@ -1711,7 +1722,10 @@ impl MpdPlayer {
         database: &Database,
         _base_url: &str,
     ) -> Result<()> {
-        let items = resolve_queue_items(database, &track_ids).await?;
+        let mut items = resolve_queue_items(database, &track_ids).await?;
+        for item in &mut items {
+            item.automatically_added = true;
+        }
         let appended_uris = queue_to_mpd_uris(&items, &self.public_base_url, &self.stream_auth);
         let _sync = self.sync.lock().await;
         let (resume, appended_at, continue_playback) = {
@@ -1958,6 +1972,9 @@ async fn apply_command(
         PlayerCommand::SetRepeat { mode } => connection.set_repeat(*mode).await,
         PlayerCommand::SetShuffle { enabled } => connection.set_shuffle(*enabled).await,
         PlayerCommand::Clear => connection.clear().await,
+        // MPD reloads the server-held clear snapshot in `MpdPlayer::execute`, where
+        // the exact queue items (including their fresh stream credentials) are available.
+        PlayerCommand::RestoreClearedQueue => Ok(()),
         PlayerCommand::PlayQueueIndex { index } => connection.play_index(*index).await,
         PlayerCommand::PlayTracks {
             track_ids,
@@ -1972,7 +1989,9 @@ async fn apply_command(
             }
             Ok(())
         }
-        PlayerCommand::Enqueue { track_ids, next } => {
+        PlayerCommand::Enqueue {
+            track_ids, next, ..
+        } => {
             let urls = resolve_urls(database, public_base_url, track_ids, stream_auth).await?;
             if *next {
                 let playback = connection.playback_state().await?;
@@ -2103,6 +2122,9 @@ pub struct ProgressTick {
 struct QueueState {
     status: PlaybackStatus,
     queue: Vec<QueueItem>,
+    /// The exact queue most recently cleared during this process. It is intentionally
+    /// not persisted: Undo is available only while the queue remains otherwise untouched.
+    cleared_queue: Option<Vec<QueueItem>>,
     position: Option<usize>,
     elapsed_seconds: Option<f64>,
     duration_seconds: Option<f64>,
@@ -2329,7 +2351,10 @@ impl BrowserPlayer {
         track_ids: Vec<String>,
         database: &Database,
     ) -> Result<()> {
-        let items = resolve_queue_items(database, &track_ids).await?;
+        let mut items = resolve_queue_items(database, &track_ids).await?;
+        for item in &mut items {
+            item.automatically_added = true;
+        }
         let persist = {
             let mut state = self.state.lock().await;
             if state.refill_revision != revision || state.queue_activity.is_none() {
@@ -2702,7 +2727,10 @@ impl ZonePlayer {
         members: &[PlayerHandle],
     ) -> Result<()> {
         let _sync = self.sync.lock().await;
-        let items = resolve_queue_items(database, &track_ids).await?;
+        let mut items = resolve_queue_items(database, &track_ids).await?;
+        for item in &mut items {
+            item.automatically_added = true;
+        }
         let resume = {
             let mut state = self.state.lock().await;
             if state.refill_revision != revision || state.queue_activity.is_none() {
@@ -2732,6 +2760,7 @@ impl ZonePlayer {
             &PlayerCommand::Enqueue {
                 track_ids,
                 next: false,
+                automatically_added: true,
             },
             members,
             database,
@@ -2900,6 +2929,7 @@ fn command_mutates_queue(command: &PlayerCommand) -> bool {
         PlayerCommand::PlayTracks { .. }
             | PlayerCommand::Enqueue { .. }
             | PlayerCommand::Clear
+            | PlayerCommand::RestoreClearedQueue
             | PlayerCommand::RemoveQueueItem { .. }
             | PlayerCommand::MoveQueueItem { .. }
             | PlayerCommand::PlayStream { .. }
@@ -2918,6 +2948,7 @@ fn command_moves_cursor(command: &PlayerCommand) -> bool {
             | PlayerCommand::Previous
             | PlayerCommand::Seek { .. }
             | PlayerCommand::Clear
+            | PlayerCommand::RestoreClearedQueue
             | PlayerCommand::PlayQueueIndex { .. }
             | PlayerCommand::PlayTracks { .. }
             | PlayerCommand::PlayStream { .. }
@@ -2951,6 +2982,14 @@ async fn apply_to_queue_state(
     command: PlayerCommand,
     database: &Database,
 ) -> Result<()> {
+    if command_mutates_queue(&command)
+        && !matches!(
+            command,
+            PlayerCommand::Clear | PlayerCommand::RestoreClearedQueue
+        )
+    {
+        state.cleared_queue = None;
+    }
     match command {
         PlayerCommand::Play => state.status = PlaybackStatus::Playing,
         PlayerCommand::Pause => state.status = PlaybackStatus::Paused,
@@ -2977,10 +3016,19 @@ async fn apply_to_queue_state(
             }
         }
         PlayerCommand::Clear => {
-            state.queue.clear();
+            state.cleared_queue = Some(std::mem::take(&mut state.queue));
             state.position = None;
             state.status = PlaybackStatus::Stopped;
             state.elapsed_seconds = Some(0.0);
+        }
+        PlayerCommand::RestoreClearedQueue => {
+            if !state.queue.is_empty() {
+                return Err(anyhow!("cannot restore while the queue is not empty"));
+            }
+            state.queue = state
+                .cleared_queue
+                .take()
+                .ok_or_else(|| anyhow!("no cleared queue is available to restore"))?;
         }
         PlayerCommand::PlayQueueIndex { index } => {
             if index < state.queue.len() {
@@ -3005,12 +3053,18 @@ async fn apply_to_queue_state(
             state.duration_seconds = None;
             state.elapsed_seconds = Some(0.0);
         }
-        PlayerCommand::Enqueue { track_ids, next } => {
-            enqueue_queue_items(
-                state,
-                resolve_queue_items(database, &track_ids).await?,
-                next,
-            );
+        PlayerCommand::Enqueue {
+            track_ids,
+            next,
+            automatically_added,
+        } => {
+            let mut items = resolve_queue_items(database, &track_ids).await?;
+            if automatically_added {
+                for item in &mut items {
+                    item.automatically_added = true;
+                }
+            }
+            enqueue_queue_items(state, items, next);
         }
         PlayerCommand::RemoveQueueItem { index } => remove_queue_item(state, index),
         PlayerCommand::MoveQueueItem { from, to } => move_queue_item(state, from, to),
@@ -3264,6 +3318,7 @@ async fn resolve_queue_items(database: &Database, track_ids: &[String]) -> Resul
                 true_peak_dbtp: loudness.map(|(_, peak)| peak),
                 album_integrated_loudness_lufs: album_loudness.map(|(lufs, _)| lufs),
                 album_true_peak_dbtp: album_loudness.map(|(_, peak)| peak),
+                automatically_added: false,
             });
         }
     }
@@ -3582,7 +3637,10 @@ impl SnapcastPlayer {
         database: &Database,
         _base_url: &str,
     ) -> Result<()> {
-        let items = resolve_queue_items(database, &track_ids).await?;
+        let mut items = resolve_queue_items(database, &track_ids).await?;
+        for item in &mut items {
+            item.automatically_added = true;
+        }
         let resume = {
             let mut state = self.state.lock().await;
             if state.refill_revision != revision || state.queue_activity.is_none() {
@@ -3611,6 +3669,7 @@ impl SnapcastPlayer {
         self.reconcile_tx.send_replace(PlayerCommand::Enqueue {
             track_ids,
             next: false,
+            automatically_added: true,
         });
         Ok(())
     }
@@ -4223,6 +4282,7 @@ impl SnapcastPlayer {
         self.reconcile_tx.send_replace(PlayerCommand::Enqueue {
             track_ids: Vec::new(),
             next: false,
+            automatically_added: false,
         });
     }
 
@@ -4347,6 +4407,25 @@ mod tests {
     use super::*;
     use musicata_core::{Album, Artist, Library, ProviderMapping, Track};
     use std::path::PathBuf;
+
+    #[test]
+    fn enqueue_json_cannot_spoof_automatic_provenance() {
+        let command: PlayerCommand = serde_json::from_str(
+            r#"{"command":"enqueue","track_ids":["track_1"],"automatically_added":true}"#,
+        )
+        .expect("parse command");
+        let PlayerCommand::Enqueue {
+            automatically_added,
+            ..
+        } = command
+        else {
+            panic!("enqueue command");
+        };
+        assert!(
+            !automatically_added,
+            "only the server's autoplay fan-out may mark an item automatic"
+        );
+    }
 
     #[test]
     fn autoplay_prefetch_is_quiet_until_playback_waits_for_tracks() {
@@ -6409,6 +6488,147 @@ mod tests {
     }
 
     #[test]
+    fn queue_provenance_survives_move_remove_and_restore() {
+        // Moving and removing queue slots must carry the provenance with the item, and
+        // restoration must retain that curated queue exactly.
+        let mut state = QueueState {
+            queue: vec![
+                QueueItem {
+                    title: "manual".into(),
+                    automatically_added: false,
+                    ..Default::default()
+                },
+                QueueItem {
+                    title: "automatic one".into(),
+                    automatically_added: true,
+                    ..Default::default()
+                },
+                QueueItem {
+                    title: "automatic two".into(),
+                    automatically_added: true,
+                    ..Default::default()
+                },
+            ],
+            position: Some(0),
+            ..Default::default()
+        };
+        move_queue_item(&mut state, 2, 1);
+        remove_queue_item(&mut state, 2);
+
+        let mut restored = QueueState::default();
+        apply_restored_snapshot(
+            &mut restored,
+            PlayerQueueSnapshot {
+                playback: state.playback(),
+                items: state.queue.clone(),
+            },
+        );
+
+        assert_eq!(
+            restored
+                .queue
+                .iter()
+                .map(|item| (item.title.as_str(), item.automatically_added))
+                .collect::<Vec<_>>(),
+            [("manual", false), ("automatic two", true)],
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_restore_keeps_exact_queue_provenance() {
+        let db_path = temp_db("clear-restore-provenance");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut state = QueueState {
+            queue: vec![
+                QueueItem {
+                    title: "selected".into(),
+                    automatically_added: false,
+                    ..Default::default()
+                },
+                QueueItem {
+                    title: "continuous".into(),
+                    automatically_added: true,
+                    ..Default::default()
+                },
+            ],
+            position: Some(0),
+            status: PlaybackStatus::Playing,
+            ..Default::default()
+        };
+
+        apply_to_queue_state(&mut state, PlayerCommand::Clear, &database)
+            .await
+            .expect("clear");
+        apply_to_queue_state(&mut state, PlayerCommand::RestoreClearedQueue, &database)
+            .await
+            .expect("restore");
+
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|item| (item.title.as_str(), item.automatically_added))
+                .collect::<Vec<_>>(),
+            [("selected", false), ("continuous", true)],
+        );
+        assert_eq!(state.status, PlaybackStatus::Stopped);
+        assert_eq!(state.position, None);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn restore_without_an_eligible_clear_snapshot_fails_without_changing_queue() {
+        let db_path = temp_db("restore-without-clear");
+        let database = Database::connect(&db_path).await.expect("connect");
+        let mut state = QueueState::default();
+        let error = apply_to_queue_state(&mut state, PlayerCommand::RestoreClearedQueue, &database)
+            .await
+            .expect_err("restore without a preceding clear must fail");
+        assert!(error.to_string().contains("no cleared queue"));
+
+        let original = QueueItem {
+            title: "selected".into(),
+            automatically_added: false,
+            ..Default::default()
+        };
+        state = QueueState {
+            queue: vec![original.clone()],
+            position: Some(0),
+            status: PlaybackStatus::Playing,
+            ..Default::default()
+        };
+
+        let error = apply_to_queue_state(&mut state, PlayerCommand::RestoreClearedQueue, &database)
+            .await
+            .expect_err("restore into a nonempty queue must fail");
+        assert!(error.to_string().contains("not empty"));
+        assert_eq!(state.queue, vec![original]);
+        assert_eq!(state.position, Some(0));
+        assert_eq!(state.status, PlaybackStatus::Playing);
+
+        apply_to_queue_state(&mut state, PlayerCommand::Clear, &database)
+            .await
+            .expect("clear");
+        apply_to_queue_state(
+            &mut state,
+            PlayerCommand::Enqueue {
+                track_ids: Vec::new(),
+                next: false,
+                automatically_added: false,
+            },
+            &database,
+        )
+        .await
+        .expect("queue mutation invalidates undo");
+        let error = apply_to_queue_state(&mut state, PlayerCommand::RestoreClearedQueue, &database)
+            .await
+            .expect_err("restore after another queue mutation must fail");
+        assert!(error.to_string().contains("no cleared queue"));
+        assert!(state.queue.is_empty());
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
     fn seek_clamps_to_track_bounds() {
         // ISS-03: a seek is clamped to [0, duration]; with unknown duration only floored at 0.
         assert_eq!(clamp_seek(-10.0, Some(180.0)), 0.0);
@@ -7224,6 +7444,14 @@ mod tests {
                 "refill must not reset playback progress"
             );
             assert_eq!(state.queue[0].track_id.as_deref(), Some("track_1"));
+            assert!(
+                !state.queue[0].automatically_added,
+                "the selected seed must remain a manual queue item"
+            );
+            assert!(
+                state.queue[1..].iter().all(|item| item.automatically_added),
+                "autoplay refill tracks must be marked as automatic"
+            );
             let ids: std::collections::HashSet<_> =
                 state.queue.iter().map(|i| &i.track_id).collect();
             assert_eq!(
@@ -7323,6 +7551,16 @@ mod tests {
             zone_state.queue.len() > 1,
             "zones must still refill: {zone_state:?}"
         );
+        assert!(
+            !zone_state.queue[0].automatically_added,
+            "the zone's selected seed must remain manual"
+        );
+        assert!(
+            zone_state.queue[1..]
+                .iter()
+                .all(|item| item.automatically_added),
+            "zone autoplay refill tracks must be marked automatic"
+        );
         if kind == "browser" {
             // Browser clients consume the zone broadcast, not a mirrored standalone queue.
             assert_eq!(state.lock().await.queue.len(), 1);
@@ -7338,19 +7576,36 @@ mod tests {
                     zone_state.queue.len(),
                     "zone refill reaches its dedicated Snapcast output once"
                 );
+                assert_eq!(
+                    zone_member.snapshot().await.queue,
+                    zone_state.queue,
+                    "zone member must retain queue provenance"
+                );
             } else {
                 assert_eq!(
                     state.lock().await.queue.len(),
                     zone_state.queue.len(),
                     "zone refill reaches its member once"
                 );
+                assert_eq!(
+                    state.lock().await.queue,
+                    zone_state.queue,
+                    "zone member must retain queue provenance"
+                );
             }
             #[cfg(not(feature = "snapcast"))]
-            assert_eq!(
-                state.lock().await.queue.len(),
-                zone_state.queue.len(),
-                "zone refill reaches its member once"
-            );
+            {
+                assert_eq!(
+                    state.lock().await.queue.len(),
+                    zone_state.queue.len(),
+                    "zone refill reaches its member once"
+                );
+                assert_eq!(
+                    state.lock().await.queue,
+                    zone_state.queue,
+                    "zone member must retain queue provenance"
+                );
+            }
         }
         if kind != "snapcast" {
             manager.set_zone(&id, None).await.unwrap();

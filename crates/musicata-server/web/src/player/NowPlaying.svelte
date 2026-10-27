@@ -73,11 +73,12 @@
       </div>
       <p class="playing-artist">{player.nowPlaying?.artist || (player.nowPlaying ? "Unknown artist" : "Choose an album from your library.")}</p>
       {#if player.nowPlaying?.album}<p class="playing-album">{player.nowPlaying.album}</p>{/if}
+      {#if player.nowPlaying?.automatically_added}<p class="continuous-play-origin">Added by continuous play</p>{/if}
       {#if player.nowPlaying && (!artwork || failed === artwork)}<p class="artwork-unavailable">Artwork unavailable</p>{/if}
     </div>
   </div>
   <div class="listening-queue">
-    <QueueDrawer embedded listening>
+    <QueueDrawer embedded listening visible={!hidden}>
       {#snippet controls()}
         <div class="playback-modes" role="group" aria-label="Playback options">
           <button type="button" aria-label="Shuffle" title="Shuffle" aria-pressed={player.shuffle}
@@ -178,7 +179,7 @@
   .playing-title-row { display:flex; align-items:flex-start; gap:16px; }
   .listening-title { flex:1; min-width:0; font-size:clamp(1.8rem,3vw,2.8rem); line-height:1.13; font-weight:400; font-family:var(--font-display); overflow-wrap:anywhere; }
   .playing-artist { margin:10px 0 0; color:var(--muted); font-size:1rem; overflow-wrap:anywhere; }
-  .playing-album,.artwork-unavailable { margin:10px 0 0; color:var(--muted); font-size:.78rem; overflow-wrap:anywhere; }
+  .playing-album,.continuous-play-origin,.artwork-unavailable { margin:10px 0 0; color:var(--muted); font-size:.78rem; overflow-wrap:anywhere; }
   .favorite-track { width:44px; min-width:44px; height:44px; border:0; background:none; color:var(--muted); cursor:pointer; }
   .favorite-track[aria-pressed="true"] { color:var(--accent); }
   .favorite-track[aria-pressed="true"] svg { fill:var(--accent-soft); }
@@ -210,8 +211,6 @@
   .now-playing-panel :global(.q-sub) { font-size:.75rem; }
   .now-playing-panel :global(.queue-options) { padding:8px 0; }
   .now-playing-panel :global(.queue-empty) { flex:1; }
-  .now-playing-panel :global(.queue-footer) { flex:none; border-top:1px solid var(--line); display:flex; justify-content:flex-end; padding:8px 0; }
-  .now-playing-panel :global(.queue-footer .ghost-button) { border:0; background:none; color:var(--muted); font-size:.78rem; }
   @media(max-width:1023px) {
     .now-playing-panel { display:flex; flex-direction:column; }
     .playing-detail { flex:none; flex-direction:row; justify-content:flex-start; padding:16px 20px; gap:18px; overflow:hidden; }
@@ -227,7 +226,6 @@
     .now-playing-panel :global(.queue-head > strong) { font-size:1.4rem; }
     .now-playing-panel :global(.queue-list) { padding:4px 0; }
     .now-playing-panel :global(.queue-row) { min-height:58px; padding:5px 4px; }
-    .now-playing-panel :global(.queue-footer) { padding:0; }
     .playing-tools { flex:none; padding:4px 16px 8px; background:var(--panel); }
     .playing-tools h3 { display:none; }
     .playing-options { max-width:none; }
@@ -247,7 +245,6 @@
     .playing-tools { grid-column:1; grid-row:2; padding:4px 16px; background:transparent; }
     .listening-queue { grid-column:2; grid-row:1/3; min-height:0; padding:4px 16px 0; }
     .now-playing-panel :global(.queue-row) { min-height:52px; }
-    .now-playing-panel :global(.queue-footer .ghost-button) { min-height:36px; }
     .transport-aux > input { max-width:110px; min-width:60px; }
   }
 </style>

@@ -16,6 +16,7 @@ import { albumPlayFlows } from "./album-play-flows.mjs";
 import { artworkFlows } from "./artwork-flows.mjs";
 import { uxFlows } from "./ux-flows.mjs";
 import { curationFlows } from "./curation-flows.mjs";
+import { createServer } from "node:http";
 
 const PORT = process.argv[2];
 const PATH = process.argv[3] || "/v2";
@@ -49,6 +50,25 @@ let failures = 0;
 function check(name, ok, detail = "") {
   console.log(`  ${ok ? "✓" : "✗"} ${name}${ok ? "" : "  <-- " + detail}`);
   if (!ok) failures++;
+}
+
+let sourceFixture = null;
+let sourceFixtureServer = null;
+let sourceFixtureAvailable = true;
+if (MODE === "behavior") {
+  sourceFixtureServer = createServer((request, response) => {
+    if (!sourceFixtureAvailable) return response.writeHead(503).end();
+    if (request.url !== "/feed.xml") return response.writeHead(404).end();
+    response.writeHead(200, { "content-type": "application/rss+xml" });
+    response.end(`<?xml version="1.0"?><rss version="2.0"><channel><title>Smoke source</title><item><title>Episode</title><guid>episode-1</guid><enclosure url="http://127.0.0.1/audio.mp3" type="audio/mpeg" /></item></channel></rss>`);
+  });
+  await new Promise((resolve) => sourceFixtureServer.listen(0, "127.0.0.1", resolve));
+  const port = sourceFixtureServer.address().port;
+  sourceFixture = await api("/api/sources", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ kind: "podcast", host: `http://127.0.0.1:${port}/feed.xml`, display_name: "Smoke source" }),
+  });
 }
 
 let groupedPlayerId = null;
@@ -461,6 +481,29 @@ await js(`document.querySelector('.queue-row .q-main')?.click()`);
 await waitUntil(`document.querySelector('.transport')?.dataset.status==='playing'`,2000);
 await clickText(".queue-head button", "Close");
 
+// A long queue must reveal the current row only when asked. Jumping is a reading aid, not a
+// focus trap: keyboard focus stays on the control the listener clicked.
+const longQueueTrack = (await api("/api/tracks?limit=1"))?.items?.[0];
+const longQueueIndex = 44;
+if (longQueueTrack) {
+  await api("/api/players/browser-local/commands", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ command: "play_tracks", track_ids: Array(48).fill(longQueueTrack.id), start_index: longQueueIndex }),
+  });
+  await waitUntil(`document.querySelector('.transport')?.dataset.status === 'playing'`, 3000);
+  await js(`document.querySelector('.queue-btn')?.click()`);
+  await waitUntil(`document.querySelectorAll('.queue-row').length === 48`, 3000);
+  await js(`(() => { const list = document.querySelector('.queue-list'); if (!list) return; list.scrollTop = 0; list.dispatchEvent(new Event('scroll')); })()`);
+  check("long queue: current track can be jumped to", await waitUntil(`document.querySelector('.jump-current')`, 1500) < Infinity);
+  await js(`document.querySelector('.jump-current')?.focus(); document.querySelector('.jump-current')?.click()`);
+  check(
+    "long queue: Jump reveals the current row without stealing focus",
+    await waitUntil(`(() => { const list=document.querySelector('.queue-list'); const row=document.querySelector('.queue-row.current'); if(!list||!row) return false; const a=list.getBoundingClientRect(), b=row.getBoundingClientRect(); return b.top >= a.top && b.bottom <= a.bottom && document.activeElement?.classList.contains('jump-current'); })()`, 1500) < Infinity,
+  );
+  await clickText(".queue-head button", "Close");
+}
+
 // Browse filter + search persistence
 await clickText(".seg", "Albums");
 await sleep(400);
@@ -816,10 +859,14 @@ check(
   ((await api("/api/players/browser-local/state"))?.queue?.length ?? 0) === oldOutputQueueBeforeSwitch,
 );
 await js(`window.__restoreRadioFetch?.()`);
-// Continuous-play (autoplay) toggle persists through the API.
-await api("/api/autoplay", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true }) });
-check("autoplay toggle persists", (await api("/api/autoplay"))?.enabled === true);
-await api("/api/autoplay", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) });
+// Continuous play is visible and editable without opening queue options.
+await js(`document.querySelector('.output-picker[open] summary')?.click(); document.querySelector('.queue-btn')?.click()`);
+check("continuous play control is visible", await waitUntil(`document.querySelector('.queue-drawer button.continuous-play-control')?.textContent.includes('off')`, 3000) < Infinity);
+await js(`document.querySelector('.queue-drawer button.continuous-play-control')?.click()`);
+check("continuous play control saves on", await waitUntil(`document.querySelector('.queue-drawer button.continuous-play-control')?.getAttribute('aria-pressed') === 'true' && !document.querySelector('.queue-drawer button.continuous-play-control')?.disabled`, 3000) < Infinity && (await api('/api/autoplay'))?.enabled === true);
+await js(`document.querySelector('.queue-drawer button.continuous-play-control')?.click()`);
+check("continuous play control saves off", await waitUntil(`document.querySelector('.queue-drawer button.continuous-play-control')?.getAttribute('aria-pressed') === 'false' && !document.querySelector('.queue-drawer button.continuous-play-control')?.disabled`, 3000) < Infinity && (await api('/api/autoplay'))?.enabled === false);
+await js(`document.querySelector('[aria-label="Close queue"]')?.click()`);
 
 // Radio: the station shows in the sidebar; playing it sets now-playing.
 check("radio station listed", await js(`[...document.querySelectorAll('.library-panel .nav-link')].some(b=>/smoke fm/i.test(b.textContent))`));
@@ -1003,10 +1050,10 @@ for (const [width, height] of [[360, 800], [800, 360], [320, 568]]) {
   check(`${label}: next changes track`, await waitUntil(`document.querySelector('#now-title')?.textContent !== ${JSON.stringify(priorTitle)}`, 2000) < Infinity);
   check(`${label}: queue button is reachable`, await tapMobile('.mini-controls [aria-label="Queue"]'));
   check(`${label}: queue opens`, await waitUntil('document.querySelector(".queue-drawer")', 1000) < Infinity);
-  check(`${label}: queue receives focus`, await js(`document.activeElement?.getAttribute('aria-label') === 'Close queue'`));
+  check(`${label}: opening queue retains trigger focus`, await js(`document.activeElement?.getAttribute('aria-label') === 'Queue'`));
   await mobileScreenshot(`${width}x${height}-queue`);
-  const queueTitle = await js('document.querySelector(".queue-row .q-title")?.textContent');
-  check(`${label}: queue track is tappable`, await tapMobile('.queue-row .q-main'));
+  const queueTitle = await js('document.querySelector(".queue-row.current .q-title")?.textContent');
+  check(`${label}: queue track is tappable`, await tapMobile('.queue-row.current .q-main'));
   check(`${label}: queue selection plays`, !!queueTitle && await waitUntil(`document.querySelector('#now-title')?.textContent === ${JSON.stringify(queueTitle)}`, 2000) < Infinity);
   check(`${label}: queue closes`, await tapMobile('.queue-head-actions button:last-child'));
   check(`${label}: queue returns focus`, await js(`document.activeElement?.getAttribute('aria-label') === 'Queue'`));
@@ -1105,6 +1152,23 @@ const healthCapture = await send("Page.addScriptToEvaluateOnNewDocument", {sourc
 await send("Emulation.setDeviceMetricsOverride", {width: 1280, height: 900, deviceScaleFactor: 1, mobile: false});
 await send("Page.navigate", {url: base + "/admin"});
 await waitUntil(`document.querySelector('[data-settings-category="outputs"]')`, 5000);
+if (sourceFixture) {
+  check("sources: editable source is listed", await waitUntil(`[...document.querySelectorAll('.admin-row')].some(row => row.textContent.includes('Smoke source'))`, 5000) < Infinity);
+  await js(`([...document.querySelectorAll('.admin-row')].find(row => row.textContent.includes('Smoke source'))?.querySelector('button')?.click())`);
+  check("sources: edit form keeps the location read-only", await waitUntil(`document.querySelector('.source-edit input[readonly]')`, 2000) < Infinity && await js(`[...document.querySelectorAll('.source-edit input[readonly]')].some(input => input.value.includes('feed.xml'))`));
+  await mobileScreenshot("source-edit");
+  await js(`(() => { const input = document.querySelector('.source-edit input:not([readonly])'); input.value = 'Renamed smoke source'; input.dispatchEvent(new Event('input', {bubbles:true})); })()`);
+  await js(`document.querySelector('.source-edit button[type="submit"]')?.click()`);
+  check("sources: successful validation swaps the displayed configuration", await waitUntil(`!document.querySelector('.source-edit') && [...document.querySelectorAll('.admin-row')].some(row => row.textContent.includes('Renamed smoke source'))`, 7000) < Infinity);
+  sourceFixtureAvailable = false;
+  await js(`([...document.querySelectorAll('.admin-row')].find(row => row.textContent.includes('Renamed smoke source'))?.querySelector('button')?.click())`);
+  await js(`(() => { const input = document.querySelector('.source-edit input:not([readonly])'); input.value = 'Rejected source name'; input.dispatchEvent(new Event('input', {bubbles:true})); })()`);
+  await js(`document.querySelector('.source-edit button[type="submit"]')?.click()`);
+  check("sources: failed validation is visible", await waitUntil(`document.body.textContent.includes('Could not validate the changed source settings.')`, 7000) < Infinity);
+  const preservedSource = (await api('/api/sources')).find(source => source.id === sourceFixture.id);
+  check("sources: failed validation retains saved identity and configuration", preservedSource?.display_name === 'Renamed smoke source' && preservedSource.host === sourceFixture.host);
+  sourceFixtureAvailable = true;
+}
 await js(`document.querySelector('[data-settings-category="outputs"]')?.click()`);
 check("Snapcast: buffer control appears", await waitUntil(`document.querySelector('[data-snapcast-buffer]')`, 5000) < Infinity);
 check("Snapcast: live health appears", await waitUntil(`document.querySelector('[data-snapcast-health]')`, 5000) < Infinity);

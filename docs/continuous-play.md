@@ -8,7 +8,11 @@ Date: 2026-06-07
 
 ## Current behavior
 
-The global **Autoplay** switch in Queue applies to browser, standalone MPD, Snapcast, and zones.
+The global **Continuous play** switch in Queue and Now Playing applies to browser, standalone MPD, Snapcast, and zones.
+The compact player also displays its state. Automatically appended songs carry an
+**Added by continuous play** label, retained through queue edits and server restarts.
+Turning the switch off stops future additions and keeps songs already queued.
+Queues saved before 1.15.1 have no provenance information, so existing entries remain unlabeled.
 A background scheduler checks each output every second.
 With repeat off and fewer than five upcoming tracks, it starts one lookup per output and
 appends up to ten similar library tracks, using the current song as the seed. Lookups run

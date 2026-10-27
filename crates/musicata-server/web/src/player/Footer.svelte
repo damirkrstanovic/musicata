@@ -5,6 +5,7 @@
   import { audioDevices } from "../lib/audioDevices.svelte";
   import { meter } from "../lib/meter.svelte";
   import { statsPanel } from "../lib/statsPanel.svelte";
+  import { autoplay } from "../lib/autoplay.svelte";
   import { startRadio, togglePlayback, next, previous } from "../lib/playback";
   import { sendCommand, type PlayerCommand } from "../lib/commands";
   import type { RepeatMode } from "../types/RepeatMode";
@@ -47,6 +48,10 @@
               : "Reconnecting…")}</strong></button>
       {#if player.connection === "online"}
         <span>{subtitle}</span>
+        <span class="continuous-play-control compact" role="status">
+          {autoplay.error ? "Continuous play unavailable" : autoplay.enabled === null ? "Continuous play loading…" : `Continuous play ${autoplay.enabled ? "on" : "off"}`}
+        </span>
+        {#if player.nowPlaying?.automatically_added}<span class="continuous-play-origin compact">Added by continuous play</span>{/if}
         {#if player.queueActivity}
           <span class="queue-activity" role="status" aria-live="polite">{player.queueActivity}</span>
         {/if}
@@ -188,6 +193,14 @@
 </footer>
 
 <style>
+  .continuous-play-control.compact {
+    width: fit-content;
+    padding: 2px 0;
+    color: var(--muted);
+    font: inherit;
+    font-size: .72rem;
+  }
+  .continuous-play-origin.compact { color: var(--accent); font-size: .72rem; }
   .output-switch {
     display: inline-flex;
     gap: 2px;

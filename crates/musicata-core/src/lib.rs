@@ -651,6 +651,9 @@ pub struct QueueItem {
     /// falling back to the per-track values above.
     pub album_integrated_loudness_lufs: Option<f64>,
     pub album_true_peak_dbtp: Option<f64>,
+    /// True when the autoplay scheduler, rather than a controller, appended this item.
+    #[serde(default)]
+    pub automatically_added: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -698,6 +701,10 @@ pub enum PlayerCommand {
         enabled: bool,
     },
     Clear,
+    /// Restore the exact queue cleared during this server session, if it has not been
+    /// replaced since. The snapshot stays server-side so controllers cannot forge item
+    /// provenance.
+    RestoreClearedQueue,
     PlayTracks {
         track_ids: Vec<String>,
         /// Which queue position to start playing from (default 0). Lets a controller
@@ -712,6 +719,10 @@ pub enum PlayerCommand {
         /// Insert after the current queue item without interrupting playback.
         #[serde(default)]
         next: bool,
+        /// Internal zone fan-out marker. Requests cannot supply it; only the autoplay
+        /// scheduler uses it to retain provenance on member queues.
+        #[serde(default, skip_deserializing)]
+        automatically_added: bool,
     },
     PlayQueueIndex {
         index: usize,

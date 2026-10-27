@@ -85,8 +85,10 @@ export async function uxFlows({js, send, check, waitUntil, tap, screenshot}) {
   await waitUntil('document.querySelector(".queue-row")',3000);
   const titles=await js(`Array.from(document.querySelectorAll('.q-title')).map(e=>e.textContent)`);
   check('UX queue: editing controls initially hidden',await js(`Array.from(document.querySelectorAll('.q-actions')).every(e=>e.hidden)`));
+  check('UX queue: options are reachable',await tap('.now-playing-panel .queue-options-toggle'));
   check('UX queue: edit action is reachable',await tap('.queue-edit'));
   check('UX queue: editing exposes reorder controls',await js(`!!document.querySelector('.q-actions:not([hidden]) button')`));
+  await tap('.now-playing-panel .queue-options-toggle');
   await tap('.queue-edit');
   check('UX queue: editing preserves content',JSON.stringify(titles)===JSON.stringify(await js(`Array.from(document.querySelectorAll('.q-title')).map(e=>e.textContent)`)));
   await screenshot('ux-desktop-now-playing');

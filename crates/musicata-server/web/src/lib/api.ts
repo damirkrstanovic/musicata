@@ -240,6 +240,14 @@ export interface CreateSourceRequest {
   domain?: string;
 }
 
+export interface UpdateSourceRequest {
+  display_name?: string;
+  username?: string | null;
+  /** Omit to retain the saved password; send null to clear it. */
+  password?: string | null;
+  domain?: string | null;
+}
+
 export interface MergeArtistsRequest {
   canonical_id: string;
   member_ids: string[];
@@ -356,6 +364,7 @@ export const api = {
   // Sources
   sources: () => getJson<SourceView[]>("/api/sources"),
   createSource: (body: CreateSourceRequest) => sendJson("/api/sources", "POST", body),
+  updateSource: (id: string, body: UpdateSourceRequest) => sendJson(`/api/sources/${encodeURIComponent(id)}`, "PATCH", body),
   deleteSource: (id: string) => sendJson(`/api/sources/${encodeURIComponent(id)}`, "DELETE"),
   rescanAll: () => sendJson("/api/sources/all/rescan", "POST"),
 

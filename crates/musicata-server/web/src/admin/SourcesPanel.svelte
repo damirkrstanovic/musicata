@@ -1,12 +1,22 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
+  import { onDestroy } from "svelte";
   import { api, ApiError, type SourceView } from "../lib/api";
+  import { connectActivity } from "../lib/activity";
   import { confirmAction } from "../lib/modal";
 
   let sources = $state<SourceView[]>([]);
   let status = $state("");
   let error = $state(false);
   let busy = $state(false);
+  let editing = $state<string | null>(null);
+  let editName = $state("");
+  let editUsername = $state("");
+  let editDomain = $state("");
+  let editPassword = $state("");
+  let clearPassword = $state(false);
+  let updatingSourceId = $state<string | null>(null);
+  let sourceRefreshFailed = $state(false);
   let kind = $state<"smb" | "opensubsonic" | "podcast" | "archive">("smb");
 
   const CAPS: [keyof SourceView["capabilities"], string][] = [
@@ -19,11 +29,16 @@
   async function load() {
     try {
       sources = await api.sources();
-    } catch (e) {
-      sources = [];
-    }
+    } catch {}
   }
   load();
+
+  const disconnectActivity = connectActivity((activities) => {
+    if (updatingSourceId && activities.some((activity) => activity.kind === "source" && activity.status !== "running")) {
+      void refreshUpdatedSource();
+    }
+  });
+  onDestroy(disconnectActivity);
 
   function setStatus(message: string, isError = false) {
     status = message;
@@ -92,6 +107,66 @@
     }
   }
 
+  function edit(source: SourceView) {
+    editing = source.id;
+    editName = source.display_name;
+    editUsername = source.username ?? "";
+    editDomain = source.domain ?? "";
+    editPassword = "";
+    clearPassword = false;
+    setStatus("");
+  }
+
+  async function saveSource(source: SourceView) {
+    busy = true;
+    setStatus("Checking the new settings…");
+    try {
+      const password = clearPassword ? null : editPassword === "" ? undefined : editPassword;
+      sourceRefreshFailed = false;
+      await api.updateSource(source.id, {
+        display_name: editName,
+        username: editUsername === "" ? null : editUsername,
+        domain: editDomain === "" ? null : editDomain,
+        ...(password === undefined ? {} : { password }),
+      });
+      editing = null;
+      // An already-completed validation may have published before the activity subscription
+      // sees it, so read once immediately after the accepted response.
+      updatingSourceId = source.id;
+      await refreshUpdatedSource();
+    } catch (e) {
+      updatingSourceId = null;
+      sourceRefreshFailed = false;
+      setStatus(e instanceof ApiError ? e.message : String(e), true);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function refreshUpdatedSource() {
+    const id = updatingSourceId;
+    if (!id) return;
+    try {
+      const nextSources = await api.sources();
+      sources = nextSources;
+      sourceRefreshFailed = false;
+      const source = nextSources.find((item) => item.id === id);
+      if (!source) {
+        setStatus("This source was removed before its settings could be saved.", true);
+        updatingSourceId = null;
+      } else if (source.update_status?.state === "failed") {
+        setStatus(source.update_status.message ?? "Could not validate the changed source settings.", true);
+        updatingSourceId = null;
+      } else if (!source.update_status) {
+        setStatus("Source settings saved.");
+        updatingSourceId = null;
+      }
+    } catch {
+      sourceRefreshFailed = true;
+      setStatus("Still checking the new settings. The saved source configuration is unchanged until validation succeeds.");
+    }
+  }
+
   async function rescanAll() {
     try {
       await api.rescanAll();
@@ -122,11 +197,40 @@
               {#if source.capabilities[key]}<span class="chip">{label}</span>{/if}
             {/each}
           </div>
+          {#if source.update_status}
+            <p class="form-status" class:error={source.update_status.state === "failed"}>{source.update_status.message}</p>
+          {/if}
         </div>
         {#if source.kind !== "local"}
-          <button type="button" class="ghost-button danger" onclick={() => remove(source)}>Remove</button>
+          <div class="field-actions">
+            <button type="button" class="ghost-button" disabled={busy || source.update_status?.state === "pending"} onclick={() => edit(source)}>Edit</button>
+            <button type="button" class="ghost-button danger" disabled={busy || source.update_status?.state === "pending"} onclick={() => remove(source)}>Remove</button>
+          </div>
         {/if}
       </div>
+      {#if editing === source.id}
+        <form class="field-form source-edit" onsubmit={(event) => { event.preventDefault(); void saveSource(source); }}>
+          <h3>Edit {source.display_name}</h3>
+          <div class="field-grid">
+            <label class="field"><span>Name</span><input bind:value={editName} required disabled={busy} /></label>
+            <label class="field"><span>User <em>(optional)</em></span><input bind:value={editUsername} disabled={busy} /></label>
+            <label class="field"><span>Domain <em>(optional)</em></span><input bind:value={editDomain} disabled={busy} /></label>
+            <label class="field"><span>New password</span><input bind:value={editPassword} type="password" autocomplete="new-password" disabled={busy || clearPassword} placeholder={source.password_configured ? "Saved — leave blank to keep" : "Not set"} /></label>
+            <label class="field checkbox"><input type="checkbox" bind:checked={clearPassword} disabled={busy || !source.password_configured} /><span>Remove saved password</span></label>
+          </div>
+          <p class="admin-hint">The source type and location stay fixed. To change them, remove this source and add the new location.</p>
+          <div class="field-grid readonly-source">
+            <label class="field"><span>Type</span><input value={source.kind} readonly /></label>
+            {#if source.host}<label class="field"><span>{source.kind === "opensubsonic" ? "Server URL" : "Host"}</span><input value={source.host} readonly /></label>{/if}
+            {#if source.share}<label class="field"><span>Share</span><input value={source.share} readonly /></label>{/if}
+            {#if source.base_path}<label class="field"><span>Path</span><input value={source.base_path} readonly /></label>{/if}
+          </div>
+          <div class="field-actions">
+            <button type="submit" class="primary-button" disabled={busy}>Save changes</button>
+            <button type="button" class="ghost-button" disabled={busy} onclick={() => editing = null}>Cancel</button>
+          </div>
+        </form>
+      {/if}
     {/each}
   </div>
 
@@ -171,6 +275,7 @@
     <div class="field-actions">
       <button type="submit" class="primary-button" disabled={busy}>Add source</button>
       <span class="form-status" class:error>{status}</span>
+      {#if updatingSourceId}<button type="button" class="ghost-button" onclick={() => void refreshUpdatedSource()}>{sourceRefreshFailed ? "Retry check" : "Check status"}</button>{/if}
     </div>
   </form>
 </section>

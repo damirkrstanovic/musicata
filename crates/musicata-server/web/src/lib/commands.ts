@@ -17,6 +17,7 @@ export type PlayerCommand =
   | { command: "set_repeat"; mode: RepeatMode }
   | { command: "set_shuffle"; enabled: boolean }
   | { command: "clear" }
+  | { command: "restore_cleared_queue" }
   | { command: "play_tracks"; track_ids: string[]; start_index: number }
   | { command: "enqueue"; track_ids: string[]; next?: boolean }
   | { command: "play_queue_index"; index: number }

@@ -37,6 +37,12 @@ export async function stablePlayerFlows({js, send, check, waitUntil, tap, screen
     await settle();
     check(`Stable ${width}: Now Playing keeps transport and output in place`,await stable());
     check(`Stable ${width}: queue is visible by default`,await js(`!!document.querySelector('.now-playing-panel .queue-drawer')?.getClientRects().length`));
+    check(`Stable ${width}: continuous play state is visible while listening`,await js(`(()=>{const control=document.querySelector('.now-playing-panel .continuous-play-control');return !!control&&/Continuous play/.test(control.textContent||'')&&/All outputs/.test(control.parentElement?.textContent||'')})()`));
+    check(`Stable ${width}: current queue item is identified to assistive technology`,await js(`(()=>{const current=document.querySelector('.now-playing-panel .queue-row[aria-current="true"]');return !document.querySelector('.now-playing-panel .queue-row')||!!current})()`));
+    check(`Stable ${width}: opening the queue reveals the current song`,await js(`(()=>{const list=document.querySelector('.now-playing-panel .queue-list'),current=list?.querySelector('.queue-row.current');if(!list||!current)return true;const a=list.getBoundingClientRect(),b=current.getBoundingClientRect();return b.top>=a.top&&b.bottom<=a.bottom})()`));
+    await js(`(()=>{window.queueManualScroll=undefined;const list=document.querySelector('.now-playing-panel .queue-list');if(!list||list.scrollHeight<=list.clientHeight)return;list.scrollTop=Math.max(0,list.scrollHeight-list.clientHeight);window.queueManualScroll=list.scrollTop})()`);
+    await settle();
+    check(`Stable ${width}: queue leaves a listener's manual scroll position alone`,await js(`(()=>{const list=document.querySelector('.now-playing-panel .queue-list');return !list||window.queueManualScroll===undefined||Math.abs(list.scrollTop-window.queueManualScroll)<2})()`));
     check(`Stable ${width}: playback modes are reachable without expanding options`,await js(`(()=>{const e=document.querySelector('.now-playing-panel [aria-label="Shuffle"]');if(!e)return false;const r=e.getBoundingClientRect();return e.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2));})()`));
     await js(`window.modeTop=document.querySelector('.playback-modes')?.getBoundingClientRect().top;document.querySelector('.now-playing-panel').scrollTop=500`);
     check(`Stable ${width}: playback modes stay fixed while queue scrolls`,await js(`Math.abs(document.querySelector('.playback-modes')?.getBoundingClientRect().top-window.modeTop)<2`));
@@ -55,6 +61,7 @@ export async function stablePlayerFlows({js, send, check, waitUntil, tap, screen
     check(`Stable ${width}: queue opens`,await tap(width<1024 ? '.mini-controls [aria-label="Queue"]' : '.queue-btn'));
     await settle();
     check(`Stable ${width}: queue keeps transport and output in place`,await stable());
+    check(`Stable ${width}: queue exposes continuous-play scope`,await js(`(()=>{const control=document.querySelector('.playback-panels .continuous-play-control');return !!control&&/All outputs/.test(control.parentElement?.textContent||'')})()`));
     check(`Stable ${width}: playback stays reachable with queue open`,await js(`(()=>{const e=[...document.querySelectorAll('.transport [aria-label="Play"],.transport [aria-label="Pause"]')].find(e=>e.getClientRects().length);if(!e)return false;const r=e.getBoundingClientRect();return e.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))&&!e.closest('[inert]')})()`));
     await screenshot(`stable-${width}-queue`);
     if(width === 1440) {
